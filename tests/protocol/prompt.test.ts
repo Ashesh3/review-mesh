@@ -36,6 +36,12 @@ describe("buildReviewerPrompt", () => {
       prompt.user.indexOf("CALLER INSTRUCTIONS"),
     );
     expect(prompt.system).toContain("Inspect only; do not edit files.");
+    expect(prompt.system).toContain(
+      "Do not execute shell commands, programs, scripts, builds, tests, Git commands, or code.",
+    );
+    expect(prompt.system).toContain(
+      "Review Mesh core may provide bounded read-only Git context",
+    );
     expect(prompt.system).toContain("Return exactly the supplied schema.");
     expect(prompt.system).toContain(
       "Use pass only with zero actionable findings.",

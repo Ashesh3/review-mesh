@@ -20,8 +20,9 @@ import {
 } from "./types.js";
 
 const CLAUDE_AGENT_SDK_VERSION = "0.3.251";
-const READ_ONLY_TOOLS = ["Read", "Glob", "Grep", "Bash"] as const;
+const READ_ONLY_TOOLS = ["Read", "Glob", "Grep"] as const;
 const DISALLOWED_TOOLS = [
+  "Bash",
   "Edit",
   "Write",
   "NotebookEdit",
@@ -33,8 +34,10 @@ const INSPECTION_TOOLS = new Set(["Read", "Glob", "Grep"]);
 const TOOL_DENIAL = "Review Mesh denied this tool for a read-only review.";
 const SANDBOX_UNAVAILABLE =
   /\b(?:unavailable|unsupported|not\s+supported|missing\s+dependencies|cannot\s+start)\b/i;
+const THROWN_SANDBOX_UNAVAILABLE =
+  /\b(?:unavailable|unsupported|not\s+supported)\b/i;
 const SANDBOX_TOKEN = /\bsandbox\b/i;
-const CLAUDE_INITIALIZE_TIMEOUT_MS = 3_000;
+const CLAUDE_INITIALIZE_TIMEOUT_MS = 15_000;
 
 type ClaudeRegistration = Extract<AdapterRegistration, { type: "claude" }>;
 
@@ -88,11 +91,16 @@ type AttemptOutcome =
       message: SDKResultMessage;
       attemptStarted: true;
     }
-  | { type: "failure"; failure: AdapterFailure; attemptStarted: boolean };
+  | {
+      type: "failure";
+      failure: AdapterFailure;
+      attemptStarted: boolean;
+      sandboxUnavailable?: boolean;
+    };
 
-function fixedToolPermission(allowBash: boolean) {
+function fixedToolPermission() {
   return async (toolName: string): Promise<PermissionResult> => {
-    if (INSPECTION_TOOLS.has(toolName) || (allowBash && toolName === "Bash")) {
+    if (INSPECTION_TOOLS.has(toolName)) {
       return { behavior: "allow" };
     }
     return {
@@ -181,6 +189,14 @@ export function isClaudeSandboxUnavailable(message: SDKMessage): boolean {
   );
 }
 
+function isThrownClaudeSandboxUnavailable(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    SANDBOX_TOKEN.test(error.message) &&
+    THROWN_SANDBOX_UNAVAILABLE.test(error.message)
+  );
+}
+
 class ClaudeAdapter implements ReviewAdapter {
   readonly id = "claude";
   private readonly environment: NodeJS.ProcessEnv;
@@ -215,6 +231,10 @@ class ClaudeAdapter implements ReviewAdapter {
       mcpServers: {},
       plugins: [],
       skills: [],
+      tools: [...READ_ONLY_TOOLS],
+      disallowedTools: [...DISALLOWED_TOOLS],
+      permissionMode: "dontAsk",
+      canUseTool: fixedToolPermission(),
       persistSession: false,
       env: buildAllowlistedEnvironment(
         this.registration.env_allowlist,
@@ -329,7 +349,7 @@ class ClaudeAdapter implements ReviewAdapter {
       tools: [...READ_ONLY_TOOLS],
       disallowedTools: [...DISALLOWED_TOOLS],
       permissionMode: "dontAsk",
-      canUseTool: fixedToolPermission(true),
+      canUseTool: fixedToolPermission(),
       systemPrompt: input.prompt.system,
       outputFormat: {
         type: "json_schema",
@@ -344,7 +364,7 @@ class ClaudeAdapter implements ReviewAdapter {
         ? {
             enabled: true,
             failIfUnavailable: true,
-            autoAllowBashIfSandboxed: true,
+            autoAllowBashIfSandboxed: false,
             allowUnsandboxedCommands: false,
             filesystem: { denyWrite: [input.context.workspace] },
             network: { allowedDomains: [], strictAllowlist: true },
@@ -354,7 +374,7 @@ class ClaudeAdapter implements ReviewAdapter {
         ? {}
         : { pathToClaudeCodeExecutable: this.registration.executable }),
     };
-    if (!sandboxed) options.canUseTool = fixedToolPermission(true);
+    if (!sandboxed) options.canUseTool = fixedToolPermission();
     return options;
   }
 
@@ -429,14 +449,18 @@ class ClaudeAdapter implements ReviewAdapter {
         };
       }
       return { type: "native_result", message: terminal, attemptStarted: true };
-    } catch {
+    } catch (error) {
+      const cancelled =
+        active.controller.signal.aborted || input.signal.aborted;
       return {
         type: "failure",
-        failure:
-          active.controller.signal.aborted || input.signal.aborted
-            ? adapterFailure.cancelled()
-            : adapterFailure.processCrashed("The Claude SDK stream failed."),
+        failure: cancelled
+          ? adapterFailure.cancelled()
+          : adapterFailure.processCrashed("The Claude SDK stream failed."),
         attemptStarted,
+        ...(!cancelled && sandboxed && isThrownClaudeSandboxUnavailable(error)
+          ? { sandboxUnavailable: true }
+          : {}),
       };
     } finally {
       closeQuery(active.query);
@@ -482,6 +506,19 @@ class ClaudeAdapter implements ReviewAdapter {
         }
 
         if (outcome.type === "failure") {
+          if (outcome.sandboxUnavailable === true) {
+            if (input.isolationPolicy === "require_enforced") {
+              yield {
+                type: "failure",
+                failure: adapterFailure.unavailable(
+                  "The Claude sandbox is unavailable for an enforced review.",
+                ),
+              };
+              return;
+            }
+            sandboxed = false;
+            continue;
+          }
           yield {
             type: "failure",
             failure: outcome.failure,

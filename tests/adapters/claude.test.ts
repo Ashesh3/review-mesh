@@ -296,13 +296,24 @@ describe("Claude Agent SDK adapter", () => {
     });
     expect(startup).toHaveBeenCalledOnce();
     const initialization = startup.mock.calls[0]![0];
-    expect(initialization.initializeTimeoutMs).toBe(3_000);
+    expect(initialization.initializeTimeoutMs).toBe(15_000);
     expect(initialization.options).toMatchObject({
       settingSources: [],
       strictMcpConfig: true,
       mcpServers: {},
       plugins: [],
       skills: [],
+      tools: ["Read", "Glob", "Grep"],
+      disallowedTools: [
+        "Bash",
+        "Edit",
+        "Write",
+        "NotebookEdit",
+        "WebFetch",
+        "WebSearch",
+        "Task",
+      ],
+      permissionMode: "dontAsk",
       persistSession: false,
       env: { ANTHROPIC_API_KEY: "test-anthropic-key" },
     });
@@ -619,8 +630,9 @@ describe("Claude Agent SDK adapter", () => {
       mcpServers: {},
       plugins: [],
       skills: [],
-      tools: ["Read", "Glob", "Grep", "Bash"],
+      tools: ["Read", "Glob", "Grep"],
       disallowedTools: [
+        "Bash",
         "Edit",
         "Write",
         "NotebookEdit",
@@ -639,7 +651,7 @@ describe("Claude Agent SDK adapter", () => {
       sandbox: {
         enabled: true,
         failIfUnavailable: true,
-        autoAllowBashIfSandboxed: true,
+        autoAllowBashIfSandboxed: false,
         allowUnsandboxedCommands: false,
         filesystem: { denyWrite: [prepared.context.workspace] },
         network: { allowedDomains: [], strictAllowlist: true },
@@ -658,12 +670,13 @@ describe("Claude Agent SDK adapter", () => {
     await collect(prepared.adapter.run(prepared.input));
     const canUseTool = prepared.query.calls[0]!.options.canUseTool!;
 
-    for (const tool of ["Read", "Glob", "Grep", "Bash"]) {
+    for (const tool of ["Read", "Glob", "Grep"]) {
       await expect(canUseTool(tool, {}, permissionContext())).resolves.toEqual({
         behavior: "allow",
       });
     }
     for (const tool of [
+      "Bash",
       "Edit",
       "Write",
       "NotebookEdit",
@@ -1040,7 +1053,16 @@ describe("Claude Agent SDK adapter", () => {
     expect(prepared.query.calls[1]!.options).toMatchObject({
       cwd: prepared.context.workspace,
       model: prepared.reviewer.model,
-      tools: ["Read", "Glob", "Grep", "Bash"],
+      tools: ["Read", "Glob", "Grep"],
+      disallowedTools: [
+        "Bash",
+        "Edit",
+        "Write",
+        "NotebookEdit",
+        "WebFetch",
+        "WebSearch",
+        "Task",
+      ],
       sandbox: { enabled: false },
     });
     expect(prepared.query.calls[1]!.options.sandbox).toEqual({
@@ -1050,7 +1072,7 @@ describe("Claude Agent SDK adapter", () => {
     const fallbackPermission = prepared.query.calls[1]!.options.canUseTool!;
     await expect(
       fallbackPermission("Bash", {}, permissionContext()),
-    ).resolves.toEqual({ behavior: "allow" });
+    ).resolves.toMatchObject({ behavior: "deny" });
     await expect(
       fallbackPermission("Write", {}, permissionContext()),
     ).resolves.toMatchObject({ behavior: "deny" });
@@ -1074,6 +1096,51 @@ describe("Claude Agent SDK adapter", () => {
     });
     expect(terminalFailure(output)).not.toHaveProperty("isolation");
   });
+
+  it.each(["unavailable", "unsupported"] as const)(
+    "retries prefer_enforced when the SDK throws a precise sandbox %s error",
+    async (token) => {
+      const sandboxed = throwingStream(
+        new Error(`Claude sandbox runtime is ${token}.`),
+      );
+      const promptOnly = messages(
+        successResult(passResult("Prompt-only Claude review completed.")),
+      );
+      const prepared = setup([sandboxed, promptOnly]);
+
+      const output = await collect(prepared.adapter.run(prepared.input));
+
+      expect(prepared.query.calls).toHaveLength(2);
+      expect(sandboxed.close).toHaveBeenCalledOnce();
+      expect(prepared.query.calls[1]!.options.sandbox).toEqual({
+        enabled: false,
+      });
+      expect(terminalResult(output)).toMatchObject({
+        isolation: "prompt_only",
+      });
+    },
+  );
+
+  it.each(["unavailable", "unsupported"] as const)(
+    "fails require_enforced closed when the SDK throws a precise sandbox %s error",
+    async (token) => {
+      const sandboxed = throwingStream(
+        new Error(`Claude sandbox runtime is ${token}.`),
+      );
+      const prepared = setup([sandboxed], {
+        isolationPolicy: "require_enforced",
+      });
+
+      const output = await collect(prepared.adapter.run(prepared.input));
+
+      expect(prepared.query.calls).toHaveLength(1);
+      expect(sandboxed.close).toHaveBeenCalledOnce();
+      expect(terminalFailure(output)).toMatchObject({
+        failure: { reason: "adapter_unavailable", retryable: false },
+      });
+      expect(terminalFailure(output)).not.toHaveProperty("isolation");
+    },
+  );
 
   it("omits prompt-only isolation when the fallback query throws before it starts", async () => {
     const calls: QueryCall[] = [];
@@ -1157,9 +1224,11 @@ describe("Claude Agent SDK adapter", () => {
     expect(terminalFailure(output)).not.toHaveProperty("isolation");
   });
 
-  it("never falls back for thrown, API, auth, or model failures that merely mention sandbox", async () => {
+  it("never falls back for thrown, API, auth, or model failures without precise sandbox unavailability tokens", async () => {
     const thrown = setup([
-      throwingStream(new Error("sandbox unavailable api_key=private")),
+      throwingStream(
+        new Error("sandbox initialization failed api_key=private"),
+      ),
     ]);
     const nearMiss = setup([
       messages(
