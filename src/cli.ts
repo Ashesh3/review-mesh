@@ -100,9 +100,11 @@ export function installAbortHandlers(
   };
 }
 
-export async function runCli(): Promise<void> {
+export async function runCli(
+  signalSource: SignalSource = process,
+): Promise<void> {
   const controller = new AbortController();
-  const removeAbortHandlers = installAbortHandlers(controller);
+  const removeAbortHandlers = installAbortHandlers(controller, signalSource);
 
   try {
     if (process.argv.length !== 3 || process.argv[2] !== "review") {
