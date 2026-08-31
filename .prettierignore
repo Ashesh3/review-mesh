@@ -1,0 +1,6 @@
+dist/
+coverage/
+node_modules/
+docs/superpowers/
+.superpowers/sdd/
+package-lock.json

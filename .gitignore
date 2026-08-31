@@ -1,0 +1,7 @@
+.worktrees/
+.git-recovered/
+node_modules/
+dist/
+coverage/
+.review-mesh-runs/
+*.log
