@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
+  adapterRegistrationSchema,
   repositoryPolicySchema,
   type RepositoryPolicy,
 } from "../../src/config/schemas.js";
@@ -10,6 +11,35 @@ import { loadConfigFiles } from "../../src/config/load.js";
 import { repositoryPolicy, trustedConfig } from "../helpers/fixtures.js";
 
 describe("resolveConfig", () => {
+  it("accepts only the trusted OpenAI-compatible registration shape", () => {
+    expect(
+      adapterRegistrationSchema.parse({
+        type: "openai_compatible",
+        base_url_env: "REVIEW_MESH_OPENAI_BASE_URL",
+        api_key_env: "REVIEW_MESH_OPENAI_API_KEY",
+      }),
+    ).toEqual({
+      type: "openai_compatible",
+      base_url_env: "REVIEW_MESH_OPENAI_BASE_URL",
+      api_key_env: "REVIEW_MESH_OPENAI_API_KEY",
+    });
+    expect(() =>
+      adapterRegistrationSchema.parse({
+        type: "openai_compatible",
+        base_url_env: "",
+        api_key_env: "REVIEW_MESH_OPENAI_API_KEY",
+      }),
+    ).toThrow();
+    expect(() =>
+      adapterRegistrationSchema.parse({
+        type: "openai_compatible",
+        base_url_env: "REVIEW_MESH_OPENAI_BASE_URL",
+        api_key_env: "REVIEW_MESH_OPENAI_API_KEY",
+        command: "node",
+      }),
+    ).toThrow();
+  });
+
   it("keeps baseline reviewers mandatory and appends repository instructions", () => {
     const resolved = resolveConfig({
       trusted: trustedConfig({

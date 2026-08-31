@@ -2,16 +2,21 @@
   "name": "review-mesh",
   "version": "0.1.0",
   "private": true,
+  "files": [
+    "dist/review-mesh.mjs",
+    "README.md"
+  ],
   "description": "Agent-first multi-runtime code review gate",
   "type": "module",
   "bin": {
-    "review-mesh": "./dist/cli.js"
+    "review-mesh": "./dist/review-mesh.mjs"
   },
   "engines": {
     "node": ">=22.12.0"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "npm run typecheck && npm run build:portable",
+    "build:portable": "node scripts/build-portable.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "test": "vitest run",
     "test:live": "vitest run tests/live --testTimeout=600000",
@@ -33,6 +38,7 @@
   },
   "devDependencies": {
     "@types/node": "22.20.0",
+    "esbuild": "0.28.2",
     "prettier": "3.9.6",
     "tsx": "4.23.12",
     "typescript": "5.9.3",

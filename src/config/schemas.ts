@@ -27,6 +27,11 @@ export const adapterRegistrationSchema = z.discriminatedUnion("type", [
     executable: nonEmptyString.optional(),
   }),
   z.strictObject({
+    type: z.literal("openai_compatible"),
+    base_url_env: nonEmptyString,
+    api_key_env: nonEmptyString,
+  }),
+  z.strictObject({
     type: z.literal("command"),
     command: nonEmptyString,
     args: z.array(z.string()).optional(),

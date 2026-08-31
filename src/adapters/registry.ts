@@ -3,6 +3,7 @@ import { createClaudeAdapter } from "./claude.js";
 import { createCopilotAdapter } from "./copilot.js";
 import { createCodexAdapter } from "./codex.js";
 import { adapterFailure } from "./errors.js";
+import { createOpenAICompatibleAdapter } from "./openai-compatible.js";
 import type {
   AdapterCapabilities,
   AdapterEvent,
@@ -57,6 +58,9 @@ export class AdapterRegistry {
     );
     this.register("copilot", (registration) =>
       createCopilotAdapter(registration),
+    );
+    this.register("openai_compatible", (registration) =>
+      createOpenAICompatibleAdapter(registration),
     );
   }
 

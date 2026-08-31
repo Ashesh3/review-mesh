@@ -1,93 +1,159 @@
 # Review Mesh
 
-Review Mesh is an agent-first, CLI-first review gate. It runs every reviewer in a trusted multi-runtime suite, streams versioned JSON Lines, and passes only when every reviewer completes with no actionable findings.
+Review Mesh is an agent-first code-review gate. One command runs every reviewer in a trusted suite, streams machine-readable JSONL progress, and succeeds only when every reviewer completes with zero actionable findings.
 
-Review Mesh inspects code only. It does not edit the workspace, apply fixes, fetch branches, select reviewers for the caller, or manage repair loops.
+```text
+request on stdin -> review-mesh review -> all configured reviewers -> JSONL result
+```
 
-## Requirements and installation
+It is designed for automation, coding agents, CI, and local review loops:
 
-- Node.js 22.12 or newer
-- Git for repository context discovery
-- Credentials or logged-in state required by each configured runtime
+- One stateless review round per invocation.
+- Mandatory reviewer roster; callers cannot skip or replace reviewers.
+- Parallel independent reviews across different models or runtimes.
+- Strict structured findings with evidence and optional file/line locations.
+- `incomplete > findings > passed` outcome precedence.
+- No source edits by Review Mesh.
+- A portable build consisting of one movable JavaScript file.
 
-Install from a checkout:
+## Quick start
+
+Requirements:
+
+- Node.js 22.12 or newer.
+- Git, when Git context is desired.
+- A trusted `config.toml` and any provider credentials it references.
+
+Build the single-file CLI:
 
 ```powershell
 npm ci
 npm run build
-npm link
 ```
 
-The executable is `review-mesh`; the only MVP operation is `review`.
+The only runtime artifact is:
 
-## Invocation
+```text
+dist/review-mesh.mjs
+```
 
-Send exactly one JSON request on stdin. Stdout contains protocol JSONL only; diagnostics are written to stderr.
+Copy it anywhere and invoke it with Node:
+
+```powershell
+Copy-Item .\dist\review-mesh.mjs C:\Tools\review-mesh.mjs
+node C:\Tools\review-mesh.mjs review
+```
+
+On macOS or Linux, the generated file has a shebang and executable bit:
+
+```bash
+cp dist/review-mesh.mjs ~/bin/review-mesh
+review-mesh review
+```
+
+Portable means the application is one file and does not need this repository or `node_modules`. Configuration, credentials, Node, Git, and any separately configured command/runtime executables remain external.
+
+## Run a review
+
+Review Mesh reads exactly one JSON request from stdin. Stdout is JSONL protocol output only; diagnostics use stderr.
+
+PowerShell:
 
 ```powershell
 $request = @{
   schema_version = "1"
-  request_id = "change-1042"
+  request_id = "auth-change-1042"
   workspace = "C:\Projects\example"
-  instructions = "Review all current changes against origin/master. Focus on authentication and compatibility."
+  instructions = "Review the current workspace. Focus on authentication, compatibility, and error handling."
   scope_hints = @{
-    base = "origin/master"
+    base = "origin/main"
     head = "HEAD"
-    paths = @("src/auth")
+    paths = @("src/auth", "tests/auth")
     staged = $false
   }
   context = @{
     task = "Add refresh-token rotation"
     constraints = @("Preserve existing clients")
   }
-} | ConvertTo-Json -Depth 10
+} | ConvertTo-Json -Depth 10 -Compress
 
-$request | review-mesh review
+$request | node C:\Tools\review-mesh.mjs review
+$LASTEXITCODE
 ```
 
-Required request fields are `schema_version`, `workspace`, and `instructions`. The optional `context` value may contain arbitrary JSON. Unknown top-level fields are rejected. Invocation data cannot register, remove, reorder, or weaken reviewers.
+Bash:
 
-## Output protocol
+```bash
+cat <<'JSON' | node ./review-mesh.mjs review
+{
+  "schema_version": "1",
+  "request_id": "auth-change-1042",
+  "workspace": "/work/example",
+  "instructions": "Review the current workspace for actionable defects.",
+  "scope_hints": {
+    "base": "origin/main",
+    "head": "HEAD",
+    "paths": ["src/auth"]
+  },
+  "context": {
+    "task": "Add refresh-token rotation"
+  }
+}
+JSON
+```
 
-Every non-empty stdout line is a schema-version `1` JSON object. Events use one run ID and strictly increasing sequence numbers. `run.completed` is always the last event of a successfully established run.
+Required request fields:
 
-| Event                 | Meaning                                                        |
-| --------------------- | -------------------------------------------------------------- |
-| `run.started`         | A live-worktree review round began.                            |
-| `context.resolved`    | Canonical workspace and best-effort Git context were resolved. |
-| `suite.resolved`      | The mandatory reviewer roster was resolved.                    |
-| `reviewer.started`    | One reviewer job started.                                      |
-| `reviewer.progress`   | A factual phase or activity update.                            |
-| `reviewer.heartbeat`  | Timed liveness and suite-state update.                         |
-| `reviewer.completed`  | One valid reviewer result.                                     |
-| `reviewer.incomplete` | One reviewer failed to produce a valid terminal result.        |
-| `run.completed`       | Final classification and all reviewer terminal records.        |
+| Field            | Meaning                                          |
+| ---------------- | ------------------------------------------------ |
+| `schema_version` | Must be the string `"1"`.                        |
+| `workspace`      | Existing local directory prepared by the caller. |
+| `instructions`   | Review focus sent to every mandatory reviewer.   |
 
-Final classifications use this precedence: `incomplete` over `findings` over `passed`.
+`request_id`, `scope_hints`, and arbitrary JSON `context` are optional. Scope hints enrich the common starting manifest; reviewers inspect the live current workspace. They do not make Review Mesh fetch refs, check out code, or snapshot a patch. In particular, deleted/base-only file contents are not supplied automatically.
 
-| Exit | Meaning                                                      |
-| ---: | ------------------------------------------------------------ |
-|  `0` | Every reviewer passed with zero actionable findings.         |
-|  `1` | All reviewers completed, and at least one reported findings. |
-|  `2` | Request, command usage, or configuration was invalid.        |
-|  `3` | A reviewer/runtime failure made the round incomplete.        |
-|  `4` | The caller interrupted the round.                            |
+## Three-model OpenAI-compatible setup
 
-## Trusted configuration
+The built-in `openai_compatible` adapter works with an OpenAI Chat Completions-compatible gateway. It is fully embedded in `review-mesh.mjs`, so no external reviewer script is needed.
 
-The default `config.toml` location is supplied by the operating system through `env-paths`:
+Set credentials in environment variables, not TOML.
 
-- Windows: `%APPDATA%\review-mesh\Config\config.toml`
-- macOS: `~/Library/Preferences/review-mesh/config.toml`
-- Linux: `$XDG_CONFIG_HOME/review-mesh/config.toml`, normally `~/.config/review-mesh/config.toml`
+PowerShell, current session:
 
-This file is trusted. It defines executable registrations, credential environment names, profiles, and the mandatory baseline roster. Keep secret values in the environment or the runtime's native credential store; configuration contains names such as `ANTHROPIC_API_KEY`, never the secret itself.
+```powershell
+$env:REVIEW_MESH_OPENAI_BASE_URL = "https://gateway.example/v1"
+$env:REVIEW_MESH_OPENAI_API_KEY = "your-key"
+```
+
+Persist for future Windows sessions:
+
+```powershell
+[Environment]::SetEnvironmentVariable(
+  "REVIEW_MESH_OPENAI_BASE_URL",
+  "https://gateway.example/v1",
+  "User"
+)
+[Environment]::SetEnvironmentVariable(
+  "REVIEW_MESH_OPENAI_API_KEY",
+  "your-key",
+  "User"
+)
+```
+
+Bash:
+
+```bash
+export REVIEW_MESH_OPENAI_BASE_URL="https://gateway.example/v1"
+export REVIEW_MESH_OPENAI_API_KEY="your-key"
+```
+
+Create the trusted configuration shown below, replacing model IDs as needed:
 
 ```toml
 schema_version = "1"
 
 [execution]
-max_concurrency = 4
+max_concurrency = 3
 heartbeat_interval_ms = 15000
 shutdown_grace_period_ms = 5000
 
@@ -95,127 +161,263 @@ shutdown_grace_period_ms = 5000
 persist_runs = true
 max_runs = 50
 
-[adapters.local_command]
-type = "command"
-command = "python"
-args = ["C:/review-agents/security-review.py"]
-env_allowlist = ["SECURITY_REVIEW_TOKEN"]
-protocol = "review-mesh-command-v1"
+[adapters.gateway]
+type = "openai_compatible"
+base_url_env = "REVIEW_MESH_OPENAI_BASE_URL"
+api_key_env = "REVIEW_MESH_OPENAI_API_KEY"
 
-[adapters.copilot]
-type = "copilot"
-env_allowlist = ["GH_TOKEN"]
-use_logged_in_user = true
-
-[adapters.claude]
-type = "claude"
-env_allowlist = ["ANTHROPIC_API_KEY"]
-# executable = "C:/tools/claude.exe"
-
-[adapters.codex]
-type = "codex"
-env_allowlist = ["CODEX_API_KEY"]
-# executable = "C:/tools/codex.exe"
-
-[reviewer_profiles.command_security]
-adapter = "local_command"
-model = "configured-by-command"
-purpose = "Find exploitable security defects"
-instructions = "Inspect trust boundaries and report only actionable defects."
+[reviewer_profiles.gemini]
+adapter = "gateway"
+model = "gemini-3.1-pro-preview"
+purpose = "Correctness, reliability, and edge-case review"
+instructions = "Inspect the full scope for actionable correctness, integration, and test-coverage defects. Cite precise file and line evidence."
 isolation = "prefer_enforced"
 timeout_ms = 900000
 
-[reviewer_profiles.copilot_correctness]
-adapter = "copilot"
-model = "gpt-5"
-purpose = "Find correctness and compatibility defects"
-instructions = "Review behavior, edge cases, tests, and compatibility."
+[reviewer_profiles.opus]
+adapter = "gateway"
+model = "claude-opus-5"
+purpose = "Architecture, security, and lifecycle review"
+instructions = "Inspect architecture, lifecycle ownership, trust boundaries, security, and regressions. Report only actionable evidence-backed defects."
 isolation = "prefer_enforced"
 timeout_ms = 900000
 
-[reviewer_profiles.claude_architecture]
-adapter = "claude"
-model = "claude-sonnet-4-5"
-purpose = "Find architecture and maintainability defects"
-instructions = "Inspect architecture, lifecycle ownership, and regressions."
-isolation = "prefer_enforced"
-timeout_ms = 900000
-
-[reviewer_profiles.codex_correctness]
-adapter = "codex"
-model = "gpt-5-codex"
-purpose = "Find implementation defects"
-instructions = "Inspect the full change and return evidence-backed findings."
+[reviewer_profiles.sol]
+adapter = "gateway"
+model = "gpt-5.6-sol"
+purpose = "Implementation, protocol, and compatibility review"
+instructions = "Inspect concurrency, cancellation, protocol invariants, error handling, compatibility, and tests. Report only actionable findings."
 isolation = "prefer_enforced"
 timeout_ms = 900000
 
 [[reviewers]]
-id = "security-command"
-profile = "command_security"
+id = "gemini"
+profile = "gemini"
 
 [[reviewers]]
-id = "correctness-copilot"
-profile = "copilot_correctness"
+id = "opus-5"
+profile = "opus"
 
 [[reviewers]]
-id = "architecture-claude"
-profile = "claude_architecture"
-
-[[reviewers]]
-id = "correctness-codex"
-profile = "codex_correctness"
+id = "sol-5-6"
+profile = "sol"
 ```
 
-The pinned Codex runtime currently fails Review Mesh's project-configuration isolation characterization, so its production adapter deliberately reports unavailable rather than claiming a clean review. The offline contract remains covered for a future runtime that satisfies the boundary.
+The gateway adapter exposes exactly three bounded reviewer tools:
+
+- `list_files`
+- `read_file`
+- `search_text`
+
+It excludes `.git`, `.git-recovered`, `.worktrees`, `node_modules`, `dist`, `coverage`, and `.review-mesh-runs`; rejects path traversal and symlink escapes; caps file, search, output, turn, and request sizes; and reports `runtime_read_only`.
+
+Reviewer models cannot execute shell commands, programs, scripts, Git, builds, tests, web tools, or code, and cannot write files. Review Mesh core separately runs a bounded allowlist of read-only Git discovery commands with `GIT_OPTIONAL_LOCKS=0` to construct the shared context manifest.
+
+## Configuration location
+
+The trusted config file is resolved using the host operating system:
+
+| Platform | Default path                                            |
+| -------- | ------------------------------------------------------- |
+| Windows  | `%APPDATA%\review-mesh\Config\config.toml`              |
+| macOS    | `~/Library/Preferences/review-mesh/config.toml`         |
+| Linux    | `${XDG_CONFIG_HOME:-~/.config}/review-mesh/config.toml` |
+
+The trusted config controls:
+
+- Adapter/runtime registrations.
+- Credential environment-variable names.
+- Reviewer profiles and exact models.
+- Mandatory baseline roster and order.
+- Concurrency, heartbeat, shutdown grace, diagnostics, and retention.
+
+Never place secret values in `config.toml`. Only reference environment-variable names.
+
+## Other adapters
+
+Review Mesh also implements these trusted adapter types:
+
+| Type                | Purpose                                                                          | Portable-file note                                                                                                                               |
+| ------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `openai_compatible` | Embedded OpenAI-compatible agent loop with bounded read-only tools.              | Fully self-contained.                                                                                                                            |
+| `command`           | Integrates a separately installed review agent using the command JSONL protocol. | External executable remains required.                                                                                                            |
+| `copilot`           | GitHub Copilot SDK reviewer.                                                     | Requires its separately installed runtime/package environment. Default profile is read/search only.                                              |
+| `claude`            | Claude Agent SDK reviewer.                                                       | Requires its native runtime and compatible endpoint/authentication. Reviewer tools are `Read`, `Glob`, and `Grep` only.                          |
+| `codex`             | Codex SDK reviewer.                                                              | Currently fails closed in production because the pinned runtime does not satisfy Review Mesh's project-configuration isolation characterization. |
+
+For a truly one-file deployment, use `openai_compatible`. Provider-native adapters can remain configured in a source installation, but their native runtime assets cannot be encoded into a cross-platform JavaScript file.
 
 ## Repository policy
 
-A workspace may contain `.review-mesh.toml`. It is untrusted, additive policy: it can append instructions, lower timeouts, require stronger isolation, or add reviewers based on profiles already registered in trusted configuration.
+A reviewed workspace may contain `.review-mesh.toml`. It is untrusted and additive only.
 
 ```toml
 schema_version = "1"
 context = { service = "payments", conventions = ["No floating-point money"] }
 
 [[reviewer_overrides]]
-id = "security-command"
+id = "opus-5"
 append_instructions = "Check payment amount validation and audit logging."
 timeout_ms = 600000
-require_enforced = true
 
 [[reviewers]]
 id = "payments-compatibility"
-profile = "copilot_correctness"
+profile = "sol"
 instructions = "Focus on backwards compatibility for stored payment records."
 timeout_ms = 600000
 ```
 
-Repository policy cannot register an executable or adapter, provide credentials, change a baseline model/profile, increase privileges or timeout, remove reviewers, or weaken isolation. Such configuration is rejected instead of partially applied.
+Repository policy may:
+
+- Add instructions to baseline reviewers.
+- Lower timeouts.
+- Promote isolation to `require_enforced`.
+- Add reviewers using profiles already defined by trusted configuration.
+- Add repository context.
+
+It cannot register executables/adapters, supply credentials, remove or reorder baseline reviewers, replace their model/profile, increase timeout or privilege, or weaken isolation. Invalid policy rejects the invocation with exit code `2`.
+
+## JSONL events
+
+Every non-empty stdout line is one strict schema-version `1` JSON object. All events in a run share one `run_id`; `seq` starts at `1` and increases monotonically; `run.completed` is final once a valid run begins and stdout remains available.
+
+| Event                 | Meaning                                                   |
+| --------------------- | --------------------------------------------------------- |
+| `run.started`         | The live-worktree review began.                           |
+| `context.resolved`    | Workspace and best-effort Git metadata were resolved.     |
+| `suite.resolved`      | The mandatory roster was resolved.                        |
+| `reviewer.started`    | One reviewer job began.                                   |
+| `reviewer.progress`   | Factual phase/activity progress.                          |
+| `reviewer.heartbeat`  | Liveness, elapsed time, and suite summary.                |
+| `reviewer.completed`  | One strict reviewer result.                               |
+| `reviewer.incomplete` | One reviewer failed to return a valid terminal result.    |
+| `run.completed`       | Final classification plus every reviewer terminal record. |
+
+Example final event:
+
+```json
+{
+  "schema_version": "1",
+  "event": "run.completed",
+  "run_id": "run_...",
+  "seq": 23,
+  "timestamp": "2026-08-31T11:45:35.446Z",
+  "data": {
+    "status": "findings",
+    "exit_code": 1,
+    "consistency_mode": "live_worktree",
+    "total_elapsed_ms": 26895,
+    "suite": {
+      "total": 1,
+      "queued": 0,
+      "running": 0,
+      "completed": 1,
+      "incomplete": 0
+    },
+    "reviewers": [
+      {
+        "reviewer_id": "correctness",
+        "status": "completed",
+        "adapter": "gateway",
+        "model": "example-model",
+        "isolation": "runtime_read_only",
+        "elapsed_ms": 26880,
+        "result": {
+          "schema_version": "1",
+          "verdict": "fail",
+          "summary": "One actionable defect was found.",
+          "actionable_findings": [
+            {
+              "id": "zero-count",
+              "severity": "high",
+              "title": "Zero count is not rejected",
+              "description": "The implementation violates the documented contract.",
+              "evidence": [
+                {
+                  "path": "calculator.js",
+                  "start_line": 1,
+                  "end_line": 3,
+                  "detail": "The function divides without validating count."
+                }
+              ],
+              "suggested_direction": "Reject zero before division and add tests."
+            }
+          ],
+          "informational_notes": []
+        }
+      }
+    ]
+  }
+}
+```
+
+## Exit codes
+
+| Code | Classification | Meaning                                                         |
+| ---: | -------------- | --------------------------------------------------------------- |
+|  `0` | `passed`       | Every reviewer completed and reported zero actionable findings. |
+|  `1` | `findings`     | Every reviewer completed; one or more reported findings.        |
+|  `2` | no run         | Invalid request, usage, trusted config, or repository policy.   |
+|  `3` | `incomplete`   | At least one reviewer/runtime did not return a valid result.    |
+|  `4` | interrupted    | Caller interrupted the round.                                   |
+
+Completed findings are retained even when another reviewer is incomplete.
+
+## Reviewer result shape
+
+Each completed reviewer returns:
+
+```json
+{
+  "schema_version": "1",
+  "verdict": "fail",
+  "summary": "One actionable defect was found.",
+  "actionable_findings": [
+    {
+      "id": "zero-count",
+      "severity": "high",
+      "title": "Zero count is not rejected",
+      "description": "The implementation violates the documented contract.",
+      "evidence": [
+        {
+          "path": "calculator.js",
+          "start_line": 1,
+          "end_line": 3,
+          "detail": "The function divides without validating count."
+        }
+      ],
+      "suggested_direction": "Reject zero before division and add tests."
+    }
+  ],
+  "informational_notes": []
+}
+```
+
+`pass` requires an empty `actionable_findings` array. `fail` requires at least one finding.
 
 ## Isolation and consistency
 
-- `enforced_read_only`: an independently enforced filesystem boundary was established.
-- `runtime_read_only`: the runtime exposes only read-oriented tools and denies write permission, but no independent outer filesystem boundary was verified.
-- `prompt_only`: behavior relies on prompt/tool policy and is best-effort, not a filesystem guarantee.
+- `enforced_read_only`: an independent filesystem boundary was established.
+- `runtime_read_only`: only read-oriented runtime tools were exposed, but no independent outer filesystem boundary was verified.
+- `prompt_only`: behavior depends on prompt/runtime policy and is not a filesystem guarantee.
 
-Each result reports the isolation actually achieved. `require_enforced` fails closed when the adapter cannot establish `enforced_read_only`.
+`require_enforced` fails closed unless the adapter can actually report `enforced_read_only`.
 
-Review Mesh reports `consistency_mode: "live_worktree"`. It does not snapshot, lock, fingerprint-gate, or invalidate a workspace that changes during a round; concurrent reviewers can observe different live states. The core itself uses bounded read-only discovery and never intentionally writes under the reviewed workspace.
+All rounds report `consistency_mode: "live_worktree"`. Review Mesh does not snapshot, lock, or invalidate a changing workspace. Concurrent reviewers can observe different states if another process modifies files during the round.
 
-Copilot's trusted `runtime.allow_shell_prompt_only = true` option adds shell inspection and therefore reports `prompt_only`. It is off by default. Claude may use a narrowly classified prompt-only fallback if its sandbox is specifically unavailable. Codex does not claim availability until its isolation characterization passes.
+## Command-adapter protocol
 
-## Command adapter protocol
+Only trusted config can register a command. Review Mesh sends one JSON request object on child stdin. Child stdout must contain JSONL only.
 
-Only trusted configuration may register the command, literal arguments, environment-variable allowlist, and protocol version. Review Mesh sends one JSON object on child stdin containing the reviewer definition and review input. Protocol metadata such as run, reviewer, workspace, and isolation identifiers is passed through a minimal environment; the parent environment is not forwarded wholesale.
-
-Child stdout is JSONL. It may emit non-terminal events:
+Non-terminal examples:
 
 ```json
-{"type":"progress","phase":"reviewing","message":"Inspecting changed files"}
-{"type":"activity","message":"Completed dependency analysis"}
 {"type":"capabilities","isolation":"enforced_read_only"}
+{"type":"progress","phase":"reviewing","message":"Inspecting files"}
+{"type":"activity","message":"Completed dependency analysis"}
 ```
 
-It must then emit exactly one terminal event:
+Exactly one terminal is required:
 
 ```json
 {
@@ -243,31 +445,24 @@ or:
 }
 ```
 
-Malformed JSON, unexpected stdout text, oversized output, a missing or duplicate terminal, output after terminal, or an invalid result makes that reviewer incomplete. On deadline or interruption, Review Mesh aborts the job, waits the configured grace period, and escalates managed process cleanup.
+Malformed/oversized output, multiple terminals, output after terminal, missing terminal, and invalid result schemas make the reviewer incomplete.
 
-## Verification
+## Development and verification
 
 ```powershell
+npm ci
 npm run verify
 ```
 
-Provider smoke tests are opt-in and never replace the offline gate. Define `REVIEW_MESH_LIVE=1` and the corresponding reviewer JSON environment variable, then run `npm run test:live`:
+Useful scripts:
 
-- `REVIEW_MESH_LIVE_CODEX_REVIEWER`
-- `REVIEW_MESH_LIVE_CLAUDE_REVIEWER`
-- `REVIEW_MESH_LIVE_COPILOT_REVIEWER`
+| Script                   | Purpose                                           |
+| ------------------------ | ------------------------------------------------- |
+| `npm run build`          | Type-check and generate the one-file CLI.         |
+| `npm run build:portable` | Generate only `dist/review-mesh.mjs`.             |
+| `npm test`               | Run offline tests.                                |
+| `npm run test:live`      | Run explicitly configured provider smoke tests.   |
+| `npm run format:check`   | Check formatting.                                 |
+| `npm run verify`         | Formatting, typecheck, tests, and portable build. |
 
-Each value is a JSON object whose `adapter` field contains the trusted adapter registration, alongside `model`, `purpose`, `instructions`, `isolation`, `timeout_ms`, and optional `runtime`. For example:
-
-```powershell
-$env:REVIEW_MESH_LIVE_COPILOT_REVIEWER = @{
-  adapter = @{ type = "copilot"; use_logged_in_user = $true }
-  model = "gpt-5"
-  purpose = "Live correctness smoke"
-  instructions = "Review the controlled fixture without editing it."
-  isolation = "prefer_enforced"
-  timeout_ms = 600000
-} | ConvertTo-Json -Compress -Depth 5
-```
-
-Unconfigured live adapters are explicitly skipped.
+The portable acceptance suite copies `review-mesh.mjs` outside the repository and runs it without `node_modules`, including a real embedded-adapter protocol round against a local test server.
