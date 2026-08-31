@@ -1,5 +1,5 @@
 .worktrees/
-.git-recovered/
+/.git-recovered/
 node_modules/
 dist/
 coverage/
