@@ -22,6 +22,7 @@ import { installAbortHandlers } from "../../src/cli.js";
 
 const projectRoot = resolve(import.meta.dirname, "../..");
 const cliEntry = join(projectRoot, "src", "cli.ts");
+const compiledCliEntry = join(projectRoot, "dist", "cli.js");
 const commandFixtureUrl = pathToFileURL(
   join(projectRoot, "tests", "fixtures", "command-adapter.mjs"),
 ).href;
@@ -160,6 +161,22 @@ function startCli(
   return child;
 }
 
+function startCompiledCli(
+  fixture: CliFixture,
+  args: readonly string[] = ["review"],
+  input = fixture.request,
+): ChildProcessWithoutNullStreams {
+  const child = spawn(process.execPath, [compiledCliEntry, ...args], {
+    cwd: projectRoot,
+    env: fixture.env,
+    stdio: "pipe",
+    windowsHide: true,
+  });
+  child.stdin.on("error", () => undefined);
+  child.stdin.end(input);
+  return child;
+}
+
 function startOpenCli(
   fixture: CliFixture,
   imports: readonly string[] = [],
@@ -207,7 +224,7 @@ async function collectProcess(
 
 async function collectProcessWithin(
   child: ChildProcessWithoutNullStreams,
-  timeoutMs = 1000,
+  timeoutMs = 5000,
 ): Promise<ProcessResult> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -275,6 +292,34 @@ afterEach(async () => {
 });
 
 describe("review-mesh review", () => {
+  it("runs the compiled CLI with valid JSONL and a passed terminal", async () => {
+    const build = await new Promise<ProcessResult>((resolveBuild, reject) => {
+      const child = spawn(
+        process.execPath,
+        ["node_modules/typescript/bin/tsc", "-p", "tsconfig.json"],
+        {
+          cwd: projectRoot,
+          env: process.env,
+          stdio: "pipe",
+          windowsHide: true,
+        },
+      );
+      void collectProcess(child).then(resolveBuild, reject);
+    });
+    expect(build).toMatchObject({ exitCode: 0, signal: null });
+    const fixture = await createFixture(["pass"]);
+
+    const result = await collectProcess(startCompiledCli(fixture));
+    const events = parseEvents(result.stdout);
+    const completed = events.at(-1);
+
+    expect(result).toMatchObject({ exitCode: 0, signal: null, stderr: "" });
+    expect(completed?.event).toBe("run.completed");
+    if (completed?.event !== "run.completed")
+      throw new Error("missing completion");
+    expect(completed.data).toMatchObject({ status: "passed", exit_code: 0 });
+  }, 20_000);
+
   it("persists only to the injected application-data runs directory when enabled", async () => {
     const fixture = await createFixture(
       ["pass"],

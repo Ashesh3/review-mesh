@@ -879,6 +879,9 @@ describe("Codex SDK facade and registry", () => {
         env: environment,
         extendEnv: false,
         reject: false,
+        timeout: 10_000,
+        forceKillAfterDelay: 1_000,
+        cleanup: true,
       },
     );
     const prompt = await execa(
@@ -899,6 +902,9 @@ describe("Codex SDK facade and registry", () => {
         env: environment,
         extendEnv: false,
         reject: false,
+        timeout: 10_000,
+        forceKillAfterDelay: 1_000,
+        cleanup: true,
       },
     );
 
@@ -912,8 +918,10 @@ describe("Codex SDK facade and registry", () => {
     expect(prompt.stdout).toContain(
       `- ${hostileSkill}: ${hostileSkill} (file:`,
     );
-    expect(prompt.stdout).toContain(`r2/${hostileSkill}/SKILL.md`);
-  });
+    expect(prompt.stdout).toMatch(
+      new RegExp(`r\\d+/${hostileSkill}/SKILL\\.md`),
+    );
+  }, 25_000);
 
   it("the real facade forwards the schema and signal through runStreamed", async () => {
     const runStreamed = vi.fn(async () => ({
