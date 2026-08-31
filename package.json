@@ -14,6 +14,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "test": "vitest run",
+    "test:live": "vitest run tests/live --testTimeout=600000",
     "test:watch": "vitest",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
