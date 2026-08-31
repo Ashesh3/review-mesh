@@ -74,10 +74,8 @@ function applyRepositoryOverride(
     });
   }
   if (override.timeout_ms !== undefined) {
-    if (override.timeout_ms >= reviewer.timeoutMs) {
-      throw repositoryPolicyError(
-        "timeout_ms must be lower than trusted timeout",
-      );
+    if (override.timeout_ms > reviewer.timeoutMs) {
+      throw repositoryPolicyError("timeout_ms must not exceed trusted timeout");
     }
     reviewer.timeoutMs = override.timeout_ms;
   }

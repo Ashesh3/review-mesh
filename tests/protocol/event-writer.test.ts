@@ -293,6 +293,72 @@ describe("EventWriter", () => {
     expect(warnings).toHaveLength(1);
   });
 
+  it("drops a bounded mirror backlog when a stuck first append is saturated", async () => {
+    const output = new PassThrough();
+    output.resume();
+    let releaseFirstAppend!: () => void;
+    const firstAppendReleased = new Promise<void>((resolve) => {
+      releaseFirstAppend = resolve;
+    });
+    let signalFirstAppendStarted!: () => void;
+    const firstAppendStarted = new Promise<void>((resolve) => {
+      signalFirstAppendStarted = resolve;
+    });
+    let closes = 0;
+    const mirroredSequences: number[] = [];
+    const warnings: Error[] = [];
+    const writer = createEventWriter({
+      output,
+      runId: "run-mirror-capacity",
+      onEvent: async (event) => {
+        mirroredSequences.push(event.seq);
+        if (event.seq === 1) {
+          signalFirstAppendStarted();
+          await firstAppendReleased;
+        }
+      },
+      onMirrorClose: async () => {
+        closes += 1;
+      },
+      onWarning: (error) => warnings.push(error),
+      mirrorFlushTimeoutMs: 10,
+      mirrorMaxPendingEvents: 8,
+      mirrorMaxPendingBytes: 64 * 1024,
+    });
+
+    await writer.emit({
+      event: "run.started",
+      data: { consistency_mode: "live_worktree" },
+    });
+    await firstAppendStarted;
+    await Promise.all(
+      Array.from({ length: 2_000 }, (_, index) =>
+        writer.emit({
+          event: "reviewer.progress",
+          reviewer_id: "reviewer-1",
+          data: {
+            phase: "reviewing",
+            message: `sensitive-payload-${index}`,
+          },
+        }),
+      ),
+    );
+
+    await expect(writer.close()).resolves.toBeUndefined();
+    expect(mirroredSequences).toEqual([1]);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.message).toBe(
+      "Run record persistence queue capacity exceeded.",
+    );
+    expect(warnings[0]?.message).not.toContain("sensitive-payload");
+
+    releaseFirstAppend();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(mirroredSequences).toEqual([1]);
+    expect(closes).toBe(1);
+    expect(warnings).toHaveLength(1);
+  });
+
   it("preserves mirror event order when the mirror is healthy", async () => {
     const output = new PassThrough();
     const mirrored: PublicEvent[] = [];

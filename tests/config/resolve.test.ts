@@ -1,16 +1,120 @@
 import { describe, expect, it } from "vitest";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import {
   adapterRegistrationSchema,
   repositoryPolicySchema,
+  trustedConfigSchema,
   type RepositoryPolicy,
 } from "../../src/config/schemas.js";
 import { resolveConfig } from "../../src/config/resolve.js";
-import { loadConfigFiles } from "../../src/config/load.js";
+import {
+  loadConfigFiles,
+  maximumRepositoryPolicyBytes,
+} from "../../src/config/load.js";
 import { repositoryPolicy, trustedConfig } from "../helpers/fixtures.js";
 
+const validTrustedToml = `schema_version = "1"
+
+[execution]
+max_concurrency = 1
+heartbeat_interval_ms = 1000
+shutdown_grace_period_ms = 1000
+
+[diagnostics]
+persist_runs = false
+max_runs = 1
+
+[adapters.command]
+type = "command"
+command = "reviewer"
+protocol = "review-mesh-command-v1"
+
+[reviewer_profiles.security]
+adapter = "command"
+model = "trusted-model"
+purpose = "Find defects"
+instructions = "Review carefully."
+isolation = "prefer_enforced"
+timeout_ms = 1000
+
+[[reviewers]]
+id = "baseline"
+profile = "security"
+`;
+
+async function configLoadFixture(): Promise<{
+  root: string;
+  configFile: string;
+  workspace: string;
+}> {
+  const root = await mkdtemp(
+    join(process.env.TEMP ?? "C:\\Temp", "review-mesh-policy-"),
+  );
+  const configFile = join(root, "config.toml");
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+  await writeFile(configFile, validTrustedToml);
+  return { root, configFile, workspace };
+}
+
 describe("resolveConfig", () => {
+  it("requires at least one trusted reviewer", () => {
+    expect(() =>
+      trustedConfigSchema.parse(trustedConfig({ reviewers: [] })),
+    ).toThrow();
+  });
+
+  it("bounds timer-backed configuration at the Node timer maximum", () => {
+    const maximumTimerMs = 2_147_483_647;
+    expect(() =>
+      trustedConfigSchema.parse(
+        trustedConfig({
+          execution: {
+            heartbeat_interval_ms: maximumTimerMs,
+            shutdown_grace_period_ms: maximumTimerMs,
+          },
+          reviewer_profiles: {
+            "security-profile": { timeout_ms: maximumTimerMs },
+          },
+        }),
+      ),
+    ).not.toThrow();
+
+    for (const trusted of [
+      trustedConfig({
+        execution: { heartbeat_interval_ms: maximumTimerMs + 1 },
+      }),
+      trustedConfig({
+        execution: { shutdown_grace_period_ms: maximumTimerMs + 1 },
+      }),
+      trustedConfig({
+        reviewer_profiles: {
+          "security-profile": { timeout_ms: maximumTimerMs + 1 },
+        },
+      }),
+    ]) {
+      expect(() => trustedConfigSchema.parse(trusted)).toThrow();
+    }
+    expect(() =>
+      repositoryPolicySchema.parse(
+        repositoryPolicy({
+          reviewer_overrides: [
+            { id: "baseline", timeout_ms: maximumTimerMs + 1 },
+          ],
+        }),
+      ),
+    ).toThrow();
+  });
+
   it("accepts only the trusted OpenAI-compatible registration shape", () => {
     expect(
       adapterRegistrationSchema.parse({
@@ -134,7 +238,7 @@ describe("resolveConfig", () => {
     ]);
   });
 
-  it("accepts only lower repository timeouts and enforcement promotion", () => {
+  it("accepts repository timeouts up to the trusted timeout and enforcement promotion", () => {
     const resolved = resolveConfig({
       trusted: trustedConfig(),
       repository: repositoryPolicy({
@@ -152,14 +256,22 @@ describe("resolveConfig", () => {
       timeoutMs: 60_000,
       isolationPolicy: "require_enforced",
     });
+    expect(
+      resolveConfig({
+        trusted: trustedConfig(),
+        repository: repositoryPolicy({
+          reviewer_overrides: [{ id: "baseline", timeout_ms: 900_000 }],
+        }),
+      }).reviewers[0]?.timeoutMs,
+    ).toBe(900_000);
     expect(() =>
       resolveConfig({
         trusted: trustedConfig(),
         repository: repositoryPolicy({
-          reviewer_overrides: [{ id: "baseline", timeout_ms: 1_800_000 }],
+          reviewer_overrides: [{ id: "baseline", timeout_ms: 900_001 }],
         }),
       }),
-    ).toThrow(/lower than trusted timeout/i);
+    ).toThrow(/must not exceed trusted timeout/i);
   });
 
   it("preserves trusted execution and repository context without admitting roster collisions", () => {
@@ -272,4 +384,174 @@ describe("loadConfigFiles", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it("rejects a repository policy symlink instead of following it", async () => {
+    const fixture = await configLoadFixture();
+    const outside = join(fixture.root, "outside.toml");
+    await writeFile(outside, 'schema_version = "1"\n');
+    await symlink(
+      outside,
+      join(fixture.workspace, ".review-mesh.toml"),
+      process.platform === "win32" ? "file" : undefined,
+    );
+
+    try {
+      await expect(loadConfigFiles(fixture)).rejects.toThrow(/regular file/i);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an oversized repository policy before parsing it", async () => {
+    const fixture = await configLoadFixture();
+    await writeFile(
+      join(fixture.workspace, ".review-mesh.toml"),
+      Buffer.alloc(maximumRepositoryPolicyBytes + 1, 0x20),
+    );
+
+    try {
+      await expect(loadConfigFiles(fixture)).rejects.toThrow(/too large/i);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when the repository policy path is replaced after open", async () => {
+    const fixture = await configLoadFixture();
+    const policy = join(fixture.workspace, ".review-mesh.toml");
+    const displaced = join(fixture.workspace, "original.toml");
+    await writeFile(policy, 'schema_version = "1"\n');
+
+    try {
+      await expect(
+        loadConfigFiles(fixture, {
+          afterRepositoryOpen: async () => {
+            await rename(policy, displaced);
+            await writeFile(
+              policy,
+              'schema_version = "1"\ncontext = { swapped = true }\n',
+            );
+          },
+        }),
+      ).rejects.toThrow(/changed/i);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("honors cancellation while loading repository policy", async () => {
+    const fixture = await configLoadFixture();
+    await writeFile(
+      join(fixture.workspace, ".review-mesh.toml"),
+      'schema_version = "1"\n',
+    );
+    const controller = new AbortController();
+
+    try {
+      await expect(
+        loadConfigFiles(
+          { ...fixture, signal: controller.signal },
+          {
+            afterRepositoryOpen: () => {
+              controller.abort(new Error("cancelled policy read"));
+            },
+          },
+        ),
+      ).rejects.toThrow(/cancelled policy read/i);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("interrupts a stuck descriptor read promptly when cancelled", async () => {
+    const fixture = await configLoadFixture();
+    await writeFile(
+      join(fixture.workspace, ".review-mesh.toml"),
+      'schema_version = "1"\n',
+    );
+    const controller = new AbortController();
+    let readStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      readStarted = resolve;
+    });
+
+    try {
+      const loading = loadConfigFiles(
+        { ...fixture, signal: controller.signal },
+        {
+          readTimeoutMs: 10_000,
+          repositoryRead: async () => {
+            readStarted();
+            return await new Promise<never>(() => undefined);
+          },
+        },
+      );
+      await started;
+      controller.abort(new Error("cancel stuck policy read"));
+
+      await expect(
+        Promise.race([
+          loading,
+          new Promise<never>((_resolve, reject) =>
+            setTimeout(
+              () => reject(new Error("cancellation was not prompt")),
+              250,
+            ),
+          ),
+        ]),
+      ).rejects.toThrow(/cancel stuck policy read/i);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it("applies a hard deadline to a stuck descriptor read", async () => {
+    const fixture = await configLoadFixture();
+    await writeFile(
+      join(fixture.workspace, ".review-mesh.toml"),
+      'schema_version = "1"\n',
+    );
+
+    try {
+      await expect(
+        Promise.race([
+          loadConfigFiles(fixture, {
+            readTimeoutMs: 20,
+            repositoryRead: async () =>
+              await new Promise<never>(() => undefined),
+          }),
+          new Promise<never>((_resolve, reject) =>
+            setTimeout(
+              () => reject(new Error("read deadline was not prompt")),
+              500,
+            ),
+          ),
+        ]),
+      ).rejects.toThrow(/read timed out after 20ms/i);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "opens a repository FIFO nonblocking and rejects it as a special file",
+    async () => {
+      const fixture = await configLoadFixture();
+      const policy = join(fixture.workspace, ".review-mesh.toml");
+      const created = spawnSync("mkfifo", [policy]);
+      expect(created.status).toBe(0);
+
+      try {
+        const result = Promise.race([
+          loadConfigFiles(fixture),
+          new Promise<never>((_resolve, reject) =>
+            setTimeout(() => reject(new Error("FIFO read blocked")), 1_000),
+          ),
+        ]);
+        await expect(result).rejects.toThrow(/regular file/i);
+      } finally {
+        await rm(fixture.root, { recursive: true, force: true });
+      }
+    },
+  );
 });

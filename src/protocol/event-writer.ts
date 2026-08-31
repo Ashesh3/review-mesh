@@ -34,6 +34,13 @@ export interface CreateEventWriterOptions {
   onMirrorClose?: () => Promise<void>;
   onWarning?: (error: Error) => void;
   mirrorFlushTimeoutMs?: number;
+  mirrorMaxPendingEvents?: number;
+  mirrorMaxPendingBytes?: number;
+}
+
+interface PendingMirrorEvent {
+  event: PublicEvent;
+  bytes: number;
 }
 
 export function createEventWriter({
@@ -45,13 +52,30 @@ export function createEventWriter({
   onMirrorClose,
   onWarning,
   mirrorFlushTimeoutMs = 1_000,
+  mirrorMaxPendingEvents = 256,
+  mirrorMaxPendingBytes = 1024 * 1024,
 }: CreateEventWriterOptions): EventWriter {
+  if (
+    !Number.isSafeInteger(mirrorMaxPendingEvents) ||
+    mirrorMaxPendingEvents < 1
+  ) {
+    throw new Error("mirrorMaxPendingEvents must be a positive safe integer");
+  }
+  if (
+    !Number.isSafeInteger(mirrorMaxPendingBytes) ||
+    mirrorMaxPendingBytes < 1
+  ) {
+    throw new Error("mirrorMaxPendingBytes must be a positive safe integer");
+  }
   let closed = false;
   let sequence = 0;
   let tail = Promise.resolve();
   let streamError: Error | undefined;
   let mirrorEnabled = onEvent !== undefined;
-  let mirrorTail = Promise.resolve();
+  let mirrorQueue: PendingMirrorEvent[] = [];
+  let mirrorQueuedBytes = 0;
+  let mirrorInFlightBytes = 0;
+  let mirrorPump: Promise<void> | undefined;
   let mirrorWarningIssued = false;
   let mirrorClose: Promise<void> | undefined;
 
@@ -75,6 +99,8 @@ export function createEventWriter({
 
   const disableMirror = (error: unknown) => {
     mirrorEnabled = false;
+    mirrorQueue = [];
+    mirrorQueuedBytes = 0;
     if (mirrorWarningIssued) return;
     mirrorWarningIssued = true;
     try {
@@ -84,25 +110,59 @@ export function createEventWriter({
     }
   };
 
-  const enqueueMirror = (event: PublicEvent) => {
-    if (!mirrorEnabled || onEvent === undefined) return;
-    const operation = mirrorTail.then(async () => {
-      if (!mirrorEnabled) return;
-      await onEvent(event);
-    });
-    mirrorTail = operation.catch((error: unknown) => {
-      disableMirror(error);
+  const startMirrorPump = () => {
+    if (mirrorPump !== undefined || onEvent === undefined) return;
+    const pump = (async () => {
+      while (mirrorEnabled) {
+        const pending = mirrorQueue.shift();
+        if (pending === undefined) return;
+        mirrorQueuedBytes -= pending.bytes;
+        mirrorInFlightBytes = pending.bytes;
+        try {
+          await onEvent(pending.event);
+        } catch (error) {
+          disableMirror(error);
+          return;
+        } finally {
+          mirrorInFlightBytes = 0;
+        }
+      }
+    })();
+    mirrorPump = pump.finally(() => {
+      mirrorPump = undefined;
+      if (mirrorEnabled && mirrorQueue.length > 0) startMirrorPump();
     });
   };
 
+  const enqueueMirror = (event: PublicEvent, bytes: number) => {
+    if (!mirrorEnabled || onEvent === undefined) return;
+    const pendingEvents =
+      mirrorQueue.length + (mirrorInFlightBytes > 0 ? 1 : 0);
+    const pendingBytes = mirrorQueuedBytes + mirrorInFlightBytes;
+    if (
+      pendingEvents >= mirrorMaxPendingEvents ||
+      bytes > mirrorMaxPendingBytes - pendingBytes
+    ) {
+      disableMirror(
+        new Error("Run record persistence queue capacity exceeded."),
+      );
+      return;
+    }
+    mirrorQueue.push({ event, bytes });
+    mirrorQueuedBytes += bytes;
+    startMirrorPump();
+  };
+
   const scheduleMirrorClose = (): Promise<void> => {
-    mirrorClose ??= mirrorTail
-      .then(async () => {
-        if (onMirrorClose !== undefined) await onMirrorClose();
-      })
-      .catch((error: unknown) => {
-        disableMirror(error);
-      });
+    mirrorClose ??= (async () => {
+      const pump = mirrorPump;
+      if (pump !== undefined) {
+        await pump;
+      }
+      if (onMirrorClose !== undefined) await onMirrorClose();
+    })().catch((error: unknown) => {
+      disableMirror(error);
+    });
     return mirrorClose;
   };
 
@@ -204,7 +264,7 @@ export function createEventWriter({
 
         await writeLine(line);
 
-        enqueueMirror(event);
+        enqueueMirror(event, Buffer.byteLength(line, "utf8"));
 
         return event;
       });

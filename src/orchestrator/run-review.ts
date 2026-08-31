@@ -85,6 +85,10 @@ interface ActiveJob {
   releaseShutdown(): void;
 }
 
+class ProbeTimeoutError extends Error {}
+
+const MAX_PROBE_TIMEOUT_MS = 30_000;
+
 const globalClock: OrchestratorClock = {
   now: () => new Date(),
   setTimeout: ((callback: () => void, delay?: number) =>
@@ -234,13 +238,56 @@ export async function runReviewRound({
   const active = new Map<string, ActiveJob>();
   const finalizing = new Set<string>();
 
+  const settleWithin = async (
+    operation: PromiseLike<unknown>,
+    maximumMs: number,
+  ): Promise<"fulfilled" | "rejected" | "timeout"> => {
+    const observed = Promise.resolve(operation).then(
+      () => "fulfilled" as const,
+      () => "rejected" as const,
+    );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      observed,
+      new Promise<"timeout">((resolve) => {
+        timer = clock.setTimeout(() => resolve("timeout"), maximumMs);
+      }),
+    ]);
+    if (timer !== undefined) clock.clearTimeout(timer);
+    return outcome;
+  };
+
   const emit = async (draft: EventDraft): Promise<void> => {
     if (!writerUsable) return;
+    let emission: PromiseLike<unknown>;
     try {
-      await writer.emit(draft);
+      emission = writer.emit(draft);
     } catch {
       writerUsable = false;
+      return;
     }
+    const outcome = await settleWithin(
+      emission,
+      config.execution.shutdown_grace_period_ms,
+    );
+    if (outcome !== "fulfilled") writerUsable = false;
+  };
+
+  const emitHeartbeat = (draft: EventDraft): Promise<void> => {
+    if (!writerUsable) return Promise.resolve();
+    let emission: PromiseLike<unknown>;
+    try {
+      emission = writer.emit(draft);
+    } catch {
+      writerUsable = false;
+      return Promise.resolve();
+    }
+    return settleWithin(
+      emission,
+      config.execution.shutdown_grace_period_ms,
+    ).then((outcome) => {
+      if (outcome !== "fulfilled") writerUsable = false;
+    });
   };
 
   const terminalRecord = (reviewerId: string): ReviewerTerminalRecord => {
@@ -274,25 +321,21 @@ export async function runReviewRound({
       clock.clearInterval(runtime.heartbeat);
       delete runtime.heartbeat;
     }
-    await Promise.allSettled([...runtime.heartbeatEmissions]);
+    const pendingHeartbeats = [...runtime.heartbeatEmissions];
+    runtime.heartbeatEmissions.clear();
+    if (pendingHeartbeats.length === 0) return;
+    const outcome = await settleWithin(
+      Promise.allSettled(pendingHeartbeats),
+      config.execution.shutdown_grace_period_ms,
+    );
+    if (outcome === "timeout") writerUsable = false;
   };
 
   const waitAtMost = async (
     operation: PromiseLike<unknown>,
     maximumMs: number,
   ): Promise<void> => {
-    const owned = Promise.resolve(operation).then(
-      () => undefined,
-      () => undefined,
-    );
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([
-      owned,
-      new Promise<void>((resolve) => {
-        timer = clock.setTimeout(resolve, maximumMs);
-      }),
-    ]);
-    if (timer !== undefined) clock.clearTimeout(timer);
+    await settleWithin(operation, maximumMs);
   };
 
   const cleanupRuntime = (runtime: ActiveJob): Promise<void> => {
@@ -440,23 +483,124 @@ export async function runReviewRound({
     });
 
     for (const job of jobs) state.transition(job.reviewer.id, "probing");
+    const probeStarted = jobs.map(() => false);
     const probeSettled = jobs.map(() => false);
-    const probeAbort = signalPromise(signal);
-    const probePromises = jobs.map(async (job, index) => {
-      try {
-        if (job.creationFailure !== undefined) throw job.creationFailure;
-        return await job.adapter!.probe(job.reviewer, signal);
-      } finally {
-        probeSettled[index] = true;
+    const probeOperations: Array<Promise<void> | undefined> = jobs.map(
+      () => undefined,
+    );
+    const probeCleanup: Array<Promise<void> | undefined> = jobs.map(
+      () => undefined,
+    );
+    const cleanupProbe = (job: ReviewerJob, index: number): Promise<void> => {
+      if (
+        !probeStarted[index] ||
+        probeSettled[index] ||
+        job.adapter?.forceCleanup === undefined
+      ) {
+        return Promise.resolve();
       }
-    });
-    const probesPromise = Promise.allSettled(probePromises);
+      const existing = probeCleanup[index];
+      if (existing !== undefined) return existing;
+      const cleanup = waitAtMost(
+        ownedPromise(() => job.adapter!.forceCleanup!()),
+        config.execution.shutdown_grace_period_ms,
+      );
+      probeCleanup[index] = cleanup;
+      return cleanup;
+    };
+    const probeAbort = signalPromise(signal);
+    const probe = async (
+      job: ReviewerJob,
+      index: number,
+    ): Promise<AdapterCapabilities> => {
+      if (job.creationFailure !== undefined) {
+        probeSettled[index] = true;
+        probeOperations[index] = Promise.resolve();
+        throw job.creationFailure;
+      }
+      probeStarted[index] = true;
+      const controller = new AbortController();
+      const unlink = linkAbort(signal, controller);
+      const localAbort = signalPromise(controller.signal);
+      let timedOut = false;
+      const deadline = clock.setTimeout(
+        () => {
+          timedOut = true;
+          controller.abort(
+            new Error("Adapter capability probe deadline expired."),
+          );
+        },
+        Math.min(job.reviewer.timeoutMs, MAX_PROBE_TIMEOUT_MS),
+      );
+      let operation: Promise<AdapterCapabilities>;
+      try {
+        operation = Promise.resolve(
+          job.adapter!.probe(job.reviewer, controller.signal),
+        );
+      } catch (error) {
+        operation = Promise.reject(error);
+      }
+      const observed = operation.then(
+        (value) => ({ type: "result" as const, value }),
+        (error: unknown) => ({ type: "error" as const, error }),
+      );
+      probeOperations[index] = observed.then(() => {
+        probeSettled[index] = true;
+      });
+      try {
+        const outcome = await Promise.race([
+          observed,
+          localAbort.promise.then(() => ({ type: "abort" as const })),
+        ]);
+        if (timedOut) {
+          await cleanupProbe(job, index);
+          throw new ProbeTimeoutError(
+            "The adapter capability probe exceeded the reviewer deadline.",
+          );
+        }
+        if (outcome.type === "abort") {
+          throw adapterFailure.cancelled();
+        }
+        if (outcome.type === "error") throw outcome.error;
+        return outcome.value;
+      } finally {
+        clock.clearTimeout(deadline);
+        localAbort.dispose();
+        unlink();
+      }
+    };
+    const probeOutcomes: PromiseSettledResult<AdapterCapabilities>[] =
+      new Array(jobs.length);
+    let nextProbe = 0;
+    const probeWorkers = Array.from(
+      { length: Math.min(config.execution.max_concurrency, jobs.length) },
+      async () => {
+        while (!interrupted) {
+          const index = nextProbe;
+          const job = jobs[index];
+          if (job === undefined) return;
+          nextProbe += 1;
+          try {
+            probeOutcomes[index] = {
+              status: "fulfilled",
+              value: await probe(job, index),
+            };
+          } catch (reason) {
+            probeOutcomes[index] = { status: "rejected", reason };
+          }
+        }
+      },
+    );
+    const probesPromise = Promise.all(probeWorkers).then(() => probeOutcomes);
     await Promise.race([probesPromise, probeAbort.promise]);
     probeAbort.dispose();
     if (interrupted && probeSettled.some((settled) => !settled)) {
+      const activeProbeOperations = probeOperations.filter(
+        (operation): operation is Promise<void> => operation !== undefined,
+      );
       let graceTimer: ReturnType<typeof setTimeout> | undefined;
       await Promise.race([
-        probesPromise,
+        Promise.all(activeProbeOperations),
         new Promise<void>((resolve) => {
           graceTimer = clock.setTimeout(
             resolve,
@@ -465,32 +609,27 @@ export async function runReviewRound({
         }),
       ]);
       if (graceTimer !== undefined) clock.clearTimeout(graceTimer);
-      await Promise.all(
-        jobs.map((job, index) =>
-          probeSettled[index] || job.adapter?.forceCleanup === undefined
-            ? Promise.resolve()
-            : waitAtMost(
-                ownedPromise(() => job.adapter!.forceCleanup!()),
-                config.execution.shutdown_grace_period_ms,
-              ),
-        ),
-      );
+      await Promise.all(jobs.map((job, index) => cleanupProbe(job, index)));
     }
-    const probeResults = interrupted ? undefined : await probesPromise;
+    const completedProbeResults = interrupted ? undefined : await probesPromise;
     const available: ReviewerJob[] = [];
     for (
       let index = 0;
-      probeResults !== undefined && index < jobs.length;
+      completedProbeResults !== undefined && index < jobs.length;
       index += 1
     ) {
       const job = jobs[index]!;
-      const probe = probeResults[index]!;
+      const probe = completedProbeResults[index]!;
       if (probe.status === "rejected") {
         const failure =
           job.creationFailure ??
-          adapterFailure.unavailable(
-            probe.reason instanceof Error ? probe.reason.message : probe.reason,
-          );
+          (probe.reason instanceof ProbeTimeoutError
+            ? adapterFailure.timeout(probe.reason.message)
+            : adapterFailure.unavailable(
+                probe.reason instanceof Error
+                  ? probe.reason.message
+                  : probe.reason,
+              ));
         await finalizeIncomplete(
           job.reviewer.id,
           interrupted ? adapterFailure.cancelled() : failure,
@@ -549,7 +688,8 @@ export async function runReviewRound({
           const current = state.reviewer(reviewer.id);
           if (current.status === "completed" || current.status === "incomplete")
             return;
-          const heartbeat = emit({
+          if (runtime.heartbeatEmissions.size > 0) return;
+          const heartbeat = emitHeartbeat({
             event: "reviewer.heartbeat",
             reviewer_id: reviewer.id,
             data: {
@@ -822,11 +962,11 @@ export async function runReviewRound({
   } finally {
     signal.removeEventListener("abort", abortActive);
     for (const runtime of active.values()) await stopRuntimeTimers(runtime);
-    try {
-      await writer.close();
-    } catch {
-      writerUsable = false;
-    }
+    const closeOutcome = await settleWithin(
+      Promise.resolve().then(() => writer.close()),
+      config.execution.shutdown_grace_period_ms,
+    );
+    if (closeOutcome !== "fulfilled") writerUsable = false;
     if (!writerUsable) {
       throw new Error("The public event stream became unavailable.");
     }

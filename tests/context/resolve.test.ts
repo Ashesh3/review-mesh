@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { access, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { mkdtemp, rm } from "node:fs/promises";
 import { afterEach, describe, expect, it } from "vitest";
+import { execa } from "execa";
 import { createGitRunner } from "../../src/context/git.js";
 import { resolveContext } from "../../src/context/resolve.js";
 import type { GitRunner } from "../../src/context/git.js";
@@ -49,6 +50,19 @@ async function snapshotFile(
     hash: createHash("sha256").update(contents).digest("hex"),
     mtimeMs: metadata.mtimeMs,
   };
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function nodeCommand(path: string): string {
+  return `node "${path.replaceAll("\\", "/")}"`;
 }
 
 describe("resolveContext", () => {
@@ -162,6 +176,64 @@ describe("resolveContext", () => {
     expect(await snapshotFile(indexPath)).toEqual(before);
   });
 
+  it("does not execute repository-configured fsmonitor or textconv helpers", async () => {
+    const repo = await createGitFixture();
+    fixtures.push(repo);
+    const fsmonitorSentinel = join(repo.path, "fsmonitor-called");
+    const textconvSentinel = join(repo.path, "textconv-called");
+    const fsmonitorScript = join(repo.path, "fsmonitor.mjs");
+    const textconvScript = join(repo.path, "textconv.mjs");
+    await writeFile(
+      fsmonitorScript,
+      `import { appendFileSync } from "node:fs";\nappendFileSync(${JSON.stringify(fsmonitorSentinel)}, "called\\n");\nprocess.stdout.write("token\\n");\n`,
+      "utf8",
+    );
+    await writeFile(
+      textconvScript,
+      `import { appendFileSync, readFileSync } from "node:fs";\nappendFileSync(${JSON.stringify(textconvSentinel)}, "called\\n");\nprocess.stdout.write(readFileSync(process.argv.at(-1)));\n`,
+      "utf8",
+    );
+    await repo.write(".gitattributes", "README.md diff=sentinel\n");
+    await repo.write("README.md", "textconv candidate\n");
+    for (const [key, value] of [
+      ["core.fsmonitor", nodeCommand(fsmonitorScript)],
+      ["diff.sentinel.textconv", nodeCommand(textconvScript)],
+    ] as const) {
+      const configured = await execa("git", ["config", key, value], {
+        cwd: repo.path,
+        reject: false,
+      });
+      expect(configured.exitCode).toBe(0);
+    }
+
+    const untrustedStatus = await execa(
+      "git",
+      ["status", "--porcelain=v2", "--untracked-files=all"],
+      { cwd: repo.path, reject: false },
+    );
+    expect(untrustedStatus.exitCode).toBe(0);
+    expect(await exists(fsmonitorSentinel)).toBe(true);
+    const untrustedDiff = await execa(
+      "git",
+      ["diff", "--textconv", "--", "README.md"],
+      { cwd: repo.path, reject: false },
+    );
+    expect(untrustedDiff.exitCode).toBe(0);
+    expect(await exists(textconvSentinel)).toBe(true);
+    await Promise.all([
+      rm(fsmonitorSentinel, { force: true }),
+      rm(textconvSentinel, { force: true }),
+    ]);
+
+    await resolveContext({
+      request: request({ workspace: repo.path }),
+      git: createGitRunner(),
+    });
+
+    expect(await exists(fsmonitorSentinel)).toBe(false);
+    expect(await exists(textconvSentinel)).toBe(false);
+  });
+
   it("bounds manifest output and reports a detached branch as null", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "review-mesh-bounded-"));
     directories.push(workspace);
@@ -243,6 +315,10 @@ describe("resolveContext", () => {
     });
     for (const command of commands.filter((args) => args[0] !== "rev-parse")) {
       expect(command).toContain("--");
+    }
+    for (const command of commands.filter((args) => args[0] === "diff")) {
+      expect(command).toContain("--no-ext-diff");
+      expect(command).toContain("--no-textconv");
     }
   });
 

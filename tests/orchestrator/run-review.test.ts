@@ -37,6 +37,29 @@ function boundaryAdapter(
   };
 }
 
+function writerWithStuckHeartbeat() {
+  const emitted: Array<{ event: string; reviewer_id?: string }> = [];
+  let resolveHeartbeatStarted!: () => void;
+  const heartbeatStarted = new Promise<void>((resolve) => {
+    resolveHeartbeatStarted = resolve;
+  });
+  return {
+    emitted,
+    heartbeatStarted,
+    writer: {
+      emit: vi.fn((draft: { event: string; reviewer_id?: string }) => {
+        emitted.push(draft);
+        if (draft.event === "reviewer.heartbeat") {
+          resolveHeartbeatStarted();
+          return new Promise<never>(() => undefined);
+        }
+        return Promise.resolve({});
+      }),
+      close: vi.fn(() => new Promise<void>(() => undefined)),
+    },
+  };
+}
+
 describe("runReviewRound", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -46,6 +69,57 @@ describe("runReviewRound", () => {
   afterEach(() => {
     expect(vi.getTimerCount()).toBe(0);
     vi.useRealTimers();
+  });
+
+  it("limits concurrent capability probes to max concurrency", async () => {
+    let activeProbes = 0;
+    let maximumActiveProbes = 0;
+    const started: string[] = [];
+    const releases = new Map<string, () => void>();
+    const adapters = Object.fromEntries(
+      ["first", "second", "third"].map((id) => [
+        id,
+        boundaryAdapter(
+          async function* () {
+            yield {
+              type: "result",
+              result: passResult(),
+              isolation: "enforced_read_only",
+            };
+          },
+          {
+            probe: async () => {
+              activeProbes += 1;
+              maximumActiveProbes = Math.max(maximumActiveProbes, activeProbes);
+              started.push(id);
+              await new Promise<void>((resolve) => releases.set(id, resolve));
+              activeProbes -= 1;
+              return availableCapabilities;
+            },
+          },
+        ),
+      ]),
+    );
+    const completionPromise = runReviewRound(
+      roundInput({
+        adapters,
+        config: { execution: { max_concurrency: 2 } },
+      }),
+    );
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(started).toEqual(["first", "second"]);
+    expect(maximumActiveProbes).toBe(2);
+
+    releases.get("first")?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(started).toEqual(["first", "second", "third"]);
+    expect(maximumActiveProbes).toBe(2);
+
+    releases.get("second")?.();
+    releases.get("third")?.();
+    await vi.runAllTimersAsync();
+    await completionPromise;
   });
 
   it("starts reviewers up to max concurrency and drains the queue in roster order", async () => {
@@ -157,6 +231,91 @@ describe("runReviewRound", () => {
     );
   });
 
+  it("times out a non-cooperative probe without blocking other reviewers", async () => {
+    let probeSignal: AbortSignal | undefined;
+    let cleanupCalls = 0;
+    const stuck = boundaryAdapter(
+      async function* () {
+        yield {
+          type: "result",
+          result: passResult(),
+          isolation: "enforced_read_only",
+        };
+      },
+      {
+        probe: (_reviewer, signal) => {
+          probeSignal = signal;
+          return new Promise<AdapterCapabilities>(() => undefined);
+        },
+        forceCleanup: async () => {
+          cleanupCalls += 1;
+        },
+      },
+    );
+    const available = fakeAdapterReturning(passResult(), 5);
+    const completionPromise = runReviewRound(
+      roundInput({
+        adapters: { stuck, available },
+        config: {
+          reviewers: [{ timeoutMs: 25 }, { timeoutMs: 100 }],
+        },
+      }),
+    );
+
+    await vi.advanceTimersByTimeAsync(25);
+    await vi.runAllTimersAsync();
+    const completion = await completionPromise;
+
+    expect(probeSignal?.aborted).toBe(true);
+    expect(cleanupCalls).toBe(1);
+    expect(completion.reviewers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          reviewer_id: "stuck",
+          reason: "timeout",
+          retryable: true,
+        }),
+        expect.objectContaining({
+          reviewer_id: "available",
+          status: "completed",
+        }),
+      ]),
+    );
+  });
+
+  it("caps probe time independently of a much longer reviewer deadline", async () => {
+    const stuck = boundaryAdapter(
+      async function* () {
+        yield {
+          type: "result",
+          result: passResult(),
+          isolation: "enforced_read_only",
+        };
+      },
+      {
+        probe: () => new Promise<AdapterCapabilities>(() => undefined),
+      },
+    );
+    let completion: Awaited<ReturnType<typeof runReviewRound>> | undefined;
+    void runReviewRound(
+      roundInput({
+        adapters: { stuck },
+        config: { reviewers: [{ timeoutMs: 120_000 }] },
+      }),
+    ).then((result) => {
+      completion = result;
+    });
+
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(completion).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.runAllTimersAsync();
+
+    expect(completion?.reviewers).toEqual([
+      expect.objectContaining({ reason: "timeout", retryable: true }),
+    ]);
+  });
+
   it("emits factual heartbeats during a silent reviewer without inventing percentages", async () => {
     const silent = fakeAdapterReturning(passResult(), 250);
     const events: PublicEvent[] = [];
@@ -184,6 +343,112 @@ describe("runReviewRound", () => {
 
     await vi.runAllTimersAsync();
     await completionPromise;
+  });
+
+  it("bounds a stuck heartbeat writer when a reviewer times out", async () => {
+    const stuck = boundaryAdapter(() => ({
+      [Symbol.asyncIterator](): AsyncIterator<AdapterEvent> {
+        return {
+          next: () =>
+            new Promise<IteratorResult<AdapterEvent>>(() => undefined),
+        };
+      },
+    }));
+    const { emitted, heartbeatStarted, writer } = writerWithStuckHeartbeat();
+    let outcome: "pending" | "resolved" | "rejected" = "pending";
+    const completionPromise = runReviewRound(
+      roundInput({
+        adapters: { stuck },
+        writer,
+        config: {
+          execution: {
+            heartbeat_interval_ms: 10,
+            shutdown_grace_period_ms: 20,
+          },
+          reviewers: [{ timeoutMs: 30 }],
+        },
+      }),
+    );
+    void completionPromise.then(
+      () => {
+        outcome = "resolved";
+      },
+      () => {
+        outcome = "rejected";
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(10);
+    await heartbeatStarted;
+    await vi.advanceTimersByTimeAsync(200);
+
+    await expect(completionPromise).rejects.toThrow(
+      "The public event stream became unavailable.",
+    );
+    expect(outcome).toBe("rejected");
+    expect(
+      emitted.filter((event) => event.event === "reviewer.heartbeat"),
+    ).toHaveLength(1);
+    expect(
+      emitted.filter((event) => event.event === "reviewer.incomplete"),
+    ).toHaveLength(0);
+    expect(
+      emitted.filter((event) => event.event === "run.completed"),
+    ).toHaveLength(0);
+  });
+
+  it("bounds a stuck heartbeat writer during caller cancellation", async () => {
+    const stuck = boundaryAdapter(() => ({
+      [Symbol.asyncIterator](): AsyncIterator<AdapterEvent> {
+        return {
+          next: () =>
+            new Promise<IteratorResult<AdapterEvent>>(() => undefined),
+        };
+      },
+    }));
+    const controller = new AbortController();
+    const { emitted, heartbeatStarted, writer } = writerWithStuckHeartbeat();
+    let outcome: "pending" | "resolved" | "rejected" = "pending";
+    const completionPromise = runReviewRound(
+      roundInput({
+        adapters: { stuck },
+        signal: controller.signal,
+        writer,
+        config: {
+          execution: {
+            heartbeat_interval_ms: 10,
+            shutdown_grace_period_ms: 20,
+          },
+        },
+      }),
+    );
+    void completionPromise.then(
+      () => {
+        outcome = "resolved";
+      },
+      () => {
+        outcome = "rejected";
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(10);
+    await heartbeatStarted;
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(200);
+
+    await expect(completionPromise).rejects.toThrow(
+      "The public event stream became unavailable.",
+    );
+    expect(outcome).toBe("rejected");
+    expect(
+      emitted.filter((event) => event.event === "reviewer.heartbeat"),
+    ).toHaveLength(1);
+    expect(
+      emitted.filter((event) => event.event === "reviewer.incomplete"),
+    ).toHaveLength(0);
+    expect(
+      emitted.filter((event) => event.event === "run.completed"),
+    ).toHaveLength(0);
   });
 
   it("converts deadline expiry to timeout and aborts the adapter signal", async () => {

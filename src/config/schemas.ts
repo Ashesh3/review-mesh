@@ -8,6 +8,8 @@ import {
 
 const nonEmptyString = z.string().min(1);
 const positiveInteger = z.number().int().positive();
+const maximumTimerMilliseconds = 2_147_483_647;
+const timerMilliseconds = positiveInteger.max(maximumTimerMilliseconds);
 const jsonRecordSchema = z.record(z.string(), z.json());
 
 export const adapterRegistrationSchema = z.discriminatedUnion("type", [
@@ -48,7 +50,7 @@ export const reviewerProfileSchema = z
     instructions: nonEmptyString.optional(),
     instructions_file: nonEmptyString.optional(),
     isolation: isolationPolicySchema,
-    timeout_ms: positiveInteger,
+    timeout_ms: timerMilliseconds,
     runtime: jsonRecordSchema.optional(),
   })
   .superRefine((profile, ctx) => {
@@ -74,8 +76,8 @@ export const trustedConfigSchema = z.strictObject({
   schema_version: protocolVersionSchema,
   execution: z.strictObject({
     max_concurrency: positiveInteger,
-    heartbeat_interval_ms: positiveInteger,
-    shutdown_grace_period_ms: positiveInteger,
+    heartbeat_interval_ms: timerMilliseconds,
+    shutdown_grace_period_ms: timerMilliseconds,
   }),
   diagnostics: z.strictObject({
     persist_runs: z.boolean(),
@@ -83,7 +85,7 @@ export const trustedConfigSchema = z.strictObject({
   }),
   adapters: z.record(nonEmptyString, adapterRegistrationSchema),
   reviewer_profiles: z.record(nonEmptyString, reviewerProfileSchema),
-  reviewers: z.array(trustedReviewerDefinitionSchema),
+  reviewers: z.array(trustedReviewerDefinitionSchema).min(1),
 });
 
 const repositoryReviewerSchema = z.strictObject({
@@ -91,7 +93,7 @@ const repositoryReviewerSchema = z.strictObject({
   profile: nonEmptyString,
   instructions: nonEmptyString.optional(),
   append_instructions: nonEmptyString.optional(),
-  timeout_ms: positiveInteger.optional(),
+  timeout_ms: timerMilliseconds.optional(),
   require_enforced: z.literal(true).optional(),
 });
 
@@ -99,7 +101,7 @@ const repositoryReviewerOverrideSchema = z
   .strictObject({
     id: nonEmptyString,
     append_instructions: nonEmptyString.optional(),
-    timeout_ms: positiveInteger.optional(),
+    timeout_ms: timerMilliseconds.optional(),
     require_enforced: z.literal(true).optional(),
   })
   .refine(

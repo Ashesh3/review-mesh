@@ -110,6 +110,7 @@ export async function runReviewApplication(
         ? {}
         : { configFile: options.configFile }),
       workspace: request.workspace,
+      signal: options.signal,
     });
     config = resolveConfig(loaded);
   } catch {

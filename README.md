@@ -110,9 +110,9 @@ Required request fields:
 | `workspace`      | Existing local directory prepared by the caller. |
 | `instructions`   | Review focus sent to every mandatory reviewer.   |
 
-`request_id`, `scope_hints`, and arbitrary JSON `context` are optional. Scope hints enrich the common starting manifest; reviewers inspect the live current workspace. They do not make Review Mesh fetch refs, check out code, or snapshot a patch. In particular, deleted/base-only file contents are not supplied automatically.
+`request_id`, `scope_hints`, and arbitrary JSON `context` are optional. Scope hints enrich the common starting manifest; reviewers inspect the current workspace state available when their adapter starts. They do not make Review Mesh fetch refs, check out code, or snapshot a Git patch. In particular, deleted/base-only file contents are not supplied automatically. The embedded `openai_compatible` adapter creates one bounded private in-memory read-only file snapshot per reviewer so all of that reviewer's tool calls see the same validated bytes.
 
-## Three-model OpenAI-compatible setup
+## Five-model OpenAI-compatible setup
 
 The built-in `openai_compatible` adapter works with an OpenAI Chat Completions-compatible gateway. It is fully embedded in `review-mesh.mjs`, so no external reviewer script is needed.
 
@@ -153,7 +153,7 @@ Create the trusted configuration shown below, replacing model IDs as needed:
 schema_version = "1"
 
 [execution]
-max_concurrency = 3
+max_concurrency = 2
 heartbeat_interval_ms = 15000
 shutdown_grace_period_ms = 5000
 
@@ -166,41 +166,65 @@ type = "openai_compatible"
 base_url_env = "REVIEW_MESH_OPENAI_BASE_URL"
 api_key_env = "REVIEW_MESH_OPENAI_API_KEY"
 
-[reviewer_profiles.gemini]
-adapter = "gateway"
-model = "gemini-3.1-pro-preview"
-purpose = "Correctness, reliability, and edge-case review"
-instructions = "Inspect the full scope for actionable correctness, integration, and test-coverage defects. Cite precise file and line evidence."
-isolation = "prefer_enforced"
-timeout_ms = 900000
-
 [reviewer_profiles.opus]
 adapter = "gateway"
 model = "claude-opus-5"
 purpose = "Architecture, security, and lifecycle review"
 instructions = "Inspect architecture, lifecycle ownership, trust boundaries, security, and regressions. Report only actionable evidence-backed defects."
 isolation = "prefer_enforced"
+timeout_ms = 1800000
+
+[reviewer_profiles.gemini]
+adapter = "gateway"
+model = "gemini-3.7-flash"
+purpose = "Correctness, reliability, and edge-case review"
+instructions = "Inspect the full scope for actionable correctness, integration, and test-coverage defects. Cite precise file and line evidence."
+isolation = "prefer_enforced"
+timeout_ms = 900000
+
+[reviewer_profiles.mai]
+adapter = "gateway"
+model = "mai-code-1.1-flash"
+purpose = "Implementation quality and regression review"
+instructions = "Inspect implementation bugs, state handling, schemas, error paths, and missing regressions. Report only actionable findings."
+isolation = "prefer_enforced"
 timeout_ms = 900000
 
 [reviewer_profiles.sol]
 adapter = "gateway"
-model = "gpt-5.6-sol"
+model = "gpt-5.6-sol-fast"
 purpose = "Implementation, protocol, and compatibility review"
 instructions = "Inspect concurrency, cancellation, protocol invariants, error handling, compatibility, and tests. Report only actionable findings."
 isolation = "prefer_enforced"
 timeout_ms = 900000
 
-[[reviewers]]
-id = "gemini"
-profile = "gemini"
+[reviewer_profiles.kimi]
+adapter = "gateway"
+model = "kimi-k3"
+purpose = "Independent systems and robustness review"
+instructions = "Inspect systems design, robustness, maintainability, portability, and boundary validation. Report only actionable findings."
+isolation = "prefer_enforced"
+timeout_ms = 900000
 
 [[reviewers]]
 id = "opus-5"
 profile = "opus"
 
 [[reviewers]]
-id = "sol-5-6"
+id = "gemini-3-7-flash"
+profile = "gemini"
+
+[[reviewers]]
+id = "mai-code-1-1-flash"
+profile = "mai"
+
+[[reviewers]]
+id = "sol-5-6-fast"
 profile = "sol"
+
+[[reviewers]]
+id = "kimi-k3"
+profile = "kimi"
 ```
 
 The gateway adapter exposes exactly three bounded reviewer tools:
@@ -211,7 +235,7 @@ The gateway adapter exposes exactly three bounded reviewer tools:
 
 It excludes `.git`, `.git-recovered`, `.worktrees`, `node_modules`, `dist`, `coverage`, and `.review-mesh-runs`; rejects path traversal and symlink escapes; caps file, search, output, turn, and request sizes; and reports `runtime_read_only`.
 
-Reviewer models cannot execute shell commands, programs, scripts, Git, builds, tests, web tools, or code, and cannot write files. Review Mesh core separately runs a bounded allowlist of read-only Git discovery commands with `GIT_OPTIONAL_LOCKS=0` to construct the shared context manifest.
+Reviewer models cannot execute shell commands, programs, scripts, Git, builds, tests, web tools, or code, and cannot write files. Review Mesh core separately runs a bounded allowlist of read-only Git discovery commands with optional locks, hooks, fsmonitor, external diff, text conversion, pagers, and interactive prompting disabled to construct the shared context manifest.
 
 ## Configuration location
 
@@ -403,7 +427,9 @@ Each completed reviewer returns:
 
 `require_enforced` fails closed unless the adapter can actually report `enforced_read_only`.
 
-All rounds report `consistency_mode: "live_worktree"`. Review Mesh does not snapshot, lock, or invalidate a changing workspace. Concurrent reviewers can observe different states if another process modifies files during the round.
+All rounds report `consistency_mode: "live_worktree"`. Review Mesh does not lock or invalidate a changing workspace, and concurrent reviewers can observe different states if another process modifies files during the round. The embedded `openai_compatible` adapter is the exception within an individual reviewer: it retains bounded, descriptor-validated text files in a private in-memory snapshot before serving any file/search tool result, then clears that snapshot when the reviewer ends. This is a reviewer-local safety and consistency measure, not a Git ref or whole-round snapshot.
+
+Run-record persistence similarly uses exclusive active/final names, pinned directory identity checks, and post-publication file-identity verification. These checks fail closed on detected replacement, but `runtime_read_only` is not a hostile-filesystem security boundary: portable Node does not expose directory-relative mutation primitives on every supported platform. Keep the application-data directory private to the Review Mesh user and do not grant untrusted processes rename or write access to it.
 
 ## Command-adapter protocol
 

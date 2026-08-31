@@ -238,10 +238,23 @@ export async function resolveContext({
       workspace,
       signal,
     ),
-    run(git, ["diff", "--name-only", "-z", ...paths], workspace, signal),
     run(
       git,
-      ["diff", "--cached", "--name-only", "-z", ...paths],
+      ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z", ...paths],
+      workspace,
+      signal,
+    ),
+    run(
+      git,
+      [
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--cached",
+        "--name-only",
+        "-z",
+        ...paths,
+      ],
       workspace,
       signal,
     ),
@@ -251,8 +264,25 @@ export async function resolveContext({
       workspace,
       signal,
     ),
-    run(git, ["diff", "--stat", ...paths], workspace, signal),
-    run(git, ["diff", "--cached", "--stat", ...paths], workspace, signal),
+    run(
+      git,
+      ["diff", "--no-ext-diff", "--no-textconv", "--stat", ...paths],
+      workspace,
+      signal,
+    ),
+    run(
+      git,
+      [
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--cached",
+        "--stat",
+        ...paths,
+      ],
+      workspace,
+      signal,
+    ),
   ]);
   const status = boundedLines(
     statusResult.exitCode === 0 ? statusResult.stdout : "",
