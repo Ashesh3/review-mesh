@@ -1,7 +1,10 @@
-import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import type { AdapterRegistration } from "../config/schemas.js";
 import { getAppPaths } from "../config/paths.js";
+import {
+  loadCopilotSdkModule,
+  resolveCopilotRuntimePath,
+} from "../copilot/runtime.js";
 import { reviewerResultSchema } from "../protocol/schemas.js";
 import { adapterFailure } from "./errors.js";
 import {
@@ -43,12 +46,22 @@ export interface CopilotStatus {
 
 export interface CopilotAuthStatus {
   isAuthenticated: boolean;
+  authType?: "user" | "env" | "gh-cli" | "hmac" | "api-key" | "token";
+  host?: string;
+  login?: string;
+  statusMessage?: string;
 }
 
 export interface CopilotModelInfo {
   id: string;
   name: string;
-  capabilities: unknown;
+  capabilities: {
+    supports?: { reasoningEffort?: boolean; [key: string]: unknown };
+    [key: string]: unknown;
+  };
+  policy?: { state: "enabled" | "disabled" | "unconfigured" };
+  supportedReasoningEfforts?: string[];
+  defaultReasoningEffort?: string;
 }
 
 export type CopilotPermissionRequest = {
@@ -89,6 +102,7 @@ export interface CopilotAssistantMessage extends CopilotSessionEvent {
 
 export interface CopilotSessionConfig {
   model: string;
+  reasoningEffort?: string;
   workingDirectory: string;
   streaming: true;
   systemMessage: { mode: "append"; content: string };
@@ -254,9 +268,18 @@ class CopilotClientSdkFacade implements CopilotClientFacade {
 export function createCopilotClientFacade(
   options: CopilotClientOptions,
 ): CopilotClientFacade {
-  const require = createRequire(import.meta.url);
-  const module = require("@github/copilot-sdk") as CopilotSdkModule;
-  return new CopilotClientSdkFacade(new module.CopilotClient(options));
+  const runtimePath = resolveCopilotRuntimePath(options.env);
+  const configuredOptions =
+    runtimePath === undefined
+      ? options
+      : {
+          ...options,
+          env: { ...options.env, COPILOT_CLI_PATH: runtimePath },
+        };
+  const module = loadCopilotSdkModule() as CopilotSdkModule;
+  return new CopilotClientSdkFacade(
+    new module.CopilotClient(configuredOptions),
+  );
 }
 
 function definedEnvironment(
@@ -338,6 +361,41 @@ function failureCapabilities(message: string): AdapterCapabilities {
   };
 }
 
+function selectableModel(model: CopilotModelInfo): boolean {
+  return model.policy === undefined || model.policy.state === "enabled";
+}
+
+function modelReadiness(
+  models: readonly CopilotModelInfo[],
+  modelId: string,
+  effort: string | undefined,
+): { available: boolean; message?: string } {
+  const model = models.find((candidate) => candidate.id === modelId);
+  if (model === undefined || !selectableModel(model)) {
+    return {
+      available: false,
+      message: `The configured Copilot model ${modelId} is unavailable.`,
+    };
+  }
+  if (effort === undefined) return { available: true };
+  if (model.capabilities.supports?.reasoningEffort !== true) {
+    return {
+      available: false,
+      message: `The configured Copilot model ${modelId} does not support reasoning effort.`,
+    };
+  }
+  if (
+    model.supportedReasoningEfforts !== undefined &&
+    !model.supportedReasoningEfforts.includes(effort)
+  ) {
+    return {
+      available: false,
+      message: `The configured Copilot model ${modelId} does not support effort ${effort}.`,
+    };
+  }
+  return { available: true };
+}
+
 class CopilotAdapter implements ReviewAdapter {
   readonly id = "copilot";
   private readonly applicationDataDirectory: string;
@@ -368,7 +426,7 @@ class CopilotAdapter implements ReviewAdapter {
       baseDirectory: join(this.applicationDataDirectory, "runtime", "copilot"),
       logLevel: "error",
       env,
-      useLoggedInUser: this.registration.use_logged_in_user ?? false,
+      useLoggedInUser: this.registration.use_logged_in_user ?? true,
     });
     let resolveLifecycle!: () => void;
     const lifecycle = new Promise<void>((resolve) => {
@@ -431,24 +489,20 @@ class CopilotAdapter implements ReviewAdapter {
         active.client.getAuthStatus(),
         active.client.listModels(),
       ]);
-      const modelAvailable = models.some(
-        (model) => model.id === reviewer.model,
-      );
-      const available = auth.isAuthenticated && modelAvailable;
+      const readiness = modelReadiness(models, reviewer.model, reviewer.effort);
+      const available = auth.isAuthenticated && readiness.available;
       return {
         available,
         authenticated: auth.isAuthenticated,
-        model_available: modelAvailable,
+        model_available: readiness.available,
         streaming: true,
         cancellation: true,
         maximumIsolation: "prompt_only",
         runtime_version: status.version,
         ...(!auth.isAuthenticated
           ? { message: "Copilot authentication is unavailable." }
-          : !modelAvailable
-            ? {
-                message: `The configured Copilot model ${reviewer.model} is unavailable.`,
-              }
+          : !readiness.available
+            ? { message: readiness.message }
             : {}),
       };
     } catch (error) {
@@ -518,6 +572,9 @@ class CopilotAdapter implements ReviewAdapter {
       }
       active.session = await active.client.createSession({
         model: input.reviewer.model,
+        ...(input.reviewer.effort === undefined
+          ? {}
+          : { reasoningEffort: input.reviewer.effort }),
         workingDirectory: input.context.workspace,
         streaming: true,
         systemMessage: { mode: "append", content: input.prompt.system },

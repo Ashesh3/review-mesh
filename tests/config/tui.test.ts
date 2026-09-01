@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
+import type { CopilotAccountService } from "../../src/copilot/account.js";
 import {
   loadManagedConfig,
   serializeManagedConfig,
@@ -32,6 +33,76 @@ afterEach(async () => {
 });
 
 describe("config menu", () => {
+  it("logs in, discovers Copilot models, and stores model plus effort", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "review-mesh-config-tui-"));
+    roots.push(directory);
+    const file = join(directory, "config.toml");
+    const loaded = await loadManagedConfig(file, true);
+    let authenticated = false;
+    const copilotAccount: CopilotAccountService = {
+      status: async () => ({
+        isAuthenticated: authenticated,
+        runtimeVersion: "1.0.11",
+      }),
+      login: async () => {
+        authenticated = true;
+      },
+      models: async () => ({
+        status: {
+          isAuthenticated: authenticated,
+          ...(authenticated ? { login: "octocat" } : {}),
+          runtimeVersion: "1.0.11",
+        },
+        models: authenticated
+          ? [
+              {
+                id: "gpt-test",
+                name: "GPT Test",
+                capabilities: { supports: { reasoningEffort: true } },
+                policy: { state: "enabled" },
+                supportedReasoningEfforts: ["low", "high"],
+              },
+            ]
+          : [],
+      }),
+    };
+    const prompt = new Answers([
+      "a",
+      "copilot-reviewer",
+      "new",
+      "github",
+      "copilot",
+      "y",
+      "gpt-test",
+      "high",
+      "Independent review",
+      "Review correctness.",
+      "900000",
+      "n",
+      "q",
+    ]);
+
+    await runConfigMenu({
+      configFile: file,
+      config: loaded.config,
+      snapshot: loaded.snapshot,
+      prompt,
+      output: new PassThrough(),
+      copilotAccount,
+    });
+
+    const saved = (await loadManagedConfig(file)).config;
+    expect(saved.adapters.github).toEqual({
+      type: "copilot",
+      use_logged_in_user: true,
+    });
+    expect(saved.agents["copilot-reviewer"]).toMatchObject({
+      adapter: "github",
+      model: "gpt-test",
+      effort: "high",
+    });
+  });
+
   it("adds the first agent, then assigns it to a canonical project", async () => {
     const directory = await mkdtemp(join(tmpdir(), "review-mesh-config-tui-"));
     roots.push(directory);
@@ -49,6 +120,7 @@ describe("config menu", () => {
       "REVIEW_BASE_URL",
       "REVIEW_API_KEY",
       "gemini-flash",
+      "high",
       "Correctness",
       "Review carefully",
       "900000",
@@ -70,6 +142,7 @@ describe("config menu", () => {
     expect(prompt.closed).toBe(true);
     const saved = await loadManagedConfig(file);
     expect(saved.config.defaults?.agents).toEqual(["gemini"]);
+    expect(saved.config.agents.gemini?.effort).toBe("high");
     expect(Object.values(saved.config.projects ?? {})).toEqual([
       {
         agents: ["gemini"],
@@ -141,6 +214,7 @@ describe("config menu", () => {
       "two",
       "gateway",
       "model-two-new",
+      "xhigh",
       "Purpose two new",
       "New agent instructions",
       "require_enforced",
@@ -173,6 +247,7 @@ describe("config menu", () => {
     expect(saved.agents.two).toMatchObject({
       adapter: "gateway",
       model: "model-two-new",
+      effort: "xhigh",
       purpose: "Purpose two new",
       instructions: "New agent instructions",
       isolation: "require_enforced",

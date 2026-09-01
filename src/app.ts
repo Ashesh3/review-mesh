@@ -78,6 +78,7 @@ function resolvedRunHeader(config: ReturnType<typeof resolveConfig>) {
       purpose: reviewer.purpose,
       adapter: reviewer.adapterId,
       model: reviewer.model,
+      ...(reviewer.effort === undefined ? {} : { effort: reviewer.effort }),
       isolation_policy: reviewer.isolationPolicy,
       timeout_ms: reviewer.timeoutMs,
       runtime: reviewer.runtime,

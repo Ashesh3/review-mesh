@@ -340,6 +340,13 @@ class ClaudeAdapter implements ReviewAdapter {
     const options: ClaudeOptions = {
       cwd: input.context.workspace,
       model: input.reviewer.model,
+      ...(input.reviewer.effort === undefined
+        ? {}
+        : {
+            effort: input.reviewer.effort as NonNullable<
+              ClaudeOptions["effort"]
+            >,
+          }),
       abortController,
       settingSources: [],
       strictMcpConfig: true,

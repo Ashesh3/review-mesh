@@ -13,8 +13,8 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { parse, stringify } from "smol-toml";
-import type { AdapterRegistration } from "./schemas.js";
-import { trustedConfigSchema } from "./schemas.js";
+import type { AdapterRegistration, ReasoningEffort } from "./schemas.js";
+import { trustedConfigSchema, validateAdapterEffort } from "./schemas.js";
 
 const MAX_CONFIG_BYTES = 4 * 1024 * 1024;
 const READ_CHUNK_BYTES = 64 * 1024;
@@ -24,6 +24,7 @@ const ENVIRONMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 export interface ManagedAgent {
   adapter: string;
   model: string;
+  effort?: ReasoningEffort;
   purpose: string;
   instructions?: string;
   instructions_file?: string;
@@ -110,11 +111,13 @@ function requireManagedConfig(value: unknown): ManagedConfig {
   const config = clone(value as ManagedConfig);
   requireAssignments(config);
   for (const [id, agent] of Object.entries(config.agents)) {
-    if (config.adapters[agent.adapter] === undefined) {
+    const adapter = config.adapters[agent.adapter];
+    if (adapter === undefined) {
       throw new Error(
         `agent ${id} references unknown adapter ${agent.adapter}`,
       );
     }
+    validateAdapterEffort(adapter.type, agent.effort, `agent ${id}`);
   }
   const assignmentLists = [
     ...(config.defaults === undefined ? [] : [config.defaults.agents]),
@@ -484,6 +487,7 @@ export function listConfig(config: ManagedConfig) {
         id,
         adapter: agent.adapter,
         model: agent.model,
+        ...(agent.effort === undefined ? {} : { effort: agent.effort }),
         purpose: agent.purpose,
         default: defaultAgents.has(id),
       })),

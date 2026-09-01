@@ -22,6 +22,7 @@ import {
   resolvedContext,
   resolvedReviewer,
 } from "../helpers/fixtures.js";
+import type { ReasoningEffort } from "../../src/config/schemas.js";
 
 const model = {
   id: "gpt-5.6-copilot",
@@ -30,6 +31,7 @@ const model = {
     supports: { vision: false, reasoningEffort: true },
     limits: { max_context_window_tokens: 128_000 },
   },
+  supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
 };
 
 function deferred<T>() {
@@ -184,6 +186,7 @@ function setup(options?: {
   createClient?: CopilotClientFactory;
   isolationPolicy?: "prefer_enforced" | "require_enforced";
   useLoggedInUser?: boolean;
+  effort?: ReasoningEffort;
 }) {
   const reviewer = resolvedReviewer({
     id: "copilot-security",
@@ -196,6 +199,7 @@ function setup(options?: {
         : { use_logged_in_user: options.useLoggedInUser }),
     },
     model: model.id,
+    ...(options?.effort === undefined ? {} : { effort: options.effort }),
     isolationPolicy: options?.isolationPolicy ?? "prefer_enforced",
     timeoutMs: 12_345,
     runtime:
@@ -288,6 +292,58 @@ describe("Copilot adapter", () => {
         useLoggedInUser: true,
       },
     ]);
+  });
+
+  it("uses the logged-in GitHub identity by default", async () => {
+    const fake = fakeFactory();
+    const prepared = setup({ createClient: fake.createClient });
+
+    await prepared.adapter.probe(prepared.reviewer, prepared.controller.signal);
+
+    expect(fake.capture.clientOptions[0]?.useLoggedInUser).toBe(true);
+  });
+
+  it("preserves an explicit token-only Copilot adapter setting", async () => {
+    const fake = fakeFactory();
+    const prepared = setup({
+      createClient: fake.createClient,
+      useLoggedInUser: false,
+    });
+
+    await prepared.adapter.probe(prepared.reviewer, prepared.controller.signal);
+
+    expect(fake.capture.clientOptions[0]?.useLoggedInUser).toBe(false);
+  });
+
+  it("validates and forwards the configured Copilot reasoning effort", async () => {
+    const fake = fakeFactory();
+    const prepared = setup({ createClient: fake.createClient, effort: "high" });
+
+    await expect(
+      prepared.adapter.probe(prepared.reviewer, prepared.controller.signal),
+    ).resolves.toMatchObject({ available: true, model_available: true });
+    await collect(prepared.adapter.run(prepared.input));
+
+    expect(fake.capture.sessionConfigs[0]).toMatchObject({
+      model: model.id,
+      reasoningEffort: "high",
+    });
+  });
+
+  it("rejects unavailable Copilot effort levels during the probe", async () => {
+    const fake = fakeFactory();
+    const prepared = setup({
+      createClient: fake.createClient,
+      effort: "ultra",
+    });
+
+    await expect(
+      prepared.adapter.probe(prepared.reviewer, prepared.controller.signal),
+    ).resolves.toMatchObject({
+      available: false,
+      model_available: false,
+      message: expect.stringContaining("does not support effort ultra"),
+    });
   });
 
   it("reports unauthenticated, absent models, and sanitized probe failures", async () => {

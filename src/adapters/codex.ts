@@ -316,6 +316,14 @@ class CodexAdapter implements ReviewAdapter {
       const nativeEvents = await facade.start({
         threadOptions: {
           model: input.reviewer.model,
+          ...(input.reviewer.effort === undefined
+            ? {}
+            : {
+                modelReasoningEffort: input.reviewer.effort as Exclude<
+                  ThreadOptions["modelReasoningEffort"],
+                  undefined
+                >,
+              }),
           workingDirectory: input.context.workspace,
           sandboxMode: "read-only",
           approvalPolicy: "never",

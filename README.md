@@ -26,7 +26,7 @@ Requirements:
 
 ### Download a standalone executable
 
-Release `v2.0.0` provides self-contained Bun executables that do not require Node.js or Bun:
+Release `v2.1.0` provides self-contained Bun executables that do not require Node.js or Bun:
 
 - Windows x64: `review-mesh-windows-x64.exe`
 - Linux x64 (glibc): `review-mesh-linux-x64`
@@ -34,14 +34,14 @@ Release `v2.0.0` provides self-contained Bun executables that do not require Nod
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v2.0.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
+Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v2.1.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
 .\review-mesh.exe review
 ```
 
 Linux:
 
 ```bash
-curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v2.0.0/review-mesh-linux-x64
+curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v2.1.0/review-mesh-linux-x64
 chmod +x ./review-mesh-linux-x64
 ./review-mesh-linux-x64 review
 ```
@@ -197,6 +197,7 @@ api_key_env = "REVIEW_MESH_OPENAI_API_KEY"
 [agents.opus-5]
 adapter = "gateway"
 model = "claude-opus-5"
+effort = "max"
 purpose = "Architecture, security, and lifecycle review"
 instructions = "Inspect architecture, lifecycle ownership, trust boundaries, security, and regressions. Report only actionable evidence-backed defects."
 isolation = "prefer_enforced"
@@ -205,6 +206,7 @@ timeout_ms = 1800000
 [agents.gemini-3-7-flash]
 adapter = "gateway"
 model = "gemini-3.7-flash"
+effort = "high"
 purpose = "Correctness, reliability, and edge-case review"
 instructions = "Inspect the full scope for actionable correctness, integration, and test-coverage defects. Cite precise file and line evidence."
 isolation = "prefer_enforced"
@@ -213,6 +215,7 @@ timeout_ms = 900000
 [agents.mai-code-1-1-flash]
 adapter = "gateway"
 model = "mai-code-1.1-flash"
+effort = "medium"
 purpose = "Implementation quality and regression review"
 instructions = "Inspect implementation bugs, state handling, schemas, error paths, and missing regressions. Report only actionable findings."
 isolation = "prefer_enforced"
@@ -221,6 +224,7 @@ timeout_ms = 900000
 [agents.sol-5-6-fast]
 adapter = "gateway"
 model = "gpt-5.6-sol-fast"
+effort = "high"
 purpose = "Implementation, protocol, and compatibility review"
 instructions = "Inspect concurrency, cancellation, protocol invariants, error handling, compatibility, and tests. Report only actionable findings."
 isolation = "prefer_enforced"
@@ -229,6 +233,7 @@ timeout_ms = 900000
 [agents.kimi-k3]
 adapter = "gateway"
 model = "kimi-k3"
+effort = "high"
 purpose = "Independent systems and robustness review"
 instructions = "Inspect systems design, robustness, maintainability, portability, and boundary validation. Report only actionable findings."
 isolation = "prefer_enforced"
@@ -257,6 +262,63 @@ It excludes `.git`, `.git-recovered`, `.worktrees`, `node_modules`, `dist`, `cov
 
 Reviewer models cannot execute shell commands, programs, scripts, Git, builds, tests, web tools, or code, and cannot write files. Review Mesh core separately runs a bounded allowlist of read-only Git discovery commands with optional locks, hooks, fsmonitor, external diff, text conversion, pagers, and interactive prompting disabled to construct the shared context manifest.
 
+`effort` is optional per agent. Review Mesh forwards it as the native reasoning-effort setting for the Copilot, Claude, Codex, and OpenAI-compatible adapters. Command adapters receive `REVIEW_MESH_MODEL` and, when configured, `REVIEW_MESH_REASONING_EFFORT` without changing the version 1 request body. Supported values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, and `persistent`; each provider/model may support only a subset.
+
+## GitHub Copilot login and models
+
+Review Mesh can sign in with GitHub Copilot, discover the exact model catalog available to that account, and use any selectable model in independently configured agents.
+
+```powershell
+review-mesh config copilot login
+review-mesh config copilot status
+review-mesh config copilot models
+```
+
+Use `--device-code` for a device-code login or `--web-flow` to force the local browser flow. GitHub Enterprise Cloud with data residency can be selected with `--host`:
+
+```powershell
+review-mesh config copilot login --device-code
+review-mesh config copilot login --host https://example.ghe.com
+review-mesh config copilot models --json
+```
+
+The login credential is managed by the GitHub Copilot runtime under Review Mesh application data; it is never written to `config.toml`. The runtime may also authenticate through supported environment variables or GitHub CLI credentials. `review-mesh config copilot models` reports account-specific model IDs and their supported effort levels.
+
+Configure one or more Copilot agents with separate model and effort choices:
+
+```toml
+[adapters.github]
+type = "copilot"
+use_logged_in_user = true
+
+[agents.copilot-architecture]
+adapter = "github"
+model = "claude-opus-5"
+effort = "max"
+purpose = "Architecture and security review"
+instructions = "Review architecture, security boundaries, lifecycle ownership, and regressions."
+isolation = "prefer_enforced"
+timeout_ms = 1800000
+
+[agents.copilot-correctness]
+adapter = "github"
+model = "gpt-5.6-sol"
+effort = "high"
+purpose = "Correctness and reliability review"
+instructions = "Review correctness, error paths, concurrency, compatibility, and tests."
+isolation = "prefer_enforced"
+timeout_ms = 900000
+
+[defaults]
+agents = ["copilot-architecture", "copilot-correctness"]
+```
+
+The interactive `review-mesh config` menu performs the same login check and model discovery while adding or editing a Copilot agent, then validates the selected effort against that model's advertised capabilities.
+
+`use_logged_in_user` defaults to `true` for Copilot adapters. Set it to `false` only when the adapter should use explicit allowlisted token environment variables without stored OAuth or GitHub CLI credential fallback.
+
+The portable Node.js file keeps the Copilot SDK and native Copilot CLI runtime external, so install `@github/copilot-sdk` and `@github/copilot` beside it or in the current project. Standalone executables embed the SDK but keep the native Copilot CLI runtime external. Install `@github/copilot` beside the executable or in the current project, or set `COPILOT_CLI_PATH` to a compatible native Copilot executable. For review adapters that use the override, include `COPILOT_CLI_PATH` in that adapter's `env_allowlist`.
+
 ## Configuration location
 
 One global config file is resolved using the host operating system:
@@ -272,6 +334,7 @@ The global config controls:
 - Adapter/runtime registrations.
 - Credential environment-variable names.
 - Globally declared agents and exact models.
+- Optional per-agent reasoning effort.
 - The optional default agent roster.
 - Per-project agent rosters, guidance, and context keyed by full path.
 - Concurrency, heartbeat, shutdown grace, diagnostics, and retention.
@@ -300,19 +363,22 @@ review-mesh config show
 review-mesh config validate
 review-mesh config list
 review-mesh config list --json
+review-mesh config copilot login
+review-mesh config copilot status --json
+review-mesh config copilot models --json
 ```
 
 ## Other adapters
 
 Review Mesh also implements these trusted adapter types:
 
-| Type                | Purpose                                                                          | Portable-file note                                                                                                                               |
-| ------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `openai_compatible` | Embedded OpenAI-compatible agent loop with bounded read-only tools.              | Fully self-contained.                                                                                                                            |
-| `command`           | Integrates a separately installed review agent using the command JSONL protocol. | External executable remains required.                                                                                                            |
-| `copilot`           | GitHub Copilot SDK reviewer.                                                     | Requires its separately installed runtime/package environment. Default profile is read/search only.                                              |
-| `claude`            | Claude Agent SDK reviewer.                                                       | Requires its native runtime and compatible endpoint/authentication. Reviewer tools are `Read`, `Glob`, and `Grep` only.                          |
-| `codex`             | Codex SDK reviewer.                                                              | Currently fails closed in production because the pinned runtime does not satisfy Review Mesh's project-configuration isolation characterization. |
+| Type                | Purpose                                                                                | Portable-file note                                                                                                                                                                          |
+| ------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `openai_compatible` | Embedded OpenAI-compatible agent loop with bounded read-only tools.                    | Fully self-contained.                                                                                                                                                                       |
+| `command`           | Integrates a separately installed review agent using the command JSONL protocol.       | External executable remains required.                                                                                                                                                       |
+| `copilot`           | GitHub Copilot SDK reviewer with account login, model discovery, and per-agent effort. | Portable Node file requires external SDK/runtime packages; standalone executables embed the SDK but still require a compatible native Copilot runtime. Default profile is read/search only. |
+| `claude`            | Claude Agent SDK reviewer.                                                             | Requires its native runtime and compatible endpoint/authentication. Reviewer tools are `Read`, `Glob`, and `Grep` only.                                                                     |
+| `codex`             | Codex SDK reviewer.                                                                    | Currently fails closed in production because the pinned runtime does not satisfy Review Mesh's project-configuration isolation characterization.                                            |
 
 For a truly one-file deployment, use `openai_compatible`. Provider-native adapters can remain configured in a source installation, but their native runtime assets cannot be encoded into a cross-platform JavaScript file.
 

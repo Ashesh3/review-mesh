@@ -178,6 +178,7 @@ describe("OpenAI-compatible adapter", () => {
       return response;
     });
     const prepared = setup(root, { fetch: mockedFetch });
+    prepared.input.reviewer.effort = "high";
 
     try {
       const events = await collect(prepared.adapter, prepared.input);
@@ -196,6 +197,9 @@ describe("OpenAI-compatible adapter", () => {
         "Content-Type": "application/json",
       });
       expect(requests[0]?.body.model).toBe("review-model");
+      expect(
+        requests.every((request) => request.body.reasoning_effort === "high"),
+      ).toBe(true);
       expect(requests[0]?.body.messages[0].content).toContain(
         "Never execute shell commands",
       );

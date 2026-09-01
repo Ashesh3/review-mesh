@@ -23,6 +23,7 @@ import type {
   AdapterReviewInput,
   ReviewAdapter,
 } from "../../src/adapters/types.js";
+import type { ReasoningEffort } from "../../src/config/schemas.js";
 import { buildAllowlistedEnvironment } from "../../src/adapters/types.js";
 import type { AdapterRegistration } from "../../src/config/schemas.js";
 import type { ResolvedContext } from "../../src/context/resolve.js";
@@ -112,6 +113,7 @@ async function setup(
     environment?: NodeJS.ProcessEnv;
     isolationVerified?: boolean;
     executable?: string;
+    effort?: ReasoningEffort;
     remove?: (
       path: string,
       options: { recursive?: boolean; force?: boolean },
@@ -133,6 +135,7 @@ async function setup(
         : { executable: options.executable }),
     },
     model: "gpt-5.6-codex",
+    ...(options.effort === undefined ? {} : { effort: options.effort }),
     isolationPolicy: options.isolationPolicy ?? "prefer_enforced",
   });
   const context = resolvedContext({
@@ -355,6 +358,17 @@ describe("Codex adapter", () => {
     expect(prepared.capture.factories[0]!.env.CODEX_HOME).not.toBe(
       prepared.capture.factories[1]!.env.CODEX_HOME,
     );
+  });
+
+  it("forwards the configured model reasoning effort", async () => {
+    const prepared = await setup({ effort: "xhigh" });
+
+    await collect(prepared.adapter.run(prepared.input));
+
+    expect(prepared.capture.starts[0]?.threadOptions).toMatchObject({
+      model: "gpt-5.6-codex",
+      modelReasoningEffort: "xhigh",
+    });
   });
 
   it("retains failed cleanup ownership and shares one force-cleanup retry", async () => {

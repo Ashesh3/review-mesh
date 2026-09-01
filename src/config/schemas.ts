@@ -6,6 +6,18 @@ import {
 } from "../protocol/schemas.js";
 
 const nonEmptyString = z.string().min(1);
+export const reasoningEffortSchema = z.enum([
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+  "persistent",
+]);
+export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
 const positiveInteger = z.number().int().positive();
 const maximumTimerMilliseconds = 2_147_483_647;
 const timerMilliseconds = positiveInteger.max(maximumTimerMilliseconds);
@@ -52,6 +64,7 @@ export const reviewerProfileSchema = z
   .strictObject({
     adapter: nonEmptyString,
     model: nonEmptyString,
+    effort: reasoningEffortSchema.optional(),
     purpose: nonEmptyString,
     instructions: nonEmptyString.optional(),
     instructions_file: nonEmptyString.optional(),
@@ -145,12 +158,47 @@ export type TrustedReviewerDefinition = z.infer<
 export type AdapterRegistration = z.infer<typeof adapterRegistrationSchema>;
 export type ReviewerProfile = z.infer<typeof reviewerProfileSchema>;
 
+const adapterEffortSupport = {
+  claude: ["low", "medium", "high", "xhigh", "max"],
+  codex: [
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+    "persistent",
+  ],
+} as const satisfies Partial<
+  Record<AdapterRegistration["type"], readonly ReasoningEffort[]>
+>;
+
+export function supportedEffortsForAdapter(
+  type: AdapterRegistration["type"],
+): readonly ReasoningEffort[] | undefined {
+  return adapterEffortSupport[type as keyof typeof adapterEffortSupport];
+}
+
+export function validateAdapterEffort(
+  type: AdapterRegistration["type"],
+  effort: ReasoningEffort | undefined,
+  label: string,
+): void {
+  if (effort === undefined) return;
+  const supported = supportedEffortsForAdapter(type);
+  if (supported !== undefined && !supported.includes(effort)) {
+    throw new Error(`${label} configures unsupported ${type} effort ${effort}`);
+  }
+}
+
 export interface ResolvedReviewer {
   id: string;
   purpose: string;
   adapterId: string;
   adapter: AdapterRegistration;
   model: string;
+  effort?: ReasoningEffort;
   instruction_layers: Array<{
     source: "trusted" | "project";
     content: string;

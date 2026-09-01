@@ -2,8 +2,9 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { runConfigCommand } from "../../src/config/command.js";
+import type { CopilotAccountService } from "../../src/copilot/account.js";
 import {
   serializeManagedConfig,
   type ManagedConfig,
@@ -70,6 +71,35 @@ afterEach(async () => {
 });
 
 describe("config command", () => {
+  const copilotAccount = (): CopilotAccountService => ({
+    status: vi.fn(async () => ({
+      isAuthenticated: true,
+      authType: "gh-cli" as const,
+      login: "octocat",
+      host: "https://github.com",
+      runtimeVersion: "1.0.11",
+    })),
+    models: vi.fn(async () => ({
+      status: {
+        isAuthenticated: true,
+        authType: "gh-cli" as const,
+        login: "octocat",
+        host: "https://github.com",
+        runtimeVersion: "1.0.11",
+      },
+      models: [
+        {
+          id: "gpt-test",
+          name: "GPT Test",
+          capabilities: { supports: { reasoningEffort: true } },
+          policy: { state: "enabled" as const },
+          supportedReasoningEfforts: ["low", "high"],
+        },
+      ],
+    })),
+    login: vi.fn(async () => undefined),
+  });
+
   it("prints the configuration path without reading stdin", async () => {
     const { file } = await fixture();
     const io = streams();
@@ -113,6 +143,53 @@ describe("config command", () => {
       agents: [{ id: "gemini", default: true }],
       projects: [],
     });
+  });
+
+  it("reports Copilot account status and available model efforts", async () => {
+    const io = streams();
+    expect(
+      await runConfigCommand({
+        args: ["copilot", "models", "--json"],
+        copilotAccount: copilotAccount(),
+        ...io,
+      }),
+    ).toBe(0);
+    expect(JSON.parse(io.stdout())).toMatchObject({
+      authenticated: true,
+      login: "octocat",
+      models: [
+        {
+          id: "gpt-test",
+          available: true,
+          reasoning_efforts: ["low", "high"],
+        },
+      ],
+    });
+  });
+
+  it("forwards Copilot login flow options and verifies the account", async () => {
+    const account = copilotAccount();
+    const io = streams();
+    expect(
+      await runConfigCommand({
+        args: [
+          "copilot",
+          "login",
+          "--device-code",
+          "--host",
+          "https://github.com",
+        ],
+        copilotAccount: account,
+        ...io,
+      }),
+    ).toBe(0);
+    expect(account.login).toHaveBeenCalledWith(
+      expect.objectContaining({
+        flow: "device-code",
+        host: "https://github.com",
+      }),
+    );
+    expect(io.stdout()).toContain("octocat");
   });
 
   it("refuses an interactive menu on redirected streams", async () => {

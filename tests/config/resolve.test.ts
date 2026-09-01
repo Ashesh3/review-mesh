@@ -30,6 +30,7 @@ function v2(workspace: string): TrustedConfigV2 {
       gemini: {
         adapter: "gateway",
         model: "gemini",
+        effort: "high",
         purpose: "Review correctness",
         instructions: "Global instructions.",
         isolation: "prefer_enforced",
@@ -73,6 +74,7 @@ describe("global configuration", () => {
       { source: "trusted", content: "Global instructions." },
       { source: "project", content: "Project guidance." },
     ]);
+    expect(resolved.reviewers[0]?.effort).toBe("high");
     expect(resolved.project_context).toEqual({ project: "demo" });
   });
 
@@ -165,6 +167,19 @@ describe("global configuration", () => {
         api_key_env: "API_KEY",
       }),
     ).toBeTruthy();
+  });
+
+  it("rejects adapter-specific effort values that cannot be forwarded", () => {
+    const config = v2("/demo");
+    config.adapters.claude = { type: "claude" };
+    config.agents.opus = {
+      ...config.agents.opus!,
+      adapter: "claude",
+      effort: "ultra",
+    };
+    expect(() =>
+      resolveConfig({ trusted: config, workspace: "/other" }),
+    ).toThrow(/unsupported claude effort ultra/i);
   });
 });
 

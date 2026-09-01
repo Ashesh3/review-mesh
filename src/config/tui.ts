@@ -1,7 +1,12 @@
 import { createInterface } from "node:readline/promises";
 import { resolve } from "node:path";
 import type { Readable, Writable } from "node:stream";
-import type { AdapterRegistration } from "./schemas.js";
+import {
+  supportedEffortsForAdapter,
+  type AdapterRegistration,
+  type ReasoningEffort,
+} from "./schemas.js";
+import type { CopilotAccountService } from "../copilot/account.js";
 import {
   canonicalProjectPath,
   listConfig,
@@ -26,6 +31,7 @@ export interface ConfigMenuOptions {
   output: NodeJS.WritableStream;
   cwd?: string;
   signal?: AbortSignal;
+  copilotAccount?: CopilotAccountService;
 }
 
 class SignalPrompter implements ConfigPrompter {
@@ -79,6 +85,28 @@ function isolationPolicy(value: string): ManagedAgent["isolation"] {
     throw new Error("isolation must be prefer_enforced or require_enforced");
   }
   return value;
+}
+
+const EFFORTS: ReadonlySet<string> = new Set([
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+  "persistent",
+]);
+
+function reasoningEffort(value: string): ReasoningEffort | undefined {
+  if (value === "" || value === "default") return undefined;
+  if (!EFFORTS.has(value)) {
+    throw new Error(
+      "effort must be default, none, minimal, low, medium, high, xhigh, max, ultra, or persistent",
+    );
+  }
+  return value as ReasoningEffort;
 }
 
 function optionalJson(value: string): unknown {
@@ -217,6 +245,104 @@ async function createAdapter(
   return id;
 }
 
+async function copilotModelAndEffort(
+  options: ConfigMenuOptions,
+  adapterId: string,
+  current?: Pick<ManagedAgent, "model" | "effort">,
+): Promise<{ model: string; effort?: ReasoningEffort }> {
+  const adapter = options.config.adapters[adapterId];
+  if (adapter?.type !== "copilot" || options.copilotAccount === undefined) {
+    const model = await answer(
+      options.prompt,
+      current === undefined ? "Model id: " : `Model id [${current.model}]: `,
+      current?.model,
+    );
+    const supported = supportedEffortsForAdapter(adapter?.type ?? "command");
+    const effort = reasoningEffort(
+      await answer(
+        options.prompt,
+        current === undefined
+          ? `Reasoning effort${supported === undefined ? "" : ` (${supported.join(",")})`} [default]: `
+          : `Reasoning effort${supported === undefined ? "" : ` (${supported.join(",")})`} [${current.effort ?? "default"}]: `,
+        current?.effort ?? "default",
+      ),
+    );
+    if (
+      effort !== undefined &&
+      supported !== undefined &&
+      !supported.includes(effort)
+    ) {
+      throw new Error(`${adapter?.type} does not support effort ${effort}`);
+    }
+    return { model, ...(effort === undefined ? {} : { effort }) };
+  }
+
+  let snapshot = await options.copilotAccount.models(options.signal);
+  if (!snapshot.status.isAuthenticated) {
+    const login = yes(
+      await answer(
+        options.prompt,
+        "GitHub Copilot is not authenticated. Sign in now? [Y/n]: ",
+        "y",
+      ),
+    );
+    if (!login) throw new Error("GitHub Copilot authentication is required");
+    await options.copilotAccount.login({
+      output: options.output,
+      error: options.output,
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+    });
+    snapshot = await options.copilotAccount.models(options.signal);
+  }
+  if (!snapshot.status.isAuthenticated) {
+    throw new Error("GitHub Copilot authentication is unavailable");
+  }
+
+  const selectable = snapshot.models.filter(
+    (model) => model.policy === undefined || model.policy.state === "enabled",
+  );
+  if (selectable.length === 0) {
+    throw new Error("the GitHub Copilot account has no available models");
+  }
+  await write(options.output, "GitHub Copilot models:\n");
+  for (const model of selectable) {
+    const efforts = model.supportedReasoningEfforts?.join(",") ?? "default";
+    await write(
+      options.output,
+      `  ${model.id}: ${model.name} (effort: ${efforts})\n`,
+    );
+  }
+  const modelId = await answer(
+    options.prompt,
+    current === undefined ? "Model id: " : `Model id [${current.model}]: `,
+    current?.model,
+  );
+  const model = selectable.find((candidate) => candidate.id === modelId);
+  if (model === undefined) {
+    throw new Error(
+      `Copilot model is not available to this account: ${modelId}`,
+    );
+  }
+  const supportedEfforts = model.supportedReasoningEfforts ?? [];
+  const fallbackEffort =
+    current?.model === modelId && current.effort !== undefined
+      ? current.effort
+      : (model.defaultReasoningEffort ?? "default");
+  const effort = reasoningEffort(
+    await answer(
+      options.prompt,
+      `Reasoning effort (${supportedEfforts.join(",") || "default only"}) [${fallbackEffort}]: `,
+      fallbackEffort,
+    ),
+  );
+  if (effort !== undefined && !supportedEfforts.includes(effort)) {
+    throw new Error(
+      `Copilot model ${modelId} does not support effort ${effort}`,
+    );
+  }
+  return { model: modelId, ...(effort === undefined ? {} : { effort }) };
+}
+
 async function addAgent(options: ConfigMenuOptions): Promise<void> {
   const { config, prompt } = options;
   const firstAgent = Object.keys(config.agents).length === 0;
@@ -235,7 +361,7 @@ async function addAgent(options: ConfigMenuOptions): Promise<void> {
   if (adapter === "new") adapter = await createAdapter(config, prompt);
   if (config.adapters[adapter] === undefined)
     throw new Error(`unknown adapter: ${adapter}`);
-  const model = await answer(prompt, "Model id: ");
+  const selection = await copilotModelAndEffort(options, adapter);
   const purpose = await answer(prompt, "Purpose: ");
   const instructions = await answer(prompt, "Review instructions: ");
   const timeoutText = await answer(
@@ -246,7 +372,7 @@ async function addAgent(options: ConfigMenuOptions): Promise<void> {
   const timeout = timerMilliseconds(timeoutText, "timeout");
   const agent: ManagedAgent = {
     adapter,
-    model,
+    ...selection,
     purpose,
     instructions,
     isolation: yes(
@@ -284,11 +410,7 @@ async function editAgent(options: ConfigMenuOptions): Promise<void> {
   if (config.adapters[adapter] === undefined) {
     throw new Error(`unknown adapter: ${adapter}`);
   }
-  const model = await answer(
-    prompt,
-    `Model id [${current.model}]: `,
-    current.model,
-  );
+  const selection = await copilotModelAndEffort(options, adapter, current);
   const purpose = await answer(
     prompt,
     `Purpose [${current.purpose}]: `,
@@ -316,7 +438,7 @@ async function editAgent(options: ConfigMenuOptions): Promise<void> {
   const edited: ManagedAgent = {
     ...current,
     adapter,
-    model,
+    ...selection,
     purpose,
     isolation,
     timeout_ms: timeout,
@@ -551,7 +673,7 @@ async function showList(options: ConfigMenuOptions): Promise<void> {
   for (const agent of listed.agents) {
     await write(
       options.output,
-      `  ${agent.id}${agent.default ? " [default]" : ""}: ${agent.model} via ${agent.adapter}\n`,
+      `  ${agent.id}${agent.default ? " [default]" : ""}: ${agent.model}${agent.effort === undefined ? "" : ` @ ${agent.effort}`} via ${agent.adapter}\n`,
     );
   }
   await write(options.output, "Projects:\n");

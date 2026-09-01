@@ -264,6 +264,7 @@ describe("generic command adapter", () => {
     const capture = join(await temporaryWorkspace(), "capture.json");
     const { adapter, input, workspace, launchedEnvironment, launchInvocation } =
       await setup("pass", { capture, captureLaunchEnvironment: true });
+    input.reviewer.effort = "high";
 
     await collect(adapter.run(input));
     const captured = JSON.parse(await readFile(capture, "utf8")) as {
@@ -289,6 +290,8 @@ describe("generic command adapter", () => {
       REVIEW_MESH_REVIEWER_ID: "command-reviewer",
       REVIEW_MESH_WORKSPACE: workspace,
       REVIEW_MESH_ISOLATION_POLICY: "prefer_enforced",
+      REVIEW_MESH_MODEL: input.reviewer.model,
+      REVIEW_MESH_REASONING_EFFORT: "high",
     });
     expect(captured.env).not.toHaveProperty("REVIEW_MESH_LEAKED_SECRET");
     expect(launchInvocation()).toMatchObject({
@@ -315,6 +318,8 @@ describe("generic command adapter", () => {
       "REVIEW_MESH_REVIEWER_ID",
       "REVIEW_MESH_WORKSPACE",
       "REVIEW_MESH_ISOLATION_POLICY",
+      "REVIEW_MESH_MODEL",
+      "REVIEW_MESH_REASONING_EFFORT",
       "PATH",
       "Path",
       "PATHEXT",

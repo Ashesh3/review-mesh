@@ -1,6 +1,7 @@
 import { isAbsolute, normalize, relative, resolve, sep } from "node:path";
 import {
   trustedConfigSchema,
+  validateAdapterEffort,
   type ProjectConfig,
   type ResolvedConfig,
   type ResolvedReviewer,
@@ -37,12 +38,14 @@ function resolveAgent(
   if (profile.instructions === undefined) {
     throw new Error(`agent ${id} has unresolved instructions_file`);
   }
+  validateAdapterEffort(adapter.type, profile.effort, `agent ${id}`);
   return {
     id,
     purpose: profile.purpose,
     adapterId: profile.adapter,
     adapter,
     model: profile.model,
+    ...(profile.effort === undefined ? {} : { effort: profile.effort }),
     instruction_layers: [
       { source: "trusted", content: profile.instructions },
       ...(projectInstructions === undefined

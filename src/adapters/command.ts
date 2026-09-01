@@ -226,6 +226,10 @@ class CommandAdapter implements ReviewAdapter {
       REVIEW_MESH_REVIEWER_ID: input.reviewer.id,
       REVIEW_MESH_WORKSPACE: input.context.workspace,
       REVIEW_MESH_ISOLATION_POLICY: input.isolationPolicy,
+      REVIEW_MESH_MODEL: input.reviewer.model,
+      ...(input.reviewer.effort === undefined
+        ? {}
+        : { REVIEW_MESH_REASONING_EFFORT: input.reviewer.effort }),
     });
 
     const child = this.launch(

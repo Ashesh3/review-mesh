@@ -78,8 +78,20 @@ if (linuxBun) {
     );
   }
 }
-build("./src/standalone.ts", "bun-windows-x64", windowsOutput, undefined, true);
-build("./src/standalone.ts", "bun-linux-x64", linuxOutput, linuxBun, true);
+build(
+  "./scripts/standalone-entry.mjs",
+  "bun-windows-x64",
+  windowsOutput,
+  undefined,
+  true,
+);
+build(
+  "./scripts/standalone-entry.mjs",
+  "bun-linux-x64",
+  linuxOutput,
+  linuxBun,
+  true,
+);
 if (process.platform !== "win32") await chmod(linuxOutput, 0o755);
 
 const checksumLines = [];

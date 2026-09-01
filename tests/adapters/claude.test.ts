@@ -19,6 +19,7 @@ import type {
   AdapterReviewInput,
   ReviewAdapter,
 } from "../../src/adapters/types.js";
+import type { ReasoningEffort } from "../../src/config/schemas.js";
 import type { AdapterRegistration } from "../../src/config/schemas.js";
 import { reviewerResultJsonSchema } from "../../src/protocol/json-schema.js";
 import { buildReviewerPrompt } from "../../src/protocol/prompt.js";
@@ -214,6 +215,7 @@ function setup(
     executable?: string;
     query?: ClaudeQueryFacade;
     startup?: ClaudeRuntimeInitializer;
+    effort?: ReasoningEffort;
   } = {},
 ) {
   const reviewer = resolvedReviewer({
@@ -227,6 +229,7 @@ function setup(
         : { executable: options.executable }),
     },
     model: "claude-sonnet-test",
+    ...(options.effort === undefined ? {} : { effort: options.effort }),
     isolationPolicy: options.isolationPolicy ?? "prefer_enforced",
   });
   const context = resolvedContext({
@@ -663,6 +666,14 @@ describe("Claude Agent SDK adapter", () => {
     });
     expect(call.options.env).not.toHaveProperty("REVIEW_MESH_UNTRUSTED_SECRET");
     expect(call.options.env).not.toBe(process.env);
+  });
+
+  it("forwards the configured Claude effort", async () => {
+    const prepared = setup(undefined, { effort: "max" });
+
+    await collect(prepared.adapter.run(prepared.input));
+
+    expect(prepared.query.calls[0]?.options.effort).toBe("max");
   });
 
   it("fails closed for tool permissions in the sandboxed attempt", async () => {

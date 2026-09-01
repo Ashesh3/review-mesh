@@ -1549,6 +1549,9 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
       for (let turn = 0; turn < this.maxTurns; turn += 1) {
         const message = await this.chat(configuration, input.signal, {
           model: input.reviewer.model,
+          ...(input.reviewer.effort === undefined
+            ? {}
+            : { reasoning_effort: input.reviewer.effort }),
           messages,
           tools: READ_ONLY_TOOLS,
           tool_choice: turn === 0 ? "required" : "auto",
@@ -1675,6 +1678,9 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         } as const;
         const finalMessage = await this.chat(configuration, input.signal, {
           model: input.reviewer.model,
+          ...(input.reviewer.effort === undefined
+            ? {}
+            : { reasoning_effort: input.reviewer.effort }),
           messages,
           response_format: responseFormat,
           max_tokens: 8_192,
@@ -1713,6 +1719,9 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           }
           const repairedMessage = await this.chat(configuration, input.signal, {
             model: input.reviewer.model,
+            ...(input.reviewer.effort === undefined
+              ? {}
+              : { reasoning_effort: input.reviewer.effort }),
             messages,
             response_format: responseFormat,
             max_tokens: 8_192,

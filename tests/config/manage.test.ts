@@ -48,6 +48,7 @@ function config(): ManagedConfig {
       gemini: {
         adapter: "gateway",
         model: "gemini-flash",
+        effort: "high",
         purpose: "Correctness",
         instructions: "Review carefully.",
         isolation: "prefer_enforced",
@@ -166,5 +167,18 @@ append_instructions = "extra"
   it("keeps an intentionally incomplete first-run draft in memory only", () => {
     expect(emptyManagedConfig().defaults?.agents).toEqual([]);
     expect(() => serializeManagedConfig(emptyManagedConfig())).toThrow();
+  });
+
+  it("rejects an effort that the selected native adapter cannot forward", () => {
+    const invalid = config();
+    invalid.adapters.claude = { type: "claude" };
+    invalid.agents.gemini = {
+      ...invalid.agents.gemini!,
+      adapter: "claude",
+      effort: "ultra",
+    };
+    expect(() => serializeManagedConfig(invalid)).toThrow(
+      /unsupported claude effort ultra/i,
+    );
   });
 });
