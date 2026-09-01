@@ -26,7 +26,7 @@ Requirements:
 
 ### Download a standalone executable
 
-Release `v1` provides self-contained Bun executables that do not require Node.js or Bun:
+Release `v2.0.0` provides self-contained Bun executables that do not require Node.js or Bun:
 
 - Windows x64: `review-mesh-windows-x64.exe`
 - Linux x64 (glibc): `review-mesh-linux-x64`
@@ -34,14 +34,14 @@ Release `v1` provides self-contained Bun executables that do not require Node.js
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v1/review-mesh-windows-x64.exe -OutFile review-mesh.exe
+Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v2.0.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
 .\review-mesh.exe review
 ```
 
 Linux:
 
 ```bash
-curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v1/review-mesh-linux-x64
+curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v2.0.0/review-mesh-linux-x64
 chmod +x ./review-mesh-linux-x64
 ./review-mesh-linux-x64 review
 ```
