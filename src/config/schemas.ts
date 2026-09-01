@@ -1,7 +1,6 @@
 import { z } from "zod";
 import {
   isolationPolicySchema,
-  protocolVersionSchema,
   type IsolationPolicy,
   type JsonValue,
 } from "../protocol/schemas.js";
@@ -11,6 +10,13 @@ const positiveInteger = z.number().int().positive();
 const maximumTimerMilliseconds = 2_147_483_647;
 const timerMilliseconds = positiveInteger.max(maximumTimerMilliseconds);
 const jsonRecordSchema = z.record(z.string(), z.json());
+const uniqueAgentIds = z
+  .array(nonEmptyString)
+  .min(1)
+  .refine(
+    (ids) => new Set(ids).size === ids.length,
+    "agent ids must be unique",
+  );
 
 export const adapterRegistrationSchema = z.discriminatedUnion("type", [
   z.strictObject({
@@ -72,64 +78,72 @@ export const trustedReviewerDefinitionSchema = z.strictObject({
   append_instructions: nonEmptyString.optional(),
 });
 
-export const trustedConfigSchema = z.strictObject({
-  schema_version: protocolVersionSchema,
-  execution: z.strictObject({
-    max_concurrency: positiveInteger,
-    heartbeat_interval_ms: timerMilliseconds,
-    shutdown_grace_period_ms: timerMilliseconds,
-  }),
-  diagnostics: z.strictObject({
-    persist_runs: z.boolean(),
-    max_runs: positiveInteger,
-  }),
+const executionSchema = z.strictObject({
+  max_concurrency: positiveInteger,
+  heartbeat_interval_ms: timerMilliseconds,
+  shutdown_grace_period_ms: timerMilliseconds,
+});
+
+const diagnosticsSchema = z.strictObject({
+  persist_runs: z.boolean(),
+  max_runs: positiveInteger,
+});
+
+export const trustedConfigV1Schema = z.strictObject({
+  schema_version: z.literal("1"),
+  execution: executionSchema,
+  diagnostics: diagnosticsSchema,
   adapters: z.record(nonEmptyString, adapterRegistrationSchema),
   reviewer_profiles: z.record(nonEmptyString, reviewerProfileSchema),
   reviewers: z.array(trustedReviewerDefinitionSchema).min(1),
 });
 
-const repositoryReviewerSchema = z.strictObject({
-  id: nonEmptyString,
-  profile: nonEmptyString,
-  instructions: nonEmptyString.optional(),
-  append_instructions: nonEmptyString.optional(),
-  timeout_ms: timerMilliseconds.optional(),
-  require_enforced: z.literal(true).optional(),
-});
-
-const repositoryReviewerOverrideSchema = z
+export const projectConfigSchema = z
   .strictObject({
-    id: nonEmptyString,
-    append_instructions: nonEmptyString.optional(),
-    timeout_ms: timerMilliseconds.optional(),
-    require_enforced: z.literal(true).optional(),
+    agents: uniqueAgentIds.optional(),
+    instructions: nonEmptyString.optional(),
+    instructions_file: nonEmptyString.optional(),
+    context: z.json().optional(),
   })
-  .refine(
-    (override) =>
-      override.append_instructions !== undefined ||
-      override.timeout_ms !== undefined ||
-      override.require_enforced !== undefined,
-    "repository reviewer override must change an allowed additive setting",
-  );
+  .superRefine((project, ctx) => {
+    if (
+      project.instructions !== undefined &&
+      project.instructions_file !== undefined
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message:
+          "project permits only one of instructions or instructions_file",
+      });
+    }
+  });
 
-export const repositoryPolicySchema = z.strictObject({
-  schema_version: protocolVersionSchema,
-  context: z.json().optional(),
-  reviewers: z.array(repositoryReviewerSchema).optional(),
-  reviewer_overrides: z.array(repositoryReviewerOverrideSchema).optional(),
+export const trustedConfigV2Schema = z.strictObject({
+  schema_version: z.literal("2"),
+  execution: executionSchema,
+  diagnostics: diagnosticsSchema,
+  adapters: z.record(nonEmptyString, adapterRegistrationSchema),
+  agents: z.record(nonEmptyString, reviewerProfileSchema),
+  defaults: z.strictObject({ agents: uniqueAgentIds }).optional(),
+  projects: z.record(nonEmptyString, projectConfigSchema).optional(),
 });
 
-export type AdapterRegistration = z.infer<typeof adapterRegistrationSchema>;
-export type ReviewerProfile = z.infer<typeof reviewerProfileSchema>;
+export const trustedConfigSchema = z.union([
+  trustedConfigV1Schema,
+  trustedConfigV2Schema,
+]);
+
+export type TrustedConfigV1 = z.infer<typeof trustedConfigV1Schema>;
+export type TrustedConfigV2 = z.infer<typeof trustedConfigV2Schema>;
+export type ProjectConfig = z.infer<typeof projectConfigSchema>;
+export type TrustedConfig = z.infer<typeof trustedConfigSchema>;
+
 export type TrustedReviewerDefinition = z.infer<
   typeof trustedReviewerDefinitionSchema
 >;
-export type TrustedConfig = z.infer<typeof trustedConfigSchema>;
-export type RepositoryReviewer = z.infer<typeof repositoryReviewerSchema>;
-export type RepositoryReviewerOverride = z.infer<
-  typeof repositoryReviewerOverrideSchema
->;
-export type RepositoryPolicy = z.infer<typeof repositoryPolicySchema>;
+
+export type AdapterRegistration = z.infer<typeof adapterRegistrationSchema>;
+export type ReviewerProfile = z.infer<typeof reviewerProfileSchema>;
 
 export interface ResolvedReviewer {
   id: string;
@@ -138,7 +152,7 @@ export interface ResolvedReviewer {
   adapter: AdapterRegistration;
   model: string;
   instruction_layers: Array<{
-    source: "trusted" | "repository";
+    source: "trusted" | "project";
     content: string;
   }>;
   isolationPolicy: IsolationPolicy;
@@ -147,8 +161,8 @@ export interface ResolvedReviewer {
 }
 
 export interface ResolvedConfig {
-  execution: TrustedConfig["execution"];
-  diagnostics: TrustedConfig["diagnostics"];
-  repository_context?: JsonValue;
+  execution: TrustedConfigV1["execution"];
+  diagnostics: TrustedConfigV1["diagnostics"];
+  project_context?: JsonValue;
   reviewers: ResolvedReviewer[];
 }

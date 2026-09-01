@@ -44,7 +44,7 @@ describe.skipIf(process.platform !== "win32")("standalone CLI", () => {
       expect(Buffer.concat(stderr).toString("utf8")).toBe(
         `${JSON.stringify({
           error: "invalid_usage",
-          message: "Expected exactly: review-mesh review",
+          message: "Expected: review-mesh review or review-mesh config",
         })}\n`,
       );
     },

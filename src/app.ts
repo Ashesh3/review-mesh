@@ -104,6 +104,7 @@ export async function runReviewApplication(
   }
 
   let config: ReturnType<typeof resolveConfig>;
+  let canonicalWorkspace: string;
   try {
     const loaded = await loadConfigFiles({
       ...(options.configFile === undefined
@@ -112,12 +113,16 @@ export async function runReviewApplication(
       workspace: request.workspace,
       signal: options.signal,
     });
-    config = resolveConfig(loaded);
+    config = resolveConfig({
+      trusted: loaded.trusted,
+      workspace: loaded.workspace,
+    });
+    canonicalWorkspace = loaded.workspace;
   } catch {
     await writeDiagnostic(
       options.stderr,
       "invalid_configuration",
-      "The trusted or repository Review Mesh configuration is invalid.",
+      "The global Review Mesh configuration or project assignment is invalid.",
     );
     return 2;
   }
@@ -125,7 +130,7 @@ export async function runReviewApplication(
   let context: Awaited<ReturnType<typeof resolveContext>>;
   try {
     context = await resolveContext({
-      request,
+      request: { ...request, workspace: canonicalWorkspace },
       git: createGitRunner(),
       signal: options.signal,
     });

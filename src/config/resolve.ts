@@ -1,171 +1,149 @@
+import { isAbsolute, normalize, relative, resolve, sep } from "node:path";
 import {
-  repositoryPolicySchema,
   trustedConfigSchema,
-  type RepositoryPolicy,
+  type ProjectConfig,
   type ResolvedConfig,
   type ResolvedReviewer,
+  type ReviewerProfile,
   type TrustedConfig,
+  type TrustedConfigV1,
+  type TrustedConfigV2,
 } from "./schemas.js";
 
 export interface ResolveConfigInput {
   trusted: TrustedConfig;
-  repository?: RepositoryPolicy;
+  workspace?: string;
 }
 
-function repositoryPolicyError(message: string): Error {
-  return new Error(`repository policy is invalid: ${message}`);
+function normalizedProjectPath(path: string): string {
+  if (!isAbsolute(path))
+    throw new Error(`project path must be absolute: ${path}`);
+  const normalized = normalize(resolve(path)).replace(/[\\/]+$/, "");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
-function resolveProfile(
-  trusted: TrustedConfig,
-  profileId: string,
+function resolveAgent(
   id: string,
-  trustedAppendInstructions?: string,
+  profile: ReviewerProfile,
+  adapters: TrustedConfigV2["adapters"],
+  projectInstructions?: string,
 ): ResolvedReviewer {
-  const profile = trusted.reviewer_profiles[profileId];
-  if (profile === undefined) {
-    throw new Error(
-      `trusted reviewer ${id} references unknown profile ${profileId}`,
-    );
-  }
-  const adapter = trusted.adapters[profile.adapter];
+  const adapter = adapters[profile.adapter];
   if (adapter === undefined) {
     throw new Error(
-      `trusted reviewer profile ${profileId} references unknown adapter ${profile.adapter}`,
+      `agent ${id} references unknown adapter ${profile.adapter}`,
     );
   }
   if (profile.instructions === undefined) {
-    throw new Error(
-      `trusted reviewer profile ${profileId} has unresolved instructions_file`,
-    );
+    throw new Error(`agent ${id} has unresolved instructions_file`);
   }
-
-  const instruction_layers: ResolvedReviewer["instruction_layers"] = [
-    { source: "trusted", content: profile.instructions },
-  ];
-  if (trustedAppendInstructions !== undefined) {
-    instruction_layers.push({
-      source: "trusted",
-      content: trustedAppendInstructions,
-    });
-  }
-
   return {
     id,
     purpose: profile.purpose,
     adapterId: profile.adapter,
     adapter,
     model: profile.model,
-    instruction_layers,
+    instruction_layers: [
+      { source: "trusted", content: profile.instructions },
+      ...(projectInstructions === undefined
+        ? []
+        : [{ source: "project" as const, content: projectInstructions }]),
+    ],
     isolationPolicy: profile.isolation,
     timeoutMs: profile.timeout_ms,
     runtime: profile.runtime ?? {},
   };
 }
 
-function applyRepositoryOverride(
-  reviewer: ResolvedReviewer,
-  override: NonNullable<RepositoryPolicy["reviewer_overrides"]>[number],
-): void {
-  if (override.append_instructions !== undefined) {
-    reviewer.instruction_layers.push({
-      source: "repository",
-      content: override.append_instructions,
-    });
-  }
-  if (override.timeout_ms !== undefined) {
-    if (override.timeout_ms > reviewer.timeoutMs) {
-      throw repositoryPolicyError("timeout_ms must not exceed trusted timeout");
-    }
-    reviewer.timeoutMs = override.timeout_ms;
-  }
-  if (
-    override.require_enforced === true &&
-    reviewer.isolationPolicy === "prefer_enforced"
-  ) {
-    reviewer.isolationPolicy = "require_enforced";
-  }
-}
-
-export function resolveConfig(input: ResolveConfigInput): ResolvedConfig {
-  const trusted = trustedConfigSchema.parse(input.trusted);
-  let repository: RepositoryPolicy | undefined;
-  if (input.repository !== undefined) {
-    try {
-      repository = repositoryPolicySchema.parse(input.repository);
-    } catch (error: unknown) {
-      const message =
-        error instanceof Error ? error.message : "invalid repository policy";
-      throw repositoryPolicyError(message);
-    }
-  }
+function resolveV1(config: TrustedConfigV1): ResolvedConfig {
   const ids = new Set<string>();
-  const reviewers: ResolvedReviewer[] = [];
-
-  for (const definition of trusted.reviewers) {
+  const reviewers = config.reviewers.map((definition) => {
     if (ids.has(definition.id)) {
       throw new Error(`duplicate trusted reviewer id: ${definition.id}`);
     }
     ids.add(definition.id);
-    reviewers.push(
-      resolveProfile(
-        trusted,
-        definition.profile,
-        definition.id,
-        definition.append_instructions,
-      ),
-    );
-  }
-
-  const overrideIds = new Set<string>();
-  for (const override of repository?.reviewer_overrides ?? []) {
-    if (overrideIds.has(override.id)) {
-      throw repositoryPolicyError(
-        `duplicate override for baseline reviewer ${override.id}`,
+    const profile = config.reviewer_profiles[definition.profile];
+    if (profile === undefined) {
+      throw new Error(
+        `trusted reviewer ${definition.id} references unknown profile ${definition.profile}`,
       );
     }
-    overrideIds.add(override.id);
-    const reviewer = reviewers.find(
-      (candidate) => candidate.id === override.id,
-    );
-    if (reviewer === undefined) {
-      throw repositoryPolicyError(
-        `override references unknown baseline reviewer ${override.id}`,
-      );
-    }
-    applyRepositoryOverride(reviewer, override);
-  }
-
-  for (const definition of repository?.reviewers ?? []) {
-    const id = `repo:${definition.id}`;
-    if (ids.has(definition.id) || ids.has(id)) {
-      throw repositoryPolicyError(`reviewer id collision for ${definition.id}`);
-    }
-    ids.add(id);
-    let reviewer: ResolvedReviewer;
-    try {
-      reviewer = resolveProfile(trusted, definition.profile, id);
-    } catch (error: unknown) {
-      const message =
-        error instanceof Error ? error.message : "invalid repository reviewer";
-      throw repositoryPolicyError(message);
-    }
-    if (definition.instructions !== undefined) {
+    const reviewer = resolveAgent(definition.id, profile, config.adapters);
+    if (definition.append_instructions !== undefined) {
       reviewer.instruction_layers.push({
-        source: "repository",
-        content: definition.instructions,
+        source: "trusted",
+        content: definition.append_instructions,
       });
     }
-    applyRepositoryOverride(reviewer, definition);
-    reviewers.push(reviewer);
-  }
-
+    return reviewer;
+  });
   return {
-    execution: trusted.execution,
-    diagnostics: trusted.diagnostics,
-    ...(repository?.context === undefined
-      ? {}
-      : { repository_context: repository.context }),
+    execution: config.execution,
+    diagnostics: config.diagnostics,
     reviewers,
   };
+}
+
+function selectProject(
+  config: TrustedConfigV2,
+  workspace: string | undefined,
+): ProjectConfig | undefined {
+  const entries = Object.entries(config.projects ?? {});
+  const normalized = new Map<string, ProjectConfig>();
+  for (const [path, project] of entries) {
+    const key = normalizedProjectPath(path);
+    if (normalized.has(key)) {
+      throw new Error(`duplicate normalized project path: ${path}`);
+    }
+    normalized.set(key, project);
+  }
+  if (workspace === undefined) return undefined;
+  const key = normalizedProjectPath(workspace);
+  let selected: { path: string; project: ProjectConfig } | undefined;
+  for (const [candidate, project] of normalized) {
+    const remainder = relative(candidate, key);
+    const contains =
+      remainder === "" ||
+      (remainder !== ".." &&
+        !remainder.startsWith(`..${sep}`) &&
+        !isAbsolute(remainder));
+    if (
+      contains &&
+      (selected === undefined || candidate.length > selected.path.length)
+    ) {
+      selected = { path: candidate, project };
+    }
+  }
+  return selected?.project;
+}
+
+function resolveV2(
+  config: TrustedConfigV2,
+  workspace: string | undefined,
+): ResolvedConfig {
+  const project = selectProject(config, workspace);
+  const agentIds = project?.agents ?? config.defaults?.agents;
+  if (agentIds === undefined || agentIds.length === 0) {
+    throw new Error("no agents are configured for the requested project");
+  }
+  const reviewers = agentIds.map((id) => {
+    const agent = config.agents[id];
+    if (agent === undefined) throw new Error(`unknown configured agent: ${id}`);
+    return resolveAgent(id, agent, config.adapters, project?.instructions);
+  });
+  return {
+    execution: config.execution,
+    diagnostics: config.diagnostics,
+    ...(project?.context === undefined
+      ? {}
+      : { project_context: project.context }),
+    reviewers,
+  };
+}
+
+export function resolveConfig(input: ResolveConfigInput): ResolvedConfig {
+  const trusted = trustedConfigSchema.parse(input.trusted);
+  return trusted.schema_version === "1"
+    ? resolveV1(trusted)
+    : resolveV2(trusted, input.workspace);
 }

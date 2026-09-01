@@ -1,20 +1,25 @@
 #!/usr/bin/env node
 
 import { resolve } from "node:path";
-import type { Readable } from "node:stream";
+import type { Readable, Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { ReviewRunError, runReviewApplication } from "./app.js";
+import { runConfigCommand } from "./config/command.js";
 
 declare const REVIEW_MESH_STANDALONE: boolean | undefined;
 
 const maximumRequestBytes = 8 * 1024 * 1024;
 
-async function writeDiagnostic(error: string, message: string): Promise<void> {
+async function writeDiagnostic(
+  error: string,
+  message: string,
+  output: NodeJS.WritableStream = process.stderr,
+): Promise<void> {
   const line = `${JSON.stringify({ error, message })}\n`;
-  if (process.stderr.write(line)) return;
+  if (output.write(line)) return;
   await new Promise<void>((resolve, reject) => {
-    process.stderr.once("drain", resolve);
-    process.stderr.once("error", reject);
+    output.once("drain", resolve);
+    output.once("error", reject);
   });
 }
 
@@ -85,6 +90,15 @@ export interface SignalSource {
   removeListener(event: "SIGINT" | "SIGTERM", listener: () => void): unknown;
 }
 
+export interface CliRuntime {
+  argv?: readonly string[];
+  input?: Readable & { isTTY?: boolean };
+  output?: Writable & { isTTY?: boolean };
+  error?: Writable;
+  configFile?: string;
+  cwd?: string;
+}
+
 export function installAbortHandlers(
   controller: AbortController,
   source: SignalSource = process,
@@ -104,15 +118,35 @@ export function installAbortHandlers(
 
 export async function runCli(
   signalSource: SignalSource = process,
+  runtime: CliRuntime = {},
 ): Promise<void> {
   const controller = new AbortController();
   const removeAbortHandlers = installAbortHandlers(controller, signalSource);
+  const argv = runtime.argv ?? process.argv.slice(2);
+  const input = runtime.input ?? process.stdin;
+  const output = runtime.output ?? process.stdout;
+  const errorOutput = runtime.error ?? process.stderr;
 
   try {
-    if (process.argv.length !== 3 || process.argv[2] !== "review") {
+    if (argv[0] === "config") {
+      process.exitCode = await runConfigCommand({
+        args: argv.slice(1),
+        input,
+        output,
+        error: errorOutput,
+        signal: controller.signal,
+        ...(runtime.configFile === undefined
+          ? {}
+          : { configFile: runtime.configFile }),
+        ...(runtime.cwd === undefined ? {} : { cwd: runtime.cwd }),
+      });
+      return;
+    }
+    if (argv.length !== 1 || argv[0] !== "review") {
       await writeDiagnostic(
         "invalid_usage",
-        "Expected exactly: review-mesh review",
+        "Expected: review-mesh review or review-mesh config",
+        errorOutput,
       );
       process.exitCode = 2;
       return;
@@ -120,7 +154,7 @@ export async function runCli(
 
     let requestText: string;
     try {
-      requestText = await readRequest(process.stdin, controller.signal);
+      requestText = await readRequest(input, controller.signal);
     } catch (error) {
       if (
         error instanceof RequestReadError &&
@@ -129,6 +163,7 @@ export async function runCli(
         await writeDiagnostic(
           "request_too_large",
           "The request exceeds the 8 MiB stdin limit.",
+          errorOutput,
         );
       } else if (
         error instanceof RequestReadError &&
@@ -137,11 +172,13 @@ export async function runCli(
         await writeDiagnostic(
           "interrupted",
           "The request read was interrupted before a valid run began.",
+          errorOutput,
         );
       } else {
         await writeDiagnostic(
           "invalid_request",
           "The Review Mesh request could not be read from stdin.",
+          errorOutput,
         );
       }
       process.exitCode = 2;
@@ -153,8 +190,8 @@ export async function runCli(
       try {
         process.exitCode = await runReviewApplication({
           requestText,
-          stdout: process.stdout,
-          stderr: process.stderr,
+          stdout: output,
+          stderr: errorOutput,
           signal: controller.signal,
         });
       } catch (error) {
@@ -163,6 +200,7 @@ export async function runCli(
           error instanceof ReviewRunError
             ? "The valid review run failed unexpectedly."
             : "Review Mesh could not start the review.",
+          errorOutput,
         );
         process.exitCode = error instanceof ReviewRunError ? 3 : 2;
       }

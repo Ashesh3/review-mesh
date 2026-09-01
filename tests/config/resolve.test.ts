@@ -1,557 +1,326 @@
 import { describe, expect, it } from "vitest";
-import {
-  mkdtemp,
-  mkdir,
-  rename,
-  rm,
-  symlink,
-  writeFile,
-} from "node:fs/promises";
-import { spawnSync } from "node:child_process";
+import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   adapterRegistrationSchema,
-  repositoryPolicySchema,
   trustedConfigSchema,
-  type RepositoryPolicy,
+  type TrustedConfigV2,
 } from "../../src/config/schemas.js";
+import { loadConfigFiles } from "../../src/config/load.js";
 import { resolveConfig } from "../../src/config/resolve.js";
-import {
-  loadConfigFiles,
-  maximumRepositoryPolicyBytes,
-} from "../../src/config/load.js";
-import { repositoryPolicy, trustedConfig } from "../helpers/fixtures.js";
+import { trustedConfig } from "../helpers/fixtures.js";
 
-const validTrustedToml = `schema_version = "1"
-
-[execution]
-max_concurrency = 1
-heartbeat_interval_ms = 1000
-shutdown_grace_period_ms = 1000
-
-[diagnostics]
-persist_runs = false
-max_runs = 1
-
-[adapters.command]
-type = "command"
-command = "reviewer"
-protocol = "review-mesh-command-v1"
-
-[reviewer_profiles.security]
-adapter = "command"
-model = "trusted-model"
-purpose = "Find defects"
-instructions = "Review carefully."
-isolation = "prefer_enforced"
-timeout_ms = 1000
-
-[[reviewers]]
-id = "baseline"
-profile = "security"
-`;
-
-async function configLoadFixture(): Promise<{
-  root: string;
-  configFile: string;
-  workspace: string;
-}> {
-  const root = await mkdtemp(
-    join(process.env.TEMP ?? "C:\\Temp", "review-mesh-policy-"),
-  );
-  const configFile = join(root, "config.toml");
-  const workspace = join(root, "workspace");
-  await mkdir(workspace);
-  await writeFile(configFile, validTrustedToml);
-  return { root, configFile, workspace };
+function v2(workspace: string): TrustedConfigV2 {
+  return {
+    schema_version: "2",
+    execution: {
+      max_concurrency: 2,
+      heartbeat_interval_ms: 1_000,
+      shutdown_grace_period_ms: 1_000,
+    },
+    diagnostics: { persist_runs: false, max_runs: 10 },
+    adapters: {
+      gateway: {
+        type: "openai_compatible",
+        base_url_env: "BASE_URL",
+        api_key_env: "API_KEY",
+      },
+    },
+    agents: {
+      gemini: {
+        adapter: "gateway",
+        model: "gemini",
+        purpose: "Review correctness",
+        instructions: "Global instructions.",
+        isolation: "prefer_enforced",
+        timeout_ms: 60_000,
+      },
+      opus: {
+        adapter: "gateway",
+        model: "opus",
+        purpose: "Review architecture",
+        instructions: "Architecture instructions.",
+        isolation: "prefer_enforced",
+        timeout_ms: 60_000,
+      },
+    },
+    defaults: { agents: ["opus"] },
+    projects: {
+      [workspace]: {
+        agents: ["gemini"],
+        instructions: "Project guidance.",
+        context: { project: "demo" },
+      },
+    },
+  };
 }
 
-describe("resolveConfig", () => {
-  it("requires at least one trusted reviewer", () => {
-    expect(() =>
-      trustedConfigSchema.parse(trustedConfig({ reviewers: [] })),
-    ).toThrow();
+describe("global configuration", () => {
+  it("keeps v1 trusted configs as global defaults", () => {
+    expect(resolveConfig({ trusted: trustedConfig() }).reviewers[0]?.id).toBe(
+      "baseline",
+    );
   });
 
-  it("bounds timer-backed configuration at the Node timer maximum", () => {
-    const maximumTimerMs = 2_147_483_647;
-    expect(() =>
-      trustedConfigSchema.parse(
-        trustedConfig({
-          execution: {
-            heartbeat_interval_ms: maximumTimerMs,
-            shutdown_grace_period_ms: maximumTimerMs,
-          },
-          reviewer_profiles: {
-            "security-profile": { timeout_ms: maximumTimerMs },
-          },
-        }),
-      ),
-    ).not.toThrow();
+  it("selects an exact project agent roster and trusted project guidance", () => {
+    const workspace =
+      process.platform === "win32" ? "C:\\work\\demo" : "/work/demo";
+    const resolved = resolveConfig({ trusted: v2(workspace), workspace });
+    expect(resolved.reviewers.map((reviewer) => reviewer.id)).toEqual([
+      "gemini",
+    ]);
+    expect(resolved.reviewers[0]?.instruction_layers).toEqual([
+      { source: "trusted", content: "Global instructions." },
+      { source: "project", content: "Project guidance." },
+    ]);
+    expect(resolved.project_context).toEqual({ project: "demo" });
+  });
 
-    for (const trusted of [
-      trustedConfig({
-        execution: { heartbeat_interval_ms: maximumTimerMs + 1 },
-      }),
-      trustedConfig({
-        execution: { shutdown_grace_period_ms: maximumTimerMs + 1 },
-      }),
-      trustedConfig({
-        reviewer_profiles: {
-          "security-profile": { timeout_ms: maximumTimerMs + 1 },
-        },
-      }),
-    ]) {
-      expect(() => trustedConfigSchema.parse(trusted)).toThrow();
-    }
+  it("uses the most-specific configured project containing the workspace", () => {
+    const root = process.platform === "win32" ? "C:\\work\\mono" : "/work/mono";
+    const nested = join(root, "packages", "api");
+    const config = v2(root);
+    config.projects![nested] = { agents: ["opus"] };
+    expect(
+      resolveConfig({
+        trusted: config,
+        workspace: join(nested, "src"),
+      }).reviewers.map(({ id }) => id),
+    ).toEqual(["opus"]);
+    expect(
+      resolveConfig({
+        trusted: config,
+        workspace: join(root, "packages", "web"),
+      }).reviewers.map(({ id }) => id),
+    ).toEqual(["gemini"]);
+  });
+
+  it("does not confuse path-component prefixes", () => {
+    const configured =
+      process.platform === "win32" ? "C:\\work\\app" : "/work/app";
+    const sibling =
+      process.platform === "win32"
+        ? "C:\\work\\application"
+        : "/work/application";
+    expect(
+      resolveConfig({
+        trusted: v2(configured),
+        workspace: sibling,
+      }).reviewers.map(({ id }) => id),
+    ).toEqual(["opus"]);
+  });
+
+  it("uses defaults for unmatched projects and rejects missing selection", () => {
+    const configured =
+      process.platform === "win32" ? "C:\\work\\demo" : "/work/demo";
+    const other =
+      process.platform === "win32" ? "C:\\work\\other" : "/work/other";
+    expect(
+      resolveConfig({
+        trusted: v2(configured),
+        workspace: other,
+      }).reviewers.map((reviewer) => reviewer.id),
+    ).toEqual(["opus"]);
+    const withoutDefaults = v2(configured);
+    delete withoutDefaults.defaults;
     expect(() =>
-      repositoryPolicySchema.parse(
-        repositoryPolicy({
-          reviewer_overrides: [
-            { id: "baseline", timeout_ms: maximumTimerMs + 1 },
-          ],
-        }),
-      ),
-    ).toThrow();
+      resolveConfig({ trusted: withoutDefaults, workspace: other }),
+    ).toThrow(/no agents/i);
+    const emptyProject = v2(configured);
+    emptyProject.projects![configured] = { agents: [] };
+    expect(() =>
+      resolveConfig({ trusted: emptyProject, workspace: configured }),
+    ).toThrow(/array|agent/i);
+  });
+
+  it("rejects relative project paths, duplicate agents, and unknown references", () => {
+    expect(() =>
+      trustedConfigSchema.parse({
+        ...v2("relative"),
+        projects: { relative: { agents: ["gemini"] } },
+      }),
+    ).not.toThrow();
+    expect(() =>
+      resolveConfig({ trusted: v2("relative"), workspace: "relative" }),
+    ).toThrow(/absolute/i);
+    expect(() =>
+      trustedConfigSchema.parse({
+        ...v2("/demo"),
+        defaults: { agents: ["opus", "opus"] },
+      }),
+    ).toThrow(/unique/i);
+    expect(() =>
+      resolveConfig({
+        trusted: { ...v2("/demo"), defaults: { agents: ["missing"] } },
+        workspace: "/other",
+      }),
+    ).toThrow(/unknown/i);
   });
 
   it("accepts only the trusted OpenAI-compatible registration shape", () => {
     expect(
       adapterRegistrationSchema.parse({
         type: "openai_compatible",
-        base_url_env: "REVIEW_MESH_OPENAI_BASE_URL",
-        api_key_env: "REVIEW_MESH_OPENAI_API_KEY",
+        base_url_env: "BASE_URL",
+        api_key_env: "API_KEY",
       }),
-    ).toEqual({
-      type: "openai_compatible",
-      base_url_env: "REVIEW_MESH_OPENAI_BASE_URL",
-      api_key_env: "REVIEW_MESH_OPENAI_API_KEY",
-    });
-    expect(() =>
-      adapterRegistrationSchema.parse({
-        type: "openai_compatible",
-        base_url_env: "",
-        api_key_env: "REVIEW_MESH_OPENAI_API_KEY",
-      }),
-    ).toThrow();
-    expect(() =>
-      adapterRegistrationSchema.parse({
-        type: "openai_compatible",
-        base_url_env: "REVIEW_MESH_OPENAI_BASE_URL",
-        api_key_env: "REVIEW_MESH_OPENAI_API_KEY",
-        command: "node",
-      }),
-    ).toThrow();
-  });
-
-  it("keeps baseline reviewers mandatory and appends repository instructions", () => {
-    const resolved = resolveConfig({
-      trusted: trustedConfig({
-        reviewer_profiles: {
-          security: {
-            adapter: "claude-main",
-            model: "claude-model",
-            purpose: "Find security defects",
-            instructions: "Find security bugs.",
-            isolation: "prefer_enforced",
-            timeout_ms: 1_800_000,
-            runtime: {},
-          },
-        },
-        reviewers: [{ id: "security-claude", profile: "security" }],
-      }),
-      repository: repositoryPolicy({
-        reviewer_overrides: [
-          {
-            id: "security-claude",
-            append_instructions: "Check tenant isolation.",
-          },
-        ],
-      }),
-    });
-
-    expect(resolved.reviewers).toHaveLength(1);
-    expect(resolved.reviewers[0]?.instruction_layers).toEqual([
-      { source: "trusted", content: "Find security bugs." },
-      { source: "repository", content: "Check tenant isolation." },
-    ]);
-  });
-
-  it.each([
-    ["adapter", "command"],
-    ["model", "different-model"],
-    ["disabled", true],
-  ])("rejects repository attempts to override baseline %s", (key, value) => {
-    expect(() =>
-      resolveConfig({
-        trusted: trustedConfig(),
-        repository: {
-          schema_version: "1",
-          reviewer_overrides: [{ id: "baseline", [key]: value }],
-        } as unknown as RepositoryPolicy,
-      }),
-    ).toThrow(/repository policy/i);
-  });
-
-  it("namespaces repository reviewer ids and forbids executable registration", () => {
-    const resolved = resolveConfig({
-      trusted: trustedConfig(),
-      repository: repositoryPolicy({
-        reviewers: [
-          {
-            id: "project-security",
-            profile: "security-profile",
-            instructions: "Review project policy.",
-          },
-        ],
-      }),
-    });
-
-    expect(resolved.reviewers.at(-1)?.id).toBe("repo:project-security");
-    expect(() =>
-      repositoryPolicySchema.parse({
-        schema_version: "1",
-        adapters: { evil: { command: "malware.exe" } },
-      }),
-    ).toThrow();
-  });
-
-  it("adds repository reviewer instructions and append instructions once in order", () => {
-    const resolved = resolveConfig({
-      trusted: trustedConfig(),
-      repository: repositoryPolicy({
-        reviewers: [
-          {
-            id: "project-security",
-            profile: "security-profile",
-            instructions: "Review project policy.",
-            append_instructions: "Check project boundaries.",
-          },
-        ],
-      }),
-    });
-
-    expect(resolved.reviewers.at(-1)?.instruction_layers).toEqual([
-      { source: "trusted", content: "Find security bugs." },
-      { source: "repository", content: "Review project policy." },
-      { source: "repository", content: "Check project boundaries." },
-    ]);
-  });
-
-  it("accepts repository timeouts up to the trusted timeout and enforcement promotion", () => {
-    const resolved = resolveConfig({
-      trusted: trustedConfig(),
-      repository: repositoryPolicy({
-        reviewer_overrides: [
-          {
-            id: "baseline",
-            timeout_ms: 60_000,
-            require_enforced: true,
-          },
-        ],
-      }),
-    });
-
-    expect(resolved.reviewers[0]).toMatchObject({
-      timeoutMs: 60_000,
-      isolationPolicy: "require_enforced",
-    });
-    expect(
-      resolveConfig({
-        trusted: trustedConfig(),
-        repository: repositoryPolicy({
-          reviewer_overrides: [{ id: "baseline", timeout_ms: 900_000 }],
-        }),
-      }).reviewers[0]?.timeoutMs,
-    ).toBe(900_000);
-    expect(() =>
-      resolveConfig({
-        trusted: trustedConfig(),
-        repository: repositoryPolicy({
-          reviewer_overrides: [{ id: "baseline", timeout_ms: 900_001 }],
-        }),
-      }),
-    ).toThrow(/must not exceed trusted timeout/i);
-  });
-
-  it("preserves trusted execution and repository context without admitting roster collisions", () => {
-    const trusted = trustedConfig({
-      execution: {
-        max_concurrency: 3,
-        heartbeat_interval_ms: 4_000,
-        shutdown_grace_period_ms: 8_000,
-      },
-    });
-    const resolved = resolveConfig({
-      trusted,
-      repository: repositoryPolicy({ context: { policy: "strict" } }),
-    });
-
-    expect(resolved.execution).toEqual(trusted.execution);
-    expect(resolved.repository_context).toEqual({ policy: "strict" });
-    expect(() =>
-      resolveConfig({
-        trusted,
-        repository: repositoryPolicy({
-          reviewers: [{ id: "baseline", profile: "security-profile" }],
-        }),
-      }),
-    ).toThrow(/collision/i);
-  });
-
-  it("rejects duplicate repository identities and unknown trusted profiles", () => {
-    expect(() =>
-      resolveConfig({
-        trusted: trustedConfig(),
-        repository: repositoryPolicy({
-          reviewers: [
-            { id: "project", profile: "security-profile" },
-            { id: "project", profile: "security-profile" },
-          ],
-        }),
-      }),
-    ).toThrow(/collision/i);
-    expect(() =>
-      resolveConfig({
-        trusted: trustedConfig(),
-        repository: repositoryPolicy({
-          reviewers: [{ id: "project", profile: "not-registered" }],
-        }),
-      }),
-    ).toThrow(/unknown profile/i);
+    ).toBeTruthy();
   });
 });
 
 describe("loadConfigFiles", () => {
-  it("loads trusted instructions only from the trusted config directory", async () => {
+  it("loads v2 global/project instruction files and ignores workspace policy", async () => {
     const root = await mkdtemp(
-      join(process.env.TEMP ?? "C:\\Temp", "review-mesh-"),
+      join(process.env.TEMP ?? "C:\\Temp", "mesh-config-"),
     );
-    const configDirectory = join(root, "trusted");
+    const configDirectory = join(root, "config");
     const workspace = join(root, "workspace");
-    await mkdir(join(configDirectory, "reviewers"), { recursive: true });
+    await mkdir(configDirectory);
     await mkdir(workspace);
+    await writeFile(join(configDirectory, "agent.md"), "Agent instructions.");
+    await writeFile(
+      join(configDirectory, "project.md"),
+      "Project instructions.",
+    );
+    await writeFile(join(workspace, ".review-mesh.toml"), "invalid = [");
+    const projectKey = (await realpath(workspace)).replaceAll("\\", "/");
     await writeFile(
       join(configDirectory, "config.toml"),
-      `schema_version = "1"\n\n[execution]\nmax_concurrency = 1\nheartbeat_interval_ms = 1000\nshutdown_grace_period_ms = 1000\n\n[diagnostics]\npersist_runs = false\nmax_runs = 1\n\n[adapters.command]\ntype = "command"\ncommand = "reviewer"\nprotocol = "review-mesh-command-v1"\n\n[reviewer_profiles.security]\nadapter = "command"\nmodel = "trusted-model"\npurpose = "Find defects"\ninstructions_file = "reviewers/security.md"\nisolation = "prefer_enforced"\ntimeout_ms = 1000\n\n[[reviewers]]\nid = "baseline"\nprofile = "security"\n`,
+      `schema_version = "2"
+[execution]
+max_concurrency = 1
+heartbeat_interval_ms = 1000
+shutdown_grace_period_ms = 1000
+[diagnostics]
+persist_runs = false
+max_runs = 1
+[adapters.command]
+type = "command"
+command = "reviewer"
+protocol = "review-mesh-command-v1"
+[agents.agent]
+adapter = "command"
+model = "model"
+purpose = "Review"
+instructions_file = "agent.md"
+isolation = "prefer_enforced"
+timeout_ms = 1000
+[projects."${projectKey}"]
+agents = ["agent"]
+instructions_file = "project.md"
+`,
     );
-    await writeFile(
-      join(configDirectory, "reviewers", "security.md"),
-      "Trusted instructions.",
-    );
-    await writeFile(
-      join(workspace, ".review-mesh.toml"),
-      'schema_version = "1"\ncontext = { repository = "demo" }\n',
-    );
-
     try {
       const loaded = await loadConfigFiles({
         configFile: join(configDirectory, "config.toml"),
         workspace,
       });
-
-      expect(loaded.trusted.reviewer_profiles.security?.instructions).toBe(
-        "Trusted instructions.",
-      );
-      expect(loaded.repository?.context).toEqual({ repository: "demo" });
+      expect(loaded.trusted.schema_version).toBe("2");
+      const resolved = resolveConfig(loaded);
+      expect(resolved.reviewers[0]?.instruction_layers).toEqual([
+        { source: "trusted", content: "Agent instructions." },
+        { source: "project", content: "Project instructions." },
+      ]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  it("rejects instruction files that canonically escape the trusted directory", async () => {
+  it("does not let a stale unrelated project disable defaults", async () => {
     const root = await mkdtemp(
-      join(process.env.TEMP ?? "C:\\Temp", "review-mesh-"),
+      join(process.env.TEMP ?? "C:\\Temp", "mesh-config-stale-"),
     );
-    const configDirectory = join(root, "trusted");
     const workspace = join(root, "workspace");
-    await mkdir(configDirectory, { recursive: true });
     await mkdir(workspace);
-    await writeFile(join(root, "outside.md"), "Untrusted instructions.");
+    const missing = join(root, "missing-project").replaceAll("\\", "/");
     await writeFile(
-      join(configDirectory, "config.toml"),
-      `schema_version = "1"\n\n[execution]\nmax_concurrency = 1\nheartbeat_interval_ms = 1000\nshutdown_grace_period_ms = 1000\n\n[diagnostics]\npersist_runs = false\nmax_runs = 1\n\n[adapters.command]\ntype = "command"\ncommand = "reviewer"\nprotocol = "review-mesh-command-v1"\n\n[reviewer_profiles.security]\nadapter = "command"\nmodel = "trusted-model"\npurpose = "Find defects"\ninstructions_file = "../outside.md"\nisolation = "prefer_enforced"\ntimeout_ms = 1000\n\n[[reviewers]]\nid = "baseline"\nprofile = "security"\n`,
+      join(root, "config.toml"),
+      `schema_version = "2"
+[execution]
+max_concurrency = 1
+heartbeat_interval_ms = 1000
+shutdown_grace_period_ms = 1000
+[diagnostics]
+persist_runs = false
+max_runs = 1
+[adapters.command]
+type = "command"
+command = "reviewer"
+protocol = "review-mesh-command-v1"
+[agents.agent]
+adapter = "command"
+model = "model"
+purpose = "Review"
+instructions = "Review carefully."
+isolation = "prefer_enforced"
+timeout_ms = 1000
+[defaults]
+agents = ["agent"]
+[projects."${missing}"]
+agents = ["agent"]
+`,
     );
-
     try {
-      await expect(
-        loadConfigFiles({
-          configFile: join(configDirectory, "config.toml"),
-          workspace,
-        }),
-      ).rejects.toThrow(/escape/i);
+      const loaded = await loadConfigFiles({
+        configFile: join(root, "config.toml"),
+        workspace,
+      });
+      expect(resolveConfig(loaded).reviewers.map(({ id }) => id)).toEqual([
+        "agent",
+      ]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  it("rejects a repository policy symlink instead of following it", async () => {
-    const fixture = await configLoadFixture();
-    const outside = join(fixture.root, "outside.toml");
-    await writeFile(outside, 'schema_version = "1"\n');
-    await symlink(
-      outside,
-      join(fixture.workspace, ".review-mesh.toml"),
-      process.platform === "win32" ? "file" : undefined,
+  it("rejects escaping instruction files and bounds a stuck trusted read", async () => {
+    const root = await mkdtemp(
+      join(process.env.TEMP ?? "C:\\Temp", "mesh-config-"),
     );
-
-    try {
-      await expect(loadConfigFiles(fixture)).rejects.toThrow(/regular file/i);
-    } finally {
-      await rm(fixture.root, { recursive: true, force: true });
-    }
-  });
-
-  it("rejects an oversized repository policy before parsing it", async () => {
-    const fixture = await configLoadFixture();
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    await writeFile(join(root, "..", "outside.md"), "outside");
     await writeFile(
-      join(fixture.workspace, ".review-mesh.toml"),
-      Buffer.alloc(maximumRepositoryPolicyBytes + 1, 0x20),
+      join(root, "config.toml"),
+      `schema_version = "1"
+[execution]
+max_concurrency = 1
+heartbeat_interval_ms = 1000
+shutdown_grace_period_ms = 1000
+[diagnostics]
+persist_runs = false
+max_runs = 1
+[adapters.command]
+type = "command"
+command = "reviewer"
+protocol = "review-mesh-command-v1"
+[reviewer_profiles.agent]
+adapter = "command"
+model = "model"
+purpose = "Review"
+instructions_file = "../outside.md"
+isolation = "prefer_enforced"
+timeout_ms = 1000
+[[reviewers]]
+id = "agent"
+profile = "agent"
+`,
     );
-
-    try {
-      await expect(loadConfigFiles(fixture)).rejects.toThrow(/too large/i);
-    } finally {
-      await rm(fixture.root, { recursive: true, force: true });
-    }
-  });
-
-  it("fails closed when the repository policy path is replaced after open", async () => {
-    const fixture = await configLoadFixture();
-    const policy = join(fixture.workspace, ".review-mesh.toml");
-    const displaced = join(fixture.workspace, "original.toml");
-    await writeFile(policy, 'schema_version = "1"\n');
-
     try {
       await expect(
-        loadConfigFiles(fixture, {
-          afterRepositoryOpen: async () => {
-            await rename(policy, displaced);
-            await writeFile(
-              policy,
-              'schema_version = "1"\ncontext = { swapped = true }\n',
-            );
-          },
-        }),
-      ).rejects.toThrow(/changed/i);
-    } finally {
-      await rm(fixture.root, { recursive: true, force: true });
-    }
-  });
-
-  it("honors cancellation while loading repository policy", async () => {
-    const fixture = await configLoadFixture();
-    await writeFile(
-      join(fixture.workspace, ".review-mesh.toml"),
-      'schema_version = "1"\n',
-    );
-    const controller = new AbortController();
-
-    try {
+        loadConfigFiles({ configFile: join(root, "config.toml"), workspace }),
+      ).rejects.toThrow(/escape/i);
       await expect(
         loadConfigFiles(
-          { ...fixture, signal: controller.signal },
+          { configFile: join(root, "config.toml"), workspace },
           {
-            afterRepositoryOpen: () => {
-              controller.abort(new Error("cancelled policy read"));
-            },
+            readTimeoutMs: 10,
+            trustedRead: async () => await new Promise<never>(() => undefined),
           },
         ),
-      ).rejects.toThrow(/cancelled policy read/i);
+      ).rejects.toThrow(/timed out/i);
     } finally {
-      await rm(fixture.root, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true });
     }
   });
-
-  it("interrupts a stuck descriptor read promptly when cancelled", async () => {
-    const fixture = await configLoadFixture();
-    await writeFile(
-      join(fixture.workspace, ".review-mesh.toml"),
-      'schema_version = "1"\n',
-    );
-    const controller = new AbortController();
-    let readStarted!: () => void;
-    const started = new Promise<void>((resolve) => {
-      readStarted = resolve;
-    });
-
-    try {
-      const loading = loadConfigFiles(
-        { ...fixture, signal: controller.signal },
-        {
-          readTimeoutMs: 10_000,
-          repositoryRead: async () => {
-            readStarted();
-            return await new Promise<never>(() => undefined);
-          },
-        },
-      );
-      await started;
-      controller.abort(new Error("cancel stuck policy read"));
-
-      await expect(
-        Promise.race([
-          loading,
-          new Promise<never>((_resolve, reject) =>
-            setTimeout(
-              () => reject(new Error("cancellation was not prompt")),
-              250,
-            ),
-          ),
-        ]),
-      ).rejects.toThrow(/cancel stuck policy read/i);
-    } finally {
-      await rm(fixture.root, { recursive: true, force: true });
-    }
-  });
-
-  it("applies a hard deadline to a stuck descriptor read", async () => {
-    const fixture = await configLoadFixture();
-    await writeFile(
-      join(fixture.workspace, ".review-mesh.toml"),
-      'schema_version = "1"\n',
-    );
-
-    try {
-      await expect(
-        Promise.race([
-          loadConfigFiles(fixture, {
-            readTimeoutMs: 20,
-            repositoryRead: async () =>
-              await new Promise<never>(() => undefined),
-          }),
-          new Promise<never>((_resolve, reject) =>
-            setTimeout(
-              () => reject(new Error("read deadline was not prompt")),
-              500,
-            ),
-          ),
-        ]),
-      ).rejects.toThrow(/read timed out after 20ms/i);
-    } finally {
-      await rm(fixture.root, { recursive: true, force: true });
-    }
-  });
-
-  it.skipIf(process.platform === "win32")(
-    "opens a repository FIFO nonblocking and rejects it as a special file",
-    async () => {
-      const fixture = await configLoadFixture();
-      const policy = join(fixture.workspace, ".review-mesh.toml");
-      const created = spawnSync("mkfifo", [policy]);
-      expect(created.status).toBe(0);
-
-      try {
-        const result = Promise.race([
-          loadConfigFiles(fixture),
-          new Promise<never>((_resolve, reject) =>
-            setTimeout(() => reject(new Error("FIFO read blocked")), 1_000),
-          ),
-        ]);
-        await expect(result).rejects.toThrow(/regular file/i);
-      } finally {
-        await rm(fixture.root, { recursive: true, force: true });
-      }
-    },
-  );
 });

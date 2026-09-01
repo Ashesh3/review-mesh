@@ -9,7 +9,7 @@ request on stdin -> review-mesh review -> all configured reviewers -> JSONL resu
 It is designed for automation, coding agents, CI, and local review loops:
 
 - One stateless review round per invocation.
-- Mandatory reviewer roster; callers cannot skip or replace reviewers.
+- Trusted global/default or project-specific agent rosters; callers cannot override them through review input.
 - Parallel independent reviews across different models or runtimes.
 - Strict structured findings with evidence and optional file/line locations.
 - `incomplete > findings > passed` outcome precedence.
@@ -175,10 +175,10 @@ export REVIEW_MESH_OPENAI_BASE_URL="https://gateway.example/v1"
 export REVIEW_MESH_OPENAI_API_KEY="your-key"
 ```
 
-Create the trusted configuration shown below, replacing model IDs as needed:
+Create the global configuration shown below, replacing model IDs and project paths as needed:
 
 ```toml
-schema_version = "1"
+schema_version = "2"
 
 [execution]
 max_concurrency = 2
@@ -194,7 +194,7 @@ type = "openai_compatible"
 base_url_env = "REVIEW_MESH_OPENAI_BASE_URL"
 api_key_env = "REVIEW_MESH_OPENAI_API_KEY"
 
-[reviewer_profiles.opus]
+[agents.opus-5]
 adapter = "gateway"
 model = "claude-opus-5"
 purpose = "Architecture, security, and lifecycle review"
@@ -202,7 +202,7 @@ instructions = "Inspect architecture, lifecycle ownership, trust boundaries, sec
 isolation = "prefer_enforced"
 timeout_ms = 1800000
 
-[reviewer_profiles.gemini]
+[agents.gemini-3-7-flash]
 adapter = "gateway"
 model = "gemini-3.7-flash"
 purpose = "Correctness, reliability, and edge-case review"
@@ -210,7 +210,7 @@ instructions = "Inspect the full scope for actionable correctness, integration, 
 isolation = "prefer_enforced"
 timeout_ms = 900000
 
-[reviewer_profiles.mai]
+[agents.mai-code-1-1-flash]
 adapter = "gateway"
 model = "mai-code-1.1-flash"
 purpose = "Implementation quality and regression review"
@@ -218,7 +218,7 @@ instructions = "Inspect implementation bugs, state handling, schemas, error path
 isolation = "prefer_enforced"
 timeout_ms = 900000
 
-[reviewer_profiles.sol]
+[agents.sol-5-6-fast]
 adapter = "gateway"
 model = "gpt-5.6-sol-fast"
 purpose = "Implementation, protocol, and compatibility review"
@@ -226,7 +226,7 @@ instructions = "Inspect concurrency, cancellation, protocol invariants, error ha
 isolation = "prefer_enforced"
 timeout_ms = 900000
 
-[reviewer_profiles.kimi]
+[agents.kimi-k3]
 adapter = "gateway"
 model = "kimi-k3"
 purpose = "Independent systems and robustness review"
@@ -234,25 +234,17 @@ instructions = "Inspect systems design, robustness, maintainability, portability
 isolation = "prefer_enforced"
 timeout_ms = 900000
 
-[[reviewers]]
-id = "opus-5"
-profile = "opus"
+[defaults]
+agents = ["opus-5", "gemini-3-7-flash", "mai-code-1-1-flash", "sol-5-6-fast", "kimi-k3"]
 
-[[reviewers]]
-id = "gemini-3-7-flash"
-profile = "gemini"
+[projects."C:/Projects/payments"]
+agents = ["opus-5", "sol-5-6-fast"]
+instructions = "Focus on monetary correctness, audit logging, and stored-record compatibility."
+context = { service = "payments", conventions = ["No floating-point money"] }
 
-[[reviewers]]
-id = "mai-code-1-1-flash"
-profile = "mai"
-
-[[reviewers]]
-id = "sol-5-6-fast"
-profile = "sol"
-
-[[reviewers]]
-id = "kimi-k3"
-profile = "kimi"
+[projects."C:/Projects/frontend"]
+agents = ["gemini-3-7-flash", "mai-code-1-1-flash", "kimi-k3"]
+instructions = "Focus on browser compatibility, accessibility, and state-management regressions."
 ```
 
 The gateway adapter exposes exactly three bounded reviewer tools:
@@ -267,7 +259,7 @@ Reviewer models cannot execute shell commands, programs, scripts, Git, builds, t
 
 ## Configuration location
 
-The trusted config file is resolved using the host operating system:
+One global config file is resolved using the host operating system:
 
 | Platform | Default path                                            |
 | -------- | ------------------------------------------------------- |
@@ -275,15 +267,40 @@ The trusted config file is resolved using the host operating system:
 | macOS    | `~/Library/Preferences/review-mesh/config.toml`         |
 | Linux    | `${XDG_CONFIG_HOME:-~/.config}/review-mesh/config.toml` |
 
-The trusted config controls:
+The global config controls:
 
 - Adapter/runtime registrations.
 - Credential environment-variable names.
-- Reviewer profiles and exact models.
-- Mandatory baseline roster and order.
+- Globally declared agents and exact models.
+- The optional default agent roster.
+- Per-project agent rosters, guidance, and context keyed by full path.
 - Concurrency, heartbeat, shutdown grace, diagnostics, and retention.
 
+Use forward slashes for Windows project keys, for example `[projects."C:/Projects/payments"]`. A project entry applies to that canonical directory and its descendants; when mappings are nested, the most-specific project path wins. If no configured project contains the workspace, `[defaults].agents` is used; without defaults, the review is rejected.
+
+Workspace `.review-mesh.toml` files are not loaded. All agent and project configuration stays in this single global file.
+
 Never place secret values in `config.toml`. Only reference environment-variable names.
+
+### Configuration manager
+
+Run the rclone-style interactive configuration menu:
+
+```powershell
+review-mesh config
+```
+
+The menu can list, add, edit, and remove global agents; create and select adapters; set the ordered default roster; add, edit, or remove full-path project assignments and context; and edit execution/diagnostic settings. Each successful change is validated and saved immediately using an atomic replacement. Existing version 1 configuration is migrated to version 2 when it is saved through the menu; this canonical rewrite does not preserve TOML comments, so keep a backup when migrating a hand-edited file.
+
+Useful non-interactive commands:
+
+```text
+review-mesh config path
+review-mesh config show
+review-mesh config validate
+review-mesh config list
+review-mesh config list --json
+```
 
 ## Other adapters
 
@@ -298,36 +315,6 @@ Review Mesh also implements these trusted adapter types:
 | `codex`             | Codex SDK reviewer.                                                              | Currently fails closed in production because the pinned runtime does not satisfy Review Mesh's project-configuration isolation characterization. |
 
 For a truly one-file deployment, use `openai_compatible`. Provider-native adapters can remain configured in a source installation, but their native runtime assets cannot be encoded into a cross-platform JavaScript file.
-
-## Repository policy
-
-A reviewed workspace may contain `.review-mesh.toml`. It is untrusted and additive only.
-
-```toml
-schema_version = "1"
-context = { service = "payments", conventions = ["No floating-point money"] }
-
-[[reviewer_overrides]]
-id = "opus-5"
-append_instructions = "Check payment amount validation and audit logging."
-timeout_ms = 600000
-
-[[reviewers]]
-id = "payments-compatibility"
-profile = "sol"
-instructions = "Focus on backwards compatibility for stored payment records."
-timeout_ms = 600000
-```
-
-Repository policy may:
-
-- Add instructions to baseline reviewers.
-- Lower timeouts.
-- Promote isolation to `require_enforced`.
-- Add reviewers using profiles already defined by trusted configuration.
-- Add repository context.
-
-It cannot register executables/adapters, supply credentials, remove or reorder baseline reviewers, replace their model/profile, increase timeout or privilege, or weaken isolation. Invalid policy rejects the invocation with exit code `2`.
 
 ## JSONL events
 
@@ -409,7 +396,7 @@ Example final event:
 | ---: | -------------- | --------------------------------------------------------------- |
 |  `0` | `passed`       | Every reviewer completed and reported zero actionable findings. |
 |  `1` | `findings`     | Every reviewer completed; one or more reported findings.        |
-|  `2` | no run         | Invalid request, usage, trusted config, or repository policy.   |
+|  `2` | no run         | Invalid request, usage, global config, or project assignment.   |
 |  `3` | `incomplete`   | At least one reviewer/runtime did not return a valid result.    |
 |  `4` | interrupted    | Caller interrupted the round.                                   |
 

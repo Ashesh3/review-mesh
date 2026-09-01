@@ -3,10 +3,9 @@ import type {
   ReviewerResult,
 } from "../../src/protocol/schemas.js";
 import type {
-  RepositoryPolicy,
   ResolvedConfig,
   ResolvedReviewer,
-  TrustedConfig,
+  TrustedConfigV1,
 } from "../../src/config/schemas.js";
 import type { ResolvedContext } from "../../src/context/resolve.js";
 import type { AdapterFailure } from "../../src/adapters/errors.js";
@@ -84,9 +83,9 @@ export function resolvedContext(
 }
 
 export function trustedConfig(
-  overrides?: DeepPartial<TrustedConfig>,
-): TrustedConfig {
-  const base: TrustedConfig = {
+  overrides?: DeepPartial<TrustedConfigV1>,
+): TrustedConfigV1 {
+  const base: TrustedConfigV1 = {
     schema_version: "1",
     execution: {
       max_concurrency: 1,
@@ -115,15 +114,6 @@ export function trustedConfig(
     reviewers: [{ id: "baseline", profile: "security-profile" }],
   };
   return deepMerge(base, overrides);
-}
-
-export function repositoryPolicy(
-  overrides?: DeepPartial<RepositoryPolicy>,
-): RepositoryPolicy {
-  return deepMerge(
-    { schema_version: "1" } satisfies RepositoryPolicy,
-    overrides,
-  );
 }
 
 export function resolvedReviewer(
@@ -233,7 +223,7 @@ export function roundInput(
       shutdown_grace_period_ms: 50,
     },
     diagnostics: { persist_runs: false, max_runs: 10 },
-    repository_context: { source: "repository" },
+    project_context: { source: "project" },
     reviewers,
   };
   const registry = new AdapterRegistry();

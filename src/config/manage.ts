@@ -1,0 +1,494 @@
+import { createHash, randomUUID } from "node:crypto";
+import { constants } from "node:fs";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+} from "node:fs/promises";
+import { basename, dirname, resolve } from "node:path";
+import { parse, stringify } from "smol-toml";
+import type { AdapterRegistration } from "./schemas.js";
+import { trustedConfigSchema } from "./schemas.js";
+
+const MAX_CONFIG_BYTES = 4 * 1024 * 1024;
+const READ_CHUNK_BYTES = 64 * 1024;
+const SAFE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const ENVIRONMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+export interface ManagedAgent {
+  adapter: string;
+  model: string;
+  purpose: string;
+  instructions?: string;
+  instructions_file?: string;
+  isolation: "prefer_enforced" | "require_enforced";
+  timeout_ms: number;
+  runtime?: Record<string, unknown>;
+}
+
+export interface ManagedProject {
+  agents?: string[];
+  instructions?: string;
+  instructions_file?: string;
+  context?: unknown;
+}
+
+export interface ManagedConfig {
+  schema_version: "2";
+  execution: {
+    max_concurrency: number;
+    heartbeat_interval_ms: number;
+    shutdown_grace_period_ms: number;
+  };
+  diagnostics: { persist_runs: boolean; max_runs: number };
+  adapters: Record<string, AdapterRegistration>;
+  agents: Record<string, ManagedAgent>;
+  defaults?: { agents: string[] };
+  projects?: Record<string, ManagedProject>;
+}
+
+export interface ConfigSnapshot {
+  exists: boolean;
+  hash?: string;
+  device?: bigint;
+  inode?: bigint;
+}
+
+export interface LoadedManagedConfig {
+  config: ManagedConfig;
+  snapshot: ConfigSnapshot;
+  sourceText?: string;
+  migrated: boolean;
+}
+
+interface ReadSnapshot {
+  snapshot: ConfigSnapshot;
+  text?: string;
+}
+
+function isMissing(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "ENOENT"
+  );
+}
+
+function sha256(value: string | Buffer): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function clone<T>(value: T): T {
+  return structuredClone(value);
+}
+
+function requireManagedConfig(value: unknown): ManagedConfig {
+  const record = asRecord(value);
+  if (
+    record?.schema_version !== "2" ||
+    asRecord(record.execution) === undefined ||
+    asRecord(record.diagnostics) === undefined ||
+    asRecord(record.adapters) === undefined ||
+    asRecord(record.agents) === undefined
+  ) {
+    throw new Error("configuration is not a Review Mesh v2 configuration");
+  }
+  trustedConfigSchema.parse(value);
+  const config = clone(value as ManagedConfig);
+  requireAssignments(config);
+  for (const [id, agent] of Object.entries(config.agents)) {
+    if (config.adapters[agent.adapter] === undefined) {
+      throw new Error(
+        `agent ${id} references unknown adapter ${agent.adapter}`,
+      );
+    }
+  }
+  const assignmentLists = [
+    ...(config.defaults === undefined ? [] : [config.defaults.agents]),
+    ...Object.values(config.projects ?? {}).flatMap((project) =>
+      project.agents === undefined ? [] : [project.agents],
+    ),
+  ];
+  for (const ids of assignmentLists) {
+    for (const id of ids) {
+      if (config.agents[id] === undefined) {
+        throw new Error(`assignment references unknown agent ${id}`);
+      }
+    }
+  }
+  return config;
+}
+
+function requireAssignments(config: ManagedConfig): void {
+  const hasDefaultAssignment = (config.defaults?.agents.length ?? 0) > 0;
+  const hasProjectAssignment = Object.values(config.projects ?? {}).some(
+    (project) => (project.agents?.length ?? 0) > 0,
+  );
+  if (!hasDefaultAssignment && !hasProjectAssignment) {
+    throw new Error(
+      "configuration must assign agents by default or to a project",
+    );
+  }
+}
+
+function appendInstructions(
+  agent: ManagedAgent,
+  append: unknown,
+  reviewerId: string,
+): ManagedAgent {
+  if (typeof append !== "string" || append.length === 0) return agent;
+  if (agent.instructions === undefined) {
+    throw new Error(
+      `v1 reviewer ${reviewerId} combines instructions_file with append_instructions and cannot be migrated automatically`,
+    );
+  }
+  return { ...agent, instructions: `${agent.instructions}\n\n${append}` };
+}
+
+/** Converts the former adapter/profile/roster layout without writing it. */
+export function migrateV1Config(value: unknown): ManagedConfig {
+  const record = asRecord(value);
+  if (record?.schema_version !== "1") {
+    throw new Error("configuration is not a Review Mesh v1 configuration");
+  }
+  // Validate the legacy document before translating it. During the v2 rollout
+  // the exported schema accepts both the legacy input and the native v2 shape.
+  trustedConfigSchema.parse(value);
+  const profiles = asRecord(record.reviewer_profiles) ?? {};
+  const reviewers = Array.isArray(record.reviewers) ? record.reviewers : [];
+  const agents: Record<string, ManagedAgent> = {};
+  const defaults: string[] = [];
+
+  for (const definitionValue of reviewers) {
+    const definition = asRecord(definitionValue);
+    const id = definition?.id;
+    const profileId = definition?.profile;
+    if (typeof id !== "string" || typeof profileId !== "string") {
+      throw new Error("legacy reviewer definition is invalid");
+    }
+    const profile = asRecord(profiles[profileId]);
+    if (profile === undefined) {
+      throw new Error(
+        `legacy reviewer ${id} references unknown profile ${profileId}`,
+      );
+    }
+    const agent = appendInstructions(
+      clone(profile as unknown as ManagedAgent),
+      definition?.append_instructions,
+      id,
+    );
+    if (agents[id] !== undefined) {
+      throw new Error(`duplicate legacy reviewer id: ${id}`);
+    }
+    agents[id] = agent;
+    defaults.push(id);
+  }
+
+  return requireManagedConfig({
+    schema_version: "2",
+    execution: clone(record.execution as ManagedConfig["execution"]),
+    diagnostics: clone(record.diagnostics as ManagedConfig["diagnostics"]),
+    adapters: clone(record.adapters as ManagedConfig["adapters"]),
+    agents,
+    defaults: { agents: defaults },
+    projects: {},
+  });
+}
+
+export function parseManagedConfig(text: string): {
+  config: ManagedConfig;
+  migrated: boolean;
+} {
+  const parsed = parse(text);
+  const version = asRecord(parsed)?.schema_version;
+  if (version === "1")
+    return { config: migrateV1Config(parsed), migrated: true };
+  return { config: requireManagedConfig(parsed), migrated: false };
+}
+
+export function serializeManagedConfig(config: ManagedConfig): string {
+  requireAssignments(config);
+  const validated = requireManagedConfig(config);
+  const text = `${stringify(validated)}\n`;
+  requireManagedConfig(parse(text));
+  return text;
+}
+
+export function emptyManagedConfig(): ManagedConfig {
+  return {
+    schema_version: "2",
+    execution: {
+      max_concurrency: 2,
+      heartbeat_interval_ms: 15_000,
+      shutdown_grace_period_ms: 5_000,
+    },
+    diagnostics: { persist_runs: true, max_runs: 50 },
+    adapters: {},
+    agents: {},
+    defaults: { agents: [] },
+    projects: {},
+  };
+}
+
+async function readSnapshot(path: string): Promise<ReadSnapshot> {
+  let pathMetadata;
+  try {
+    pathMetadata = await lstat(path, { bigint: true });
+  } catch (error) {
+    if (isMissing(error)) return { snapshot: { exists: false } };
+    throw error;
+  }
+  if (pathMetadata.isSymbolicLink() || !pathMetadata.isFile()) {
+    throw new Error("configuration path must be a regular file, not a symlink");
+  }
+  if (pathMetadata.size > BigInt(MAX_CONFIG_BYTES)) {
+    throw new Error("configuration file exceeds the 4 MiB limit");
+  }
+  const flags =
+    constants.O_RDONLY |
+    (constants.O_NONBLOCK ?? 0) |
+    (constants.O_NOFOLLOW ?? 0);
+  const handle = await open(path, flags);
+  try {
+    const opened = await handle.stat({ bigint: true });
+    if (
+      !opened.isFile() ||
+      opened.dev !== pathMetadata.dev ||
+      opened.ino !== pathMetadata.ino ||
+      opened.size > BigInt(MAX_CONFIG_BYTES)
+    ) {
+      throw new Error("configuration changed while opening");
+    }
+    const chunks: Buffer[] = [];
+    let total = 0;
+    while (total <= MAX_CONFIG_BYTES) {
+      const buffer = Buffer.allocUnsafe(
+        Math.min(READ_CHUNK_BYTES, MAX_CONFIG_BYTES + 1 - total),
+      );
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, total);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      chunks.push(buffer.subarray(0, bytesRead));
+    }
+    const bytes = Buffer.concat(chunks, total);
+    const [after, pathAfter] = await Promise.all([
+      handle.stat({ bigint: true }),
+      lstat(path, { bigint: true }),
+    ]);
+    if (
+      bytes.byteLength > MAX_CONFIG_BYTES ||
+      after.dev !== opened.dev ||
+      after.ino !== opened.ino ||
+      after.size !== opened.size ||
+      after.mtimeNs !== opened.mtimeNs ||
+      after.ctimeNs !== opened.ctimeNs ||
+      pathAfter.isSymbolicLink() ||
+      !pathAfter.isFile() ||
+      pathAfter.dev !== opened.dev ||
+      pathAfter.ino !== opened.ino
+    ) {
+      throw new Error("configuration changed while reading");
+    }
+    return {
+      snapshot: {
+        exists: true,
+        hash: sha256(bytes),
+        device: opened.dev,
+        inode: opened.ino,
+      },
+      text: new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+function sameSnapshot(left: ConfigSnapshot, right: ConfigSnapshot): boolean {
+  if (left.exists !== right.exists) return false;
+  if (!left.exists) return true;
+  return (
+    left.hash === right.hash &&
+    left.device === right.device &&
+    left.inode === right.inode
+  );
+}
+
+export async function loadManagedConfig(
+  configFile: string,
+  allowMissing = false,
+): Promise<LoadedManagedConfig> {
+  const current = await readSnapshot(configFile);
+  if (!current.snapshot.exists) {
+    if (!allowMissing)
+      throw new Error(`configuration file does not exist: ${configFile}`);
+    return {
+      config: emptyManagedConfig(),
+      snapshot: current.snapshot,
+      migrated: false,
+    };
+  }
+  const sourceText = current.text!;
+  const parsed = parseManagedConfig(sourceText);
+  return { ...parsed, snapshot: current.snapshot, sourceText };
+}
+
+async function requireStableParent(parent: string): Promise<{
+  path: string;
+  device: bigint;
+  inode: bigint;
+}> {
+  await mkdir(parent, { recursive: true, mode: 0o700 });
+  const canonical = await realpath(parent);
+  const [pathMetadata, metadata] = await Promise.all([
+    lstat(parent, { bigint: true }),
+    lstat(canonical, { bigint: true }),
+  ]);
+  if (
+    pathMetadata.isSymbolicLink() ||
+    !pathMetadata.isDirectory() ||
+    !metadata.isDirectory() ||
+    pathMetadata.dev !== metadata.dev ||
+    pathMetadata.ino !== metadata.ino
+  ) {
+    throw new Error("configuration directory must be a real directory");
+  }
+  return { path: canonical, device: metadata.dev, inode: metadata.ino };
+}
+
+async function assertStableParent(
+  parent: string,
+  pinned: { path: string; device: bigint; inode: bigint },
+): Promise<void> {
+  const canonical = await realpath(parent);
+  const [pathMetadata, metadata] = await Promise.all([
+    lstat(parent, { bigint: true }),
+    lstat(canonical, { bigint: true }),
+  ]);
+  const samePath =
+    process.platform === "win32"
+      ? canonical.toLowerCase() === pinned.path.toLowerCase()
+      : canonical === pinned.path;
+  if (
+    !samePath ||
+    pathMetadata.isSymbolicLink() ||
+    !pathMetadata.isDirectory() ||
+    !metadata.isDirectory() ||
+    pathMetadata.dev !== metadata.dev ||
+    pathMetadata.ino !== metadata.ino ||
+    metadata.dev !== pinned.device ||
+    metadata.ino !== pinned.inode
+  ) {
+    throw new Error("configuration directory changed while saving");
+  }
+}
+
+export async function saveManagedConfig(
+  configFile: string,
+  config: ManagedConfig,
+  expected: ConfigSnapshot,
+): Promise<ConfigSnapshot> {
+  const text = serializeManagedConfig(config);
+  const parent = dirname(resolve(configFile));
+  const pinned = await requireStableParent(parent);
+  const target = resolve(pinned.path, basename(configFile));
+  await assertStableParent(parent, pinned);
+  const current = (await readSnapshot(target)).snapshot;
+  if (!sameSnapshot(current, expected)) {
+    throw new Error("configuration changed on disk; reload before saving");
+  }
+
+  const temporary = resolve(
+    pinned.path,
+    `.${basename(configFile)}.${process.pid}.${randomUUID()}.tmp`,
+  );
+  const flags =
+    constants.O_WRONLY |
+    constants.O_CREAT |
+    constants.O_EXCL |
+    (constants.O_NOFOLLOW ?? 0);
+  let handle;
+  try {
+    await assertStableParent(parent, pinned);
+    handle = await open(temporary, flags, 0o600);
+    await handle.writeFile(text, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    if (process.platform !== "win32") await chmod(temporary, 0o600);
+    // Validate the exact bytes that will be published, not just the source
+    // object passed to this function.
+    parseManagedConfig(await readFile(temporary, "utf8"));
+    await assertStableParent(parent, pinned);
+    if (!sameSnapshot((await readSnapshot(target)).snapshot, expected)) {
+      throw new Error("configuration changed on disk; reload before saving");
+    }
+    await rename(temporary, target);
+    await assertStableParent(parent, pinned);
+    return (await readSnapshot(target)).snapshot;
+  } finally {
+    await handle?.close().catch(() => undefined);
+    await rm(temporary, { force: true }).catch(() => undefined);
+  }
+}
+
+export async function canonicalProjectPath(
+  candidate: string,
+  cwd = process.cwd(),
+): Promise<string> {
+  const canonical = await realpath(resolve(cwd, candidate));
+  if (!(await stat(canonical)).isDirectory()) {
+    throw new Error("project path must identify an existing directory");
+  }
+  const slashNormalized = canonical.replaceAll("\\", "/");
+  return process.platform === "win32"
+    ? slashNormalized.toLowerCase()
+    : slashNormalized;
+}
+
+export function requireSafeIdentifier(value: string, label: string): string {
+  if (!SAFE_IDENTIFIER.test(value)) {
+    throw new Error(
+      `${label} must contain only letters, numbers, underscores, and hyphens`,
+    );
+  }
+  return value;
+}
+
+export function requireEnvironmentName(value: string): string {
+  if (!ENVIRONMENT_NAME.test(value)) {
+    throw new Error("environment variable name is invalid");
+  }
+  return value;
+}
+
+export function listConfig(config: ManagedConfig) {
+  const defaultAgents = new Set(config.defaults?.agents ?? []);
+  return {
+    schema_version: config.schema_version,
+    agents: Object.entries(config.agents)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([id, agent]) => ({
+        id,
+        adapter: agent.adapter,
+        model: agent.model,
+        purpose: agent.purpose,
+        default: defaultAgents.has(id),
+      })),
+    projects: Object.entries(config.projects ?? {})
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([path, project]) => ({ path, agents: project.agents ?? [] })),
+  };
+}

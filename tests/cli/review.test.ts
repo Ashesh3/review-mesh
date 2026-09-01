@@ -18,7 +18,7 @@ import {
   publicEventSchema,
   type PublicEvent,
 } from "../../src/protocol/schemas.js";
-import { installAbortHandlers } from "../../src/cli.js";
+import { installAbortHandlers, runCli as runCliEntry } from "../../src/cli.js";
 
 const projectRoot = resolve(import.meta.dirname, "../..");
 const cliEntry = join(projectRoot, "src", "cli.ts");
@@ -292,6 +292,32 @@ afterEach(async () => {
 });
 
 describe("review-mesh review", () => {
+  it("dispatches config path without consuming redirected stdin", async () => {
+    const fixture = await createFixture();
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const error = new PassThrough();
+    let stdout = "";
+    let stderr = "";
+    output.on("data", (chunk) => (stdout += chunk.toString()));
+    error.on("data", (chunk) => (stderr += chunk.toString()));
+    input.write("unconsumed review request");
+
+    await runCliEntry(new EventEmitter(), {
+      argv: ["config", "path"],
+      input,
+      output,
+      error,
+      configFile: fixture.configFile,
+    });
+
+    expect(process.exitCode).toBe(0);
+    expect(stdout).toBe(`${fixture.configFile}\n`);
+    expect(stderr).toBe("");
+    expect(input.read()?.toString()).toBe("unconsumed review request");
+    process.exitCode = undefined;
+  });
+
   it("runs the compiled CLI with valid JSONL and a passed terminal", async () => {
     const build = await new Promise<ProcessResult>((resolveBuild, reject) => {
       const child = spawn(

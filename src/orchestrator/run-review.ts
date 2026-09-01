@@ -717,9 +717,9 @@ export async function runReviewRound({
         const prompt = buildReviewerPrompt({
           reviewer,
           context,
-          ...(config.repository_context === undefined
+          ...(config.project_context === undefined
             ? {}
-            : { repositoryContext: config.repository_context }),
+            : { projectContext: config.project_context }),
           resultJsonSchema: reviewerResultJsonSchema,
         });
         let terminal:
