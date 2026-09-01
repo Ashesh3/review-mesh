@@ -6,8 +6,8 @@ import { build } from "esbuild";
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputFile = resolve(projectRoot, "dist", "review-mesh.mjs");
 
-await rm(dirname(outputFile), { recursive: true, force: true });
 await mkdir(dirname(outputFile), { recursive: true });
+await rm(outputFile, { force: true });
 await build({
   absWorkingDir: projectRoot,
   entryPoints: ["src/cli.ts"],

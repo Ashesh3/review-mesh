@@ -5,6 +5,8 @@ import type { Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { ReviewRunError, runReviewApplication } from "./app.js";
 
+declare const REVIEW_MESH_STANDALONE: boolean | undefined;
+
 const maximumRequestBytes = 8 * 1024 * 1024;
 
 async function writeDiagnostic(error: string, message: string): Promise<void> {
@@ -173,6 +175,7 @@ export async function runCli(
 }
 
 const invokedDirectly =
+  (typeof REVIEW_MESH_STANDALONE === "undefined" || !REVIEW_MESH_STANDALONE) &&
   process.argv[1] !== undefined &&
   pathToFileURL(resolve(process.argv[1])).href === import.meta.url;
 

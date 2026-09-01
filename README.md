@@ -14,7 +14,7 @@ It is designed for automation, coding agents, CI, and local review loops:
 - Strict structured findings with evidence and optional file/line locations.
 - `incomplete > findings > passed` outcome precedence.
 - No source edits by Review Mesh.
-- A portable build consisting of one movable JavaScript file.
+- Portable single-file builds: a Node.js script and standalone Windows/Linux executables.
 
 ## Quick start
 
@@ -23,6 +23,34 @@ Requirements:
 - Node.js 22.12 or newer.
 - Git, when Git context is desired.
 - A trusted `config.toml` and any provider credentials it references.
+
+### Download a standalone executable
+
+Release `v1` provides self-contained Bun executables that do not require Node.js or Bun:
+
+- Windows x64: `review-mesh-windows-x64.exe`
+- Linux x64 (glibc): `review-mesh-linux-x64`
+
+Windows PowerShell:
+
+```powershell
+Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v1/review-mesh-windows-x64.exe -OutFile review-mesh.exe
+.\review-mesh.exe review
+```
+
+Linux:
+
+```bash
+curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v1/review-mesh-linux-x64
+chmod +x ./review-mesh-linux-x64
+./review-mesh-linux-x64 review
+```
+
+Each executable contains Review Mesh and its JavaScript dependencies. Git, trusted configuration, credentials, and separately configured command/provider runtimes remain external.
+
+Release binaries are built with Bun 1.4.0. Verify downloads against `SHA256SUMS.txt` from the release assets.
+
+### Build the portable Node.js file
 
 Build the single-file CLI:
 
@@ -482,13 +510,15 @@ npm run verify
 
 Useful scripts:
 
-| Script                   | Purpose                                           |
-| ------------------------ | ------------------------------------------------- |
-| `npm run build`          | Type-check and generate the one-file CLI.         |
-| `npm run build:portable` | Generate only `dist/review-mesh.mjs`.             |
-| `npm test`               | Run offline tests.                                |
-| `npm run test:live`      | Run explicitly configured provider smoke tests.   |
-| `npm run format:check`   | Check formatting.                                 |
-| `npm run verify`         | Formatting, typecheck, tests, and portable build. |
+| Script                      | Purpose                                                                                 |
+| --------------------------- | --------------------------------------------------------------------------------------- |
+| `npm run build`             | Type-check and generate the one-file CLI.                                               |
+| `npm run build:portable`    | Generate only `dist/review-mesh.mjs`.                                                   |
+| `npm run build:standalone`  | With Bun 1.4.0, generate Windows/Linux x64 executables and checksums in `dist/release`. |
+| `npm run verify:standalone` | Build standalone artifacts and smoke-test the Windows executable on Windows.            |
+| `npm test`                  | Run offline tests.                                                                      |
+| `npm run test:live`         | Run explicitly configured provider smoke tests.                                         |
+| `npm run format:check`      | Check formatting.                                                                       |
+| `npm run verify`            | Formatting, typecheck, tests, and portable build.                                       |
 
 The portable acceptance suite copies `review-mesh.mjs` outside the repository and runs it without `node_modules`, including a real embedded-adapter protocol round against a local test server.
