@@ -34,7 +34,7 @@ async function temporaryRoot(): Promise<string> {
 
 function startedEvent(): PublicEvent {
   return {
-    schema_version: "3",
+    schema_version: "4",
     event: "run.started",
     run_id: "run-current",
     seq: 1,

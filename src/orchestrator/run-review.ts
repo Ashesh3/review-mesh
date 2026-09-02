@@ -71,6 +71,20 @@ interface ReviewerJob {
   creationFailure?: AdapterFailure;
 }
 
+function terminalOutcome(
+  state: SuiteState,
+  reviewerId: string,
+): "clear" | "findings" | "incomplete" {
+  const reviewer = state.reviewer(reviewerId);
+  if (reviewer.status === "incomplete") return "incomplete";
+  if (reviewer.status !== "completed" || reviewer.result === undefined) {
+    throw new Error(`reviewer "${reviewerId}" is not completed`);
+  }
+  return reviewer.result.actionable_findings.length === 0
+    ? "clear"
+    : "findings";
+}
+
 interface ActiveJob {
   job: ReviewerJob;
   controller: AbortController;
@@ -205,6 +219,11 @@ function terminalDraft(record: ReviewerTerminalRecord): EventDraft {
       },
     };
   }
+  if (record.status === "skipped") {
+    throw new Error(
+      "Skipped fallback model runs do not emit reviewer terminal events.",
+    );
+  }
   return {
     event: "reviewer.incomplete",
     reviewer_id: record.reviewer_id,
@@ -303,12 +322,16 @@ export async function runReviewRound({
     const activeIds = new Set([...active.keys(), ...activeProbes]);
     summary.queued = state.reviewers.filter(
       (reviewer) =>
+        reviewer.status !== "deferred" &&
+        reviewer.status !== "skipped" &&
         reviewer.status !== "completed" &&
         reviewer.status !== "incomplete" &&
         !activeIds.has(reviewer.reviewer.id),
     ).length;
     summary.running = state.reviewers.filter(
       (reviewer) =>
+        reviewer.status !== "deferred" &&
+        reviewer.status !== "skipped" &&
         reviewer.status !== "completed" &&
         reviewer.status !== "incomplete" &&
         activeIds.has(reviewer.reviewer.id),
@@ -438,6 +461,7 @@ export async function runReviewRound({
     if (
       current.status === "completed" ||
       current.status === "incomplete" ||
+      current.status === "skipped" ||
       finalizing.has(reviewerId)
     )
       return;
@@ -457,6 +481,7 @@ export async function runReviewRound({
     if (
       current.status === "completed" ||
       current.status === "incomplete" ||
+      current.status === "skipped" ||
       finalizing.has(reviewer.id)
     )
       return;
@@ -537,6 +562,14 @@ export async function runReviewRound({
             }),
         reviewers: config.reviewers.map((reviewer) => ({
           id: reviewer.id,
+          agent_id: reviewer.agentId ?? reviewer.id,
+          model_index: reviewer.modelIndex ?? 0,
+          model_count: reviewer.modelCount ?? 1,
+          ...(reviewer.previousReviewerId === undefined
+            ? {}
+            : { previous_reviewer_id: reviewer.previousReviewerId }),
+          activation:
+            (reviewer.modelIndex ?? 0) === 0 ? "immediate" : "after_clear_pass",
           purpose: reviewer.purpose,
           adapter: reviewer.adapterId,
           adapter_type: reviewer.adapter.type,
@@ -654,106 +687,6 @@ export async function runReviewRound({
         unlink();
       }
     };
-    const probeOutcomes: PromiseSettledResult<AdapterCapabilities>[] =
-      new Array(jobs.length);
-    let nextProbe = 0;
-    const probeWorkers = Array.from(
-      { length: Math.min(config.execution.max_concurrency, jobs.length) },
-      () => {
-        return (async () => {
-          while (!interrupted) {
-            const index = nextProbe;
-            const job = jobs[index];
-            if (job === undefined) return;
-            nextProbe += 1;
-            state.transition(job.reviewer.id, "probing");
-            activeProbes.add(job.reviewer.id);
-            const probingMessage =
-              "Checking the configured adapter, authentication, model, and isolation capability.";
-            state.recordActivity(job.reviewer.id, probingMessage);
-            await emit({
-              event: "reviewer.progress",
-              reviewer_id: job.reviewer.id,
-              data: { phase: "probing", message: probingMessage },
-            });
-            try {
-              probeOutcomes[index] = {
-                status: "fulfilled",
-                value: await probe(job, index),
-              };
-            } catch (reason) {
-              probeOutcomes[index] = { status: "rejected", reason };
-            } finally {
-              activeProbes.delete(job.reviewer.id);
-            }
-          }
-        })();
-      },
-    );
-    const probesPromise = Promise.all(probeWorkers).then(() => probeOutcomes);
-    await Promise.race([probesPromise, probeAbort.promise]);
-    probeAbort.dispose();
-    if (interrupted && probeSettled.some((settled) => !settled)) {
-      await stopPreflightHeartbeat();
-      const activeProbeOperations = probeOperations.filter(
-        (operation): operation is Promise<void> => operation !== undefined,
-      );
-      let graceTimer: ReturnType<typeof setTimeout> | undefined;
-      await Promise.race([
-        Promise.all(activeProbeOperations),
-        new Promise<void>((resolve) => {
-          graceTimer = clock.setTimeout(
-            resolve,
-            config.execution.shutdown_grace_period_ms,
-          );
-        }),
-      ]);
-      if (graceTimer !== undefined) clock.clearTimeout(graceTimer);
-      await Promise.all(jobs.map((job, index) => cleanupProbe(job, index)));
-    }
-    const completedProbeResults = interrupted ? undefined : await probesPromise;
-    const available: ReviewerJob[] = [];
-    for (
-      let index = 0;
-      completedProbeResults !== undefined && index < jobs.length;
-      index += 1
-    ) {
-      const job = jobs[index]!;
-      const probe = completedProbeResults[index]!;
-      if (probe.status === "rejected") {
-        const failure =
-          job.creationFailure ??
-          (probe.reason instanceof ProbeTimeoutError
-            ? adapterFailure.timeout(probe.reason.message)
-            : adapterFailure.unavailable(
-                probe.reason instanceof Error
-                  ? probe.reason.message
-                  : probe.reason,
-              ));
-        await finalizeIncomplete(
-          job.reviewer.id,
-          interrupted ? adapterFailure.cancelled() : failure,
-        );
-        continue;
-      }
-      state.setCapabilities(job.reviewer.id, probe.value);
-      const failure = probeFailure(probe.value);
-      if (failure !== undefined)
-        await finalizeIncomplete(job.reviewer.id, failure);
-      else {
-        state.transition(job.reviewer.id, "queued");
-        const queuedMessage = "Ready and waiting for an execution slot.";
-        state.recordActivity(job.reviewer.id, queuedMessage);
-        await emit({
-          event: "reviewer.progress",
-          reviewer_id: job.reviewer.id,
-          data: { phase: "queued", message: queuedMessage },
-        });
-        available.push(job);
-      }
-    }
-
-    let nextJob = 0;
     const execute = async (job: ReviewerJob): Promise<void> => {
       const reviewer = job.reviewer;
       const controller = new AbortController();
@@ -996,18 +929,188 @@ export async function runReviewRound({
       }
     };
 
-    const workers = Array.from(
-      { length: Math.min(config.execution.max_concurrency, available.length) },
-      () => {
-        return (async () => {
+    const jobsByAgent = new Map<string, ReviewerJob[]>();
+    for (const job of jobs) {
+      const agentId = job.reviewer.agentId ?? job.reviewer.id;
+      const chain = jobsByAgent.get(agentId) ?? [];
+      chain.push(job);
+      jobsByAgent.set(agentId, chain);
+    }
+    for (const chain of jobsByAgent.values()) {
+      chain.sort(
+        (left, right) =>
+          (left.reviewer.modelIndex ?? 0) - (right.reviewer.modelIndex ?? 0),
+      );
+    }
+
+    const skipRemaining = async (
+      chain: readonly ReviewerJob[],
+      startIndex: number,
+      outcome: "findings" | "incomplete",
+      blockedByReviewerId: string,
+    ): Promise<void> => {
+      for (let index = startIndex; index < chain.length; index += 1) {
+        const reviewer = chain[index]!.reviewer;
+        state.skip(
+          reviewer.id,
+          outcome === "findings" ? "prior_findings" : "prior_incomplete",
+          blockedByReviewerId,
+        );
+        await emit({
+          event: "reviewer.skipped",
+          reviewer_id: reviewer.id,
+          data: {
+            adapter: reviewer.adapterId,
+            model: reviewer.model,
+            elapsed_ms: 0,
+            reason:
+              outcome === "findings" ? "prior_findings" : "prior_incomplete",
+            blocked_by_reviewer_id: blockedByReviewerId,
+          },
+        });
+      }
+    };
+
+    const prepareJob = async (
+      job: ReviewerJob,
+      chain: readonly ReviewerJob[],
+      index: number,
+    ): Promise<boolean> => {
+      const reviewer = job.reviewer;
+      if (index > 0) state.transition(reviewer.id, "queued");
+      state.transition(reviewer.id, "probing");
+      activeProbes.add(reviewer.id);
+      const probingMessage =
+        "Checking the configured adapter, authentication, model, and isolation capability.";
+      state.recordActivity(reviewer.id, probingMessage);
+      await emit({
+        event: "reviewer.progress",
+        reviewer_id: reviewer.id,
+        data: { phase: "probing", message: probingMessage },
+      });
+      let capabilities: AdapterCapabilities;
+      try {
+        capabilities = await probe(job, jobs.indexOf(job));
+      } catch (reason) {
+        activeProbes.delete(reviewer.id);
+        const failure =
+          job.creationFailure ??
+          (reason instanceof ProbeTimeoutError
+            ? adapterFailure.timeout(reason.message)
+            : adapterFailure.unavailable(
+                reason instanceof Error ? reason.message : reason,
+              ));
+        await finalizeIncomplete(
+          reviewer.id,
+          interrupted ? adapterFailure.cancelled() : failure,
+        );
+        if (!interrupted) {
+          await skipRemaining(chain, index + 1, "incomplete", reviewer.id);
+        }
+        return false;
+      }
+      activeProbes.delete(reviewer.id);
+      state.setCapabilities(reviewer.id, capabilities);
+      const failure = probeFailure(capabilities);
+      if (failure !== undefined) {
+        await finalizeIncomplete(reviewer.id, failure);
+        await skipRemaining(chain, index + 1, "incomplete", reviewer.id);
+        return false;
+      }
+      state.transition(reviewer.id, "queued");
+      const queuedMessage =
+        index === 0
+          ? "Ready and waiting for an execution slot."
+          : "Prior model passed without findings; this fallback model is ready.";
+      state.recordActivity(reviewer.id, queuedMessage);
+      await emit({
+        event: "reviewer.progress",
+        reviewer_id: reviewer.id,
+        data: { phase: "queued", message: queuedMessage },
+      });
+      return true;
+    };
+
+    const runAgentChain = async (
+      chain: readonly ReviewerJob[],
+    ): Promise<void> => {
+      for (let index = 0; index < chain.length && !interrupted; index += 1) {
+        const job = chain[index]!;
+        const reviewer = job.reviewer;
+        if (index > 0 && !(await prepareJob(job, chain, index))) return;
+        await execute(job);
+        if (interrupted) return;
+        const outcome = terminalOutcome(state, reviewer.id);
+        if (outcome !== "clear") {
+          await skipRemaining(chain, index + 1, outcome, reviewer.id);
+          return;
+        }
+      }
+    };
+
+    probeAbort.dispose();
+    const chains = [...jobsByAgent.values()];
+    const firstProbeOutcomes: Array<{
+      chain: ReviewerJob[];
+      available: boolean;
+    }> = new Array(chains.length);
+    let nextFirstProbe = 0;
+    const firstProbeWorkers = Array.from(
+      { length: Math.min(config.execution.max_concurrency, chains.length) },
+      () =>
+        (async () => {
           while (!interrupted) {
-            const job = available[nextJob];
-            if (job === undefined) return;
-            nextJob += 1;
-            await execute(job);
+            const index = nextFirstProbe;
+            const chain = chains[index];
+            if (chain === undefined) return;
+            nextFirstProbe += 1;
+            firstProbeOutcomes[index] = {
+              chain,
+              available: await prepareJob(chain[0]!, chain, 0),
+            };
           }
-        })();
+        })(),
+    );
+    await Promise.race([Promise.all(firstProbeWorkers), probeAbort.promise]);
+    if (interrupted) {
+      await stopPreflightHeartbeat();
+      const activeProbeOperations = probeOperations.filter(
+        (operation): operation is Promise<void> => operation !== undefined,
+      );
+      let graceTimer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        Promise.all(activeProbeOperations),
+        new Promise<void>((resolve) => {
+          graceTimer = clock.setTimeout(
+            resolve,
+            config.execution.shutdown_grace_period_ms,
+          );
+        }),
+      ]);
+      if (graceTimer !== undefined) clock.clearTimeout(graceTimer);
+      await Promise.all(jobs.map((job, index) => cleanupProbe(job, index)));
+      await Promise.all(firstProbeWorkers);
+    }
+    const runnableChains = firstProbeOutcomes
+      .filter((outcome) => outcome.available)
+      .map((outcome) => outcome.chain);
+    let nextChain = 0;
+    const workers = Array.from(
+      {
+        length: Math.min(
+          config.execution.max_concurrency,
+          runnableChains.length,
+        ),
       },
+      () =>
+        (async () => {
+          while (!interrupted) {
+            const chain = runnableChains[nextChain];
+            if (chain === undefined) return;
+            nextChain += 1;
+            await runAgentChain(chain);
+          }
+        })(),
     );
     const workersPromise = Promise.allSettled(workers);
     let workersSettled = false;
@@ -1052,7 +1155,8 @@ export async function runReviewRound({
       for (const reviewer of state.reviewers) {
         if (
           reviewer.status !== "completed" &&
-          reviewer.status !== "incomplete"
+          reviewer.status !== "incomplete" &&
+          reviewer.status !== "skipped"
         ) {
           await finalizeIncomplete(
             reviewer.reviewer.id,

@@ -123,21 +123,44 @@ describe("global configuration", () => {
 
     const resolved = resolveConfig({ trusted: config, workspace });
     expect(
-      resolved.reviewers.map(({ id, adapterId, model, effort }) => ({
-        id,
-        adapterId,
-        model,
-        effort,
-      })),
+      resolved.reviewers.map(
+        ({
+          id,
+          agentId,
+          modelIndex,
+          modelCount,
+          previousReviewerId,
+          adapterId,
+          model,
+          effort,
+        }) => ({
+          id,
+          agentId,
+          modelIndex,
+          modelCount,
+          previousReviewerId,
+          adapterId,
+          model,
+          effort,
+        }),
+      ),
     ).toEqual([
       {
         id: "gemini::opus",
+        agentId: "gemini",
+        modelIndex: 0,
+        modelCount: 2,
+        previousReviewerId: undefined,
         adapterId: "gateway",
         model: "claude-opus",
         effort: "high",
       },
       {
         id: "gemini::grok",
+        agentId: "gemini",
+        modelIndex: 1,
+        modelCount: 2,
+        previousReviewerId: "gemini::opus",
         adapterId: "claude",
         model: "grok-code",
         effort: "max",

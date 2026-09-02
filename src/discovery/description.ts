@@ -89,7 +89,7 @@ export async function describeTool(options: DescribeToolOptions = {}) {
     streams: {
       review: {
         stdin: "empty-or-review-request-json-v2" as const,
-        stdout: "public-events-jsonl-v3" as const,
+        stdout: "public-events-jsonl-v4" as const,
         stderr: "diagnostic-jsonl-v1" as const,
         final_event: "run.completed" as const,
       },
@@ -113,11 +113,17 @@ export async function describeTool(options: DescribeToolOptions = {}) {
         "Configuration and workspace selection are valid; adapters, credentials, models, and isolation are probed when review starts.",
     },
     protocol: {
-      version: "3" as const,
+      version: "4" as const,
       request_version: "2" as const,
       consistency_mode: "live_worktree" as const,
       maximum_request_bytes: 8 * 1024 * 1024,
       outcome_precedence: ["incomplete", "findings", "passed"] as const,
+      model_fallback: {
+        parallelism: "across_agents" as const,
+        order: "configured_model_runs" as const,
+        advance_only_after: "completed_pass_with_zero_findings" as const,
+        stop_agent_after: ["findings", "incomplete"] as const,
+      },
       progress: {
         phases: [
           "queued",

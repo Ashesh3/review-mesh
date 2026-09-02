@@ -4,7 +4,7 @@ export type JsonValue =
   null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 export const protocolVersionSchema = z.literal("1");
-export const publicEventVersionSchema = z.literal("3");
+export const publicEventVersionSchema = z.literal("4");
 export const runStatusSchema = z.enum(["passed", "findings", "incomplete"]);
 export const isolationPolicySchema = z.enum([
   "prefer_enforced",
@@ -235,10 +235,12 @@ export const reviewerPhaseSchema = z.enum([
 
 const suiteSchema = z.strictObject({
   total: nonNegativeInteger,
+  deferred: nonNegativeInteger,
   queued: nonNegativeInteger,
   running: nonNegativeInteger,
   completed: nonNegativeInteger,
   incomplete: nonNegativeInteger,
+  skipped: nonNegativeInteger,
 });
 
 const reviewerTerminalRecordSchema = z.discriminatedUnion("status", [
@@ -262,6 +264,15 @@ const reviewerTerminalRecordSchema = z.discriminatedUnion("status", [
     message: boundedMessage,
     retryable: z.boolean(),
   }),
+  z.strictObject({
+    reviewer_id: nonEmptyString,
+    status: z.literal("skipped"),
+    adapter: nonEmptyString,
+    model: nonEmptyString,
+    elapsed_ms: nonNegativeInteger,
+    reason: z.enum(["prior_findings", "prior_incomplete"]),
+    blocked_by_reviewer_id: nonEmptyString,
+  }),
 ]);
 
 const eventEnvelopeSchema = z.strictObject({
@@ -277,6 +288,11 @@ const eventEnvelopeSchema = z.strictObject({
 
 const suiteReviewerSchema = z.strictObject({
   id: nonEmptyString,
+  agent_id: nonEmptyString,
+  model_index: nonNegativeInteger,
+  model_count: positiveInteger,
+  previous_reviewer_id: nonEmptyString.optional(),
+  activation: z.enum(["immediate", "after_clear_pass"]),
   purpose: nonEmptyString,
   adapter: nonEmptyString,
   adapter_type: adapterTypeSchema,
@@ -325,6 +341,34 @@ const runCompletedDataSchema = z
       : hasFindings
         ? "findings"
         : "passed";
+
+    const terminalCounts = {
+      completed: value.reviewers.filter(
+        (reviewer) => reviewer.status === "completed",
+      ).length,
+      incomplete: value.reviewers.filter(
+        (reviewer) => reviewer.status === "incomplete",
+      ).length,
+      skipped: value.reviewers.filter(
+        (reviewer) => reviewer.status === "skipped",
+      ).length,
+    };
+
+    if (
+      value.suite.total !== value.reviewers.length ||
+      value.suite.deferred !== 0 ||
+      value.suite.queued !== 0 ||
+      value.suite.running !== 0 ||
+      value.suite.completed !== terminalCounts.completed ||
+      value.suite.incomplete !== terminalCounts.incomplete ||
+      value.suite.skipped !== terminalCounts.skipped
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message:
+          "run.completed suite counts must match its terminal reviewer records",
+      });
+    }
 
     if (value.status !== expectedStatus) {
       ctx.addIssue({
@@ -401,6 +445,16 @@ const publicEventSchemas = [
       reason: incompleteReasonSchema,
       message: boundedMessage,
       retryable: z.boolean(),
+    }),
+  }),
+  eventEnvelopeSchema.extend({
+    event: z.literal("reviewer.skipped"),
+    data: z.strictObject({
+      adapter: nonEmptyString,
+      model: nonEmptyString,
+      elapsed_ms: nonNegativeInteger,
+      reason: z.enum(["prior_findings", "prior_incomplete"]),
+      blocked_by_reviewer_id: nonEmptyString,
     }),
   }),
   eventEnvelopeSchema.extend({

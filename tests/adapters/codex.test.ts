@@ -7,6 +7,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
 import type { CodexOptions, ThreadEvent } from "@openai/codex-sdk";
 import { execa } from "execa";
@@ -30,6 +31,8 @@ import type { ResolvedContext } from "../../src/context/resolve.js";
 import { reviewerResultJsonSchema } from "../../src/protocol/json-schema.js";
 import { buildReviewerPrompt } from "../../src/protocol/prompt.js";
 import type { ReviewerResult } from "../../src/protocol/schemas.js";
+
+const require = createRequire(import.meta.url);
 import {
   passResult,
   resolvedContext,
@@ -872,7 +875,7 @@ describe("Codex SDK facade and registry", () => {
     );
     const environment = buildAllowlistedEnvironment([], process.env);
     environment.CODEX_HOME = codexHome;
-    const codexCli = resolve("node_modules/@openai/codex/bin/codex.js");
+    const codexCli = require.resolve("@openai/codex/bin/codex.js");
     const overrides = [
       "project_doc_max_bytes=0",
       "mcp_servers={}",

@@ -10,6 +10,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
@@ -23,6 +24,8 @@ import {
 import { installAbortHandlers, runCli as runCliEntry } from "../../src/cli.js";
 
 const projectRoot = resolve(import.meta.dirname, "../..");
+const require = createRequire(import.meta.url);
+const tscCli = require.resolve("typescript/bin/tsc");
 const cliEntry = join(projectRoot, "src", "cli.ts");
 const compiledCliEntry = join(projectRoot, "dist", "cli.js");
 const commandFixtureUrl = pathToFileURL(
@@ -346,7 +349,7 @@ afterEach(async () => {
 });
 
 describe("review-mesh review", () => {
-  it("fans one configured agent out into independent model reviewer runs", async () => {
+  it("runs one agent's models in ordered clear-pass fallback", async () => {
     const fixture = await createFixture([], multiModelConfig());
 
     const result = await runCli(fixture);
@@ -359,12 +362,21 @@ describe("review-mesh review", () => {
         reviewers: [
           {
             id: "architecture::opus",
+            agent_id: "architecture",
+            model_index: 0,
+            model_count: 2,
+            activation: "immediate",
             adapter: "opus",
             model: "claude-opus-test",
             effort: "high",
           },
           {
             id: "architecture::grok",
+            agent_id: "architecture",
+            model_index: 1,
+            model_count: 2,
+            previous_reviewer_id: "architecture::opus",
+            activation: "after_clear_pass",
             adapter: "grok",
             model: "grok-test",
             effort: "medium",
@@ -496,12 +508,12 @@ describe("review-mesh review", () => {
       streams: {
         review: {
           stdin: "empty-or-review-request-json-v2",
-          stdout: "public-events-jsonl-v3",
+          stdout: "public-events-jsonl-v4",
           final_event: "run.completed",
         },
       },
       protocol: {
-        version: "3",
+        version: "4",
         request_version: "2",
         review_scope: {
           default_mode: "changes",
@@ -577,16 +589,12 @@ describe("review-mesh review", () => {
 
   it("runs the compiled CLI with valid JSONL and a passed terminal", async () => {
     const build = await new Promise<ProcessResult>((resolveBuild, reject) => {
-      const child = spawn(
-        process.execPath,
-        ["node_modules/typescript/bin/tsc", "-p", "tsconfig.json"],
-        {
-          cwd: projectRoot,
-          env: process.env,
-          stdio: "pipe",
-          windowsHide: true,
-        },
-      );
+      const child = spawn(process.execPath, [tscCli, "-p", "tsconfig.json"], {
+        cwd: projectRoot,
+        env: process.env,
+        stdio: "pipe",
+        windowsHide: true,
+      });
       void collectProcess(child).then(resolveBuild, reject);
     });
     expect(build).toMatchObject({ exitCode: 0, signal: null });

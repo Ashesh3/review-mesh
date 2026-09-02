@@ -17,8 +17,8 @@ export type HelpTopic =
 const overview = `Review Mesh ${reviewMeshVersion}
 
 Agent-first multi-runtime code review gate. Review Mesh runs the complete trusted
-reviewer suite selected for a workspace, streams factual JSONL progress, waits
-for every reviewer, and exits only after a terminal run.completed event.
+agent suite selected for a workspace, streams factual JSONL progress, waits for
+each agent's executed model chain, and exits only after run.completed.
 
 USAGE
   review-mesh review [WORKSPACE]
@@ -41,9 +41,10 @@ AGENT QUICK START
      With empty stdin, Review Mesh reviews only the current Git change set above
      the inferred default branch, including local staged/unstaged/untracked work.
      With JSON on stdin, send the explicit v2 request described below.
-  4. Read stdout one JSON object per line until run.completed. Do not stop after
-     a finding: the remaining mandatory reviewers still run. Heartbeats mean the
-     process is alive even when a reviewer has no new activity to report.
+  4. Read stdout one JSON object per line until run.completed. Agents run in
+     parallel, but each multi-model agent advances through model_runs in order
+     only while the previous model completes with a clear pass. A finding or
+     incomplete result stops that agent's fallback chain; other agents continue.
 
 DISCOVERY COMMANDS
   describe   Resolve the suite selected for a workspace without starting it.
@@ -199,7 +200,7 @@ validation as final authority.
 `,
   events: `REVIEW-MESH EVENTS
 
-Every non-empty review stdout line is one schema-version 3 JSON object. Events
+Every non-empty review stdout line is one schema-version 4 JSON object. Events
 share run_id, have strictly increasing seq values, and include timestamps.
 
 Sequence and meaning:
@@ -211,12 +212,13 @@ Sequence and meaning:
   reviewer.heartbeat   Liveness during probes, queueing, and active review.
   reviewer.completed   Valid terminal result for one reviewer.
   reviewer.incomplete  Reviewer/runtime did not return a valid result.
+  reviewer.skipped     A later fallback was not needed after findings/failure.
   run.completed        Final status, exit code, and every terminal record.
 
-Always continue reading until run.completed or process termination. A finding is
-not terminal for the suite. Review Mesh reports factual phases and elapsed time,
-never invented percentages. Use 'review-mesh schema events --json' for the exact
-machine contract.
+Always continue reading until run.completed or process termination. A finding
+stops later models only for the same logical agent; other agents continue.
+Review Mesh reports factual phases and elapsed time, never invented percentages.
+Use 'review-mesh schema events --json' for the exact machine contract.
 `,
   adapters: `REVIEW-MESH ADAPTERS
 
@@ -234,11 +236,14 @@ optional effort, or ordered model_runs with explicit run ids, exact models,
 optional effort, and optional per-run adapter overrides. Multi-model agents
 expand to concrete reviewer ids such as architecture::opus and
 architecture::grok. Existing scalar agents retain their original ids. Global
-max_concurrency determines whether the expanded runs execute in parallel or
-sequentially. Use 'review-mesh schema config --json' for the authoritative
-shapes, 'review-mesh config copilot models --json' for account-specific Copilot
-models, and 'review-mesh describe . --json' for the exact effective roster.
-Provider readiness is probed when review starts.
+max_concurrency applies across logical agents. Each agent starts only its first
+configured model; it advances to the next model only after a valid pass with no
+actionable findings. Findings or an incomplete run stop that agent's remaining
+models, which are reported as skipped. Use 'review-mesh schema config --json'
+for the authoritative shapes, 'review-mesh config copilot models --json' for
+account-specific Copilot models, and 'review-mesh describe . --json' for the
+exact effective roster. Provider readiness is probed when each model becomes
+eligible to run.
 `,
   "command-adapter": `REVIEW-MESH COMMAND ADAPTER PROTOCOL
 
@@ -291,7 +296,7 @@ documents are promoted to v4 when saved. Use 'review-mesh schema config --json' 
 `,
   "exit-codes": `REVIEW-MESH EXIT CODES
 
-  0  passed       Every mandatory reviewer completed with no findings.
+  0  passed       Every executed reviewer completed with no findings.
   1  findings     Every reviewer completed; at least one found a defect.
   2  no run       Invalid usage, request, configuration, or project assignment.
   3  incomplete   A reviewer/runtime failed to produce a valid terminal result.

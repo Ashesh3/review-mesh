@@ -254,7 +254,7 @@ export function createEventWriter({
 
         const event = publicEventSchema.parse({
           ...draft,
-          schema_version: "3",
+          schema_version: "4",
           run_id: runId,
           ...(requestId === undefined ? {} : { request_id: requestId }),
           seq: ++sequence,

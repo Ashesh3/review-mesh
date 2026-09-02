@@ -51,6 +51,7 @@ export function renderDescription(
     lines.push(
       `${index + 1}. ${reviewer.id} — ${reviewer.purpose}`,
       `   model=${reviewer.model} adapter=${reviewer.adapter_id} (${reviewer.adapter_type})${reviewer.effort === undefined ? "" : ` effort=${reviewer.effort}`}`,
+      `   activation=${reviewer.activation}${reviewer.previous_reviewer_id === undefined ? "" : ` after=${reviewer.previous_reviewer_id}`}`,
       `   isolation=${reviewer.isolation_policy} timeout_ms=${reviewer.timeout_ms}`,
     );
   });

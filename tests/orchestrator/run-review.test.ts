@@ -161,7 +161,15 @@ describe("runReviewRound", () => {
       events.find((event) => event.event === "reviewer.heartbeat"),
     ).toMatchObject({
       data: {
-        suite: { total: 3, queued: 1, running: 2, completed: 0, incomplete: 0 },
+        suite: {
+          total: 3,
+          deferred: 0,
+          queued: 1,
+          running: 2,
+          completed: 0,
+          incomplete: 0,
+          skipped: 0,
+        },
       },
     });
     await vi.advanceTimersByTimeAsync(5);
@@ -277,7 +285,15 @@ describe("runReviewRound", () => {
         phase: "probing",
         last_activity_message:
           "Checking the configured adapter, authentication, model, and isolation capability.",
-        suite: { total: 1, queued: 0, running: 1, completed: 0, incomplete: 0 },
+        suite: {
+          total: 1,
+          deferred: 0,
+          queued: 0,
+          running: 1,
+          completed: 0,
+          incomplete: 0,
+          skipped: 0,
+        },
       },
     });
     expect(JSON.stringify(events)).not.toMatch(/percent/i);
@@ -305,6 +321,143 @@ describe("runReviewRound", () => {
     expect(second.runCalls).toBe(1);
     expect(completion.status).toBe("findings");
     expect(events.at(-1)?.event).toBe("run.completed");
+  });
+
+  it("advances each multi-model agent only after a clear pass while agents run in parallel", async () => {
+    const architectureFirst = fakeAdapterReturning(
+      passResult("architecture first"),
+      20,
+    );
+    const architectureSecond = fakeAdapterReturning(
+      failResult("architecture-second"),
+      10,
+    );
+    const architectureThird = fakeAdapterReturning(passResult("unused"), 1);
+    const securityFirst = fakeAdapterReturning(passResult("security first"), 5);
+    const securitySecond = fakeAdapterReturning(
+      passResult("security second"),
+      5,
+    );
+    const events: PublicEvent[] = [];
+    const completionPromise = runReviewRound(
+      roundInput({
+        adapters: {
+          architectureFirst,
+          architectureSecond,
+          architectureThird,
+          securityFirst,
+          securitySecond,
+        },
+        onEvent: (event) => events.push(event),
+        config: {
+          execution: { max_concurrency: 2 },
+          reviewers: [
+            {
+              agentId: "architecture",
+              modelIndex: 0,
+              modelCount: 3,
+            },
+            {
+              agentId: "architecture",
+              modelIndex: 1,
+              modelCount: 3,
+              previousReviewerId: "architectureFirst",
+            },
+            {
+              agentId: "architecture",
+              modelIndex: 2,
+              modelCount: 3,
+              previousReviewerId: "architectureSecond",
+            },
+            { agentId: "security", modelIndex: 0, modelCount: 2 },
+            {
+              agentId: "security",
+              modelIndex: 1,
+              modelCount: 2,
+              previousReviewerId: "securityFirst",
+            },
+          ],
+        },
+      }),
+    );
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(architectureFirst.runCalls).toBe(1);
+    expect(securityFirst.runCalls).toBe(1);
+    expect(architectureSecond.runCalls).toBe(0);
+    expect(securitySecond.runCalls).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(5);
+    expect(securitySecond.runCalls).toBe(1);
+    expect(architectureSecond.runCalls).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(15);
+    expect(architectureSecond.runCalls).toBe(1);
+    await vi.runAllTimersAsync();
+    const completion = await completionPromise;
+
+    expect(architectureThird.probeCalls).toHaveLength(0);
+    expect(architectureThird.runCalls).toBe(0);
+    expect(completion.status).toBe("findings");
+    expect(completion.reviewers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          reviewer_id: "architectureThird",
+          status: "skipped",
+          reason: "prior_findings",
+          blocked_by_reviewer_id: "architectureSecond",
+        }),
+      ]),
+    );
+    expect(
+      events.filter((event) => event.event === "reviewer.skipped"),
+    ).toEqual([
+      expect.objectContaining({
+        reviewer_id: "architectureThird",
+        data: expect.objectContaining({
+          reason: "prior_findings",
+          blocked_by_reviewer_id: "architectureSecond",
+        }),
+      }),
+    ]);
+  });
+
+  it("stops a model fallback chain after an incomplete run", async () => {
+    const first = new FakeAdapter({
+      capabilities: {
+        ...availableCapabilities,
+        model_available: false,
+        message: "First fallback model is unavailable.",
+      },
+    });
+    const second = fakeAdapterReturning(passResult("unused"), 1);
+    const completionPromise = runReviewRound(
+      roundInput({
+        adapters: { first, second },
+        config: {
+          reviewers: [
+            { agentId: "architecture", modelIndex: 0, modelCount: 2 },
+            {
+              agentId: "architecture",
+              modelIndex: 1,
+              modelCount: 2,
+              previousReviewerId: "first",
+            },
+          ],
+        },
+      }),
+    );
+
+    await vi.runAllTimersAsync();
+    const completion = await completionPromise;
+    expect(second.probeCalls).toHaveLength(0);
+    expect(second.runCalls).toBe(0);
+    expect(completion.status).toBe("incomplete");
+    expect(completion.reviewers[1]).toMatchObject({
+      status: "skipped",
+      reason: "prior_incomplete",
+      blocked_by_reviewer_id: "first",
+    });
   });
 
   it("runs available reviewers when another probe is definitively unavailable", async () => {
@@ -449,7 +602,15 @@ describe("runReviewRound", () => {
         phase: "reviewing",
         elapsed_ms: 100,
         last_activity_message: expect.any(String),
-        suite: { total: 1, queued: 0, running: 1, completed: 0, incomplete: 0 },
+        suite: {
+          total: 1,
+          deferred: 0,
+          queued: 0,
+          running: 1,
+          completed: 0,
+          incomplete: 0,
+          skipped: 0,
+        },
       },
     });
     expect(JSON.stringify(heartbeats)).not.toMatch(/percent/i);

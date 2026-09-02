@@ -133,10 +133,12 @@ describe("suite state", () => {
     );
     expect(summarizeSuite(state)).toEqual({
       total: 5,
+      deferred: 0,
       queued: 1,
       running: 2,
       completed: 1,
       incomplete: 1,
+      skipped: 0,
     });
   });
 

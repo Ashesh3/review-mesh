@@ -53,6 +53,10 @@ function configuredAdapter(
 
 function resolveReviewer(
   id: string,
+  agentId: string,
+  modelIndex: number,
+  modelCount: number,
+  previousReviewerId: string | undefined,
   profile: ReviewerProfileBase,
   adapterId: string,
   model: string,
@@ -67,6 +71,10 @@ function resolveReviewer(
   validateAdapterEffort(adapter.type, effort, `agent ${id}`);
   return {
     id,
+    agentId,
+    modelIndex,
+    modelCount,
+    ...(previousReviewerId === undefined ? {} : { previousReviewerId }),
     purpose: profile.purpose,
     adapterId,
     adapter,
@@ -92,13 +100,18 @@ function resolveAgent(
 ): ResolvedReviewer[] {
   configuredAdapter(id, profile.adapter, adapters);
   if ("model_runs" in profile) {
-    return profile.model_runs.map((run) => {
+    return profile.model_runs.map((run, index) => {
       const adapterId = run.adapter ?? profile.adapter;
       const label = `agent ${id} model run ${run.id}`;
       const adapter = configuredAdapter(id, adapterId, adapters, label);
       validateAdapterEffort(adapter.type, run.effort, label);
+      const reviewerId = `${id}::${run.id}`;
       return resolveReviewer(
-        `${id}::${run.id}`,
+        reviewerId,
+        id,
+        index,
+        profile.model_runs.length,
+        index === 0 ? undefined : `${id}::${profile.model_runs[index - 1]!.id}`,
         profile,
         adapterId,
         run.model,
@@ -111,6 +124,10 @@ function resolveAgent(
   return [
     resolveReviewer(
       id,
+      id,
+      0,
+      1,
+      undefined,
       profile,
       profile.adapter,
       profile.model,
@@ -168,6 +185,10 @@ function resolveV1(
     }
     const reviewer = resolveReviewer(
       definition.id,
+      definition.id,
+      0,
+      1,
+      undefined,
       profile,
       profile.adapter,
       profile.model,

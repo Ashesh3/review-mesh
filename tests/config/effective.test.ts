@@ -106,7 +106,7 @@ describe("effective configuration description", () => {
     expect(encoded).not.toContain("private_runtime");
   });
 
-  it("describes each expanded model run as an independent reviewer", async () => {
+  it("describes each expanded model run with its fallback activation", async () => {
     const { file, workspace } = await fixture();
     const source = await readFile(file, "utf8");
     await writeFile(
@@ -127,8 +127,24 @@ describe("effective configuration description", () => {
     expect(result).toMatchObject({
       valid: true,
       reviewers: [
-        { id: "reviewer::opus", model: "claude-opus" },
-        { id: "reviewer::grok", model: "grok-code", effort: "high" },
+        {
+          id: "reviewer::opus",
+          agent_id: "reviewer",
+          model_index: 0,
+          model_count: 2,
+          activation: "immediate",
+          model: "claude-opus",
+        },
+        {
+          id: "reviewer::grok",
+          agent_id: "reviewer",
+          model_index: 1,
+          model_count: 2,
+          previous_reviewer_id: "reviewer::opus",
+          activation: "after_clear_pass",
+          model: "grok-code",
+          effort: "high",
+        },
       ],
     });
   });

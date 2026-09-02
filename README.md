@@ -1,6 +1,9 @@
 # Review Mesh
 
-Review Mesh is an agent-first code-review gate. One command runs every reviewer in a trusted suite, streams machine-readable JSONL progress, and succeeds only when every reviewer completes with zero actionable findings.
+Review Mesh is an agent-first code-review gate. One command runs every logical
+agent in a trusted suite, streams machine-readable JSONL progress, and succeeds
+only when every agent's executed model chain completes with zero actionable
+findings and no incomplete runs.
 
 ```text
 current directory or request JSON -> review-mesh review -> trusted project/default roster -> live JSONL -> run.completed
@@ -10,7 +13,7 @@ It is designed for automation, coding agents, CI, and local review loops:
 
 - One stateless review round per invocation.
 - Trusted global/default or project-specific agent rosters; callers cannot override them through review input.
-- Parallel independent reviews across different models or runtimes.
+- Parallel logical agents with ordered per-agent model fallback across runtimes.
 - Strict structured findings with evidence and optional file/line locations.
 - `incomplete > findings > passed` outcome precedence.
 - No source edits by Review Mesh.
@@ -60,8 +63,9 @@ For an AI caller, identity and scope are separate:
 
 ### Download a standalone executable
 
-Release `v4.0.1` provides project-name configuration, multi-model agents,
-per-reviewer gateway session affinity, the agent-first CLI, public event protocol v3, and
+Release `v5.0.0` provides ordered multi-model fallback, project-name
+configuration, per-reviewer gateway session affinity, the agent-first CLI,
+public event protocol v4, and
 self-contained Bun executables that do not require Node.js or Bun:
 
 - Windows x64: `review-mesh-windows-x64.exe`
@@ -70,14 +74,14 @@ self-contained Bun executables that do not require Node.js or Bun:
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v4.0.1/review-mesh-windows-x64.exe -OutFile review-mesh.exe
+Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v5.0.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
 .\review-mesh.exe review
 ```
 
 Linux:
 
 ```bash
-curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v4.0.1/review-mesh-linux-x64
+curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v5.0.0/review-mesh-linux-x64
 chmod +x ./review-mesh-linux-x64
 ./review-mesh-linux-x64 review
 ```
@@ -327,8 +331,8 @@ instructions = "Focus on browser compatibility, accessibility, and state-managem
 
 ## Run one agent through multiple models
 
-An agent can keep one purpose and instruction set while creating several
-independent model runs. Use `model_runs` instead of the scalar `model` and
+An agent can keep one purpose and instruction set while configuring several
+ordered model fallbacks. Use `model_runs` instead of the scalar `model` and
 `effort` fields:
 
 ```toml
@@ -371,20 +375,22 @@ final terminal records; the exact model is also reported separately. Existing
 single-model agents retain their original unqualified reviewer IDs and remain
 fully supported.
 
-Every expanded run is mandatory and receives the same purpose, trusted
-instructions, isolation policy, runtime options, project guidance, and
-per-run timeout. A finding from either model makes the round `findings`; an
-incomplete run makes the round `incomplete`, while completed findings from the
-other model are retained. Review Mesh does not merge or deduplicate findings
-between models.
+The runs form an ordered fallback chain. Review Mesh starts every logical agent
+in parallel (subject to `execution.max_concurrency`) using only that agent's
+first configured model. A later model becomes eligible only after the previous
+model completed with a valid `pass` and zero actionable findings. A finding
+stops that agent immediately and reports all later models as `skipped` with
+`prior_findings`; an incomplete result likewise stops the chain with
+`prior_incomplete`. Other agents continue independently through their own
+chains. This preserves broad parallel review while avoiding unnecessary model
+calls once an agent has already found something actionable.
 
-`execution.max_concurrency` controls scheduling globally. A value of `2` or
-higher allows both runs above to execute in parallel when slots are available;
-`1` runs the entire resolved suite sequentially. There is no separate
-per-agent serial/parallel switch. Each model run is a complete provider request,
-so multi-model agents proportionally increase token usage, provider quota, and
-potential cost. Concurrent live-worktree runs can also observe different file
-states if another process modifies the workspace during the round.
+Every model that actually runs receives the same purpose, trusted instructions,
+isolation policy, runtime options, project guidance, and per-run timeout.
+Review Mesh does not merge or deduplicate findings between models. Each fallback
+is a complete provider request, so agents that repeatedly pass can still consume
+additional tokens, quota, and cost. Concurrent logical agents can also observe
+different live-worktree states if another process modifies the workspace.
 
 The gateway adapter exposes exactly three bounded reviewer tools:
 
@@ -585,17 +591,18 @@ For a truly one-file deployment, use `openai_compatible`. Provider-native adapte
 
 ## JSONL events
 
-Every non-empty stdout line is one strict schema-version `3` JSON object. Review
+Every non-empty stdout line is one strict schema-version `4` JSON object. Review
 requests use schema version `2`, while reviewer-result objects remain schema
 version `1`. All events in a
 run share one `run_id`; `seq` starts at `1` and increases monotonically;
 `run.completed` is final once a valid run begins and stdout remains available.
-Immediately after suite resolution, each concrete reviewer reports capability
-probing, then readiness/queue state. A multi-model agent contributes one concrete
-reviewer and one unit to `suite.total` for every model run, identified as
-`agent-id::run-id`. Heartbeats also cover silent probes and queued reviewers, so
-a caller can distinguish slow work from a stuck process without relying on
-invented percentages.
+Immediately after suite resolution, each concrete model run is listed with its
+logical `agent_id`, zero-based `model_index`, `model_count`, activation policy,
+and predecessor. Only first models probe immediately; later models probe after
+their predecessor passes clearly. A multi-model agent contributes one unit to
+`suite.total` for every configured run, identified as `agent-id::run-id`.
+Heartbeats and suite summaries distinguish deferred, queued, running, completed,
+incomplete, and skipped runs without inventing percentages.
 
 | Event                 | Meaning                                                     |
 | --------------------- | ----------------------------------------------------------- |
@@ -607,13 +614,14 @@ invented percentages.
 | `reviewer.heartbeat`  | Liveness, elapsed time, and suite summary.                  |
 | `reviewer.completed`  | One strict reviewer result.                                 |
 | `reviewer.incomplete` | One reviewer failed to return a valid terminal result.      |
+| `reviewer.skipped`    | A later model was bypassed after prior findings/failure.    |
 | `run.completed`       | Final classification plus every reviewer terminal record.   |
 
 Example final event:
 
 ```json
 {
-  "schema_version": "3",
+  "schema_version": "4",
   "event": "run.completed",
   "run_id": "run_...",
   "seq": 23,
@@ -625,10 +633,12 @@ Example final event:
     "total_elapsed_ms": 26895,
     "suite": {
       "total": 1,
+      "deferred": 0,
       "queued": 0,
       "running": 0,
       "completed": 1,
-      "incomplete": 0
+      "incomplete": 0,
+      "skipped": 0
     },
     "reviewers": [
       {
@@ -671,8 +681,8 @@ Example final event:
 
 | Code | Classification | Meaning                                                         |
 | ---: | -------------- | --------------------------------------------------------------- |
-|  `0` | `passed`       | Every reviewer completed and reported zero actionable findings. |
-|  `1` | `findings`     | Every reviewer completed; one or more reported findings.        |
+|  `0` | `passed`       | Every executed run completed with zero actionable findings.     |
+|  `1` | `findings`     | One or more runs found defects; later same-agent runs may skip. |
 |  `2` | no run         | Invalid request, usage, global config, or project assignment.   |
 |  `3` | `incomplete`   | At least one reviewer/runtime did not return a valid result.    |
 |  `4` | interrupted    | Caller interrupted the round.                                   |

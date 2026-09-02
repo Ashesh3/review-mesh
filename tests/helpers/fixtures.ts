@@ -360,7 +360,7 @@ export function suiteState(reviewers: ReviewerTerminalRecord[]): SuiteState {
       state.transition(terminal.reviewer_id, "starting");
       state.transition(terminal.reviewer_id, "reviewing");
       state.complete(terminal.reviewer_id, terminal.result, terminal.isolation);
-    } else {
+    } else if (terminal.status === "incomplete") {
       state.incomplete(
         terminal.reviewer_id,
         {
@@ -369,6 +369,12 @@ export function suiteState(reviewers: ReviewerTerminalRecord[]): SuiteState {
           retryable: terminal.retryable,
         },
         terminal.isolation,
+      );
+    } else {
+      state.skip(
+        terminal.reviewer_id,
+        terminal.reason,
+        terminal.blocked_by_reviewer_id,
       );
     }
   }

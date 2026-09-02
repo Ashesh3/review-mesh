@@ -59,6 +59,11 @@ export interface EffectiveConfigDescription {
   diagnostics: { persist_runs: boolean; max_runs: number };
   reviewers: Array<{
     id: string;
+    agent_id: string;
+    model_index: number;
+    model_count: number;
+    previous_reviewer_id?: string;
+    activation: "immediate" | "after_clear_pass";
     purpose: string;
     adapter_id: string;
     adapter_type: AdapterRegistration["type"];
@@ -134,6 +139,14 @@ export function describeResolvedConfig(
     diagnostics: structuredClone(input.resolved.diagnostics),
     reviewers: input.resolved.reviewers.map((reviewer) => ({
       id: reviewer.id,
+      agent_id: reviewer.agentId ?? reviewer.id,
+      model_index: reviewer.modelIndex ?? 0,
+      model_count: reviewer.modelCount ?? 1,
+      ...(reviewer.previousReviewerId === undefined
+        ? {}
+        : { previous_reviewer_id: reviewer.previousReviewerId }),
+      activation:
+        (reviewer.modelIndex ?? 0) === 0 ? "immediate" : "after_clear_pass",
       purpose: reviewer.purpose,
       adapter_id: reviewer.adapterId,
       adapter_type: reviewer.adapter.type,

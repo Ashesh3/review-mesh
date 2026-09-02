@@ -11,6 +11,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -20,6 +21,8 @@ import {
 } from "../../src/protocol/schemas.js";
 
 const projectRoot = resolve(import.meta.dirname, "../..");
+const require = createRequire(import.meta.url);
+const tscCli = require.resolve("typescript/bin/tsc");
 const compiledCli = join(projectRoot, "dist", "cli.js");
 const fixtureUrl = pathToFileURL(
   join(projectRoot, "tests", "fixtures", "command-adapter.mjs"),
@@ -219,11 +222,11 @@ function processAlive(pid: number): boolean {
 }
 
 beforeAll(async () => {
-  const build = spawn(
-    process.execPath,
-    ["node_modules/typescript/bin/tsc", "-p", "tsconfig.json"],
-    { cwd: projectRoot, stdio: "pipe", windowsHide: true },
-  );
+  const build = spawn(process.execPath, [tscCli, "-p", "tsconfig.json"], {
+    cwd: projectRoot,
+    stdio: "pipe",
+    windowsHide: true,
+  });
   expect(await collect(build)).toMatchObject({ exitCode: 0, signal: null });
 }, 20_000);
 

@@ -181,11 +181,21 @@ describe("publicEventSchema", () => {
     retryable: true,
   };
 
+  const skippedReviewer = {
+    reviewer_id: "reviewer-2",
+    status: "skipped" as const,
+    adapter: "test",
+    model: "fallback-model",
+    elapsed_ms: 0,
+    reason: "prior_findings" as const,
+    blocked_by_reviewer_id: "reviewer-1",
+  };
+
   const runCompleted = (
     status: "passed" | "findings" | "incomplete",
     reviewers: readonly unknown[],
   ) => ({
-    schema_version: "3",
+    schema_version: "4",
     event: "run.completed",
     run_id: "run-1",
     seq: 1,
@@ -197,6 +207,7 @@ describe("publicEventSchema", () => {
       total_elapsed_ms: 1,
       suite: {
         total: reviewers.length,
+        deferred: 0,
         queued: 0,
         running: 0,
         completed: reviewers.filter(
@@ -212,6 +223,13 @@ describe("publicEventSchema", () => {
             reviewer !== null &&
             "status" in reviewer &&
             reviewer.status === "incomplete",
+        ).length,
+        skipped: reviewers.filter(
+          (reviewer) =>
+            typeof reviewer === "object" &&
+            reviewer !== null &&
+            "status" in reviewer &&
+            reviewer.status === "skipped",
         ).length,
       },
       reviewers,
@@ -242,9 +260,22 @@ describe("publicEventSchema", () => {
     expect(event.data.status).toBe("passed");
   });
 
+  it("accepts skipped fallbacks without changing findings precedence", () => {
+    const event = publicEventSchema.parse(
+      runCompleted("findings", [
+        completedReviewer(failedResult),
+        skippedReviewer,
+      ]),
+    );
+    if (event.event !== "run.completed") {
+      throw new Error("expected a run.completed event");
+    }
+    expect(event.data.suite.skipped).toBe(1);
+  });
+
   it("accepts resolved suite and reviewer startup metadata", () => {
     const envelope = {
-      schema_version: "3" as const,
+      schema_version: "4" as const,
       run_id: "run-1",
       request_id: "request-1",
       seq: 1,
@@ -271,6 +302,10 @@ describe("publicEventSchema", () => {
           reviewers: [
             {
               id: "reviewer-1",
+              agent_id: "reviewer-1",
+              model_index: 0,
+              model_count: 1,
+              activation: "immediate",
               purpose: "Review correctness",
               adapter: "gateway",
               adapter_type: "openai_compatible",

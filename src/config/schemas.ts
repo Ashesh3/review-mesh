@@ -276,6 +276,10 @@ export function validateAdapterEffort(
 
 export interface ResolvedReviewer {
   id: string;
+  agentId?: string;
+  modelIndex?: number;
+  modelCount?: number;
+  previousReviewerId?: string;
   purpose: string;
   adapterId: string;
   adapter: AdapterRegistration;

@@ -9,13 +9,17 @@ import type {
 } from "../protocol/schemas.js";
 
 export type ReviewerLifecycleStatus =
+  | "deferred"
   | "queued"
   | "probing"
   | "starting"
   | "reviewing"
   | "validating"
   | "completed"
-  | "incomplete";
+  | "incomplete"
+  | "skipped";
+
+export type ReviewerSkipReason = "prior_findings" | "prior_incomplete";
 
 export interface ReviewerActivity {
   at: Date;
@@ -33,6 +37,8 @@ export interface ReviewerState {
   readonly isolation?: IsolationLevel;
   readonly result?: ReviewerResult;
   readonly failure?: AdapterFailure;
+  readonly skipReason?: ReviewerSkipReason;
+  readonly blockedByReviewerId?: string;
   readonly elapsedMs?: number;
 }
 
@@ -47,6 +53,8 @@ interface InternalReviewerState extends ReviewerState {
   isolation?: IsolationLevel;
   result?: ReviewerResult;
   failure?: AdapterFailure;
+  skipReason?: ReviewerSkipReason;
+  blockedByReviewerId?: string;
   elapsedMs?: number;
 }
 
@@ -70,14 +78,21 @@ export interface SuiteState {
     failure: AdapterFailure,
     isolation?: IsolationLevel,
   ): ReviewerState;
+  skip(
+    id: string,
+    reason: ReviewerSkipReason,
+    blockedByReviewerId: string,
+  ): ReviewerState;
 }
 
 export interface SuiteSummary {
   total: number;
+  deferred: number;
   queued: number;
   running: number;
   completed: number;
   incomplete: number;
+  skipped: number;
 }
 
 export interface RunAggregate {
@@ -88,6 +103,7 @@ export interface RunAggregate {
 const transitions: Readonly<
   Record<ReviewerLifecycleStatus, readonly ReviewerLifecycleStatus[]>
 > = {
+  deferred: ["queued"],
   queued: ["probing", "starting"],
   probing: ["queued", "starting"],
   starting: ["reviewing"],
@@ -95,6 +111,7 @@ const transitions: Readonly<
   validating: [],
   completed: [],
   incomplete: [],
+  skipped: [],
 };
 
 function elapsedMs(state: InternalReviewerState, now: Date): number {
@@ -137,6 +154,21 @@ function terminalRecord(state: ReviewerState): ReviewerTerminalRecord {
       retryable: state.failure.retryable,
     };
   }
+  if (
+    state.status === "skipped" &&
+    state.skipReason !== undefined &&
+    state.blockedByReviewerId !== undefined
+  ) {
+    return {
+      reviewer_id: state.reviewer.id,
+      status: "skipped",
+      adapter: state.reviewer.adapterId,
+      model: state.reviewer.model,
+      elapsed_ms: state.elapsedMs ?? 0,
+      reason: state.skipReason,
+      blocked_by_reviewer_id: state.blockedByReviewerId,
+    };
+  }
   throw new Error(`reviewer "${state.reviewer.id}" is not terminal`);
 }
 
@@ -164,6 +196,10 @@ function snapshot(state: InternalReviewerState): ReviewerState {
       : { capabilities: clone(state.capabilities) }),
     ...(state.result === undefined ? {} : { result: clone(state.result) }),
     ...(state.failure === undefined ? {} : { failure: clone(state.failure) }),
+    ...(state.skipReason === undefined ? {} : { skipReason: state.skipReason }),
+    ...(state.blockedByReviewerId === undefined
+      ? {}
+      : { blockedByReviewerId: state.blockedByReviewerId }),
   };
 }
 
@@ -174,7 +210,7 @@ export function createSuiteState(
   const queuedAt = now();
   const states = reviewers.map<InternalReviewerState>((reviewer) => ({
     reviewer: clone(reviewer),
-    status: "queued",
+    status: (reviewer.modelIndex ?? 0) === 0 ? "queued" : "deferred",
     queuedAt,
   }));
   const byId = new Map(states.map((state) => [state.reviewer.id, state]));
@@ -187,7 +223,11 @@ export function createSuiteState(
     return state;
   };
   const ensureActive = (state: InternalReviewerState): void => {
-    if (state.status === "completed" || state.status === "incomplete") {
+    if (
+      state.status === "completed" ||
+      state.status === "incomplete" ||
+      state.status === "skipped"
+    ) {
       throw new Error(`reviewer "${state.reviewer.id}" is already terminal`);
     }
   };
@@ -262,21 +302,35 @@ export function createSuiteState(
       state.elapsedMs = elapsedMs(state, state.completedAt);
       return snapshot(state);
     },
+    skip(id, reason, blockedByReviewerId) {
+      const state = lookup(id);
+      ensureActive(state);
+      state.status = "skipped";
+      state.skipReason = reason;
+      state.blockedByReviewerId = blockedByReviewerId;
+      state.completedAt = now();
+      state.elapsedMs = 0;
+      return snapshot(state);
+    },
   };
 }
 
 export function summarizeSuite(state: SuiteState): SuiteSummary {
   const summary: SuiteSummary = {
     total: state.reviewers.length,
+    deferred: 0,
     queued: 0,
     running: 0,
     completed: 0,
     incomplete: 0,
+    skipped: 0,
   };
   for (const reviewer of state.reviewers) {
-    if (reviewer.status === "queued") summary.queued += 1;
+    if (reviewer.status === "deferred") summary.deferred += 1;
+    else if (reviewer.status === "queued") summary.queued += 1;
     else if (reviewer.status === "completed") summary.completed += 1;
     else if (reviewer.status === "incomplete") summary.incomplete += 1;
+    else if (reviewer.status === "skipped") summary.skipped += 1;
     else summary.running += 1;
   }
   return summary;
