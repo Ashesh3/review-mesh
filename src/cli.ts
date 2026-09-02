@@ -11,6 +11,8 @@ import {
 import type { AdapterRegistry } from "./adapters/registry.js";
 import { runConfigCommand } from "./config/command.js";
 import { resolveProjectName } from "./config/project-names.js";
+import { getAppPaths, type AppPaths } from "./config/paths.js";
+import { readRunStatus, RunStatusError } from "./diagnostics/run-status.js";
 import {
   normalizeHelpTopic,
   renderHelp,
@@ -172,6 +174,7 @@ export interface CliRuntime {
   configFile?: string;
   cwd?: string;
   adapterRegistry?: AdapterRegistry;
+  appPaths?: AppPaths;
   runReview?: (options: ReviewApplicationOptions) => Promise<number>;
 }
 
@@ -226,7 +229,7 @@ export async function runCli(
       if (topic === undefined) {
         await writeDiagnostic(
           "unknown_help_topic",
-          `Unknown help topic: ${argv[1] ?? ""}. Available topics: review, config, config-file, adapters, command-adapter, describe, schema, events, exit-codes.`,
+          `Unknown help topic: ${argv[1] ?? ""}. Available topics: review, status, config, config-file, adapters, command-adapter, describe, schema, events, exit-codes.`,
           errorOutput,
         );
         process.exitCode = 2;
@@ -320,13 +323,56 @@ export async function runCli(
       });
       return;
     }
+    if (argv[0] === "status") {
+      const argumentsWithoutJson = argv
+        .slice(1)
+        .filter((argument) => argument !== "--json");
+      if (
+        argumentsWithoutJson.length < 1 ||
+        argumentsWithoutJson.length > 2 ||
+        argv
+          .slice(1)
+          .some(
+            (argument) => argument.startsWith("--") && argument !== "--json",
+          )
+      ) {
+        await writeUsageDiagnostic(
+          "Expected: review-mesh status RUN_ID [REVIEWER_ID] [--json]",
+          "review-mesh help status",
+          errorOutput,
+        );
+        process.exitCode = 2;
+        return;
+      }
+      try {
+        const status = await readRunStatus({
+          runsDirectory: (runtime.appPaths ?? getAppPaths()).runsDirectory,
+          runId: argumentsWithoutJson[0]!,
+          ...(argumentsWithoutJson[1] === undefined
+            ? {}
+            : { reviewerId: argumentsWithoutJson[1] }),
+        });
+        await writeText(output, `${JSON.stringify(status)}\n`);
+        process.exitCode = 0;
+      } catch (error) {
+        await writeDiagnostic(
+          error instanceof RunStatusError ? error.code : "status_failed",
+          error instanceof RunStatusError
+            ? error.message
+            : "The persisted Review Mesh run status could not be read.",
+          errorOutput,
+        );
+        process.exitCode = 2;
+      }
+      return;
+    }
     if (
       argv[0] !== "review" ||
       argv.length > 2 ||
       (argv.length === 2 && argv[1]?.startsWith("-"))
     ) {
       await writeUsageDiagnostic(
-        "Unknown command. Expected one of: review, describe, schema, config, help, or version.",
+        "Unknown command. Expected one of: review, status, describe, schema, config, help, or version.",
         "review-mesh --help",
         errorOutput,
         ["Run review-mesh --help for the complete command manual."],
@@ -412,6 +458,9 @@ export async function runCli(
           ...(runtime.adapterRegistry === undefined
             ? {}
             : { adapterRegistry: runtime.adapterRegistry }),
+          ...(runtime.appPaths === undefined
+            ? {}
+            : { appPaths: runtime.appPaths }),
         });
       } catch (error) {
         await writeDiagnostic(

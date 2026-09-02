@@ -444,11 +444,63 @@ describe("review-mesh review", () => {
     expect(version.stdout).toMatch(/^review-mesh \d+\.\d+\.\d+\n$/);
   });
 
+  it("queries one persisted reviewer status without starting a review", async () => {
+    const fixture = await createFixture();
+    const runsDirectory = join(fixture.root, "injected-app-data", "runs");
+    await mkdir(runsDirectory, { recursive: true });
+    await writeFile(
+      join(runsDirectory, "run-query.jsonl.active.12.1.owner"),
+      `${JSON.stringify({
+        schema_version: "4",
+        event: "reviewer.progress",
+        run_id: "run-query",
+        seq: 1,
+        timestamp: "2026-09-03T00:00:00.000Z",
+        reviewer_id: "fixture-0",
+        data: { phase: "reviewing", message: "Inspecting files." },
+      })}\n`,
+    );
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const error = new PassThrough();
+    let stdout = "";
+    let stderr = "";
+    output.on("data", (chunk) => (stdout += chunk.toString()));
+    error.on("data", (chunk) => (stderr += chunk.toString()));
+    input.end();
+
+    await runCliEntry(new EventEmitter(), {
+      argv: ["status", "run-query", "fixture-0", "--json"],
+      input,
+      output,
+      error,
+      configFile: fixture.configFile,
+      appPaths: {
+        configFile: fixture.configFile,
+        reviewersDirectory: join(fixture.root, "reviewers"),
+        runsDirectory,
+      },
+      runReview: async () => {
+        throw new Error("status must not start a review");
+      },
+    });
+
+    expect(process.exitCode).toBe(0);
+    expect(stderr).toBe("");
+    expect(JSON.parse(stdout)).toMatchObject({
+      kind: "review-mesh.run-status",
+      run_id: "run-query",
+      reviewers: [{ reviewer_id: "fixture-0", state: "reviewing" }],
+    });
+    process.exitCode = undefined;
+  });
+
   it("prints authoritative Zod-derived schemas", async () => {
     const fixture = await createFixture();
     for (const name of [
       "request",
       "events",
+      "run-status",
       "result",
       "config",
       "config-apply",
@@ -518,6 +570,11 @@ describe("review-mesh review", () => {
         review_scope: {
           default_mode: "changes",
           full_review_requires_explicit_mode: true,
+        },
+        progress: {
+          adapter_activity_streamed: false,
+          status_query_available: true,
+          retryable_adapter_failures: { maximum_attempts: 2 },
         },
       },
       request_examples: {

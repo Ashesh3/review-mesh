@@ -9,6 +9,75 @@ import {
   reviewRequestV2Schema,
 } from "../protocol/schemas.js";
 
+const runStatusReviewerSchema = z.strictObject({
+  reviewer_id: z.string().min(1),
+  purpose: z.string().min(1).optional(),
+  adapter: z.string().min(1).optional(),
+  model: z.string().min(1).optional(),
+  state: z.enum([
+    "deferred",
+    "queued",
+    "probing",
+    "starting",
+    "reviewing",
+    "validating",
+    "completed",
+    "incomplete",
+    "skipped",
+  ]),
+  last_event_seq: z.number().int().positive().optional(),
+  last_event_at: z.iso.datetime({ offset: true }).optional(),
+  last_activity_message: z.string().min(1).max(1_000).optional(),
+  attempt: z.number().int().positive().optional(),
+  elapsed_ms: z.number().int().nonnegative().optional(),
+  isolation: z
+    .enum(["enforced_read_only", "runtime_read_only", "prompt_only"])
+    .optional(),
+  result: z
+    .strictObject({
+      verdict: z.enum(["pass", "fail"]),
+      summary: z.string().min(1),
+      actionable_findings: z.number().int().nonnegative(),
+      informational_notes: z.number().int().nonnegative(),
+    })
+    .optional(),
+  failure: z
+    .strictObject({
+      reason: z.string().min(1),
+      message: z.string().min(1).max(1_000),
+      retryable: z.boolean(),
+    })
+    .optional(),
+  skipped: z
+    .strictObject({
+      reason: z.enum(["prior_findings", "prior_incomplete"]),
+      blocked_by_reviewer_id: z.string().min(1),
+    })
+    .optional(),
+});
+
+const runStatusSchema = z.strictObject({
+  schema_version: z.literal("1"),
+  kind: z.literal("review-mesh.run-status"),
+  run_id: z.string().min(1),
+  active: z.boolean(),
+  status: z.enum(["running", "passed", "findings", "incomplete"]),
+  exit_code: z.number().int().nonnegative().optional(),
+  total_elapsed_ms: z.number().int().nonnegative().optional(),
+  suite: z.strictObject({
+    total: z.number().int().nonnegative(),
+    deferred: z.number().int().nonnegative(),
+    queued: z.number().int().nonnegative(),
+    running: z.number().int().nonnegative(),
+    completed: z.number().int().nonnegative(),
+    incomplete: z.number().int().nonnegative(),
+    skipped: z.number().int().nonnegative(),
+  }),
+  reviewers: z.array(runStatusReviewerSchema),
+  reviewer_id: z.string().min(1).optional(),
+  last_seq: z.number().int().nonnegative(),
+});
+
 const diagnosticSchema = z.strictObject({
   schema_version: z.literal("1"),
   kind: z.literal("review-mesh.diagnostic"),
@@ -61,6 +130,7 @@ const commandAdapterEventSchema = z.discriminatedUnion("type", [
 export const schemaNames = [
   "request",
   "events",
+  "run-status",
   "result",
   "config",
   "config-apply",
@@ -72,6 +142,7 @@ export type SchemaName = (typeof schemaNames)[number];
 const schemas = {
   request: reviewRequestV2Schema,
   events: publicEventSchema,
+  "run-status": runStatusSchema,
   result: reviewerResultSchema,
   config: trustedConfigSchema,
   "config-apply": configApplyRequestSchema,

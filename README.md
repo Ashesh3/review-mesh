@@ -5,6 +5,8 @@ agent in a trusted suite, streams machine-readable JSONL progress, and succeeds
 only when every agent's executed model chain completes with zero actionable
 findings and no incomplete runs.
 
+Transient reviewer failures explicitly marked `retryable: true` are retried once after a one-second backoff before a reviewer is declared incomplete. Native per-tool activity is retained as the reviewer's latest status instead of emitting one public record per tool action; query a persisted run with `review-mesh status RUN_ID [REVIEWER_ID] --json`.
+
 ```text
 current directory or request JSON -> review-mesh review -> trusted project/default roster -> live JSONL -> run.completed
 ```
@@ -616,6 +618,12 @@ incomplete, and skipped runs without inventing percentages.
 | `reviewer.incomplete` | One reviewer failed to return a valid terminal result.      |
 | `reviewer.skipped`    | A later model was bypassed after prior findings/failure.    |
 | `run.completed`       | Final classification plus every reviewer terminal record.   |
+
+`reviewer.progress` is phase-level. High-frequency adapter activity updates the
+reviewer's persisted latest activity and appears in heartbeats/status snapshots,
+but is not emitted once per tool action. Use `review-mesh status RUN_ID --json`
+for the compact roster or add a reviewer id for one reviewer. The generated
+machine contract is available from `review-mesh schema run-status --json`.
 
 Example final event:
 

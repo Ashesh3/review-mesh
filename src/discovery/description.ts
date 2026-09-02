@@ -22,6 +22,11 @@ const commands = [
     help_command: "review-mesh help describe",
   },
   {
+    name: "status",
+    usage: "review-mesh status RUN_ID [REVIEWER_ID] --json",
+    help_command: "review-mesh help status",
+  },
+  {
     name: "schema",
     usage: "review-mesh schema list | review-mesh schema NAME --json",
     help_command: "review-mesh help schema",
@@ -92,12 +97,14 @@ export async function describeTool(options: DescribeToolOptions = {}) {
         stdout: "public-events-jsonl-v4" as const,
         stderr: "diagnostic-jsonl-v1" as const,
         final_event: "run.completed" as const,
+        status_query: "review-mesh status RUN_ID [REVIEWER_ID] --json" as const,
       },
     },
     commands,
     schemas: {
       request: { command: "review-mesh schema request --json" },
       events: { command: "review-mesh schema events --json" },
+      run_status: { command: "review-mesh schema run-status --json" },
       reviewer_result: { command: "review-mesh schema result --json" },
       config: { command: "review-mesh schema config --json" },
       config_apply: { command: "review-mesh schema config-apply --json" },
@@ -135,6 +142,12 @@ export async function describeTool(options: DescribeToolOptions = {}) {
         ] as const,
         heartbeats_cover: ["probing", "queued", "reviewing"] as const,
         percentages_reported: false as const,
+        adapter_activity_streamed: false as const,
+        status_query_available: true as const,
+        retryable_adapter_failures: {
+          maximum_attempts: 2 as const,
+          backoff_ms: 1_000 as const,
+        },
       },
       review_scope: {
         default_mode: "changes" as const,

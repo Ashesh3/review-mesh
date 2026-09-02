@@ -1,0 +1,289 @@
+import { mkdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { mkdtemp } from "node:fs/promises";
+import { afterEach, describe, expect, it } from "vitest";
+import { readRunStatus } from "../../src/diagnostics/run-status.js";
+
+const temporaryRoots: string[] = [];
+
+async function fixture() {
+  const root = await mkdtemp(join(tmpdir(), "review-mesh-status-"));
+  temporaryRoots.push(root);
+  const runsDirectory = join(root, "runs");
+  await mkdir(runsDirectory, { recursive: true });
+  return { root, runsDirectory };
+}
+
+function line(value: unknown): string {
+  return `${JSON.stringify(value)}\n`;
+}
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryRoots
+      .splice(0)
+      .map((root) => rm(root, { recursive: true, force: true })),
+  );
+});
+
+describe("readRunStatus", () => {
+  it("summarizes one active reviewer without returning unrelated reviewers", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-active";
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl.active.12.1.owner`),
+      [
+        line({
+          record: "resolution",
+          run_id: runId,
+          resolution: {
+            reviewers: [
+              { id: "first", purpose: "First", adapter: "gateway", model: "a" },
+              {
+                id: "second",
+                purpose: "Second",
+                adapter: "gateway",
+                model: "b",
+              },
+            ],
+          },
+        }),
+        line({
+          schema_version: "3",
+          event: "run.started",
+          run_id: runId,
+          seq: 1,
+          timestamp: "2026-09-03T00:00:00.000Z",
+          data: { consistency_mode: "live_worktree" },
+        }),
+        line({
+          schema_version: "3",
+          event: "reviewer.progress",
+          run_id: runId,
+          seq: 2,
+          timestamp: "2026-09-03T00:00:01.000Z",
+          reviewer_id: "second",
+          data: { phase: "reviewing", message: "Inspecting files." },
+        }),
+        line({
+          schema_version: "3",
+          event: "reviewer.heartbeat",
+          run_id: runId,
+          seq: 3,
+          timestamp: "2026-09-03T00:00:02.000Z",
+          reviewer_id: "second",
+          data: {
+            phase: "reviewing",
+            elapsed_ms: 2_000,
+            last_activity_at: "2026-09-03T00:00:01.000Z",
+            last_activity_message: "Completed inspection tool.",
+            suite: {
+              total: 2,
+              queued: 1,
+              running: 1,
+              completed: 0,
+              incomplete: 0,
+            },
+          },
+        }),
+        '{"schema_version":"3","event":"reviewer.progress"',
+      ].join(""),
+    );
+
+    await expect(
+      readRunStatus({ runsDirectory, runId, reviewerId: "second" }),
+    ).resolves.toMatchObject({
+      kind: "review-mesh.run-status",
+      run_id: runId,
+      active: true,
+      status: "running",
+      last_seq: 3,
+      reviewers: [
+        {
+          reviewer_id: "second",
+          state: "reviewing",
+          elapsed_ms: 2_000,
+          last_activity_message: "Completed inspection tool.",
+        },
+      ],
+    });
+  });
+
+  it("prefers the final record and returns terminal failures", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-complete";
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      line({
+        schema_version: "3",
+        event: "run.completed",
+        run_id: runId,
+        seq: 1,
+        timestamp: "2026-09-03T00:00:02.000Z",
+        data: {
+          status: "incomplete",
+          exit_code: 3,
+          consistency_mode: "live_worktree",
+          total_elapsed_ms: 10,
+          suite: {
+            total: 1,
+            queued: 0,
+            running: 0,
+            completed: 0,
+            incomplete: 1,
+          },
+          reviewers: [
+            {
+              reviewer_id: "kimi",
+              status: "incomplete",
+              adapter: "gateway",
+              model: "kimi",
+              elapsed_ms: 10,
+              reason: "adapter_unavailable",
+              message: "Endpoint unavailable.",
+              retryable: true,
+            },
+          ],
+        },
+      }),
+    );
+
+    await expect(
+      readRunStatus({ runsDirectory, runId }),
+    ).resolves.toMatchObject({
+      active: false,
+      status: "incomplete",
+      exit_code: 3,
+      reviewers: [
+        {
+          reviewer_id: "kimi",
+          state: "incomplete",
+          failure: { reason: "adapter_unavailable", retryable: true },
+        },
+      ],
+    });
+  });
+
+  it("returns a compact completed-result summary instead of replaying findings", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-result";
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      line({
+        schema_version: "4",
+        event: "reviewer.completed",
+        run_id: runId,
+        seq: 1,
+        timestamp: "2026-09-03T00:00:01.000Z",
+        reviewer_id: "reviewer",
+        data: {
+          adapter: "gateway",
+          model: "model",
+          isolation: "runtime_read_only",
+          elapsed_ms: 10,
+          result: {
+            schema_version: "1",
+            verdict: "fail",
+            summary: "One issue found.",
+            actionable_findings: [
+              {
+                id: "secret-detail",
+                severity: "high",
+                title: "Large finding",
+                description: "Do not replay this in status.",
+                evidence: [{ detail: "Evidence." }],
+                suggested_direction: "Fix it.",
+              },
+            ],
+            informational_notes: [],
+          },
+        },
+      }),
+    );
+
+    const status = await readRunStatus({ runsDirectory, runId });
+    expect(status).toMatchObject({
+      reviewers: [
+        {
+          result: {
+            verdict: "fail",
+            summary: "One issue found.",
+            actionable_findings: 1,
+            informational_notes: 0,
+          },
+        },
+      ],
+    });
+    expect(JSON.stringify(status)).not.toContain("secret-detail");
+  });
+
+  it("reports v4 skipped fallback runs and compact suite counts", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-skipped";
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      line({
+        schema_version: "4",
+        event: "reviewer.skipped",
+        run_id: runId,
+        seq: 1,
+        timestamp: "2026-09-03T00:00:01.000Z",
+        reviewer_id: "agent::fallback",
+        data: {
+          adapter: "gateway",
+          model: "fallback",
+          elapsed_ms: 0,
+          reason: "prior_incomplete",
+          blocked_by_reviewer_id: "agent::primary",
+        },
+      }),
+    );
+
+    await expect(
+      readRunStatus({ runsDirectory, runId }),
+    ).resolves.toMatchObject({
+      suite: { total: 1, deferred: 0, skipped: 1 },
+      reviewers: [
+        {
+          reviewer_id: "agent::fallback",
+          state: "skipped",
+          skipped: {
+            reason: "prior_incomplete",
+            blocked_by_reviewer_id: "agent::primary",
+          },
+        },
+      ],
+    });
+  });
+
+  it("rejects unsafe ids and missing records", async () => {
+    const { runsDirectory } = await fixture();
+    await expect(
+      readRunStatus({ runsDirectory, runId: "../outside" }),
+    ).rejects.toMatchObject({ code: "invalid_run_id" });
+    await expect(
+      readRunStatus({ runsDirectory, runId: "run-missing" }),
+    ).rejects.toMatchObject({ code: "run_not_found" });
+  });
+
+  it("returns an empty reviewer selection for an unknown exact reviewer id", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-known";
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      line({
+        schema_version: "4",
+        event: "run.started",
+        run_id: runId,
+        seq: 1,
+        timestamp: "2026-09-03T00:00:00.000Z",
+        data: { consistency_mode: "live_worktree" },
+      }),
+    );
+
+    await expect(
+      readRunStatus({ runsDirectory, runId, reviewerId: "missing" }),
+    ).resolves.toMatchObject({ reviewer_id: "missing", reviewers: [] });
+  });
+});

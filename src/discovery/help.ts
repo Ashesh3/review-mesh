@@ -5,6 +5,7 @@ export const reviewMeshVersion = packageMetadata.version;
 export type HelpTopic =
   | "overview"
   | "review"
+  | "status"
   | "config"
   | "describe"
   | "schema"
@@ -22,6 +23,7 @@ each agent's executed model chain, and exits only after run.completed.
 
 USAGE
   review-mesh review [WORKSPACE]
+  review-mesh status RUN_ID [REVIEWER_ID] [--json]
   review-mesh describe [WORKSPACE] [--json]
   review-mesh schema list
   review-mesh schema NAME [--json]
@@ -48,6 +50,7 @@ AGENT QUICK START
 
 DISCOVERY COMMANDS
   describe   Resolve the suite selected for a workspace without starting it.
+  status     Query a compact persisted run or individual reviewer snapshot.
   schema     List or print generated Zod-derived structural schemas.
   help       Print this manual or a focused topic page.
   config     Inspect or manage trusted global configuration.
@@ -58,7 +61,7 @@ REVIEW I/O CONTRACT
   stderr     Diagnostics before a run begins or if infrastructure fails.
 
 HELP TOPICS
-  review, config, config-file, adapters, command-adapter, describe, schema,
+  review, status, config, config-file, adapters, command-adapter, describe, schema,
   events, exit-codes
 
 Run 'review-mesh help TOPIC' or 'review-mesh TOPIC --help' for details.
@@ -104,6 +107,22 @@ and a piped non-empty JSON request are mutually exclusive.
 
 Exit codes: 0 passed, 1 findings, 2 invalid request/config/usage,
 3 incomplete reviewer/runtime, 4 interrupted.
+`,
+  status: `REVIEW-MESH STATUS
+
+USAGE
+  review-mesh status RUN_ID [REVIEWER_ID] [--json]
+
+Reads the sanitized persisted record for one active or completed run. With only
+RUN_ID it returns a compact snapshot for the whole reviewer roster. Add an exact
+REVIEWER_ID to return only that reviewer. The result includes lifecycle state,
+latest activity, elapsed time, terminal result or failure when available, and
+the last observed event sequence.
+
+This command is read-only and does not contact, cancel, or otherwise change the
+running review. It is available when diagnostics.persist_runs is enabled. Use
+the run_id from run.started; callers can poll this command instead of retaining
+every progress or heartbeat event in their own context.
 `,
   config: `REVIEW-MESH CONFIG
 
@@ -176,11 +195,12 @@ This is the recommended first command for an AI caller.
 USAGE
   review-mesh schema list
   review-mesh schema [request|events|result|config|config-apply|diagnostic|
-                      command-adapter-event] [--json]
+                      run-status|command-adapter-event] [--json]
 
 Prints JSON Schema generated from the runtime Zod schemas:
   request  Required v2 JSON object accepted on review stdin
   events   JSONL event object emitted by a valid review run
+  run-status  Compact active or completed run/reviewer status snapshot
   result   Terminal result required from each reviewer
   config   Trusted global configuration (v1/v2/v3 legacy or v4 current)
   config-apply  Revision-guarded full-config update request
@@ -219,6 +239,11 @@ Always continue reading until run.completed or process termination. A finding
 stops later models only for the same logical agent; other agents continue.
 Review Mesh reports factual phases and elapsed time, never invented percentages.
 Use 'review-mesh schema events --json' for the exact machine contract.
+High-frequency adapter activity is retained as latest status instead of being
+emitted once per tool action; query it with
+'review-mesh status RUN_ID [REVIEWER_ID] --json'. Adapter failures explicitly
+marked retryable are retried once within the original reviewer deadline before
+the logical agent's fallback policy is applied.
 `,
   adapters: `REVIEW-MESH ADAPTERS
 
@@ -314,6 +339,7 @@ export function normalizeHelpTopic(
   const normalized = value.toLowerCase();
   if (normalized === "help") return "overview";
   if (normalized === "event" || normalized === "jsonl") return "events";
+  if (normalized === "progress" || normalized === "run-status") return "status";
   if (normalized === "adapter") return "adapters";
   if (normalized === "command" || normalized === "protocol")
     return "command-adapter";

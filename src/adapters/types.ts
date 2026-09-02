@@ -21,6 +21,8 @@ export interface AdapterCapabilities {
   maximumIsolation: IsolationLevel | "unknown";
   runtime_version?: string;
   message?: string;
+  /** Readiness failed transiently and may be probed once more. */
+  retryable?: boolean;
 }
 
 export interface AdapterReviewInput {

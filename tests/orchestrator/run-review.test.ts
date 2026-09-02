@@ -323,6 +323,162 @@ describe("runReviewRound", () => {
     expect(events.at(-1)?.event).toBe("run.completed");
   });
 
+  it("retries one transient reviewer failure before applying model fallback policy", async () => {
+    let attempts = 0;
+    const first = new FakeAdapter({
+      onRun: (queue) => {
+        attempts += 1;
+        if (attempts === 1) {
+          queue.push({
+            type: "failure",
+            failure: {
+              reason: "adapter_unavailable",
+              message: "The endpoint is temporarily unavailable.",
+              retryable: true,
+            },
+            isolation: "enforced_read_only",
+          });
+          return;
+        }
+        queue.push({
+          type: "result",
+          result: passResult("Recovered after a transient failure."),
+          isolation: "enforced_read_only",
+        });
+      },
+    });
+    const second = fakeAdapterReturning(passResult("Fallback ran."));
+    const events: PublicEvent[] = [];
+    const completionPromise = runReviewRound(
+      roundInput({
+        adapters: { first, second },
+        onEvent: (event) => events.push(event),
+        config: {
+          reviewers: [
+            {
+              id: "agent::first",
+              agentId: "agent",
+              modelIndex: 0,
+              modelCount: 2,
+            },
+            {
+              id: "agent::second",
+              agentId: "agent",
+              modelIndex: 1,
+              modelCount: 2,
+              previousReviewerId: "agent::first",
+            },
+          ],
+        },
+      }),
+    );
+
+    await vi.runAllTimersAsync();
+    const completion = await completionPromise;
+
+    expect(first.runCalls).toBe(2);
+    expect(second.runCalls).toBe(1);
+    expect(completion.status).toBe("passed");
+    expect(
+      events.filter(
+        (event) =>
+          event.event === "reviewer.progress" &&
+          event.reviewer_id === "agent::first" &&
+          event.data.phase === "starting" &&
+          event.data.message?.includes("attempt 2 of 2"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("retries at most once before marking later model runs skipped", async () => {
+    const first = new FakeAdapter({
+      onRun: (queue) => {
+        queue.push({
+          type: "failure",
+          failure: {
+            reason: "adapter_unavailable",
+            message: "The endpoint is temporarily unavailable.",
+            retryable: true,
+          },
+          isolation: "runtime_read_only",
+        });
+      },
+    });
+    const second = fakeAdapterReturning(passResult());
+    const completionPromise = runReviewRound(
+      roundInput({
+        adapters: { first, second },
+        config: {
+          reviewers: [
+            {
+              id: "agent::first",
+              agentId: "agent",
+              modelIndex: 0,
+              modelCount: 2,
+            },
+            {
+              id: "agent::second",
+              agentId: "agent",
+              modelIndex: 1,
+              modelCount: 2,
+              previousReviewerId: "agent::first",
+            },
+          ],
+        },
+      }),
+    );
+
+    await vi.runAllTimersAsync();
+    const completion = await completionPromise;
+
+    expect(first.runCalls).toBe(2);
+    expect(second.runCalls).toBe(0);
+    expect(completion.reviewers).toEqual([
+      expect.objectContaining({
+        reviewer_id: "agent::first",
+        status: "incomplete",
+        retryable: true,
+      }),
+      expect.objectContaining({
+        reviewer_id: "agent::second",
+        status: "skipped",
+        reason: "prior_incomplete",
+      }),
+    ]);
+  });
+
+  it("keeps adapter activity as latest status without one public record per action", async () => {
+    const chatty = new FakeAdapter({
+      onRun: (queue) => {
+        queue.push({ type: "activity", message: "Started inspection tool." });
+        queue.push({ type: "activity", message: "Completed inspection tool." });
+        queue.push({
+          type: "result",
+          result: passResult(),
+          isolation: "enforced_read_only",
+        });
+      },
+    });
+    const events: PublicEvent[] = [];
+    const completionPromise = runReviewRound(
+      roundInput({
+        adapters: { chatty },
+        onEvent: (event) => events.push(event),
+      }),
+    );
+
+    await vi.runAllTimersAsync();
+    await completionPromise;
+
+    expect(
+      events.filter(
+        (event) =>
+          event.event === "reviewer.progress" &&
+          event.data.message?.includes("inspection tool"),
+      ),
+    ).toHaveLength(0);
+  });
+
   it("advances each multi-model agent only after a clear pass while agents run in parallel", async () => {
     const architectureFirst = fakeAdapterReturning(
       passResult("architecture first"),

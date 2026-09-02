@@ -102,6 +102,8 @@ interface ActiveJob {
 class ProbeTimeoutError extends Error {}
 
 const MAX_PROBE_TIMEOUT_MS = 30_000;
+const MAX_REVIEW_ATTEMPTS = 2;
+const RETRY_DELAY_MS = 1_000;
 
 const globalClock: OrchestratorClock = {
   now: () => new Date(),
@@ -132,6 +134,7 @@ function probeFailure(
   if (!capabilities.available) {
     return adapterFailure.unavailable(
       capabilities.message ?? "The adapter is unavailable.",
+      capabilities.retryable === true,
     );
   }
   return undefined;
@@ -203,6 +206,28 @@ function ownedPromise(
   } catch {
     return Promise.resolve();
   }
+}
+
+function waitForDelay(
+  clock: OrchestratorClock,
+  signal: AbortSignal,
+  delayMs: number,
+): Promise<boolean> {
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (completed: boolean) => {
+      if (settled) return;
+      settled = true;
+      clock.clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      resolve(completed);
+    };
+    const onAbort = () => finish(false);
+    const timer = clock.setTimeout(() => finish(true), delayMs);
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
 }
 
 function terminalDraft(record: ReviewerTerminalRecord): EventDraft {
@@ -630,6 +655,7 @@ export async function runReviewRound({
     const probe = async (
       job: ReviewerJob,
       index: number,
+      remainingMs = Math.min(job.reviewer.timeoutMs, MAX_PROBE_TIMEOUT_MS),
     ): Promise<AdapterCapabilities> => {
       if (job.creationFailure !== undefined) {
         probeSettled[index] = true;
@@ -641,15 +667,12 @@ export async function runReviewRound({
       const unlink = linkAbort(signal, controller);
       const localAbort = signalPromise(controller.signal);
       let timedOut = false;
-      const deadline = clock.setTimeout(
-        () => {
-          timedOut = true;
-          controller.abort(
-            new Error("Adapter capability probe deadline expired."),
-          );
-        },
-        Math.min(job.reviewer.timeoutMs, MAX_PROBE_TIMEOUT_MS),
-      );
+      const deadline = clock.setTimeout(() => {
+        timedOut = true;
+        controller.abort(
+          new Error("Adapter capability probe deadline expired."),
+        );
+      }, remainingMs);
       let operation: Promise<AdapterCapabilities>;
       try {
         operation = Promise.resolve(
@@ -687,245 +710,342 @@ export async function runReviewRound({
         unlink();
       }
     };
+    const probeWithRetry = async (
+      job: ReviewerJob,
+      index: number,
+    ): Promise<AdapterCapabilities> => {
+      const deadlineAt =
+        clock.now().getTime() +
+        Math.min(job.reviewer.timeoutMs, MAX_PROBE_TIMEOUT_MS);
+      for (let attempt = 1; attempt <= MAX_REVIEW_ATTEMPTS; attempt += 1) {
+        const remainingMs = Math.max(0, deadlineAt - clock.now().getTime());
+        if (remainingMs === 0) {
+          throw new ProbeTimeoutError(
+            "The adapter capability probe exceeded the reviewer deadline.",
+          );
+        }
+        probeSettled[index] = false;
+        const capabilities = await probe(job, index, remainingMs);
+        const failure = probeFailure(capabilities);
+        if (
+          failure?.retryable !== true ||
+          attempt >= MAX_REVIEW_ATTEMPTS ||
+          interrupted
+        ) {
+          return capabilities;
+        }
+        const retryMessage = `Retrying readiness after a transient endpoint failure (attempt ${attempt + 1} of ${MAX_REVIEW_ATTEMPTS}).`;
+        state.recordActivity(job.reviewer.id, retryMessage);
+        await emit({
+          event: "reviewer.progress",
+          reviewer_id: job.reviewer.id,
+          data: { phase: "probing", message: retryMessage },
+        });
+        const retryDelayMs = Math.min(
+          RETRY_DELAY_MS,
+          Math.max(0, deadlineAt - clock.now().getTime()),
+        );
+        if (
+          retryDelayMs < RETRY_DELAY_MS ||
+          !(await waitForDelay(clock, signal, retryDelayMs))
+        ) {
+          throw new ProbeTimeoutError(
+            "The adapter capability probe exceeded the reviewer deadline.",
+          );
+        }
+      }
+      throw new Error("unreachable probe retry state");
+    };
     const execute = async (job: ReviewerJob): Promise<void> => {
       const reviewer = job.reviewer;
-      const controller = new AbortController();
-      const unlink = linkAbort(signal, controller);
-      let releaseShutdown!: () => void;
-      const shutdownReleased = new Promise<void>((resolve) => {
-        releaseShutdown = resolve;
-      });
-      const runtime: ActiveJob = {
-        job,
-        controller,
-        iteratorReturnRequested: false,
-        heartbeatEmissions: new Set(),
-        timedOut: false,
-        shutdownReleased,
-        releaseShutdown,
-      };
-      active.set(reviewer.id, runtime);
-      try {
-        if (interrupted) {
-          await finalizeIncomplete(reviewer.id, adapterFailure.cancelled());
-          return;
-        }
-        state.transition(reviewer.id, "starting");
-        if (
-          !state.reviewers.some(
-            (candidate) =>
-              candidate.status === "queued" || candidate.status === "probing",
-          )
-        ) {
-          clearPreflightHeartbeat();
-        }
-        await emit({
-          event: "reviewer.started",
-          reviewer_id: reviewer.id,
-          data: {
-            purpose: reviewer.purpose,
-            adapter: reviewer.adapterId,
-            model: reviewer.model,
-            ...(reviewer.effort === undefined
-              ? {}
-              : { effort: reviewer.effort }),
-            isolation_policy: reviewer.isolationPolicy,
-            timeout_ms: reviewer.timeoutMs,
-          },
+      const deadlineAt = clock.now().getTime() + reviewer.timeoutMs;
+      for (let attempt = 1; attempt <= MAX_REVIEW_ATTEMPTS; attempt += 1) {
+        const controller = new AbortController();
+        const unlink = linkAbort(signal, controller);
+        let releaseShutdown!: () => void;
+        const shutdownReleased = new Promise<void>((resolve) => {
+          releaseShutdown = resolve;
         });
-        state.transition(reviewer.id, "reviewing");
-
-        runtime.deadline = clock.setTimeout(() => {
-          runtime.timedOut = true;
-          controller.abort(new Error("Reviewer deadline expired."));
-        }, reviewer.timeoutMs);
-        runtime.heartbeat = clock.setInterval(() => {
-          const current = state.reviewer(reviewer.id);
-          if (current.status === "completed" || current.status === "incomplete")
-            return;
-          if (runtime.heartbeatEmissions.size > 0) return;
-          const heartbeat = emitHeartbeat({
-            event: "reviewer.heartbeat",
-            reviewer_id: reviewer.id,
-            data: {
-              phase: phaseForHeartbeat(state, reviewer.id),
-              elapsed_ms: Math.max(
-                0,
-                clock.now().getTime() -
-                  (current.startedAt ?? startedAt).getTime(),
-              ),
-              ...(current.lastActivity === undefined
-                ? {}
-                : {
-                    last_activity_at: current.lastActivity.at.toISOString(),
-                    last_activity_message: current.lastActivity.message,
-                  }),
-              suite: heartbeatSuite(),
-              ...(current.isolation === undefined
-                ? {}
-                : { isolation: current.isolation }),
-            },
-          });
-          runtime.heartbeatEmissions.add(heartbeat);
-          void heartbeat.finally(() =>
-            runtime.heartbeatEmissions.delete(heartbeat),
-          );
-        }, config.execution.heartbeat_interval_ms);
-
-        const prompt = buildReviewerPrompt({
-          reviewer,
-          context,
-          ...(config.project_context === undefined
-            ? {}
-            : { projectContext: config.project_context }),
-          resultJsonSchema: reviewerResultJsonSchema,
-        });
-        let terminal:
-          Extract<AdapterEvent, { type: "result" | "failure" }> | undefined;
-        let duplicateTerminal = false;
-        let iteratorAbort:
-          { promise: Promise<void>; dispose(): void } | undefined;
+        const runtime: ActiveJob = {
+          job,
+          controller,
+          iteratorReturnRequested: false,
+          heartbeatEmissions: new Set(),
+          timedOut: false,
+          shutdownReleased,
+          releaseShutdown,
+        };
+        active.set(reviewer.id, runtime);
+        let retryFailure: AdapterFailure | undefined;
+        let retryIsolation: IsolationLevel | undefined;
         try {
-          const stream = job.adapter!.run({
-            runId,
-            reviewer,
-            context,
-            prompt,
-            resultJsonSchema: reviewerResultJsonSchema,
-            isolationPolicy: reviewer.isolationPolicy,
-            signal: controller.signal,
-          });
-          const iterator = stream[Symbol.asyncIterator]();
-          runtime.iterator = iterator;
-          iteratorAbort = signalPromise(controller.signal);
-          for (;;) {
-            const next = iterator.next();
-            const outcome = await Promise.race([
-              next.then(
-                (result) => ({ type: "next" as const, result }),
-                (error: unknown) => ({ type: "error" as const, error }),
-              ),
-              iteratorAbort.promise.then(() => ({ type: "abort" as const })),
-            ]);
-            if (outcome.type === "abort") {
-              if (runtime.timedOut) {
-                let nextSettled = false;
-                const ownedNext = next.then(
-                  () => {
-                    nextSettled = true;
-                  },
-                  () => {
-                    nextSettled = true;
-                  },
-                );
-                await waitAtMost(
-                  ownedNext,
-                  config.execution.shutdown_grace_period_ms,
-                );
-                if (!nextSettled) {
-                  await cleanupWithinBound([runtime]);
-                }
-                requestIteratorReturn(runtime);
-                break;
-              }
-              await Promise.race([
-                next.catch(() => undefined),
-                runtime.shutdownReleased,
-              ]);
-              break;
-            }
-            if (outcome.type === "error") throw outcome.error;
-            if (outcome.result.done) break;
-            const event = outcome.result.value;
-            if (event.type === "activity" || event.type === "progress") {
-              const message = boundedMessage(event.message);
-              if (message !== undefined)
-                state.recordActivity(reviewer.id, message);
-              if (
-                event.type === "progress" &&
-                event.phase === "validating" &&
-                state.reviewer(reviewer.id).status === "reviewing"
-              ) {
-                state.transition(reviewer.id, "validating");
-              }
-              await emit({
-                event: "reviewer.progress",
-                reviewer_id: reviewer.id,
-                data: {
-                  phase: phaseForHeartbeat(state, reviewer.id),
-                  ...(message === undefined ? {} : { message }),
-                },
-              });
-              continue;
-            }
-            if (terminal !== undefined) {
-              duplicateTerminal = true;
-              continue;
-            }
-            terminal = event;
-            if (event.isolation !== undefined)
-              state.setIsolation(reviewer.id, event.isolation);
+          if (interrupted) {
+            await finalizeIncomplete(reviewer.id, adapterFailure.cancelled());
+            return;
           }
-        } catch (error) {
-          if (!controller.signal.aborted) {
+          if (clock.now().getTime() >= deadlineAt) {
             await finalizeIncomplete(
               reviewer.id,
-              adapterFailure.processCrashed(
-                error instanceof Error ? error.message : error,
+              adapterFailure.timeout(
+                "The reviewer exceeded its configured deadline.",
               ),
             );
             return;
           }
-        } finally {
-          iteratorAbort?.dispose();
-        }
-
-        if (interrupted) {
-          await finalizeIncomplete(reviewer.id, adapterFailure.cancelled());
-        } else if (runtime.timedOut) {
-          await finalizeIncomplete(
-            reviewer.id,
-            adapterFailure.timeout(
-              "The reviewer exceeded its configured deadline.",
-            ),
-          );
-        } else if (duplicateTerminal || terminal === undefined) {
-          await finalizeIncomplete(
-            reviewer.id,
-            adapterFailure.protocolViolation(
-              duplicateTerminal
-                ? "The adapter emitted more than one terminal event."
-                : "The adapter stream ended without a terminal event.",
-            ),
-            terminal?.isolation,
-          );
-        } else if (
-          reviewer.isolationPolicy === "require_enforced" &&
-          terminal.isolation !== "enforced_read_only"
-        ) {
-          await finalizeIncomplete(
-            reviewer.id,
-            adapterFailure.unavailable(
-              "The adapter did not achieve the required enforced read-only isolation.",
-            ),
-            terminal.isolation,
-          );
-        } else if (terminal.type === "failure") {
-          await finalizeIncomplete(
-            reviewer.id,
-            normalizeFailure(terminal.failure),
-            terminal.isolation,
-          );
-        } else {
-          if (state.reviewer(reviewer.id).status === "reviewing") {
-            state.transition(reviewer.id, "validating");
+          state.transition(reviewer.id, "starting");
+          if (
+            !state.reviewers.some(
+              (candidate) =>
+                candidate.status === "queued" || candidate.status === "probing",
+            )
+          ) {
+            clearPreflightHeartbeat();
           }
-          await finalizeResult(reviewer, terminal.result, terminal.isolation);
+          await emit({
+            event: "reviewer.started",
+            reviewer_id: reviewer.id,
+            data: {
+              purpose: reviewer.purpose,
+              adapter: reviewer.adapterId,
+              model: reviewer.model,
+              ...(reviewer.effort === undefined
+                ? {}
+                : { effort: reviewer.effort }),
+              isolation_policy: reviewer.isolationPolicy,
+              timeout_ms: reviewer.timeoutMs,
+            },
+          });
+          state.transition(reviewer.id, "reviewing");
+
+          runtime.deadline = clock.setTimeout(
+            () => {
+              runtime.timedOut = true;
+              controller.abort(new Error("Reviewer deadline expired."));
+            },
+            Math.max(0, deadlineAt - clock.now().getTime()),
+          );
+          runtime.heartbeat = clock.setInterval(() => {
+            const current = state.reviewer(reviewer.id);
+            if (
+              current.status === "completed" ||
+              current.status === "incomplete"
+            )
+              return;
+            if (runtime.heartbeatEmissions.size > 0) return;
+            const heartbeat = emitHeartbeat({
+              event: "reviewer.heartbeat",
+              reviewer_id: reviewer.id,
+              data: {
+                phase: phaseForHeartbeat(state, reviewer.id),
+                elapsed_ms: Math.max(
+                  0,
+                  clock.now().getTime() -
+                    (current.startedAt ?? startedAt).getTime(),
+                ),
+                ...(current.lastActivity === undefined
+                  ? {}
+                  : {
+                      last_activity_at: current.lastActivity.at.toISOString(),
+                      last_activity_message: current.lastActivity.message,
+                    }),
+                suite: heartbeatSuite(),
+                ...(current.isolation === undefined
+                  ? {}
+                  : { isolation: current.isolation }),
+              },
+            });
+            runtime.heartbeatEmissions.add(heartbeat);
+            void heartbeat.finally(() =>
+              runtime.heartbeatEmissions.delete(heartbeat),
+            );
+          }, config.execution.heartbeat_interval_ms);
+
+          const prompt = buildReviewerPrompt({
+            reviewer,
+            context,
+            ...(config.project_context === undefined
+              ? {}
+              : { projectContext: config.project_context }),
+            resultJsonSchema: reviewerResultJsonSchema,
+          });
+          let terminal:
+            Extract<AdapterEvent, { type: "result" | "failure" }> | undefined;
+          let duplicateTerminal = false;
+          let iteratorAbort:
+            { promise: Promise<void>; dispose(): void } | undefined;
+          try {
+            const stream = job.adapter!.run({
+              runId,
+              reviewer,
+              context,
+              prompt,
+              resultJsonSchema: reviewerResultJsonSchema,
+              isolationPolicy: reviewer.isolationPolicy,
+              signal: controller.signal,
+            });
+            const iterator = stream[Symbol.asyncIterator]();
+            runtime.iterator = iterator;
+            iteratorAbort = signalPromise(controller.signal);
+            for (;;) {
+              const next = iterator.next();
+              const outcome = await Promise.race([
+                next.then(
+                  (result) => ({ type: "next" as const, result }),
+                  (error: unknown) => ({ type: "error" as const, error }),
+                ),
+                iteratorAbort.promise.then(() => ({ type: "abort" as const })),
+              ]);
+              if (outcome.type === "abort") {
+                if (runtime.timedOut) {
+                  let nextSettled = false;
+                  const ownedNext = next.then(
+                    () => {
+                      nextSettled = true;
+                    },
+                    () => {
+                      nextSettled = true;
+                    },
+                  );
+                  await waitAtMost(
+                    ownedNext,
+                    config.execution.shutdown_grace_period_ms,
+                  );
+                  if (!nextSettled) {
+                    await cleanupWithinBound([runtime]);
+                  }
+                  requestIteratorReturn(runtime);
+                  break;
+                }
+                await Promise.race([
+                  next.catch(() => undefined),
+                  runtime.shutdownReleased,
+                ]);
+                break;
+              }
+              if (outcome.type === "error") throw outcome.error;
+              if (outcome.result.done) break;
+              const event = outcome.result.value;
+              if (event.type === "activity" || event.type === "progress") {
+                const message = boundedMessage(event.message);
+                if (message !== undefined)
+                  state.recordActivity(reviewer.id, message);
+                if (
+                  event.type === "progress" &&
+                  event.phase === "validating" &&
+                  state.reviewer(reviewer.id).status === "reviewing"
+                ) {
+                  state.transition(reviewer.id, "validating");
+                }
+                if (event.type === "progress") {
+                  await emit({
+                    event: "reviewer.progress",
+                    reviewer_id: reviewer.id,
+                    data: {
+                      phase: phaseForHeartbeat(state, reviewer.id),
+                      ...(message === undefined ? {} : { message }),
+                    },
+                  });
+                }
+                continue;
+              }
+              if (terminal !== undefined) {
+                duplicateTerminal = true;
+                continue;
+              }
+              terminal = event;
+              if (event.isolation !== undefined)
+                state.setIsolation(reviewer.id, event.isolation);
+            }
+          } catch (error) {
+            if (!controller.signal.aborted) {
+              retryFailure = adapterFailure.processCrashed(
+                error instanceof Error ? error.message : error,
+              );
+            }
+          } finally {
+            iteratorAbort?.dispose();
+          }
+
+          if (interrupted) {
+            retryFailure = adapterFailure.cancelled();
+          } else if (runtime.timedOut) {
+            retryFailure = adapterFailure.timeout(
+              "The reviewer exceeded its configured deadline.",
+            );
+          } else if (retryFailure === undefined) {
+            if (duplicateTerminal || terminal === undefined) {
+              retryFailure = adapterFailure.protocolViolation(
+                duplicateTerminal
+                  ? "The adapter emitted more than one terminal event."
+                  : "The adapter stream ended without a terminal event.",
+              );
+              retryIsolation = terminal?.isolation;
+            } else if (
+              reviewer.isolationPolicy === "require_enforced" &&
+              terminal.isolation !== "enforced_read_only"
+            ) {
+              retryFailure = adapterFailure.unavailable(
+                "The adapter did not achieve the required enforced read-only isolation.",
+              );
+              retryIsolation = terminal.isolation;
+            } else if (terminal.type === "failure") {
+              retryFailure = normalizeFailure(terminal.failure);
+              retryIsolation = terminal.isolation;
+            } else {
+              if (state.reviewer(reviewer.id).status === "reviewing") {
+                state.transition(reviewer.id, "validating");
+              }
+              await finalizeResult(
+                reviewer,
+                terminal.result,
+                terminal.isolation,
+              );
+              return;
+            }
+          }
+          if (
+            retryFailure.retryable &&
+            attempt < MAX_REVIEW_ATTEMPTS &&
+            !interrupted
+          ) {
+            await stopRuntimeTimers(runtime);
+            const retryMessage = `Retrying after a transient reviewer failure (attempt ${attempt + 1} of ${MAX_REVIEW_ATTEMPTS}).`;
+            state.recordActivity(reviewer.id, retryMessage);
+            await emit({
+              event: "reviewer.progress",
+              reviewer_id: reviewer.id,
+              data: { phase: "starting", message: retryMessage },
+            });
+            const retryDelayMs = Math.min(
+              RETRY_DELAY_MS,
+              Math.max(0, deadlineAt - clock.now().getTime()),
+            );
+            const deadlineExpired = retryDelayMs < RETRY_DELAY_MS;
+            if (
+              deadlineExpired ||
+              !(await waitForDelay(clock, signal, retryDelayMs)) ||
+              interrupted
+            ) {
+              await finalizeIncomplete(
+                reviewer.id,
+                deadlineExpired
+                  ? adapterFailure.timeout(
+                      "The reviewer exceeded its configured deadline.",
+                    )
+                  : adapterFailure.cancelled(),
+                retryIsolation,
+              );
+              return;
+            }
+            continue;
+          }
+          await finalizeIncomplete(reviewer.id, retryFailure, retryIsolation);
+          return;
+        } finally {
+          await stopRuntimeTimers(runtime);
+          unlink();
+          active.delete(reviewer.id);
         }
-      } finally {
-        await stopRuntimeTimers(runtime);
-        unlink();
-        active.delete(reviewer.id);
       }
     };
 
@@ -990,7 +1110,7 @@ export async function runReviewRound({
       });
       let capabilities: AdapterCapabilities;
       try {
-        capabilities = await probe(job, jobs.indexOf(job));
+        capabilities = await probeWithRetry(job, jobs.indexOf(job));
       } catch (reason) {
         activeProbes.delete(reviewer.id);
         const failure =

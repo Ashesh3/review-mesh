@@ -107,8 +107,8 @@ const transitions: Readonly<
   queued: ["probing", "starting"],
   probing: ["queued", "starting"],
   starting: ["reviewing"],
-  reviewing: ["validating"],
-  validating: [],
+  reviewing: ["validating", "starting"],
+  validating: ["starting"],
   completed: [],
   incomplete: [],
   skipped: [],
@@ -244,6 +244,12 @@ export function createSuiteState(
     const at = now();
     if (next === "probing" && state.startedAt === undefined) {
       state.startedAt = at;
+    }
+    if (
+      next === "starting" &&
+      (state.status === "reviewing" || state.status === "validating")
+    ) {
+      delete state.isolation;
     }
     state.status = next;
     return state;

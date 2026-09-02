@@ -81,6 +81,16 @@ function resolvedRunHeader(config: ReturnType<typeof resolveConfig>) {
     diagnostics: config.diagnostics,
     reviewers: config.reviewers.map((reviewer) => ({
       id: reviewer.id,
+      ...(reviewer.agentId === undefined ? {} : { agent_id: reviewer.agentId }),
+      ...(reviewer.modelIndex === undefined
+        ? {}
+        : { model_index: reviewer.modelIndex }),
+      ...(reviewer.modelCount === undefined
+        ? {}
+        : { model_count: reviewer.modelCount }),
+      ...(reviewer.previousReviewerId === undefined
+        ? {}
+        : { previous_reviewer_id: reviewer.previousReviewerId }),
       purpose: reviewer.purpose,
       adapter: reviewer.adapterId,
       model: reviewer.model,

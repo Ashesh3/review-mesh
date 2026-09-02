@@ -1447,6 +1447,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         authenticated:
           failure.reason === "authentication_failed" ? false : "unknown",
         message: failure.message,
+        retryable: failure.retryable,
       };
     }
   }
