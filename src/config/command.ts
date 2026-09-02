@@ -6,7 +6,7 @@ import {
   configRevision,
   listConfig,
   loadManagedConfig,
-  migrateV2Config,
+  migrateLegacyConfig,
   saveManagedConfig,
   serializeManagedConfig,
 } from "./manage.js";
@@ -55,7 +55,7 @@ READ-ONLY COMMANDS
 
   review-mesh config list [--json]
       List declared agents, their scalar model or ordered model runs, and
-      project assignments. Multi-model agents expand during review according to
+      project-name assignments. Multi-model agents expand during review according to
       the global max_concurrency setting.
 
   review-mesh config export --json
@@ -88,10 +88,12 @@ COPILOT ACCOUNT
   review-mesh config copilot models [--json]
 
 PROJECT SELECTION
-  Project keys must be absolute paths. A project applies to that directory and
-  its descendants; the most-specific matching project wins. Its "agents" list
-  overrides defaults. If it omits "agents", default agents remain active while
-  project instructions and context are layered onto the review.
+  Project keys are repository/project names, not paths. Review Mesh prefers the
+  origin remote repository name, then another remote, then the Git common/root
+  directory name; non-Git workspaces use the workspace directory name. Matching
+  is case-insensitive, so clones and linked worktrees use the same assignment.
+  A project's "agents" list overrides defaults. If it omits "agents", default
+  agents remain active while project instructions and context are layered on.
 
 EXIT CODES
   0  Command succeeded.
@@ -497,8 +499,9 @@ export async function runConfigCommand(
         return 2;
       }
       const desired =
-        request.config.schema_version === "2"
-          ? migrateV2Config(request.config)
+        request.config.schema_version === "2" ||
+        request.config.schema_version === "3"
+          ? await migrateLegacyConfig(request.config)
           : request.config;
       const desiredText = serializeManagedConfig(desired);
       if (
@@ -615,7 +618,7 @@ export async function runConfigCommand(
         for (const project of listed.projects) {
           await write(
             options.output,
-            `${project.path}\t${project.agents.join(",")}\n`,
+            `${project.name}\t${project.agents.join(",")}\n`,
           );
         }
       }
@@ -644,7 +647,7 @@ export async function runConfigCommand(
     if (loaded.migrated) {
       await write(
         options.output,
-        "Loaded legacy v1/v2 configuration; the first successful change will save it as v3.\n",
+        "Loaded legacy v1/v2/v3 configuration; the first successful change will save it as v4.\n",
       );
     }
     await runConfigMenu({

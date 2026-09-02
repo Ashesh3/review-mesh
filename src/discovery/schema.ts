@@ -6,7 +6,7 @@ import {
 import {
   publicEventSchema,
   reviewerResultSchema,
-  reviewRequestSchema,
+  reviewRequestV2Schema,
 } from "../protocol/schemas.js";
 
 const diagnosticSchema = z.strictObject({
@@ -70,7 +70,7 @@ export const schemaNames = [
 export type SchemaName = (typeof schemaNames)[number];
 
 const schemas = {
-  request: reviewRequestSchema,
+  request: reviewRequestV2Schema,
   events: publicEventSchema,
   result: reviewerResultSchema,
   config: trustedConfigSchema,

@@ -1,5 +1,7 @@
 {
-  "schema_version": "1",
+  "schema_version": "2",
+  "project_name": "review-mesh",
   "workspace": ".",
-  "instructions": "Review the current workspace."
+  "instructions": "Review the current changes.",
+  "review_scope": { "mode": "changes", "base": "main" }
 }

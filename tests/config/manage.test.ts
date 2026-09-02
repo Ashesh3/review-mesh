@@ -10,8 +10,8 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { stringify } from "smol-toml";
 import {
-  canonicalProjectPath,
   emptyManagedConfig,
   loadManagedConfig,
   parseManagedConfig,
@@ -30,7 +30,7 @@ async function root(): Promise<string> {
 
 function config(): ManagedConfig {
   return {
-    schema_version: "3",
+    schema_version: "4",
     execution: {
       max_concurrency: 2,
       heartbeat_interval_ms: 15_000,
@@ -67,7 +67,7 @@ afterEach(async () => {
 });
 
 describe("managed configuration", () => {
-  it("round-trips a native v2 configuration", () => {
+  it("round-trips a native v4 configuration", () => {
     const text = serializeManagedConfig(config());
     expect(parseManagedConfig(text)).toEqual({
       config: config(),
@@ -171,7 +171,7 @@ describe("managed configuration", () => {
     expect(() => serializeManagedConfig(singleRun)).toThrow(/at least two/i);
   });
 
-  it("migrates the ordered v1 roster into v2 default agents", () => {
+  it("migrates the ordered v1 roster into v4 default agents", () => {
     const legacy = `schema_version = "1"
 [execution]
 max_concurrency = 1
@@ -204,18 +204,59 @@ append_instructions = "extra"
     );
   });
 
-  it("reads scalar v2 configuration and promotes it to managed v3", () => {
+  it("reads scalar v2 configuration and promotes it to managed v4", () => {
     const legacyV2 = serializeManagedConfig(config()).replace(
-      'schema_version = "3"',
+      'schema_version = "4"',
       'schema_version = "2"',
     );
     const result = parseManagedConfig(legacyV2);
     expect(result.migrated).toBe(true);
-    expect(result.config.schema_version).toBe("3");
+    expect(result.config.schema_version).toBe("4");
     expect(result.config.agents.gemini).toMatchObject({
       model: "gemini-flash",
       effort: "high",
     });
+  });
+
+  it("migrates path-keyed v3 projects to names and rejects collisions", () => {
+    const legacyV3 = config() as unknown as Record<string, unknown>;
+    legacyV3.schema_version = "3";
+    legacyV3.projects = {
+      "C:/work/payments": { agents: ["gemini"] },
+    };
+    const migrated = parseManagedConfig(`${stringify(legacyV3)}\n`);
+    expect(migrated.migrated).toBe(true);
+    expect(migrated.config.projects).toEqual({
+      payments: { agents: ["gemini"] },
+    });
+
+    const colliding = `schema_version = "3"
+[execution]
+max_concurrency = 2
+heartbeat_interval_ms = 15000
+shutdown_grace_period_ms = 5000
+[diagnostics]
+persist_runs = true
+max_runs = 50
+[adapters.gateway]
+type = "openai_compatible"
+base_url_env = "REVIEW_BASE_URL"
+api_key_env = "REVIEW_API_KEY"
+[agents.gemini]
+adapter = "gateway"
+model = "gemini-flash"
+purpose = "Correctness"
+instructions = "Review carefully."
+isolation = "prefer_enforced"
+timeout_ms = 900000
+[defaults]
+agents = ["gemini"]
+[projects."C:/one/demo"]
+agents = ["gemini"]
+[projects."D:/two/demo"]
+agents = ["gemini"]
+`;
+    expect(() => parseManagedConfig(colliding)).toThrow(/both migrate/i);
   });
 
   it("writes a new file atomically and rejects a stale writer", async () => {
@@ -281,17 +322,6 @@ append_instructions = "extra"
       throw error;
     }
     await expect(loadManagedConfig(linked)).rejects.toThrow(/symlink/i);
-  });
-
-  it("canonicalizes existing project directories", async () => {
-    const directory = await root();
-    const project = join(directory, "Project");
-    await mkdir(project);
-    const actual = await canonicalProjectPath(project);
-    expect(actual.includes("\\")).toBe(false);
-    expect(
-      actual.endsWith(process.platform === "win32" ? "/project" : "/Project"),
-    ).toBe(true);
   });
 
   it("does not serialize environment variable values", () => {
@@ -368,21 +398,18 @@ append_instructions = "extra"
     );
   });
 
-  it("rejects relative and duplicate normalized project keys before saving", () => {
-    const relative = config();
-    relative.projects = { relative: { agents: ["gemini"] } };
-    expect(() => serializeManagedConfig(relative)).toThrow(/absolute/i);
+  it("rejects path-shaped and duplicate normalized project names before saving", () => {
+    const pathShaped = config();
+    pathShaped.projects = { "work/demo": { agents: ["gemini"] } };
+    expect(() => serializeManagedConfig(pathShaped)).toThrow(/project name/i);
 
-    const root = process.platform === "win32" ? "C:\\Work\\Demo" : "/work/demo";
     const duplicate = config();
     duplicate.projects = {
-      [root]: { agents: ["gemini"] },
-      [`${root}${process.platform === "win32" ? "\\" : "/"}`]: {
-        agents: ["gemini"],
-      },
+      Demo: { agents: ["gemini"] },
+      demo: { agents: ["gemini"] },
     };
     expect(() => serializeManagedConfig(duplicate)).toThrow(
-      /duplicate normalized project path/i,
+      /duplicate normalized project name/i,
     );
   });
 

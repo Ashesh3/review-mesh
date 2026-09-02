@@ -19,7 +19,7 @@ export interface DescribeEffectiveConfigInput {
 export interface DescribeResolvedConfigInput {
   configFile: string;
   revision: string;
-  configSchemaVersion: "1" | "2" | "3";
+  configSchemaVersion: "1" | "2" | "3" | "4";
   migrated: boolean;
   workspace: string;
   resolved: ReturnType<typeof resolveConfig>;
@@ -41,12 +41,15 @@ export interface EffectiveConfigDescription {
   valid: true;
   config_path: string;
   revision: string;
-  config_schema_version: "1" | "2" | "3";
+  config_schema_version: "1" | "2" | "3" | "4";
   migrated: boolean;
   workspace: string;
   selection: {
     source: "legacy" | "defaults" | "project";
-    matched_project_path?: string;
+    project_name?: string;
+    project_name_source?:
+      "git_remote" | "git_common_directory" | "git_root" | "workspace";
+    matched_project_name?: string;
   };
   execution: {
     max_concurrency: number;
@@ -117,9 +120,15 @@ export function describeResolvedConfig(
     workspace: input.workspace,
     selection: {
       source: selection.source,
-      ...(selection.matchedProjectPath === undefined
+      ...(selection.projectName === undefined
         ? {}
-        : { matched_project_path: selection.matchedProjectPath }),
+        : { project_name: selection.projectName }),
+      ...(selection.projectNameSource === undefined
+        ? {}
+        : { project_name_source: selection.projectNameSource }),
+      ...(selection.matchedProjectName === undefined
+        ? {}
+        : { matched_project_name: selection.matchedProjectName }),
     },
     execution: structuredClone(input.resolved.execution),
     diagnostics: structuredClone(input.resolved.diagnostics),
@@ -209,7 +218,12 @@ export async function describeEffectiveConfig(
       workspace,
       ...(input.signal === undefined ? {} : { signal: input.signal }),
     });
-    const resolved = resolveConfig(loaded);
+    const resolved = resolveConfig({
+      trusted: loaded.trusted,
+      workspace: loaded.workspace,
+      projectName: loaded.projectName,
+      projectNameSource: loaded.projectNameSource,
+    });
     const after = await loadManagedConfig(configFile);
     if (configRevision(after.snapshot) !== revision) {
       throw new Error("configuration changed while resolving");

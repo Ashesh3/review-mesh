@@ -61,8 +61,19 @@ export async function describeTool(options: DescribeToolOptions = {}) {
     options.workspace === undefined
       ? "review-mesh review"
       : `review-mesh review "${effectiveWorkspace.replaceAll('"', '\\"')}"`;
+  const explicitChangeRequest =
+    configuration.valid && configuration.selection.project_name !== undefined
+      ? {
+          schema_version: "2" as const,
+          project_name: configuration.selection.project_name,
+          workspace: effectiveWorkspace,
+          instructions:
+            "Review the current changes for actionable correctness, security, reliability, compatibility, and test-coverage defects.",
+          review_scope: { mode: "changes" as const },
+        }
+      : undefined;
   return {
-    schema_version: "1" as const,
+    schema_version: "2" as const,
     kind: "review-mesh.description" as const,
     tool: {
       name: "review-mesh" as const,
@@ -77,8 +88,8 @@ export async function describeTool(options: DescribeToolOptions = {}) {
     },
     streams: {
       review: {
-        stdin: "empty-or-review-request-json-v1" as const,
-        stdout: "public-events-jsonl-v2" as const,
+        stdin: "empty-or-review-request-json-v2" as const,
+        stdout: "public-events-jsonl-v3" as const,
         stderr: "diagnostic-jsonl-v1" as const,
         final_event: "run.completed" as const,
       },
@@ -102,7 +113,8 @@ export async function describeTool(options: DescribeToolOptions = {}) {
         "Configuration and workspace selection are valid; adapters, credentials, models, and isolation are probed when review starts.",
     },
     protocol: {
-      version: "2" as const,
+      version: "3" as const,
+      request_version: "2" as const,
       consistency_mode: "live_worktree" as const,
       maximum_request_bytes: 8 * 1024 * 1024,
       outcome_precedence: ["incomplete", "findings", "passed"] as const,
@@ -118,7 +130,39 @@ export async function describeTool(options: DescribeToolOptions = {}) {
         heartbeats_cover: ["probing", "queued", "reviewing"] as const,
         percentages_reported: false as const,
       },
+      review_scope: {
+        default_mode: "changes" as const,
+        full_review_requires_explicit_mode: true as const,
+        inferred_base_order: [
+          "origin/HEAD",
+          "origin/main",
+          "origin/master",
+          "other-remote/HEAD",
+          "other-remote/main",
+          "other-remote/master",
+          "main",
+          "master",
+        ] as const,
+        included_changes: [
+          "merge-base-to-checked-out-head",
+          "staged",
+          "unstaged",
+          "untracked",
+        ] as const,
+      },
     },
+    request_examples:
+      explicitChangeRequest === undefined
+        ? undefined
+        : {
+            changes: explicitChangeRequest,
+            full: {
+              ...explicitChangeRequest,
+              instructions:
+                "Review the entire codebase for actionable defects.",
+              review_scope: { mode: "full" as const },
+            },
+          },
     exit_codes: {
       "0": "success or review passed",
       "1": "review completed with actionable findings",

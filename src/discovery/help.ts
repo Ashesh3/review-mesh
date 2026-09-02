@@ -33,13 +33,14 @@ USAGE
 AGENT QUICK START
   1. Run: review-mesh describe . --json
      This resolves the configuration that applies to the current workspace and
-     reports the exact agents, models, purposes, effort, isolation policy,
-     timeouts, concurrency, heartbeat interval, and configuration path.
+     reports project_name plus the exact agents, models, purposes, effort,
+     isolation policy, timeouts, concurrency, heartbeat interval, and config.
   2. Run: review-mesh schema request --json
      This returns the generated JSON Schema for an explicit review request.
   3. Run: review-mesh review [WORKSPACE]
-     With empty stdin, Review Mesh reviews the current directory using a safe
-     default instruction. With JSON on stdin, it uses the supplied request.
+     With empty stdin, Review Mesh reviews only the current Git change set above
+     the inferred default branch, including local staged/unstaged/untracked work.
+     With JSON on stdin, send the explicit v2 request described below.
   4. Read stdout one JSON object per line until run.completed. Do not stop after
      a finding: the remaining mandatory reviewers still run. Heartbeats mean the
      process is alive even when a reviewer has no new activity to report.
@@ -71,24 +72,34 @@ USAGE
 
 WORKSPACE defaults to the current directory. If stdin is a terminal or is empty,
 Review Mesh synthesizes this request immediately:
-  {"schema_version":"1","workspace":"<current directory>",
-   "instructions":"Review for evidence-backed correctness, security,
-   reliability, compatibility, and test-coverage defects."}
+  {"schema_version":"2","project_name":"<resolved repository name>",
+   "workspace":"<current directory>",
+   "instructions":"Review the current change set for evidence-backed defects.",
+   "review_scope":{"mode":"changes"}}
 
 If stdin is not empty, it must be exactly one request object. Required fields:
-  schema_version  The string "1".
+  schema_version  The string "2".
+  project_name    Copy configuration.selection.project_name from describe.
   workspace       An existing local directory.
   instructions    Review focus sent to every mandatory reviewer.
+  review_scope    {mode:"changes", base?, head?, branch?, paths?}, or
+                  {mode:"full", paths?} for an explicit whole-codebase review.
 
 Optional fields:
   request_id      Caller correlation id copied into every event.
-  scope_hints     {base, head, branch, paths, staged} Git discovery hints.
   context         Arbitrary JSON supplied as lower-priority caller context.
 
 Before running, use 'review-mesh describe WORKSPACE --json' to see the exact
-trusted suite. During a run, consume stdout as JSONL until run.completed.
-The caller cannot disable, replace, reorder, or select mandatory reviewers.
-A positional WORKSPACE and a piped non-empty JSON request are mutually exclusive.
+project_name and trusted suite. project_name is an assertion: it must match the
+Git-derived workspace identity and cannot select another project's settings.
+For mode=changes, omitted base means the remote/default main or master branch;
+omitted head means the checked-out HEAD. An explicit branch/head must match the
+checked-out worktree. Committed changes above the merge base plus staged,
+unstaged, and untracked files form the review scope. paths only narrows it.
+Use mode=full only when the caller explicitly asks for the entire codebase.
+During a run, consume stdout as JSONL until run.completed. The caller cannot
+disable, replace, reorder, or select mandatory reviewers. A positional WORKSPACE
+and a piped non-empty JSON request are mutually exclusive.
 
 Exit codes: 0 passed, 1 findings, 2 invalid request/config/usage,
 3 incomplete reviewer/runtime, 4 interrupted.
@@ -104,13 +115,16 @@ USAGE
   review-mesh config effective [WORKSPACE] --json
                                       Resolve the safe effective agent roster
   review-mesh config export --json   Export full config plus revision
-  review-mesh config apply --json    Atomically apply a full v3 config with CAS
+  review-mesh config apply --json    Atomically apply a full v4 config with CAS
   review-mesh config copilot login [--device-code|--web-flow] [--host URL]
   review-mesh config copilot status [--json]
   review-mesh config copilot models [--json]
 
-Configuration is global and trusted. Project entries are keyed by absolute path;
-the most-specific containing path wins, otherwise defaults are used. Workspace
+Configuration is global and trusted. Project entries are keyed by project name,
+not by folder path. Review Mesh prefers the origin remote repository name, then
+another remote, then the Git common/root directory name; non-Git workspaces use
+the workspace directory name. Matching is case-insensitive, so clones and linked
+worktrees share one assignment. Otherwise defaults are used. Workspace
 .review-mesh.toml files are intentionally ignored. Store environment-variable
 names in config, never credential values.
 
@@ -127,7 +141,7 @@ For agent-driven configuration changes:
 Apply is a strict whole-document transaction, limited to 5 MiB. The serialized
 TOML itself remains capped at 4 MiB; the extra request budget covers JSON
 escaping and envelope fields. Apply validates
-project paths and references, uses the exported SHA-256 revision as a
+project names and references, uses the exported SHA-256 revision as a
 compare-and-swap guard, and atomically replaces the file. A stale writer gets
 config_conflict and must export again. This serialization covers Review Mesh
 writers; do not run an external editor concurrently with config apply. Export
@@ -143,12 +157,13 @@ USAGE
   review-mesh describe [WORKSPACE] [--json]
 
 Loads and validates the trusted global configuration, canonicalizes WORKSPACE
-(default: current directory), applies the most-specific project assignment, and
+(default: current directory), resolves its project name and assignment, and
 prints the exact effective reviewer suite without probing providers or starting
 a review.
 
-The JSON form includes configuration status/path, workspace, execution,
-diagnostics, and reviewers with id, purpose, adapter,
+The JSON form includes configuration status/path, workspace, resolved
+project_name, project_name_source, matched_project_name when configured,
+execution, diagnostics, and reviewers with id, purpose, adapter,
 adapter_type, model, optional effort, isolation_policy, timeout_ms,
 and instruction_sources. It never prints instructions, credentials, project
 context, environment values, or runtime option values.
@@ -163,10 +178,10 @@ USAGE
                       command-adapter-event] [--json]
 
 Prints JSON Schema generated from the runtime Zod schemas:
-  request  JSON object accepted on review stdin
+  request  Required v2 JSON object accepted on review stdin
   events   JSONL event object emitted by a valid review run
   result   Terminal result required from each reviewer
-  config   Trusted global configuration (v1/v2 legacy or v3 current)
+  config   Trusted global configuration (v1/v2/v3 legacy or v4 current)
   config-apply  Revision-guarded full-config update request
   diagnostic    Stable public diagnostic fields
   command-adapter-event  External reviewer JSONL event union
@@ -176,14 +191,15 @@ the schema name and schema. Without --json, a short label precedes pretty JSON.
 
 These schemas describe strict JSON structure. Runtime semantic checks still
 apply where JSON Schema cannot express Review Mesh policy: result verdict/finding
-consistency, evidence line-pair rules, exactly one instruction source, project
-path normalization, assignment/reference validity, and provider-specific effort.
+consistency, evidence line-pair rules, project/workspace identity, checked-out
+branch/head assertions, default-base discovery, exactly one instruction source,
+project-name uniqueness, assignment/reference validity, and provider effort.
 Use 'review-mesh config validate' after constructing config and treat runtime
 validation as final authority.
 `,
   events: `REVIEW-MESH EVENTS
 
-Every non-empty review stdout line is one schema-version 2 JSON object. Events
+Every non-empty review stdout line is one schema-version 3 JSON object. Events
 share run_id, have strictly increasing seq values, and include timestamps.
 
 Sequence and meaning:
@@ -248,17 +264,19 @@ adapter protocol section for full request and limit details.
 Review Mesh uses one trusted global config.toml. Run 'review-mesh config path'
 for its exact platform path. Workspace .review-mesh.toml files are ignored.
 
-Schema version 3 contains:
+Schema version 4 contains:
   execution    max concurrency, heartbeat interval, shutdown grace
   diagnostics  sanitized run persistence and retention
   adapters     trusted runtime registrations and environment-variable names
   agents       scalar model/effort or model_runs, purpose, instructions,
                isolation, timeout, and optional per-run adapter overrides
   defaults     ordered fallback agent roster
-  projects     absolute-path roster/guidance/context overrides
+  projects     project-name roster/guidance/context overrides
 
-The most-specific project ancestor wins. A project with agents overrides the
-default roster; a project without agents layers guidance/context onto defaults.
+The resolved project name selects at most one entry. A project with agents
+overrides the default roster; a project without agents layers guidance/context
+onto defaults. Names match case-insensitively. Git remote repository names are
+preferred, making clones and linked worktrees portable across folder locations.
 Instruction files must remain beneath the config directory. Never store literal
 credentials in this file.
 
@@ -267,8 +285,8 @@ For autonomous changes, use export/apply with revision compare-and-swap:
   review-mesh config apply --json
 
 Export contains instruction and runtime fields and should be treated as
-sensitive. Apply accepts a complete v2 or v3 document, not a patch; v2 is
-promoted to v3 when saved. Use 'review-mesh schema config --json' and
+sensitive. Apply accepts a complete v2, v3, or v4 document, not a patch; legacy
+documents are promoted to v4 when saved. Use 'review-mesh schema config --json' and
 'review-mesh config --help' for exact details.
 `,
   "exit-codes": `REVIEW-MESH EXIT CODES

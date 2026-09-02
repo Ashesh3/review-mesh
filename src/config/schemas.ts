@@ -6,6 +6,17 @@ import {
 } from "../protocol/schemas.js";
 
 const nonEmptyString = z.string().min(1);
+export const projectNameSchema = z
+  .string()
+  .min(1)
+  .max(255)
+  .regex(
+    /^(?!\.{1,2}$)(?!\s)(?!.*\s$)[^\u0000-\u001f/\\]+$/u,
+    "project name must be trimmed and contain no path separators or control characters",
+  )
+  .describe(
+    "Portable project-name key matched case-insensitively against the workspace's Git-derived repository name.",
+  );
 export const reasoningEffortSchema = z.enum([
   "none",
   "minimal",
@@ -196,15 +207,27 @@ export const trustedConfigV3Schema = z.strictObject({
   projects: z.record(nonEmptyString, projectConfigSchema).optional(),
 });
 
+export const trustedConfigV4Schema = z.strictObject({
+  schema_version: z.literal("4"),
+  execution: executionSchema,
+  diagnostics: diagnosticsSchema,
+  adapters: z.record(nonEmptyString, adapterRegistrationSchema),
+  agents: z.record(nonEmptyString, agentProfileSchema),
+  defaults: z.strictObject({ agents: uniqueAgentIds }).optional(),
+  projects: z.record(projectNameSchema, projectConfigSchema).optional(),
+});
+
 export const trustedConfigSchema = z.union([
   trustedConfigV1Schema,
   trustedConfigV2Schema,
   trustedConfigV3Schema,
+  trustedConfigV4Schema,
 ]);
 
 export type TrustedConfigV1 = z.infer<typeof trustedConfigV1Schema>;
 export type TrustedConfigV2 = z.infer<typeof trustedConfigV2Schema>;
 export type TrustedConfigV3 = z.infer<typeof trustedConfigV3Schema>;
+export type TrustedConfigV4 = z.infer<typeof trustedConfigV4Schema>;
 export type ProjectConfig = z.infer<typeof projectConfigSchema>;
 export type TrustedConfig = z.infer<typeof trustedConfigSchema>;
 
@@ -272,7 +295,10 @@ export interface ResolvedConfig {
   diagnostics: TrustedConfigV1["diagnostics"];
   selection?: {
     source: "legacy" | "defaults" | "project";
-    matchedProjectPath?: string;
+    projectName?: string;
+    projectNameSource?:
+      "git_remote" | "git_common_directory" | "git_root" | "workspace";
+    matchedProjectName?: string;
   };
   project_context?: JsonValue;
   reviewers: ResolvedReviewer[];
@@ -286,5 +312,9 @@ export const configRevisionSchema = z.union([
 export const configApplyRequestSchema = z.strictObject({
   schema_version: z.literal("1"),
   expected_revision: configRevisionSchema,
-  config: z.union([trustedConfigV2Schema, trustedConfigV3Schema]),
+  config: z.union([
+    trustedConfigV2Schema,
+    trustedConfigV3Schema,
+    trustedConfigV4Schema,
+  ]),
 });

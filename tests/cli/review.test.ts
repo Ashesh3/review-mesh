@@ -14,6 +14,7 @@ import { dirname, join, resolve } from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { execa } from "execa";
 import { runReviewApplication } from "../../src/app.js";
 import {
   publicEventSchema,
@@ -118,7 +119,7 @@ ${adapters}`;
 }
 
 function multiModelConfig(): string {
-  return `schema_version = "3"
+  return `schema_version = "4"
 
 [execution]
 max_concurrency = 2
@@ -166,6 +167,16 @@ async function createFixture(
   const workspace = join(root, "workspace");
   const configFile = isolatedConfigFile(root);
   await mkdir(workspace, { recursive: true });
+  await execa("git", ["init", "--initial-branch=main"], { cwd: workspace });
+  await execa("git", ["config", "user.name", "Review Mesh Test"], {
+    cwd: workspace,
+  });
+  await execa("git", ["config", "user.email", "review-mesh@example.test"], {
+    cwd: workspace,
+  });
+  await writeFile(join(workspace, "README.md"), "fixture\n");
+  await execa("git", ["add", "README.md"], { cwd: workspace });
+  await execa("git", ["commit", "-m", "Initial fixture"], { cwd: workspace });
   await mkdir(dirname(configFile), { recursive: true });
   await writeFile(configFile, config);
   return {
@@ -174,10 +185,12 @@ async function createFixture(
     configFile,
     env: isolatedEnvironment(root),
     request: JSON.stringify({
-      schema_version: "1",
+      schema_version: "2",
       request_id: "cli-test-request",
+      project_name: "workspace",
       workspace,
       instructions: "Review the controlled workspace.",
+      review_scope: { mode: "changes" },
     }),
   };
 }
@@ -461,7 +474,7 @@ describe("review-mesh review", () => {
     expect(result).toMatchObject({ exitCode: 0, stderr: "" });
     const description = JSON.parse(result.stdout);
     expect(description).toMatchObject({
-      schema_version: "1",
+      schema_version: "2",
       kind: "review-mesh.description",
       tool: { name: "review-mesh", agent_first: true },
       invocation: {
@@ -470,13 +483,39 @@ describe("review-mesh review", () => {
       configuration: {
         valid: true,
         config_path: fixture.configFile,
+        selection: {
+          project_name: expect.any(String),
+          project_name_source: expect.any(String),
+        },
         execution: { max_concurrency: 2 },
         reviewers: [
           { id: "fixture-0", model: "fixture-model-0" },
           { id: "fixture-1", model: "fixture-model-1" },
         ],
       },
-      streams: { review: { final_event: "run.completed" } },
+      streams: {
+        review: {
+          stdin: "empty-or-review-request-json-v2",
+          stdout: "public-events-jsonl-v3",
+          final_event: "run.completed",
+        },
+      },
+      protocol: {
+        version: "3",
+        request_version: "2",
+        review_scope: {
+          default_mode: "changes",
+          full_review_requires_explicit_mode: true,
+        },
+      },
+      request_examples: {
+        changes: {
+          schema_version: "2",
+          project_name: "workspace",
+          review_scope: { mode: "changes" },
+        },
+        full: { review_scope: { mode: "full" } },
+      },
     });
     expect(description.invocation.default_review).toContain(canonicalWorkspace);
   });
@@ -884,6 +923,32 @@ describe("review-mesh review", () => {
     });
   });
 
+  it("rejects a v2 project name that does not match the workspace", async () => {
+    const fixture = await createFixture();
+    const stderr = new PassThrough();
+    let diagnostic = "";
+    stderr.setEncoding("utf8");
+    stderr.on("data", (chunk: string) => (diagnostic += chunk));
+    const exitCode = await runReviewApplication({
+      requestText: JSON.stringify({
+        schema_version: "2",
+        project_name: "wrong-project",
+        workspace: fixture.workspace,
+        instructions: "Review changes.",
+        review_scope: { mode: "changes" },
+      }),
+      configFile: fixture.configFile,
+      stdout: new PassThrough(),
+      stderr,
+      signal: new AbortController().signal,
+    });
+    expect(exitCode).toBe(2);
+    expect(JSON.parse(diagnostic)).toMatchObject({
+      error: "invalid_request",
+      message: expect.stringContaining("workspace identity workspace"),
+    });
+  });
+
   it("synthesizes immediately for TTY stdin without consuming it", async () => {
     const fixture = await createFixture();
     const input = new PassThrough() as PassThrough & { isTTY?: boolean };
@@ -911,8 +976,10 @@ describe("review-mesh review", () => {
     });
     expect(requestText).toBeDefined();
     expect(JSON.parse(requestText!)).toMatchObject({
-      schema_version: "1",
+      schema_version: "2",
+      project_name: "workspace",
       workspace: resolve(fixture.workspace),
+      review_scope: { mode: "changes" },
     });
   });
 
@@ -979,9 +1046,11 @@ describe("review-mesh review", () => {
   it("accepts an exactly 8 MiB request before configuration validation", async () => {
     const fixture = await createFixture(["pass"], 'schema_version = "1"\n');
     const request = {
-      schema_version: "1",
+      schema_version: "2",
+      project_name: "workspace",
       workspace: fixture.workspace,
       instructions: "Review the controlled workspace.",
+      review_scope: { mode: "changes" },
       context: { padding: "" },
     };
     const base = JSON.stringify(request);

@@ -5,7 +5,15 @@ import type { GitRunner, GitRunResult } from "./git.js";
 const MAX_STATUS_ENTRIES = 2_000;
 const MAX_CHANGED_FILES = 10_000;
 const MAX_DIFF_STAT_BYTES = 64 * 1_024;
+const MAX_DIFF_BYTES = 2 * 1_024 * 1_024;
 const MAX_ERROR_BYTES = 8 * 1_024;
+
+export class ReviewScopeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ReviewScopeError";
+  }
+}
 
 export interface RefResolution {
   requested: string;
@@ -28,19 +36,29 @@ export interface GitContext {
   status_entries: string[];
   changed_files: string[];
   diff_stat: string;
+  diff: string;
   truncated: {
     status_entries: boolean;
     changed_files: boolean;
     diff_stat: boolean;
+    diff: boolean;
   };
 }
 
 export interface ResolvedContext {
   consistency_mode: "live_worktree";
   workspace: string;
+  project_name: string;
   instructions: string;
   caller_context?: JsonValue;
-  scope_hints?: ReviewRequest["scope_hints"];
+  review_scope: {
+    mode: "changes" | "full";
+    source: "request";
+    base?: string;
+    head?: string;
+    branch?: string;
+    paths?: string[];
+  };
   git: NonGitContext | GitContext;
 }
 
@@ -147,7 +165,7 @@ async function resolveRef(
 ): Promise<RefResolution> {
   const result = await run(
     git,
-    ["rev-parse", "--verify", `${requested}^{commit}`],
+    ["rev-parse", "--verify", "--end-of-options", `${requested}^{commit}`],
     cwd,
     signal,
   );
@@ -155,6 +173,64 @@ async function resolveRef(
   return resolved === null
     ? { requested, resolved: null, error: boundedError(result) }
     : { requested, resolved };
+}
+
+type NormalizedReviewScope = ResolvedContext["review_scope"];
+
+function normalizedReviewScope(request: ReviewRequest): NormalizedReviewScope {
+  return {
+    mode: request.review_scope.mode,
+    source: "request",
+    ...(request.review_scope.mode !== "changes" ||
+    request.review_scope.base === undefined
+      ? {}
+      : { base: request.review_scope.base }),
+    ...(request.review_scope.mode !== "changes" ||
+    request.review_scope.head === undefined
+      ? {}
+      : { head: request.review_scope.head }),
+    ...(request.review_scope.mode !== "changes" ||
+    request.review_scope.branch === undefined
+      ? {}
+      : { branch: request.review_scope.branch }),
+    ...(request.review_scope.paths === undefined
+      ? {}
+      : { paths: [...request.review_scope.paths] }),
+  };
+}
+
+async function defaultBaseRef(
+  git: GitRunner,
+  cwd: string,
+  signal: AbortSignal | undefined,
+): Promise<RefResolution | undefined> {
+  const candidates: string[] = [];
+  const remotes = trimOutput(await run(git, ["remote"], cwd, signal))
+    ?.split(/\r?\n/u)
+    .map((remote) => remote.trim())
+    .filter(Boolean);
+  for (const remote of [
+    ...(remotes?.includes("origin") === true ? ["origin"] : []),
+    ...(remotes ?? []).filter((name) => name !== "origin").sort(),
+  ]) {
+    const symbolic = trimOutput(
+      await run(
+        git,
+        ["symbolic-ref", "--quiet", "--short", `refs/remotes/${remote}/HEAD`],
+        cwd,
+        signal,
+      ),
+    );
+    if (symbolic !== null) candidates.push(symbolic);
+    candidates.push(`${remote}/main`, `${remote}/master`);
+  }
+  candidates.push("main", "master");
+
+  for (const candidate of [...new Set(candidates)]) {
+    const resolved = await resolveRef(git, cwd, candidate, signal);
+    if (resolved.resolved !== null) return resolved;
+  }
+  return undefined;
 }
 
 export async function resolveContext({
@@ -167,16 +243,16 @@ export async function resolveContext({
     throw new Error(`workspace is not a directory: ${workspace}`);
   }
 
+  const reviewScope = normalizedReviewScope(request);
   const manifest: Omit<ResolvedContext, "git"> = {
     consistency_mode: "live_worktree",
     workspace,
+    project_name: request.project_name,
     instructions: request.instructions,
     ...(request.context === undefined
       ? {}
       : { caller_context: request.context }),
-    ...(request.scope_hints === undefined
-      ? {}
-      : { scope_hints: request.scope_hints }),
+    review_scope: reviewScope,
   };
   const inside = await run(
     git,
@@ -184,8 +260,14 @@ export async function resolveContext({
     workspace,
     signal,
   );
-  if (trimOutput(inside) !== "true")
+  if (trimOutput(inside) !== "true") {
+    if (reviewScope.mode === "changes") {
+      throw new ReviewScopeError(
+        "Change-focused review requires a Git repository; use review_scope.mode=full for a non-Git workspace.",
+      );
+    }
     return { ...manifest, git: { is_repository: false } };
+  }
 
   const [rootResult, headResult, branchResult] = await Promise.all([
     run(git, ["rev-parse", "--show-toplevel"], workspace, signal),
@@ -199,14 +281,45 @@ export async function resolveContext({
     );
   }
 
-  const [base, requestedHead] = await Promise.all([
-    request.scope_hints?.base === undefined
-      ? Promise.resolve(undefined)
-      : resolveRef(git, workspace, request.scope_hints.base, signal),
-    request.scope_hints?.head === undefined
-      ? Promise.resolve(undefined)
-      : resolveRef(git, workspace, request.scope_hints.head, signal),
-  ]);
+  const branch = resolveBranch(branchResult);
+  if (reviewScope.branch !== undefined && reviewScope.branch !== branch) {
+    throw new ReviewScopeError(
+      `Requested branch ${reviewScope.branch} does not match checked-out branch ${branch ?? "<detached>"}.`,
+    );
+  }
+
+  const requestedHead =
+    reviewScope.mode === "changes"
+      ? await resolveRef(git, workspace, reviewScope.head ?? "HEAD", signal)
+      : undefined;
+  if (requestedHead?.resolved === null) {
+    throw new ReviewScopeError(
+      `Could not resolve requested review head ${requestedHead.requested}.`,
+    );
+  }
+  const actualHead = trimOutput(headResult);
+  if (
+    requestedHead?.resolved !== undefined &&
+    actualHead !== null &&
+    requestedHead.resolved !== actualHead
+  ) {
+    throw new ReviewScopeError(
+      "The requested review head does not match the checked-out workspace HEAD.",
+    );
+  }
+  const base =
+    reviewScope.mode !== "changes"
+      ? undefined
+      : reviewScope.base === undefined
+        ? await defaultBaseRef(git, workspace, signal)
+        : await resolveRef(git, workspace, reviewScope.base, signal);
+  if (reviewScope.mode === "changes" && base?.resolved == null) {
+    throw new ReviewScopeError(
+      reviewScope.base === undefined
+        ? "Could not infer the repository default branch; pass review_scope.base explicitly."
+        : `Could not resolve requested review base ${base?.requested ?? reviewScope.base}.`,
+    );
+  }
   let mergeBase: string | null = null;
   if (
     base?.resolved !== null &&
@@ -221,12 +334,22 @@ export async function resolveContext({
       signal,
     );
     mergeBase = trimOutput(result);
+    if (mergeBase === null) {
+      throw new ReviewScopeError(
+        "The requested review base and checked-out head do not have a resolvable merge base.",
+      );
+    }
   }
 
-  const paths = pathspecArgs(request.scope_hints?.paths);
+  const paths = pathspecArgs(reviewScope.paths);
   const [
     statusResult,
+    committedDiffResult,
+    unstagedDiffResult,
+    stagedDiffResult,
+    committedPathsResult,
     unstagedPathsResult,
+    committedStatResult,
     stagedPathsResult,
     untrackedPathsResult,
     unstagedStatResult,
@@ -238,12 +361,89 @@ export async function resolveContext({
       workspace,
       signal,
     ),
+    mergeBase === null || requestedHead?.resolved == null
+      ? Promise.resolve<GitRunResult>({ stdout: "", stderr: "", exitCode: 0 })
+      : run(
+          git,
+          [
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--unified=3",
+            "--no-color",
+            mergeBase,
+            requestedHead.resolved,
+            ...paths,
+          ],
+          workspace,
+          signal,
+        ),
+    run(
+      git,
+      [
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--unified=3",
+        "--no-color",
+        ...paths,
+      ],
+      workspace,
+      signal,
+    ),
+    run(
+      git,
+      [
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--cached",
+        "--unified=3",
+        "--no-color",
+        ...paths,
+      ],
+      workspace,
+      signal,
+    ),
+    mergeBase === null || requestedHead?.resolved == null
+      ? Promise.resolve<GitRunResult>({ stdout: "", stderr: "", exitCode: 0 })
+      : run(
+          git,
+          [
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--name-only",
+            "-z",
+            mergeBase,
+            requestedHead.resolved,
+            ...paths,
+          ],
+          workspace,
+          signal,
+        ),
     run(
       git,
       ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z", ...paths],
       workspace,
       signal,
     ),
+    mergeBase === null || requestedHead?.resolved == null
+      ? Promise.resolve<GitRunResult>({ stdout: "", stderr: "", exitCode: 0 })
+      : run(
+          git,
+          [
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--stat",
+            mergeBase,
+            requestedHead.resolved,
+            ...paths,
+          ],
+          workspace,
+          signal,
+        ),
     run(
       git,
       [
@@ -284,9 +484,33 @@ export async function resolveContext({
       signal,
     ),
   ]);
+  if (
+    reviewScope.mode === "changes" &&
+    [
+      statusResult,
+      committedDiffResult,
+      unstagedDiffResult,
+      stagedDiffResult,
+      committedPathsResult,
+      unstagedPathsResult,
+      committedStatResult,
+      stagedPathsResult,
+      untrackedPathsResult,
+      unstagedStatResult,
+      stagedStatResult,
+    ].some((result) => result.exitCode !== 0)
+  ) {
+    throw new ReviewScopeError(
+      "Review Mesh could not collect the complete Git change scope.",
+    );
+  }
   const status = boundedLines(
     statusResult.exitCode === 0 ? statusResult.stdout : "",
     MAX_STATUS_ENTRIES,
+  );
+  const committedPaths = boundedPaths(
+    committedPathsResult.exitCode === 0 ? committedPathsResult.stdout : "",
+    MAX_CHANGED_FILES,
   );
   const unstagedPaths = boundedPaths(
     unstagedPathsResult.exitCode === 0 ? unstagedPathsResult.stdout : "",
@@ -305,22 +529,32 @@ export async function resolveContext({
       ...unstagedPaths.values,
       ...stagedPaths.values,
       ...untrackedPaths.values,
+      ...committedPaths.values,
     ]),
   ];
   const changedFilesTruncated =
+    committedPaths.truncated ||
     unstagedPaths.truncated ||
     stagedPaths.truncated ||
     untrackedPaths.truncated ||
     unstagedPathsResult.outputTruncated === true ||
     stagedPathsResult.outputTruncated === true ||
     untrackedPathsResult.outputTruncated === true ||
+    committedPathsResult.outputTruncated === true ||
     changedFiles.length > MAX_CHANGED_FILES;
   const diffStat = boundedText(
-    [unstagedStatResult, stagedStatResult]
+    [committedStatResult, unstagedStatResult, stagedStatResult]
       .filter((result) => result.exitCode === 0 && result.stdout.length > 0)
       .map((result) => result.stdout)
       .join("\n"),
     MAX_DIFF_STAT_BYTES,
+  );
+  const diff = boundedText(
+    [committedDiffResult, unstagedDiffResult, stagedDiffResult]
+      .filter((result) => result.exitCode === 0 && result.stdout.length > 0)
+      .map((result) => result.stdout)
+      .join("\n"),
+    MAX_DIFF_BYTES,
   );
 
   return {
@@ -328,22 +562,29 @@ export async function resolveContext({
     git: {
       is_repository: true,
       root: await realpath(root),
-      branch: resolveBranch(branchResult),
-      head: trimOutput(headResult),
+      branch,
+      head: actualHead,
       ...(base === undefined ? {} : { base }),
       ...(requestedHead === undefined ? {} : { requested_head: requestedHead }),
       merge_base: mergeBase,
       status_entries: status.values,
       changed_files: changedFiles.slice(0, MAX_CHANGED_FILES),
       diff_stat: diffStat.value,
+      diff: diff.value,
       truncated: {
         status_entries:
           status.truncated || statusResult.outputTruncated === true,
         changed_files: changedFilesTruncated,
         diff_stat:
           diffStat.truncated ||
+          committedStatResult.outputTruncated === true ||
           unstagedStatResult.outputTruncated === true ||
           stagedStatResult.outputTruncated === true,
+        diff:
+          diff.truncated ||
+          committedDiffResult.outputTruncated === true ||
+          unstagedDiffResult.outputTruncated === true ||
+          stagedDiffResult.outputTruncated === true,
       },
     },
   };

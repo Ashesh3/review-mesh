@@ -520,10 +520,18 @@ export async function runReviewRound({
           : {
               selection: {
                 source: config.selection.source,
-                ...(config.selection.matchedProjectPath === undefined
+                ...(config.selection.projectName === undefined
+                  ? {}
+                  : { project_name: config.selection.projectName }),
+                ...(config.selection.projectNameSource === undefined
                   ? {}
                   : {
-                      matched_project_path: config.selection.matchedProjectPath,
+                      project_name_source: config.selection.projectNameSource,
+                    }),
+                ...(config.selection.matchedProjectName === undefined
+                  ? {}
+                  : {
+                      matched_project_name: config.selection.matchedProjectName,
                     }),
               },
             }),

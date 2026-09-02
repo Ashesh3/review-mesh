@@ -9,7 +9,6 @@ import {
   realpath,
   rename,
   rm,
-  stat,
 } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { parse, stringify } from "smol-toml";
@@ -18,14 +17,20 @@ import type {
   ModelRun,
   ReasoningEffort,
   TrustedConfigV2,
+  TrustedConfigV3,
 } from "./schemas.js";
 import type { JsonValue } from "../protocol/schemas.js";
 import {
   trustedConfigSchema,
-  trustedConfigV3Schema,
+  trustedConfigV4Schema,
   validateAdapterEffort,
 } from "./schemas.js";
 import { validateProjectKeys } from "./project-paths.js";
+import {
+  projectNameFromLegacyPath,
+  resolveProjectName,
+  validateProjectNames,
+} from "./project-names.js";
 
 export const MAX_CONFIG_BYTES = 4 * 1024 * 1024;
 const READ_CHUNK_BYTES = 64 * 1024;
@@ -73,7 +78,7 @@ export interface ManagedProject {
 }
 
 export interface ManagedConfig {
-  schema_version: "3";
+  schema_version: "4";
   execution: {
     max_concurrency: number;
     heartbeat_interval_ms: number;
@@ -191,18 +196,18 @@ function clone<T>(value: T): T {
 function requireManagedConfig(value: unknown): ManagedConfig {
   const record = asRecord(value);
   if (
-    record?.schema_version !== "3" ||
+    record?.schema_version !== "4" ||
     asRecord(record.execution) === undefined ||
     asRecord(record.diagnostics) === undefined ||
     asRecord(record.adapters) === undefined ||
     asRecord(record.agents) === undefined
   ) {
-    throw new Error("configuration is not a Review Mesh v3 configuration");
+    throw new Error("configuration is not a Review Mesh v4 configuration");
   }
   const config = clone(
-    trustedConfigV3Schema.parse(value) as unknown as ManagedConfig,
+    trustedConfigV4Schema.parse(value) as unknown as ManagedConfig,
   );
-  validateProjectKeys(config.projects);
+  validateProjectNames(config.projects);
   requireAssignments(config);
   const expandedReviewerIds = new Set<string>();
   for (const [id, agent] of Object.entries(config.agents)) {
@@ -326,7 +331,7 @@ export function migrateV1Config(value: unknown): ManagedConfig {
   }
 
   return requireManagedConfig({
-    schema_version: "3",
+    schema_version: "4",
     execution: clone(record.execution as ManagedConfig["execution"]),
     diagnostics: clone(record.diagnostics as ManagedConfig["diagnostics"]),
     adapters: clone(record.adapters as ManagedConfig["adapters"]),
@@ -344,8 +349,93 @@ export function migrateV2Config(value: unknown): ManagedConfig {
   }
   return requireManagedConfig({
     ...(clone(parsed) as TrustedConfigV2),
-    schema_version: "3",
+    schema_version: "4",
+    projects: migrateLegacyProjects(parsed.projects),
   });
+}
+
+function migrateLegacyProjects(
+  projects: TrustedConfigV2["projects"] | TrustedConfigV3["projects"],
+): ManagedConfig["projects"] {
+  const migrated: Record<string, ManagedProject> = {};
+  const sources = new Map<string, string>();
+  for (const [path, project] of Object.entries(projects ?? {})) {
+    const name = projectNameFromLegacyPath(path);
+    const normalized = name.toLocaleLowerCase("en-US");
+    const previous = sources.get(normalized);
+    if (previous !== undefined) {
+      throw new Error(
+        `legacy project paths ${previous} and ${path} both migrate to project name ${name}`,
+      );
+    }
+    sources.set(normalized, path);
+    migrated[name] = clone(project);
+  }
+  return migrated;
+}
+
+async function migrateLegacyProjectsByIdentity(
+  projects: TrustedConfigV2["projects"] | TrustedConfigV3["projects"],
+): Promise<ManagedConfig["projects"]> {
+  const migrated: Record<string, ManagedProject> = {};
+  const sources = new Map<string, string>();
+  for (const [path, project] of Object.entries(projects ?? {})) {
+    let name: string;
+    try {
+      name = (await resolveProjectName(path)).name;
+    } catch {
+      name = projectNameFromLegacyPath(path);
+    }
+    const normalized = name.toLocaleLowerCase("en-US");
+    const previous = sources.get(normalized);
+    if (previous !== undefined) {
+      throw new Error(
+        `legacy project paths ${previous} and ${path} both migrate to project name ${name}`,
+      );
+    }
+    sources.set(normalized, path);
+    migrated[name] = clone(project);
+  }
+  return migrated;
+}
+
+/** Promotes path-keyed multi-model v3 projects to name-keyed v4 projects. */
+export function migrateV3Config(value: unknown): ManagedConfig {
+  const parsed = trustedConfigSchema.parse(value);
+  if (parsed.schema_version !== "3") {
+    throw new Error("configuration is not a Review Mesh v3 configuration");
+  }
+  validateProjectKeys(parsed.projects);
+  return requireManagedConfig({
+    ...(clone(parsed) as TrustedConfigV3),
+    schema_version: "4",
+    projects: migrateLegacyProjects(parsed.projects),
+  });
+}
+
+/** Migrates legacy path keys using repository identity for paths that still exist. */
+export async function migrateLegacyConfig(
+  value: unknown,
+): Promise<ManagedConfig> {
+  const parsed = trustedConfigSchema.parse(value);
+  if (parsed.schema_version === "1") return migrateV1Config(parsed);
+  if (parsed.schema_version === "2") {
+    validateProjectKeys(parsed.projects);
+    return requireManagedConfig({
+      ...(clone(parsed) as TrustedConfigV2),
+      schema_version: "4",
+      projects: await migrateLegacyProjectsByIdentity(parsed.projects),
+    });
+  }
+  if (parsed.schema_version === "3") {
+    validateProjectKeys(parsed.projects);
+    return requireManagedConfig({
+      ...(clone(parsed) as TrustedConfigV3),
+      schema_version: "4",
+      projects: await migrateLegacyProjectsByIdentity(parsed.projects),
+    });
+  }
+  return requireManagedConfig(parsed);
 }
 
 export function parseManagedConfig(text: string): {
@@ -358,6 +448,8 @@ export function parseManagedConfig(text: string): {
     return { config: migrateV1Config(parsed), migrated: true };
   if (version === "2")
     return { config: migrateV2Config(parsed), migrated: true };
+  if (version === "3")
+    return { config: migrateV3Config(parsed), migrated: true };
   return { config: requireManagedConfig(parsed), migrated: false };
 }
 
@@ -374,7 +466,7 @@ export function serializeManagedConfig(config: ManagedConfig): string {
 
 export function emptyManagedConfig(): ManagedConfig {
   return {
-    schema_version: "3",
+    schema_version: "4",
     execution: {
       max_concurrency: 2,
       heartbeat_interval_ms: 15_000,
@@ -494,7 +586,12 @@ export async function loadManagedConfig(
     };
   }
   const sourceText = current.text!;
-  const parsed = parseManagedConfig(sourceText);
+  const source = parse(sourceText);
+  const version = asRecord(source)?.schema_version;
+  const parsed =
+    version === "2" || version === "3"
+      ? { config: await migrateLegacyConfig(source), migrated: true }
+      : parseManagedConfig(sourceText);
   return { ...parsed, snapshot: current.snapshot, sourceText };
 }
 
@@ -601,20 +698,6 @@ export async function saveManagedConfig(
   }
 }
 
-export async function canonicalProjectPath(
-  candidate: string,
-  cwd = process.cwd(),
-): Promise<string> {
-  const canonical = await realpath(resolve(cwd, candidate));
-  if (!(await stat(canonical)).isDirectory()) {
-    throw new Error("project path must identify an existing directory");
-  }
-  const slashNormalized = canonical.replaceAll("\\", "/");
-  return process.platform === "win32"
-    ? slashNormalized.toLowerCase()
-    : slashNormalized;
-}
-
 export function requireSafeIdentifier(value: string, label: string): string {
   if (!SAFE_IDENTIFIER.test(value)) {
     throw new Error(
@@ -651,6 +734,6 @@ export function listConfig(config: ManagedConfig) {
       })),
     projects: Object.entries(config.projects ?? {})
       .sort(([left], [right]) => left.localeCompare(right))
-      .map(([path, project]) => ({ path, agents: project.agents ?? [] })),
+      .map(([name, project]) => ({ name, agents: project.agents ?? [] })),
   };
 }

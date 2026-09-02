@@ -22,9 +22,9 @@ async function fixture() {
   roots.push(root);
   const workspace = join(root, "project");
   await mkdir(workspace);
-  const projectPath = (await realpath(workspace)).replaceAll("\\", "/");
+  const projectName = "project";
   const config: ManagedConfig = {
-    schema_version: "3",
+    schema_version: "4",
     execution: {
       max_concurrency: 2,
       heartbeat_interval_ms: 5000,
@@ -51,7 +51,7 @@ async function fixture() {
     },
     defaults: { agents: ["reviewer"] },
     projects: {
-      [projectPath]: {
+      [projectName]: {
         instructions: "SECRET PROJECT INSTRUCTION",
         context: { secret: "SECRET PROJECT CONTEXT" },
       },
@@ -59,7 +59,7 @@ async function fixture() {
   };
   const file = join(root, "config.toml");
   await writeFile(file, serializeManagedConfig(config));
-  return { file, workspace, projectPath };
+  return { file, workspace, projectName };
 }
 
 afterEach(async () => {
@@ -70,7 +70,7 @@ afterEach(async () => {
 
 describe("effective configuration description", () => {
   it("returns the effective ordered suite without secret or instruction contents", async () => {
-    const { file, workspace, projectPath } = await fixture();
+    const { file, workspace, projectName } = await fixture();
     const result = await describeEffectiveConfig({
       configFile: file,
       workspace,
@@ -81,7 +81,9 @@ describe("effective configuration description", () => {
       config_path: file,
       selection: {
         source: "defaults",
-        matched_project_path: projectPath,
+        project_name: projectName,
+        project_name_source: "workspace",
+        matched_project_name: projectName,
       },
       execution: { max_concurrency: 2, heartbeat_interval_ms: 5000 },
       reviewers: [

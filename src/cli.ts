@@ -10,6 +10,7 @@ import {
 } from "./app.js";
 import type { AdapterRegistry } from "./adapters/registry.js";
 import { runConfigCommand } from "./config/command.js";
+import { resolveProjectName } from "./config/project-names.js";
 import {
   normalizeHelpTopic,
   renderHelp,
@@ -73,17 +74,27 @@ async function writeText(
   });
 }
 
-function defaultRequest(cwd: string): string {
+async function defaultRequest(
+  cwd: string,
+  signal: AbortSignal,
+): Promise<string> {
+  const project = await resolveProjectName(cwd, { signal });
   return JSON.stringify({
-    schema_version: "1",
+    schema_version: "2",
+    project_name: project.name,
     workspace: cwd,
     instructions:
-      "Review the current workspace for actionable correctness, security, reliability, compatibility, and test-coverage defects. Report only evidence-backed findings with precise file and line references when available.",
+      "Review the current change set for actionable correctness, security, reliability, compatibility, and test-coverage defects. Report only evidence-backed findings with precise file and line references when available.",
+    review_scope: { mode: "changes" },
   });
 }
 
-function explicitReviewRequest(cwd: string, workspace: string): string {
-  return defaultRequest(resolve(cwd, workspace));
+async function explicitReviewRequest(
+  cwd: string,
+  workspace: string,
+  signal: AbortSignal,
+): Promise<string> {
+  return defaultRequest(resolve(cwd, workspace), signal);
 }
 
 class RequestReadError extends Error {
@@ -331,8 +342,12 @@ export async function runCli(
       requestText =
         input.isTTY === true
           ? positionalWorkspace === undefined
-            ? defaultRequest(cwd)
-            : explicitReviewRequest(cwd, positionalWorkspace)
+            ? await defaultRequest(cwd, controller.signal)
+            : await explicitReviewRequest(
+                cwd,
+                positionalWorkspace,
+                controller.signal,
+              )
           : await readRequest(input, controller.signal);
     } catch (error) {
       if (
@@ -366,8 +381,12 @@ export async function runCli(
     if (requestText.trim().length === 0) {
       requestText =
         positionalWorkspace === undefined
-          ? defaultRequest(cwd)
-          : explicitReviewRequest(cwd, positionalWorkspace);
+          ? await defaultRequest(cwd, controller.signal)
+          : await explicitReviewRequest(
+              cwd,
+              positionalWorkspace,
+              controller.signal,
+            );
     } else if (positionalWorkspace !== undefined && input.isTTY !== true) {
       await writeUsageDiagnostic(
         "A positional review workspace cannot be combined with a JSON request on stdin.",

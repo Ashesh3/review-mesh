@@ -91,7 +91,12 @@ describe("resolveContext", () => {
         workspace: repo.path,
         instructions: "Keep this raw.",
         context: { ticket: "RM-4" },
-        scope_hints: { base: "HEAD~1", head: "HEAD", paths: ["src"] },
+        review_scope: {
+          mode: "changes",
+          base: "HEAD~1",
+          head: "HEAD",
+          paths: ["src"],
+        },
       }),
       git: createGitRunner(),
     });
@@ -100,7 +105,9 @@ describe("resolveContext", () => {
     expect(context.consistency_mode).toBe("live_worktree");
     expect(context.instructions).toBe("Keep this raw.");
     expect(context.caller_context).toEqual({ ticket: "RM-4" });
-    expect(context.scope_hints).toEqual({
+    expect(context.review_scope).toEqual({
+      mode: "changes",
+      source: "request",
       base: "HEAD~1",
       head: "HEAD",
       paths: ["src"],
@@ -126,39 +133,159 @@ describe("resolveContext", () => {
     expect(context.git.diff_stat).toContain("src/staged.ts");
   });
 
-  it("returns an explicit non-git manifest instead of failing", async () => {
+  it("allows an explicit full review outside Git", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "review-mesh-non-git-"));
     directories.push(workspace);
 
     const context = await resolveContext({
-      request: request({ workspace }),
-      git: createGitRunner(),
-    });
-
-    expect(context.git).toEqual({ is_repository: false });
-  });
-
-  it("surfaces an unresolved explicit base without substituting another ref", async () => {
-    const repo = await createGitFixture();
-    fixtures.push(repo);
-
-    const context = await resolveContext({
       request: request({
-        workspace: repo.path,
-        scope_hints: { base: "missing-ref", head: "HEAD" },
+        project_name: "plain",
+        workspace,
+        review_scope: { mode: "full" },
       }),
       git: createGitRunner(),
     });
 
-    expect(context.git.is_repository).toBe(true);
-    if (!context.git.is_repository)
-      throw new Error("expected a Git repository");
-    expect(context.git.base).toMatchObject({
-      requested: "missing-ref",
-      resolved: null,
+    expect(context.git).toEqual({ is_repository: false });
+    expect(context.review_scope).toEqual({ mode: "full", source: "request" });
+  });
+
+  it("defaults v2 requests to changes above main and includes local work", async () => {
+    const repo = await createGitFixture();
+    fixtures.push(repo);
+    await execa("git", ["branch", "-M", "main"], { cwd: repo.path });
+    await execa("git", ["checkout", "-b", "feature/change-scope"], {
+      cwd: repo.path,
     });
-    expect(context.git.base?.error).toBeTruthy();
-    expect(context.git.merge_base).toBeNull();
+    await repo.write("src/feature.ts", "export const feature = true;\n");
+    await repo.stage("src/feature.ts");
+    await execa("git", ["commit", "-m", "Feature commit"], { cwd: repo.path });
+    await repo.write("src/local.ts", "export const local = true;\n");
+
+    const context = await resolveContext({
+      request: {
+        schema_version: "2",
+        project_name: "project",
+        workspace: repo.path,
+        instructions: "Review the current changes.",
+        review_scope: { mode: "changes" },
+      },
+      git: createGitRunner(),
+    });
+
+    expect(context.review_scope).toEqual({
+      mode: "changes",
+      source: "request",
+    });
+    expect(context.git.is_repository).toBe(true);
+    if (!context.git.is_repository) throw new Error("expected Git repository");
+    expect(context.git.base?.requested).toBe("main");
+    expect(context.git.merge_base).toMatch(/^[0-9a-f]{40}$/u);
+    expect(context.git.changed_files).toEqual(
+      expect.arrayContaining(["src/feature.ts", "src/local.ts"]),
+    );
+    expect(context.git.diff).toContain("src/feature.ts");
+  });
+
+  it("rejects mismatched branch assertions and non-Git change scopes", async () => {
+    const repo = await createGitFixture();
+    fixtures.push(repo);
+    await expect(
+      resolveContext({
+        request: {
+          schema_version: "2",
+          project_name: "project",
+          workspace: repo.path,
+          instructions: "Review changes.",
+          review_scope: { mode: "changes", branch: "not-current" },
+        },
+        git: createGitRunner(),
+      }),
+    ).rejects.toThrow(/does not match checked-out branch/i);
+
+    const workspace = await mkdtemp(join(tmpdir(), "review-mesh-non-git-v2-"));
+    directories.push(workspace);
+    await expect(
+      resolveContext({
+        request: {
+          schema_version: "2",
+          project_name: "plain",
+          workspace,
+          instructions: "Review changes.",
+          review_scope: { mode: "changes" },
+        },
+        git: createGitRunner(),
+      }),
+    ).rejects.toThrow(/requires a Git repository/i);
+  });
+
+  it("rejects an unresolved explicit base without substituting another ref", async () => {
+    const repo = await createGitFixture();
+    fixtures.push(repo);
+
+    await expect(
+      resolveContext({
+        request: request({
+          workspace: repo.path,
+          review_scope: {
+            mode: "changes",
+            base: "missing-ref",
+            head: "HEAD",
+          },
+        }),
+        git: createGitRunner(),
+      }),
+    ).rejects.toThrow(/could not resolve requested review base missing-ref/i);
+  });
+
+  it("fails closed when Git cannot produce a complete change scope", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "review-mesh-scope-fail-"));
+    directories.push(workspace);
+    const commit = "a".repeat(40);
+    const base = "b".repeat(40);
+    const git: GitRunner = {
+      async run(args) {
+        if (args.includes("--is-inside-work-tree")) {
+          return { stdout: "true\n", stderr: "", exitCode: 0 };
+        }
+        if (args.includes("--show-toplevel")) {
+          return { stdout: `${workspace}\n`, stderr: "", exitCode: 0 };
+        }
+        if (args.includes("--abbrev-ref")) {
+          return { stdout: "feature\n", stderr: "", exitCode: 0 };
+        }
+        if (args[0] === "rev-parse" && args[1] === "HEAD") {
+          return { stdout: `${commit}\n`, stderr: "", exitCode: 0 };
+        }
+        if (args.includes("--verify")) {
+          return {
+            stdout: `${args.at(-1) === "HEAD^{commit}" ? commit : base}\n`,
+            stderr: "",
+            exitCode: 0,
+          };
+        }
+        if (args[0] === "merge-base") {
+          return { stdout: `${"b".repeat(40)}\n`, stderr: "", exitCode: 0 };
+        }
+        if (args[0] === "merge-base") {
+          return { stdout: `${base}\n`, stderr: "", exitCode: 0 };
+        }
+        if (args[0] === "diff" && args.includes("--name-only")) {
+          return { stdout: "", stderr: "failed", exitCode: 1 };
+        }
+        return { stdout: "", stderr: "", exitCode: 0 };
+      },
+    };
+
+    await expect(
+      resolveContext({
+        request: request({
+          workspace,
+          review_scope: { mode: "changes", base: "main" },
+        }),
+        git,
+      }),
+    ).rejects.toThrow(/complete Git change scope/i);
   });
 
   it("does not refresh a stale Git index during context discovery", async () => {
@@ -254,11 +381,29 @@ describe("resolveContext", () => {
           return { stdout: `${"a".repeat(40)}\n`, stderr: "", exitCode: 0 };
         }
         if (args.includes("--verify")) {
+          const requested = args.at(-1);
+          if (requested === "HEAD^{commit}") {
+            return {
+              stdout: `${"a".repeat(40)}\n`,
+              stderr: "",
+              exitCode: 0,
+            };
+          }
+          if (requested === "main^{commit}") {
+            return {
+              stdout: `${"b".repeat(40)}\n`,
+              stderr: "",
+              exitCode: 0,
+            };
+          }
           return {
             stdout: "",
             stderr: `${"x".repeat(8_191)}😀`,
             exitCode: 1,
           };
+        }
+        if (args[0] === "merge-base") {
+          return { stdout: `${"a".repeat(40)}\n`, stderr: "", exitCode: 0 };
         }
         if (args[0] === "status") {
           return {
@@ -291,7 +436,11 @@ describe("resolveContext", () => {
     const context = await resolveContext({
       request: request({
         workspace,
-        scope_hints: { base: "missing-ref", paths: ["-looks-like-an-option"] },
+        review_scope: {
+          mode: "changes",
+          base: "main",
+          paths: ["-looks-like-an-option"],
+        },
       }),
       git,
     });
@@ -312,8 +461,11 @@ describe("resolveContext", () => {
       status_entries: true,
       changed_files: true,
       diff_stat: true,
+      diff: false,
     });
-    for (const command of commands.filter((args) => args[0] !== "rev-parse")) {
+    for (const command of commands.filter(
+      (args) => args[0] !== "rev-parse" && args[0] !== "merge-base",
+    )) {
       expect(command).toContain("--");
     }
     for (const command of commands.filter((args) => args[0] === "diff")) {
@@ -337,6 +489,16 @@ describe("resolveContext", () => {
           return { stdout: "main\n", stderr: "", exitCode: 0 };
         }
         if (args[0] === "rev-parse" && args[1] === "HEAD") {
+          return { stdout: `${"a".repeat(40)}\n`, stderr: "", exitCode: 0 };
+        }
+        if (args.includes("--verify")) {
+          return {
+            stdout: `${"a".repeat(40)}\n`,
+            stderr: "",
+            exitCode: 0,
+          };
+        }
+        if (args[0] === "merge-base") {
           return { stdout: `${"a".repeat(40)}\n`, stderr: "", exitCode: 0 };
         }
         if (args[0] === "status") {
@@ -379,6 +541,7 @@ describe("resolveContext", () => {
       status_entries: true,
       changed_files: true,
       diff_stat: true,
+      diff: false,
     });
   });
 });
