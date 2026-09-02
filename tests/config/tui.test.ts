@@ -185,7 +185,7 @@ describe("config menu", () => {
     });
   });
 
-  it("adds the first agent, then assigns it to a canonical project", async () => {
+  it("adds the first agent, then assigns it to a project name", async () => {
     const directory = await mkdtemp(join(tmpdir(), "review-mesh-config-tui-"));
     roots.push(directory);
     const project = join(directory, "project");
@@ -209,7 +209,7 @@ describe("config menu", () => {
       "900000",
       "n",
       "p",
-      project,
+      "project",
       "gemini",
       "Project focus",
       '{"team":"core"}',
@@ -240,13 +240,9 @@ describe("config menu", () => {
     roots.push(directory);
     const project = join(directory, "project");
     await mkdir(project);
-    const canonicalProject =
-      process.platform === "win32"
-        ? project.replaceAll("\\", "/").toLowerCase()
-        : project.replaceAll("\\", "/");
     const file = join(directory, "config.toml");
     const initial: ManagedConfig = {
-      schema_version: "3",
+      schema_version: "4",
       execution: {
         max_concurrency: 1,
         heartbeat_interval_ms: 100,
@@ -280,7 +276,7 @@ describe("config menu", () => {
       },
       defaults: { agents: ["one"] },
       projects: {
-        [canonicalProject]: {
+        project: {
           agents: ["one"],
           instructions: "Original project focus",
           context: { tier: 1 },
@@ -305,7 +301,7 @@ describe("config menu", () => {
       "2000",
       "y",
       "o",
-      project,
+      "project",
       "two",
       "Edited project focus",
       '{"tier":2}',
@@ -359,7 +355,7 @@ describe("config menu", () => {
     roots.push(directory);
     const file = join(directory, "config.toml");
     const initial: ManagedConfig = {
-      schema_version: "3",
+      schema_version: "4",
       execution: {
         max_concurrency: 2,
         heartbeat_interval_ms: 100,
@@ -456,7 +452,7 @@ describe("config menu", () => {
     roots.push(directory);
     const file = join(directory, "config.toml");
     const initial: ManagedConfig = {
-      schema_version: "3",
+      schema_version: "4",
       execution: {
         max_concurrency: 2,
         heartbeat_interval_ms: 100,
@@ -583,7 +579,7 @@ describe("config menu", () => {
       output,
     });
     expect(loaded.config).toEqual<ManagedConfig>({
-      schema_version: "3",
+      schema_version: "4",
       execution: {
         max_concurrency: 2,
         heartbeat_interval_ms: 15000,
@@ -628,14 +624,13 @@ describe("config menu", () => {
     expect(loaded.config.agents.only).toBeDefined();
   });
 
-  it("removes a stored project after its directory was deleted", async () => {
+  it("removes a stored project by name", async () => {
     const directory = await mkdtemp(join(tmpdir(), "review-mesh-config-tui-"));
     roots.push(directory);
-    const stale = join(directory, "deleted-project");
-    const stored = stale.replaceAll("\\", "/").toLowerCase();
+    const stored = "deleted-project";
     const file = join(directory, "config.toml");
     const initial: ManagedConfig = {
-      schema_version: "3",
+      schema_version: "4",
       execution: {
         max_concurrency: 1,
         heartbeat_interval_ms: 100,
@@ -668,7 +663,7 @@ describe("config menu", () => {
       configFile: file,
       config: loaded.config,
       snapshot: loaded.snapshot,
-      prompt: new Answers(["d", stale, "y", "q"]),
+      prompt: new Answers(["d", stored, "y", "q"]),
       output: new PassThrough(),
     });
     expect((await loadManagedConfig(file)).config.projects).toEqual({});

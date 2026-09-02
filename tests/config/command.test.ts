@@ -15,7 +15,7 @@ const roots: string[] = [];
 
 function config(): ManagedConfig {
   return {
-    schema_version: "3",
+    schema_version: "4",
     execution: {
       max_concurrency: 1,
       heartbeat_interval_ms: 100,
@@ -120,7 +120,7 @@ describe("config command", () => {
     expect(
       await runConfigCommand({ args: ["show"], configFile: file, ...shown }),
     ).toBe(0);
-    expect(shown.stdout()).toContain('schema_version = "3"');
+    expect(shown.stdout()).toContain('schema_version = "4"');
 
     const validated = streams();
     expect(
@@ -144,7 +144,7 @@ describe("config command", () => {
       }),
     ).toBe(0);
     expect(JSON.parse(io.stdout())).toMatchObject({
-      schema_version: "3",
+      schema_version: "4",
       agents: [{ id: "gemini", default: true }],
       projects: [],
     });
@@ -235,11 +235,11 @@ describe("config command", () => {
     const exported = JSON.parse(io.stdout());
     expect(exported).toMatchObject({
       schema_version: "1",
-      config_schema_version: "3",
+      config_schema_version: "4",
       path: file,
       exists: true,
       migrated: false,
-      config: { schema_version: "3" },
+      config: { schema_version: "4" },
     });
     expect(exported.revision).toMatch(/^[a-f0-9]{64}$/);
     expect(exported.config.agents.gemini.instructions).toBe("review");
@@ -250,9 +250,8 @@ describe("config command", () => {
     const project = join(directory, "project");
     await mkdir(project);
     const updated = config();
-    const canonicalProject = (await realpath(project)).replaceAll("\\", "/");
     updated.projects = {
-      [canonicalProject]: {
+      project: {
         agents: ["gemini"],
         instructions: "project secret instruction",
         context: { secret: "project secret context" },
@@ -383,7 +382,7 @@ describe("config command", () => {
       }),
     ).toBe(0);
     const saved = (await loadManagedConfig(file)).config;
-    expect(saved.schema_version).toBe("3");
+    expect(saved.schema_version).toBe("4");
     expect(saved.execution.max_concurrency).toBe(4);
   });
 
@@ -421,7 +420,7 @@ describe("config command", () => {
 
     const unsafe = streams();
     const unsafeConfig = config();
-    unsafeConfig.projects = { relative: { agents: ["gemini"] } };
+    unsafeConfig.projects = { "not/a/name": { agents: ["gemini"] } };
     inputJson(unsafe, {
       schema_version: "1",
       expected_revision: (await loadManagedConfig(file)).snapshot.hash,
@@ -435,7 +434,7 @@ describe("config command", () => {
       }),
     ).toBe(2);
     expect(JSON.parse(unsafe.stderr())).toMatchObject({
-      error: "configuration_error",
+      error: "invalid_request",
     });
 
     const oversized = streams();

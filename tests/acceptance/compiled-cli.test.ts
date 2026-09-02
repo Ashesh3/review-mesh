@@ -120,10 +120,12 @@ async function createFixture(modes: readonly string[]): Promise<Fixture> {
     workspace,
     env: isolatedEnvironment(root),
     request: JSON.stringify({
-      schema_version: "1",
+      schema_version: "2",
       request_id: "acceptance-request",
+      project_name: "workspace",
       workspace,
       instructions: "Review the controlled fixture.",
+      review_scope: { mode: "full" },
     }),
   };
 }

@@ -214,9 +214,11 @@ profile = "portable"
     const result = await run(
       artifact,
       {
-        schema_version: "1",
+        schema_version: "2",
+        project_name: "command-workspace",
         workspace,
         instructions: "Review the portable command fixture.",
+        review_scope: { mode: "full" },
       },
       { cwd: root, env: isolatedEnvironment(join(root, "command-home")) },
     );
@@ -304,9 +306,11 @@ profile = "portable"
       const result = await run(
         artifact,
         {
-          schema_version: "1",
+          schema_version: "2",
+          project_name: "openai-workspace",
           workspace,
           instructions: "Review the portable OpenAI-compatible fixture.",
+          review_scope: { mode: "full" },
         },
         {
           cwd: root,

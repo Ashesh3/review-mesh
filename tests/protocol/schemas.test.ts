@@ -7,13 +7,75 @@ import {
 } from "../../src/protocol/schemas.js";
 
 describe("reviewRequestSchema", () => {
+  it("accepts the explicit v2 project/workspace/change-scope contract", () => {
+    expect(
+      reviewRequestSchema.parse({
+        schema_version: "2",
+        project_name: "review-mesh",
+        workspace: "F:\\Projects\\review-mesh-worktree",
+        instructions: "Review the current pull-request changes.",
+        review_scope: {
+          mode: "changes",
+          base: "origin/main",
+          head: "HEAD",
+          branch: "feature/project-names",
+          paths: ["src", "tests/config"],
+        },
+      }),
+    ).toMatchObject({
+      schema_version: "2",
+      project_name: "review-mesh",
+      review_scope: { mode: "changes", base: "origin/main" },
+    });
+  });
+
+  it("requires explicit full mode and rejects unsafe path/ref assertions", () => {
+    expect(() =>
+      reviewRequestSchema.parse({
+        schema_version: "2",
+        project_name: "review-mesh",
+        workspace: "/work/review-mesh",
+        instructions: "Review everything.",
+        review_scope: { mode: "full" },
+      }),
+    ).not.toThrow();
+    expect(() =>
+      reviewRequestSchema.parse({
+        schema_version: "2",
+        project_name: "review-mesh",
+        workspace: "/work/review-mesh",
+        instructions: "Review changes.",
+        review_scope: { mode: "changes", base: "--all" },
+      }),
+    ).toThrow();
+    expect(() =>
+      reviewRequestSchema.parse({
+        schema_version: "2",
+        project_name: "review-mesh",
+        workspace: "/work/review-mesh",
+        instructions: "Review changes.",
+        review_scope: { mode: "changes", paths: ["src/**"] },
+      }),
+    ).toThrow();
+    expect(() =>
+      reviewRequestSchema.parse({
+        schema_version: "2",
+        project_name: "review-mesh",
+        workspace: "/work/review-mesh",
+        instructions: "Review changes.",
+        review_scope: { mode: "changes", paths: ["../outside"] },
+      }),
+    ).toThrow();
+  });
+
   it("preserves raw instructions and arbitrary context", () => {
     const request = reviewRequestSchema.parse({
-      schema_version: "1",
+      schema_version: "2",
       request_id: "caller-7",
+      project_name: "demo",
       workspace: "F:\\Projects\\demo",
       instructions: "Review current changes exactly as supplied.",
-      scope_hints: { base: "origin/master", staged: false },
+      review_scope: { mode: "changes", base: "origin/master" },
       context: { nested: { custom: [1, true, "x"] } },
     });
 
@@ -26,9 +88,11 @@ describe("reviewRequestSchema", () => {
   it("rejects reviewer selection and unknown top-level fields", () => {
     expect(() =>
       reviewRequestSchema.parse({
-        schema_version: "1",
+        schema_version: "2",
+        project_name: "demo",
         workspace: ".",
         instructions: "review",
+        review_scope: { mode: "changes" },
         reviewers: ["security-claude"],
       }),
     ).toThrow();
@@ -121,7 +185,7 @@ describe("publicEventSchema", () => {
     status: "passed" | "findings" | "incomplete",
     reviewers: readonly unknown[],
   ) => ({
-    schema_version: "2",
+    schema_version: "3",
     event: "run.completed",
     run_id: "run-1",
     seq: 1,
@@ -180,7 +244,7 @@ describe("publicEventSchema", () => {
 
   it("accepts resolved suite and reviewer startup metadata", () => {
     const envelope = {
-      schema_version: "2" as const,
+      schema_version: "3" as const,
       run_id: "run-1",
       request_id: "request-1",
       seq: 1,
@@ -200,7 +264,9 @@ describe("publicEventSchema", () => {
           },
           selection: {
             source: "project",
-            matched_project_path: "/work/project",
+            project_name: "project",
+            project_name_source: "git_remote",
+            matched_project_name: "project",
           },
           reviewers: [
             {

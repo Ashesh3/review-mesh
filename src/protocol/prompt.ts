@@ -52,6 +52,10 @@ export function buildReviewerPrompt({
   const system = [
     "# REVIEW MESH INVARIANTS",
     "Inspect only; do not edit files.",
+    context.review_scope.mode === "changes"
+      ? "This is a change-focused review. Treat the supplied diff and changed_files list as the authoritative primary scope. The diff includes committed changes from the merge base to the checked-out HEAD plus staged and unstaged changes; untracked files are named in changed_files and may be read directly. Inspect unchanged files only when needed to understand or validate an impact of those changes. Do not audit or report unrelated pre-existing code."
+      : "This is an explicitly requested full-scope review. You may inspect the complete workspace within the caller's optional path filter.",
+    "If a finding is not caused by, exposed by, or directly relevant to the authorized review scope, omit it.",
     "Use only adapter-approved direct read-only file and search tools. Do not execute shell commands, programs, scripts, builds, tests, Git commands, or code. Review Mesh core may provide bounded read-only Git context collected outside the reviewer runtime.",
     "Return exactly the supplied schema.",
     "Use pass only with zero actionable findings.",

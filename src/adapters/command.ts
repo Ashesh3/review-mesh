@@ -225,6 +225,10 @@ class CommandAdapter implements ReviewAdapter {
       REVIEW_MESH_RUN_ID: input.runId,
       REVIEW_MESH_REVIEWER_ID: input.reviewer.id,
       REVIEW_MESH_WORKSPACE: input.context.workspace,
+      ...(input.context.project_name === undefined
+        ? {}
+        : { REVIEW_MESH_PROJECT_NAME: input.context.project_name }),
+      REVIEW_MESH_REVIEW_SCOPE: input.context.review_scope.mode,
       REVIEW_MESH_ISOLATION_POLICY: input.isolationPolicy,
       REVIEW_MESH_MODEL: input.reviewer.model,
       ...(input.reviewer.effort === undefined

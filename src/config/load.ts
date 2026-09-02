@@ -7,12 +7,16 @@ import {
   trustedConfigV1Schema,
   trustedConfigV2Schema,
   trustedConfigV3Schema,
+  trustedConfigV4Schema,
   type AgentProfile,
   type ProjectConfig,
   type ReviewerProfile,
   type TrustedConfig,
 } from "./schemas.js";
 import { getAppPaths } from "./paths.js";
+import { migrateLegacyConfig } from "./manage.js";
+import { resolveProjectName, type ProjectNameSource } from "./project-names.js";
+import type { GitRunner } from "../context/git.js";
 
 const maximumTrustedTextBytes = 4 * 1024 * 1024;
 const readChunkBytes = 64 * 1024;
@@ -27,6 +31,7 @@ export interface LoadConfigFilesInput {
 export interface LoadConfigFilesDependencies {
   trustedRead?: ConfigFileRead;
   readTimeoutMs?: number;
+  git?: GitRunner;
 }
 
 export type ConfigFileRead = (
@@ -40,6 +45,8 @@ export type ConfigFileRead = (
 export interface LoadedConfigFiles {
   trusted: TrustedConfig;
   workspace: string;
+  projectName: string;
+  projectNameSource: ProjectNameSource;
 }
 
 function isWithinDirectory(directory: string, target: string): boolean {
@@ -256,9 +263,13 @@ async function resolveInstructionFiles(
       await resolveEntries(Object.entries(trusted.projects ?? {})),
     ),
   };
-  return trusted.schema_version === "2"
-    ? trustedConfigV2Schema.parse(resolved)
-    : trustedConfigV3Schema.parse(resolved);
+  if (trusted.schema_version === "2") {
+    return trustedConfigV2Schema.parse(resolved);
+  }
+  if (trusted.schema_version === "3") {
+    return trustedConfigV3Schema.parse(resolved);
+  }
+  return trustedConfigV4Schema.parse(resolved);
 }
 
 export async function loadConfigFiles(
@@ -280,15 +291,27 @@ export async function loadConfigFiles(
       ),
     ),
   );
-  const resolvedTrusted = await resolveInstructionFiles(
+  const instructionsResolved = await resolveInstructionFiles(
     trusted,
     configFile,
     input.signal,
     readTimeoutMs,
   );
+  const resolvedTrusted =
+    instructionsResolved.schema_version === "2" ||
+    instructionsResolved.schema_version === "3"
+      ? await migrateLegacyConfig(instructionsResolved)
+      : instructionsResolved;
 
+  const workspace = await realpath(input.workspace);
+  const project = await resolveProjectName(workspace, {
+    ...(dependencies.git === undefined ? {} : { git: dependencies.git }),
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
+  });
   return {
     trusted: resolvedTrusted,
-    workspace: await realpath(input.workspace),
+    workspace,
+    projectName: project.name,
+    projectNameSource: project.source,
   };
 }

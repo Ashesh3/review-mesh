@@ -57,9 +57,11 @@ function deepMerge<T>(base: T, override: DeepPartial<T> | undefined): T {
 
 export function request(overrides?: Partial<ReviewRequest>): ReviewRequest {
   return {
-    schema_version: "1",
+    schema_version: "2",
+    project_name: "demo",
     workspace: "F:\\Projects\\demo",
     instructions: "Review the changes.",
+    review_scope: { mode: "changes" },
     ...overrides,
   };
 }
@@ -70,7 +72,9 @@ export function resolvedContext(
   const base: ResolvedContext = {
     consistency_mode: "live_worktree",
     workspace: "F:\\Projects\\demo",
+    project_name: "demo",
     instructions: "Review the changes.",
+    review_scope: { mode: "changes", source: "request" },
     git: { is_repository: false },
   };
   return {

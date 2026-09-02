@@ -6,6 +6,7 @@ import {
   trustedConfigSchema,
   type TrustedConfigV2,
   type TrustedConfigV3,
+  type TrustedConfigV4,
 } from "../../src/config/schemas.js";
 import { loadConfigFiles } from "../../src/config/load.js";
 import { resolveConfig } from "../../src/config/resolve.js";
@@ -61,6 +62,17 @@ function v3(workspace: string): TrustedConfigV3 {
   return { ...v2(workspace), schema_version: "3" };
 }
 
+function v4(projectName: string): TrustedConfigV4 {
+  const legacy = v3("/legacy/path");
+  return {
+    ...legacy,
+    schema_version: "4",
+    projects: {
+      [projectName]: legacy.projects!["/legacy/path"]!,
+    },
+  };
+}
+
 describe("global configuration", () => {
   it("keeps v1 trusted configs as global defaults", () => {
     expect(resolveConfig({ trusted: trustedConfig() }).reviewers[0]?.id).toBe(
@@ -83,7 +95,7 @@ describe("global configuration", () => {
     expect(resolved.project_context).toEqual({ project: "demo" });
     expect(resolved.selection).toEqual({
       source: "project",
-      matchedProjectPath: workspace,
+      matchedProjectName: "demo",
     });
   });
 
@@ -140,7 +152,24 @@ describe("global configuration", () => {
     );
   });
 
-  it("uses the most-specific configured project containing the workspace", () => {
+  it("selects v4 project settings by name regardless of workspace path", () => {
+    const config = v4("Review-Mesh");
+    const resolved = resolveConfig({
+      trusted: config,
+      workspace: "/unrelated/clone/location",
+      projectName: "review-mesh",
+      projectNameSource: "git_remote",
+    });
+    expect(resolved.reviewers.map(({ id }) => id)).toEqual(["gemini"]);
+    expect(resolved.selection).toEqual({
+      source: "project",
+      projectName: "review-mesh",
+      projectNameSource: "git_remote",
+      matchedProjectName: "Review-Mesh",
+    });
+  });
+
+  it("keeps legacy v2 path selection readable during migration", () => {
     const root = process.platform === "win32" ? "C:\\work\\mono" : "/work/mono";
     const nested = join(root, "packages", "api");
     const config = v2(root);
@@ -359,7 +388,7 @@ instructions_file = "project.md"
         configFile: join(configDirectory, "config.toml"),
         workspace,
       });
-      expect(loaded.trusted.schema_version).toBe("2");
+      expect(loaded.trusted.schema_version).toBe("4");
       const resolved = resolveConfig(loaded);
       expect(resolved.reviewers[0]?.instruction_layers).toEqual([
         { source: "trusted", content: "Agent instructions." },

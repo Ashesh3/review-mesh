@@ -10,12 +10,20 @@ import {
   type TrustedConfigV1,
   type TrustedConfigV2,
   type TrustedConfigV3,
+  type TrustedConfigV4,
 } from "./schemas.js";
 import { selectProject } from "./project-paths.js";
+import {
+  projectNameFromLegacyPath,
+  selectProjectByName,
+} from "./project-names.js";
 
 export interface ResolveConfigInput {
   trusted: TrustedConfig;
   workspace?: string;
+  projectName?: string;
+  projectNameSource?:
+    "git_remote" | "git_common_directory" | "git_root" | "workspace";
 }
 
 type ReviewerProfileBase = Pick<
@@ -125,7 +133,9 @@ function requireUniqueResolvedIds(
   }
 }
 
-function requireUniqueExpandedAgentIds(config: TrustedConfigV3): void {
+function requireUniqueExpandedAgentIds(
+  config: TrustedConfigV3 | TrustedConfigV4,
+): void {
   const ids = new Set<string>();
   for (const [agentId, profile] of Object.entries(config.agents)) {
     const expandedIds =
@@ -139,7 +149,11 @@ function requireUniqueExpandedAgentIds(config: TrustedConfigV3): void {
   }
 }
 
-function resolveV1(config: TrustedConfigV1): ResolvedConfig {
+function resolveV1(
+  config: TrustedConfigV1,
+  projectName: string | undefined,
+  projectNameSource: ResolveConfigInput["projectNameSource"],
+): ResolvedConfig {
   const ids = new Set<string>();
   const reviewers = config.reviewers.map((definition) => {
     if (ids.has(definition.id)) {
@@ -171,18 +185,33 @@ function resolveV1(config: TrustedConfigV1): ResolvedConfig {
   return {
     execution: config.execution,
     diagnostics: config.diagnostics,
-    selection: { source: "legacy" },
+    selection: {
+      source: "legacy",
+      ...(projectName === undefined ? {} : { projectName }),
+      ...(projectNameSource === undefined ? {} : { projectNameSource }),
+    },
     reviewers,
   };
 }
 
 function resolveV2(
-  config: TrustedConfigV2 | TrustedConfigV3,
+  config: TrustedConfigV2 | TrustedConfigV3 | TrustedConfigV4,
   workspace: string | undefined,
+  projectName: string | undefined,
+  projectNameSource: ResolveConfigInput["projectNameSource"],
 ): ResolvedConfig {
-  if (config.schema_version === "3") requireUniqueExpandedAgentIds(config);
-  const selectedProject = selectProject(config.projects, workspace);
-  const project = selectedProject?.project;
+  if (config.schema_version === "3" || config.schema_version === "4") {
+    requireUniqueExpandedAgentIds(config);
+  }
+  const selectedByName =
+    config.schema_version === "4"
+      ? selectProjectByName(config.projects, projectName)
+      : undefined;
+  const selectedByPath =
+    config.schema_version === "4"
+      ? undefined
+      : selectProject(config.projects, workspace);
+  const project = (selectedByName ?? selectedByPath)?.project;
   const agentIds = project?.agents ?? config.defaults?.agents;
   if (agentIds === undefined || agentIds.length === 0) {
     throw new Error("no agents are configured for the requested project");
@@ -200,9 +229,15 @@ function resolveV2(
     diagnostics: config.diagnostics,
     selection: {
       source: project?.agents === undefined ? "defaults" : "project",
-      ...(selectedProject === undefined
+      ...(projectName === undefined ? {} : { projectName }),
+      ...(projectNameSource === undefined ? {} : { projectNameSource }),
+      ...(selectedByName === undefined && selectedByPath === undefined
         ? {}
-        : { matchedProjectPath: selectedProject.path }),
+        : {
+            matchedProjectName:
+              selectedByName?.name ??
+              projectNameFromLegacyPath(selectedByPath!.path),
+          }),
     },
     ...(project?.context === undefined
       ? {}
@@ -214,6 +249,11 @@ function resolveV2(
 export function resolveConfig(input: ResolveConfigInput): ResolvedConfig {
   const trusted = trustedConfigSchema.parse(input.trusted);
   return trusted.schema_version === "1"
-    ? resolveV1(trusted)
-    : resolveV2(trusted, input.workspace);
+    ? resolveV1(trusted, input.projectName, input.projectNameSource)
+    : resolveV2(
+        trusted,
+        input.workspace,
+        input.projectName,
+        input.projectNameSource,
+      );
 }

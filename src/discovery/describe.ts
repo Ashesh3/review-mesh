@@ -40,7 +40,8 @@ export function renderDescription(
     return `${lines.join("\n")}\n`;
   }
   lines.push(
-    `Selection: ${configuration.selection.source}${configuration.selection.matched_project_path === undefined ? "" : ` (${configuration.selection.matched_project_path})`}`,
+    `Project: ${configuration.selection.project_name ?? "unresolved"}`,
+    `Selection: ${configuration.selection.source}${configuration.selection.matched_project_name === undefined ? "" : ` (${configuration.selection.matched_project_name})`}`,
     `Reviewers: ${configuration.reviewers.length}`,
     `Concurrency: ${configuration.execution.max_concurrency}`,
     `Heartbeat: every ${configuration.execution.heartbeat_interval_ms} ms`,

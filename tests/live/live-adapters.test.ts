@@ -123,10 +123,12 @@ async function runLiveAdapter(
   const reviewer = resolvedReviewer(type, definition);
   const context = await resolveContext({
     request: {
-      schema_version: "1",
+      schema_version: "2",
+      project_name: "live-project",
       workspace: repository.root,
       instructions:
         "Review this repository. Report the divide-by-zero defect if actionable.",
+      review_scope: { mode: "full" },
     },
     git: createGitRunner(),
     signal: new AbortController().signal,

@@ -42,10 +42,26 @@ and whether referenced credential environment variables are present. It never
 prints credential values, instruction bodies, project context, or runtime
 options.
 
+The selection object includes `project_name` and `project_name_source`, plus
+`matched_project_name` when a configured project entry matched. This makes the
+automatic identity decision inspectable before a review starts.
+
+For an AI caller, identity and scope are separate:
+
+- `project_name` selects no path. Copy it from `describe`; Review Mesh verifies
+  it against the workspace's Git-derived identity before using project settings.
+- `workspace` is the local worktree or clone to inspect.
+- `review_scope.mode = "changes"` is the default and reviews committed changes
+  above the merge base plus staged, unstaged, and untracked work.
+- `review_scope.branch`, `base`, and `head` are optional assertions/overrides.
+  If supplied, branch/head must match the checked-out worktree.
+- `review_scope.mode = "full"` is required for an intentional whole-codebase
+  review. It is never inferred from an ordinary branch/worktree request.
+
 ### Download a standalone executable
 
-Release `v3.1.0` provides multi-model agents, the agent-first CLI, public event
-protocol v2, and
+Release `v4.0.0` provides project-name configuration, multi-model agents, the
+agent-first CLI, public event protocol v3, and
 self-contained Bun executables that do not require Node.js or Bun:
 
 - Windows x64: `review-mesh-windows-x64.exe`
@@ -54,14 +70,14 @@ self-contained Bun executables that do not require Node.js or Bun:
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v3.1.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
+Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v4.0.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
 .\review-mesh.exe review
 ```
 
 Linux:
 
 ```bash
-curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v3.1.0/review-mesh-linux-x64
+curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v4.0.0/review-mesh-linux-x64
 chmod +x ./review-mesh-linux-x64
 ./review-mesh-linux-x64 review
 ```
@@ -126,15 +142,17 @@ PowerShell:
 
 ```powershell
 $request = @{
-  schema_version = "1"
+  schema_version = "2"
   request_id = "auth-change-1042"
+  project_name = "example"
   workspace = "C:\Projects\example"
   instructions = "Review the current workspace. Focus on authentication, compatibility, and error handling."
-  scope_hints = @{
+  review_scope = @{
+    mode = "changes"
     base = "origin/main"
     head = "HEAD"
+    branch = "feature/refresh-token-rotation"
     paths = @("src/auth", "tests/auth")
-    staged = $false
   }
   context = @{
     task = "Add refresh-token rotation"
@@ -151,11 +169,13 @@ Bash:
 ```bash
 cat <<'JSON' | node ./review-mesh.mjs review
 {
-  "schema_version": "1",
+  "schema_version": "2",
   "request_id": "auth-change-1042",
+  "project_name": "example",
   "workspace": "/work/example",
   "instructions": "Review the current workspace for actionable defects.",
-  "scope_hints": {
+  "review_scope": {
+    "mode": "changes",
     "base": "origin/main",
     "head": "HEAD",
     "paths": ["src/auth"]
@@ -171,11 +191,27 @@ Required request fields:
 
 | Field            | Meaning                                          |
 | ---------------- | ------------------------------------------------ |
-| `schema_version` | Must be the string `"1"`.                        |
+| `schema_version` | Must be the string `"2"`.                        |
+| `project_name`   | Exact project identity copied from `describe`.   |
 | `workspace`      | Existing local directory prepared by the caller. |
 | `instructions`   | Review focus sent to every mandatory reviewer.   |
+| `review_scope`   | Explicit `changes` or `full` scope object.       |
 
-`request_id`, `scope_hints`, and arbitrary JSON `context` are optional. Scope hints enrich the common starting manifest; reviewers inspect the current workspace state available when their adapter starts. They do not make Review Mesh fetch refs, check out code, or snapshot a Git patch. In particular, deleted/base-only file contents are not supplied automatically. The embedded `openai_compatible` adapter creates one bounded private in-memory read-only file snapshot per reviewer so all of that reviewer's tool calls see the same validated bytes.
+`request_id` and arbitrary JSON `context` are optional. In `changes` mode,
+`base`, `head`, `branch`, and `paths` are optional. Review Mesh infers the base
+from the remote/default `main` or `master` branch and uses checked-out `HEAD`
+when omitted. It computes the merge base, collects the committed diff from that
+point to `HEAD`, and adds staged, unstaged, and untracked paths. `paths` narrows
+the scope; it never broadens it. Review Mesh does not fetch refs or check out a
+branch. If an explicit branch/head does not match the current worktree, the run
+is rejected before reviewers start. Agents should generate v2 requests from the
+embedded schema.
+
+Review agents receive a trusted invariant telling them to treat the supplied
+diff and `changed_files` as the authoritative primary scope, inspect unchanged
+files only to understand the effects of those changes, and omit unrelated
+pre-existing issues. Only `review_scope = { mode = "full" }` authorizes a full
+codebase audit.
 
 ## Five-model OpenAI-compatible setup
 
@@ -212,10 +248,10 @@ export REVIEW_MESH_OPENAI_BASE_URL="https://gateway.example/v1"
 export REVIEW_MESH_OPENAI_API_KEY="your-key"
 ```
 
-Create the global configuration shown below, replacing model IDs and project paths as needed:
+Create the global configuration shown below, replacing model IDs and project names as needed:
 
 ```toml
-schema_version = "3"
+schema_version = "4"
 
 [execution]
 max_concurrency = 2
@@ -279,12 +315,12 @@ timeout_ms = 900000
 [defaults]
 agents = ["opus-5", "gemini-3-7-flash", "mai-code-1-1-flash", "sol-5-6-fast", "kimi-k3"]
 
-[projects."C:/Projects/payments"]
+[projects.payments]
 agents = ["opus-5", "sol-5-6-fast"]
 instructions = "Focus on monetary correctness, audit logging, and stored-record compatibility."
 context = { service = "payments", conventions = ["No floating-point money"] }
 
-[projects."C:/Projects/frontend"]
+[projects.frontend]
 agents = ["gemini-3-7-flash", "mai-code-1-1-flash", "kimi-k3"]
 instructions = "Focus on browser compatibility, accessibility, and state-management regressions."
 ```
@@ -296,7 +332,7 @@ independent model runs. Use `model_runs` instead of the scalar `model` and
 `effort` fields:
 
 ```toml
-schema_version = "3"
+schema_version = "4"
 
 [adapters.gateway]
 type = "openai_compatible"
@@ -364,7 +400,7 @@ Reviewer models cannot execute shell commands, programs, scripts, Git, builds, t
 Review Mesh forwards it as the native reasoning-effort setting for the Copilot,
 Claude, Codex, and OpenAI-compatible adapters. Command adapters receive
 `REVIEW_MESH_MODEL` and, when configured, `REVIEW_MESH_REASONING_EFFORT`
-without changing the version 1 request body. Supported values are `none`,
+plus `REVIEW_MESH_PROJECT_NAME` and `REVIEW_MESH_REVIEW_SCOPE`. Supported values are `none`,
 `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, and `persistent`;
 each provider/model may support only a subset.
 
@@ -444,10 +480,10 @@ The global config controls:
 - Globally declared scalar or multi-model agents and exact models.
 - Optional per-agent or per-model-run reasoning effort and adapter overrides.
 - The optional default agent roster.
-- Per-project agent rosters, guidance, and context keyed by full path.
+- Per-project agent rosters, guidance, and context keyed by project name.
 - Concurrency, heartbeat, shutdown grace, diagnostics, and retention.
 
-Use forward slashes for Windows project keys, for example `[projects."C:/Projects/payments"]`. A project entry applies to that canonical directory and its descendants; when mappings are nested, the most-specific project path wins. If no configured project contains the workspace, `[defaults].agents` is used; without defaults, the review is rejected.
+Project keys are names, not paths—for example, `[projects.payments]`. Review Mesh first prefers the `origin` remote repository name, then another remote repository name, then the Git common-directory or worktree-root name. A non-Git workspace uses its directory name. Matching is case-insensitive, so clones and linked worktrees in different folders share one project entry. If no project name matches, `[defaults].agents` is used; without defaults, the review is rejected.
 
 Workspace `.review-mesh.toml` files are not loaded. All agent and project configuration stays in this single global file.
 
@@ -463,12 +499,18 @@ review-mesh config
 
 The menu can list, add, edit, and remove global scalar or multi-model agents;
 create and select adapters, including per-run overrides; set the ordered default
-roster; add, edit, or remove full-path project assignments and context; and edit
+roster; add, edit, or remove project-name assignments and context; and edit
 execution/diagnostic settings. Each successful change is validated and saved
-immediately using an atomic replacement. Existing version 1 or scalar-agent
-version 2 configuration is read and migrated to version 3 when it is saved
+immediately using an atomic replacement. Existing version 1, scalar-agent
+version 2, or path-keyed version 3 configuration is read and migrated to version
+4 when it is saved
 through the menu; this canonical rewrite does not preserve TOML comments, so
 keep a backup when migrating a hand-edited file.
+
+During v3 migration, an existing project path is resolved with the same Git
+repository-name rules used at runtime. A stale or missing path falls back to its
+last folder component. Migration rejects two old paths that collapse to the same
+case-insensitive project name instead of silently overwriting either entry.
 
 Useful non-interactive commands:
 
@@ -498,11 +540,11 @@ as sensitive. To update configuration non-interactively, edit the exported
 {
   "schema_version": "1",
   "expected_revision": "<revision from config export>",
-  "config": { "schema_version": "3" }
+  "config": { "schema_version": "4" }
 }
 ```
 
-The `config` value above is abbreviated; send the complete desired v3 document.
+The `config` value above is abbreviated; send the complete desired v4 document.
 Apply is whole-document, limited to 5 MiB of JSON input (the config file remains
 limited to 4 MiB), validated before publication, and
 uses revision compare-and-swap plus atomic replacement. A stale revision fails
@@ -525,7 +567,7 @@ review-mesh schema command-adapter-event --json
 Runtime semantic validation remains authoritative for cross-field and
 cross-reference policy that generated JSON Schema cannot fully express, such as
 verdict/finding consistency, evidence line pairs, instruction-source choice,
-absolute project paths, assignment references, and provider-specific effort.
+project-name uniqueness, assignment references, and provider-specific effort.
 
 ## Other adapters
 
@@ -543,8 +585,9 @@ For a truly one-file deployment, use `openai_compatible`. Provider-native adapte
 
 ## JSONL events
 
-Every non-empty stdout line is one strict schema-version `2` JSON object. Review
-request and reviewer-result objects remain schema version `1`. All events in a
+Every non-empty stdout line is one strict schema-version `3` JSON object. Review
+requests use schema version `2`, while reviewer-result objects remain schema
+version `1`. All events in a
 run share one `run_id`; `seq` starts at `1` and increases monotonically;
 `run.completed` is final once a valid run begins and stdout remains available.
 Immediately after suite resolution, each concrete reviewer reports capability
@@ -570,7 +613,7 @@ Example final event:
 
 ```json
 {
-  "schema_version": "2",
+  "schema_version": "3",
   "event": "run.completed",
   "run_id": "run_...",
   "seq": 23,
@@ -682,7 +725,10 @@ Run-record persistence similarly uses exclusive active/final names, pinned direc
 
 ## Command-adapter protocol
 
-Only trusted config can register a command. Review Mesh sends one JSON request object on child stdin. Child stdout must contain JSONL only.
+Only trusted config can register a command. Review Mesh sends one JSON request
+object on child stdin. Its `context` contains the validated `project_name`,
+`workspace`, explicit `review_scope`, changed-file list, bounded diff/stat, and
+Git refs. Child stdout must contain JSONL only.
 
 Non-terminal examples:
 

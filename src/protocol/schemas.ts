@@ -4,7 +4,7 @@ export type JsonValue =
   null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 export const protocolVersionSchema = z.literal("1");
-export const publicEventVersionSchema = z.literal("2");
+export const publicEventVersionSchema = z.literal("3");
 export const runStatusSchema = z.enum(["passed", "findings", "incomplete"]);
 export const isolationPolicySchema = z.enum([
   "prefer_enforced",
@@ -53,22 +53,102 @@ const reasoningEffortSchema = z.enum([
   "persistent",
 ]);
 
-const scopeHintsSchema = z.strictObject({
-  base: nonEmptyString.optional(),
-  head: nonEmptyString.optional(),
-  branch: nonEmptyString.optional(),
-  paths: z.array(nonEmptyString).optional(),
-  staged: z.boolean().optional(),
+const projectNameSchema = z
+  .string()
+  .min(1)
+  .max(255)
+  .regex(
+    /^(?!\.{1,2}$)(?!\s)(?!.*\s$)[^\u0000-\u001f/\\]+$/u,
+    "project name must be trimmed and contain no path separators or control characters",
+  )
+  .describe(
+    "Project identity copied from review-mesh describe WORKSPACE --json at configuration.selection.project_name. This is an assertion, not a settings selector; runtime rejects a mismatch with the workspace's derived identity.",
+  );
+const gitRefSchema = nonEmptyString
+  .max(1_024)
+  .refine(
+    (value) => !value.startsWith("-") && !/[\u0000-\u001f]/u.test(value),
+    "Git refs must not start with '-' or contain control characters",
+  );
+const reviewPathSchema = nonEmptyString
+  .max(4_096)
+  .refine(
+    (value) =>
+      !value.startsWith("/") &&
+      !value.startsWith(":") &&
+      !/^[A-Za-z]:/u.test(value) &&
+      !value.includes("\\") &&
+      !/[*?[\]]/u.test(value) &&
+      !value.split("/").includes("..") &&
+      !/[\u0000-\u001f]/u.test(value),
+    "review paths must be literal forward-slash workspace-relative paths without '..' or pathspec magic",
+  );
+const reviewPathsSchema = z
+  .array(reviewPathSchema)
+  .min(1)
+  .describe(
+    "Optional workspace-relative path filter. It only narrows the authorized changes/full scope and never broadens it.",
+  )
+  .optional();
+
+export const reviewScopeSchema = z
+  .discriminatedUnion("mode", [
+    z.strictObject({
+      mode: z
+        .literal("changes")
+        .describe(
+          "Review only committed changes above the merge base plus staged, unstaged, and untracked work.",
+        ),
+      base: gitRefSchema
+        .describe(
+          "Optional comparison base ref, normally the PR base such as origin/main. When omitted, Review Mesh infers the remote/default main or master branch without fetching.",
+        )
+        .optional(),
+      head: gitRefSchema
+        .describe(
+          "Optional head ref. Defaults to HEAD and must resolve to the checked-out workspace HEAD.",
+        )
+        .optional(),
+      branch: gitRefSchema
+        .describe(
+          "Optional short checked-out branch-name assertion. A mismatch rejects the request before reviewers start.",
+        )
+        .optional(),
+      paths: reviewPathsSchema,
+    }),
+    z.strictObject({
+      mode: z
+        .literal("full")
+        .describe(
+          "Explicitly authorize a whole-codebase review. Review Mesh never infers this mode from an ordinary branch or worktree request.",
+        ),
+      paths: reviewPathsSchema,
+    }),
+  ])
+  .describe(
+    "Required review boundary. Use changes by default; use full only when the caller explicitly requested the entire codebase.",
+  );
+
+export const reviewRequestV2Schema = z.strictObject({
+  schema_version: z.literal("2").describe("The current review request schema."),
+  request_id: nonEmptyString
+    .describe("Optional caller correlation id copied into public events.")
+    .optional(),
+  project_name: projectNameSchema,
+  workspace: nonEmptyString.describe(
+    "Existing local worktree or clone to inspect. Review Mesh never checks out or fetches a branch.",
+  ),
+  instructions: nonEmptyString.describe(
+    "Caller review focus applied within the authorized review_scope; it cannot broaden that scope or change the configured reviewer roster.",
+  ),
+  review_scope: reviewScopeSchema,
+  context: z
+    .json()
+    .describe("Optional lower-priority caller metadata.")
+    .optional(),
 });
 
-export const reviewRequestSchema = z.strictObject({
-  schema_version: protocolVersionSchema,
-  request_id: nonEmptyString.optional(),
-  workspace: nonEmptyString,
-  instructions: nonEmptyString,
-  scope_hints: scopeHintsSchema.optional(),
-  context: z.json().optional(),
-});
+export const reviewRequestSchema = reviewRequestV2Schema;
 
 const findingEvidenceSchema = z
   .strictObject({
@@ -209,7 +289,11 @@ const suiteReviewerSchema = z.strictObject({
 
 const suiteSelectionSchema = z.strictObject({
   source: z.enum(["legacy", "defaults", "project"]),
-  matched_project_path: nonEmptyString.optional(),
+  project_name: nonEmptyString.optional(),
+  project_name_source: z
+    .enum(["git_remote", "git_common_directory", "git_root", "workspace"])
+    .optional(),
+  matched_project_name: nonEmptyString.optional(),
 });
 
 const executionSchema = z.strictObject({

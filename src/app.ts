@@ -6,7 +6,7 @@ import { loadConfigFiles } from "./config/load.js";
 import { getAppPaths, type AppPaths } from "./config/paths.js";
 import { resolveConfig } from "./config/resolve.js";
 import { createGitRunner } from "./context/git.js";
-import { resolveContext } from "./context/resolve.js";
+import { resolveContext, ReviewScopeError } from "./context/resolve.js";
 import { createRunRecorder } from "./diagnostics/run-recorder.js";
 import {
   runReviewRound,
@@ -109,21 +109,43 @@ export async function runReviewApplication(
     return 2;
   }
 
-  let config: ReturnType<typeof resolveConfig>;
-  let canonicalWorkspace: string;
+  let loaded: Awaited<ReturnType<typeof loadConfigFiles>>;
   try {
-    const loaded = await loadConfigFiles({
+    loaded = await loadConfigFiles({
       ...(options.configFile === undefined
         ? {}
         : { configFile: options.configFile }),
       workspace: request.workspace,
       signal: options.signal,
     });
+  } catch {
+    await writeDiagnostic(
+      options.stderr,
+      "invalid_configuration",
+      "The global Review Mesh configuration or project assignment is invalid.",
+    );
+    return 2;
+  }
+  if (
+    request.project_name.toLocaleLowerCase("en-US") !==
+    loaded.projectName.toLocaleLowerCase("en-US")
+  ) {
+    await writeDiagnostic(
+      options.stderr,
+      "invalid_request",
+      `The request project_name must match the workspace identity ${loaded.projectName}.`,
+    );
+    return 2;
+  }
+
+  let config: ReturnType<typeof resolveConfig>;
+  try {
     config = resolveConfig({
       trusted: loaded.trusted,
       workspace: loaded.workspace,
+      projectName: loaded.projectName,
+      projectNameSource: loaded.projectNameSource,
     });
-    canonicalWorkspace = loaded.workspace;
   } catch {
     await writeDiagnostic(
       options.stderr,
@@ -136,15 +158,17 @@ export async function runReviewApplication(
   let context: Awaited<ReturnType<typeof resolveContext>>;
   try {
     context = await resolveContext({
-      request: { ...request, workspace: canonicalWorkspace },
+      request: { ...request, workspace: loaded.workspace },
       git: createGitRunner(),
       signal: options.signal,
     });
-  } catch {
+  } catch (error) {
     await writeDiagnostic(
       options.stderr,
       "invalid_request",
-      "The requested workspace or review scope could not be resolved.",
+      error instanceof ReviewScopeError
+        ? error.message
+        : "The requested workspace or review scope could not be resolved.",
     );
     return 2;
   }

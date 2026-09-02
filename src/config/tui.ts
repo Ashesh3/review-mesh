@@ -1,5 +1,4 @@
 import { createInterface } from "node:readline/promises";
-import { resolve } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import {
   supportedEffortsForAdapter,
@@ -9,7 +8,6 @@ import {
 import type { CopilotAccountService } from "../copilot/account.js";
 import type { JsonValue } from "../protocol/schemas.js";
 import {
-  canonicalProjectPath,
   listConfig,
   requireEnvironmentName,
   requireSafeIdentifier,
@@ -18,6 +16,7 @@ import {
   type ManagedAgent,
   type ManagedConfig,
 } from "./manage.js";
+import { requireProjectName } from "./project-names.js";
 
 export interface ConfigPrompter {
   ask(question: string, signal?: AbortSignal): Promise<string>;
@@ -176,26 +175,12 @@ function chooseAgents(value: string, config: ManagedConfig): string[] {
   return [...new Set(ids)];
 }
 
-function lexicalProjectPath(candidate: string, cwd = process.cwd()): string {
-  const normalized = resolve(cwd, candidate).replaceAll("\\", "/");
-  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-}
-
-async function storedProjectPath(
-  candidate: string,
-  config: ManagedConfig,
-  cwd?: string,
-): Promise<string> {
+function storedProjectName(candidate: string, config: ManagedConfig): string {
   const projects = config.projects ?? {};
-  try {
-    const canonical = await canonicalProjectPath(candidate, cwd);
-    if (projects[canonical] !== undefined) return canonical;
-  } catch {
-    // A deleted or unavailable project remains removable by its stored path.
-  }
-  const requested = lexicalProjectPath(candidate, cwd);
+  const requested = requireProjectName(candidate);
   const match = Object.keys(projects).find(
-    (path) => lexicalProjectPath(path, cwd) === requested,
+    (name) =>
+      name.toLocaleLowerCase("en-US") === requested.toLocaleLowerCase("en-US"),
   );
   if (match === undefined) throw new Error(`unknown project: ${requested}`);
   return match;
@@ -643,7 +628,7 @@ async function removeAgent(options: ConfigMenuOptions): Promise<void> {
       delete options.config.defaults;
     }
   }
-  for (const [path, project] of Object.entries(options.config.projects ?? {})) {
+  for (const [name, project] of Object.entries(options.config.projects ?? {})) {
     if (project.agents !== undefined) {
       project.agents = project.agents.filter((candidate) => candidate !== id);
       if (project.agents.length === 0) {
@@ -651,7 +636,7 @@ async function removeAgent(options: ConfigMenuOptions): Promise<void> {
           delete project.agents;
         } else {
           throw new Error(
-            `cannot remove ${id}: project ${path} would have no enabled agents`,
+            `cannot remove ${id}: project ${name} would have no enabled agents`,
           );
         }
       }
@@ -660,12 +645,17 @@ async function removeAgent(options: ConfigMenuOptions): Promise<void> {
 }
 
 async function addProject(options: ConfigMenuOptions): Promise<void> {
-  const projectPath = await canonicalProjectPath(
-    await answer(options.prompt, "Project directory: "),
-    options.cwd,
+  const projectName = requireProjectName(
+    await answer(options.prompt, "Project name: "),
   );
-  if (options.config.projects?.[projectPath] !== undefined) {
-    throw new Error(`project already exists: ${projectPath}`);
+  if (
+    Object.keys(options.config.projects ?? {}).some(
+      (name) =>
+        name.toLocaleLowerCase("en-US") ===
+        projectName.toLocaleLowerCase("en-US"),
+    )
+  ) {
+    throw new Error(`project already exists: ${projectName}`);
   }
   await write(
     options.output,
@@ -684,7 +674,7 @@ async function addProject(options: ConfigMenuOptions): Promise<void> {
     "Project context as JSON [optional]: ",
   );
   options.config.projects ??= {};
-  options.config.projects[projectPath] = {
+  options.config.projects[projectName] = {
     agents,
     ...(instructions === "" ? {} : { instructions }),
     ...(contextText === "" ? {} : { context: optionalJson(contextText) }),
@@ -692,13 +682,12 @@ async function addProject(options: ConfigMenuOptions): Promise<void> {
 }
 
 async function editProject(options: ConfigMenuOptions): Promise<void> {
-  const projectPath = await storedProjectPath(
-    await answer(options.prompt, "Project directory to edit: "),
+  const projectName = storedProjectName(
+    await answer(options.prompt, "Project name to edit: "),
     options.config,
-    options.cwd,
   );
-  const project = options.config.projects?.[projectPath];
-  if (project === undefined) throw new Error(`unknown project: ${projectPath}`);
+  const project = options.config.projects?.[projectName];
+  if (project === undefined) throw new Error(`unknown project: ${projectName}`);
   await write(
     options.output,
     `Agents: ${Object.keys(options.config.agents).sort().join(", ")}\n`,
@@ -794,17 +783,16 @@ async function setDefaultAgents(options: ConfigMenuOptions): Promise<void> {
 }
 
 async function removeProject(options: ConfigMenuOptions): Promise<void> {
-  const projectPath = await storedProjectPath(
-    await answer(options.prompt, "Project directory to remove: "),
+  const projectName = storedProjectName(
+    await answer(options.prompt, "Project name to remove: "),
     options.config,
-    options.cwd,
   );
-  if (options.config.projects?.[projectPath] === undefined) {
-    throw new Error(`unknown project: ${projectPath}`);
+  if (options.config.projects?.[projectName] === undefined) {
+    throw new Error(`unknown project: ${projectName}`);
   }
-  if (!yes(await answer(options.prompt, `Remove ${projectPath}? [y/N]: `, "n")))
+  if (!yes(await answer(options.prompt, `Remove ${projectName}? [y/N]: `, "n")))
     return;
-  delete options.config.projects[projectPath];
+  delete options.config.projects[projectName];
 }
 
 async function showList(options: ConfigMenuOptions): Promise<void> {
@@ -843,7 +831,7 @@ async function showList(options: ConfigMenuOptions): Promise<void> {
   for (const project of listed.projects) {
     await write(
       options.output,
-      `  ${project.path}: ${project.agents.join(", ")}\n`,
+      `  ${project.name}: ${project.agents.join(", ")}\n`,
     );
   }
 }

@@ -153,10 +153,12 @@ async function setup(
             status_entries: [],
             changed_files: [],
             diff_stat: "",
+            diff: "",
             truncated: {
               status_entries: false,
               changed_files: false,
               diff_stat: false,
+              diff: false,
             },
           }
         : ({ is_repository: false } satisfies ResolvedContext["git"]),
