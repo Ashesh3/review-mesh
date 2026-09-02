@@ -4,6 +4,7 @@ export type JsonValue =
   null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 export const protocolVersionSchema = z.literal("1");
+export const publicEventVersionSchema = z.literal("2");
 export const runStatusSchema = z.enum(["passed", "findings", "incomplete"]);
 export const isolationPolicySchema = z.enum([
   "prefer_enforced",
@@ -29,9 +30,28 @@ export const incompleteReasonSchema = z.enum([
 
 const nonEmptyString = z.string().min(1);
 const nonNegativeInteger = z.number().int().nonnegative();
+const positiveInteger = z.number().int().positive();
 const boundedMessage = z.string().min(1).max(1_000);
 const timestampSchema = z.iso.datetime({ offset: true });
 const consistencyModeSchema = z.literal("live_worktree");
+const adapterTypeSchema = z.enum([
+  "copilot",
+  "claude",
+  "codex",
+  "openai_compatible",
+  "command",
+]);
+const reasoningEffortSchema = z.enum([
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+  "persistent",
+]);
 
 const scopeHintsSchema = z.strictObject({
   base: nonEmptyString.optional(),
@@ -165,7 +185,7 @@ const reviewerTerminalRecordSchema = z.discriminatedUnion("status", [
 ]);
 
 const eventEnvelopeSchema = z.strictObject({
-  schema_version: protocolVersionSchema,
+  schema_version: publicEventVersionSchema,
   event: z.string(),
   run_id: nonEmptyString,
   request_id: nonEmptyString.optional(),
@@ -179,9 +199,23 @@ const suiteReviewerSchema = z.strictObject({
   id: nonEmptyString,
   purpose: nonEmptyString,
   adapter: nonEmptyString,
+  adapter_type: adapterTypeSchema,
   model: nonEmptyString,
+  effort: reasoningEffortSchema.optional(),
   isolation_policy: isolationPolicySchema,
+  timeout_ms: positiveInteger,
   instruction_sources: z.array(nonEmptyString),
+});
+
+const suiteSelectionSchema = z.strictObject({
+  source: z.enum(["legacy", "defaults", "project"]),
+  matched_project_path: nonEmptyString.optional(),
+});
+
+const executionSchema = z.strictObject({
+  max_concurrency: positiveInteger,
+  heartbeat_interval_ms: positiveInteger,
+  shutdown_grace_period_ms: positiveInteger,
 });
 
 const runCompletedDataSchema = z
@@ -229,6 +263,8 @@ const publicEventSchemas = [
     event: z.literal("suite.resolved"),
     data: z.strictObject({
       total: nonNegativeInteger,
+      execution: executionSchema,
+      selection: suiteSelectionSchema.optional(),
       reviewers: z.array(suiteReviewerSchema),
     }),
   }),
@@ -238,7 +274,9 @@ const publicEventSchemas = [
       purpose: nonEmptyString,
       adapter: nonEmptyString,
       model: nonEmptyString,
+      effort: reasoningEffortSchema.optional(),
       isolation_policy: isolationPolicySchema,
+      timeout_ms: positiveInteger,
     }),
   }),
   eventEnvelopeSchema.extend({
@@ -254,6 +292,7 @@ const publicEventSchemas = [
       phase: reviewerPhaseSchema,
       elapsed_ms: nonNegativeInteger,
       last_activity_at: timestampSchema.optional(),
+      last_activity_message: boundedMessage.optional(),
       suite: suiteSchema,
       isolation: isolationLevelSchema.optional(),
     }),

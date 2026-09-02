@@ -14,6 +14,7 @@ import type {
   AdapterEvent,
   AdapterReviewInput,
 } from "../../src/adapters/types.js";
+import { buildAllowlistedEnvironment } from "../../src/adapters/types.js";
 import { reviewerResultJsonSchema } from "../../src/protocol/json-schema.js";
 import { buildReviewerPrompt } from "../../src/protocol/prompt.js";
 import { runReviewRound } from "../../src/orchestrator/run-review.js";
@@ -340,6 +341,16 @@ describe("generic command adapter", () => {
         )
         .sort(),
     );
+  });
+
+  it("does not copy inherited properties from an environment object", () => {
+    const inherited = Object.create({
+      toString: "inherited-secret",
+    }) as NodeJS.ProcessEnv;
+    inherited.PATH = "safe-path";
+    expect(buildAllowlistedEnvironment(["toString"], inherited)).toEqual({
+      PATH: "safe-path",
+    });
   });
 
   it.each([

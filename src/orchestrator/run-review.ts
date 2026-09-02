@@ -236,7 +236,11 @@ export async function runReviewRound({
   let writerUsable = true;
   let interrupted = signal.aborted;
   const active = new Map<string, ActiveJob>();
+  const activeProbes = new Set<string>();
   const finalizing = new Set<string>();
+  let preflightHeartbeat: ReturnType<typeof setInterval> | undefined;
+  const preflightHeartbeatEmissions = new Set<Promise<void>>();
+  let preflightHeartbeatCursor = 0;
 
   const settleWithin = async (
     operation: PromiseLike<unknown>,
@@ -296,7 +300,7 @@ export async function runReviewRound({
 
   const heartbeatSuite = () => {
     const summary = summarizeSuite(state);
-    const activeIds = new Set(active.keys());
+    const activeIds = new Set([...active.keys(), ...activeProbes]);
     summary.queued = state.reviewers.filter(
       (reviewer) =>
         reviewer.status !== "completed" &&
@@ -310,6 +314,63 @@ export async function runReviewRound({
         activeIds.has(reviewer.reviewer.id),
     ).length;
     return summary;
+  };
+
+  const clearPreflightHeartbeat = (): void => {
+    if (preflightHeartbeat === undefined) return;
+    clock.clearInterval(preflightHeartbeat);
+    preflightHeartbeat = undefined;
+  };
+
+  const startPreflightHeartbeat = (): void => {
+    preflightHeartbeat = clock.setInterval(() => {
+      if (preflightHeartbeatEmissions.size > 0) return;
+      const candidates = state.reviewers.filter(
+        (reviewer) =>
+          reviewer.status === "queued" || reviewer.status === "probing",
+      );
+      if (candidates.length === 0) return;
+      const current = candidates[preflightHeartbeatCursor % candidates.length]!;
+      preflightHeartbeatCursor += 1;
+      const heartbeat = emitHeartbeat({
+        event: "reviewer.heartbeat",
+        reviewer_id: current.reviewer.id,
+        data: {
+          phase: phaseForHeartbeat(state, current.reviewer.id),
+          elapsed_ms: Math.max(
+            0,
+            clock.now().getTime() -
+              (current.startedAt ?? current.queuedAt).getTime(),
+          ),
+          ...(current.lastActivity === undefined
+            ? {}
+            : {
+                last_activity_at: current.lastActivity.at.toISOString(),
+                last_activity_message: current.lastActivity.message,
+              }),
+          suite: heartbeatSuite(),
+          ...(current.isolation === undefined
+            ? {}
+            : { isolation: current.isolation }),
+        },
+      });
+      preflightHeartbeatEmissions.add(heartbeat);
+      void heartbeat.finally(() =>
+        preflightHeartbeatEmissions.delete(heartbeat),
+      );
+    }, config.execution.heartbeat_interval_ms);
+  };
+
+  const stopPreflightHeartbeat = async (): Promise<void> => {
+    clearPreflightHeartbeat();
+    const pendingHeartbeats = [...preflightHeartbeatEmissions];
+    preflightHeartbeatEmissions.clear();
+    if (pendingHeartbeats.length === 0) return;
+    const outcome = await settleWithin(
+      Promise.allSettled(pendingHeartbeats),
+      config.execution.shutdown_grace_period_ms,
+    );
+    if (outcome === "timeout") writerUsable = false;
   };
 
   const stopRuntimeTimers = async (runtime: ActiveJob): Promise<void> => {
@@ -453,18 +514,35 @@ export async function runReviewRound({
       event: "suite.resolved",
       data: {
         total: config.reviewers.length,
+        execution: { ...config.execution },
+        ...(config.selection === undefined
+          ? {}
+          : {
+              selection: {
+                source: config.selection.source,
+                ...(config.selection.matchedProjectPath === undefined
+                  ? {}
+                  : {
+                      matched_project_path: config.selection.matchedProjectPath,
+                    }),
+              },
+            }),
         reviewers: config.reviewers.map((reviewer) => ({
           id: reviewer.id,
           purpose: reviewer.purpose,
           adapter: reviewer.adapterId,
+          adapter_type: reviewer.adapter.type,
           model: reviewer.model,
+          ...(reviewer.effort === undefined ? {} : { effort: reviewer.effort }),
           isolation_policy: reviewer.isolationPolicy,
+          timeout_ms: reviewer.timeoutMs,
           instruction_sources: reviewer.instruction_layers.map(
             (layer) => layer.source,
           ),
         })),
       },
     });
+    startPreflightHeartbeat();
 
     const jobs: ReviewerJob[] = config.reviewers.map((reviewer) => {
       try {
@@ -482,7 +560,6 @@ export async function runReviewRound({
       }
     });
 
-    for (const job of jobs) state.transition(job.reviewer.id, "probing");
     const probeStarted = jobs.map(() => false);
     const probeSettled = jobs.map(() => false);
     const probeOperations: Array<Promise<void> | undefined> = jobs.map(
@@ -574,27 +651,42 @@ export async function runReviewRound({
     let nextProbe = 0;
     const probeWorkers = Array.from(
       { length: Math.min(config.execution.max_concurrency, jobs.length) },
-      async () => {
-        while (!interrupted) {
-          const index = nextProbe;
-          const job = jobs[index];
-          if (job === undefined) return;
-          nextProbe += 1;
-          try {
-            probeOutcomes[index] = {
-              status: "fulfilled",
-              value: await probe(job, index),
-            };
-          } catch (reason) {
-            probeOutcomes[index] = { status: "rejected", reason };
+      () => {
+        return (async () => {
+          while (!interrupted) {
+            const index = nextProbe;
+            const job = jobs[index];
+            if (job === undefined) return;
+            nextProbe += 1;
+            state.transition(job.reviewer.id, "probing");
+            activeProbes.add(job.reviewer.id);
+            const probingMessage =
+              "Checking the configured adapter, authentication, model, and isolation capability.";
+            state.recordActivity(job.reviewer.id, probingMessage);
+            await emit({
+              event: "reviewer.progress",
+              reviewer_id: job.reviewer.id,
+              data: { phase: "probing", message: probingMessage },
+            });
+            try {
+              probeOutcomes[index] = {
+                status: "fulfilled",
+                value: await probe(job, index),
+              };
+            } catch (reason) {
+              probeOutcomes[index] = { status: "rejected", reason };
+            } finally {
+              activeProbes.delete(job.reviewer.id);
+            }
           }
-        }
+        })();
       },
     );
     const probesPromise = Promise.all(probeWorkers).then(() => probeOutcomes);
     await Promise.race([probesPromise, probeAbort.promise]);
     probeAbort.dispose();
     if (interrupted && probeSettled.some((settled) => !settled)) {
+      await stopPreflightHeartbeat();
       const activeProbeOperations = probeOperations.filter(
         (operation): operation is Promise<void> => operation !== undefined,
       );
@@ -640,7 +732,17 @@ export async function runReviewRound({
       const failure = probeFailure(probe.value);
       if (failure !== undefined)
         await finalizeIncomplete(job.reviewer.id, failure);
-      else available.push(job);
+      else {
+        state.transition(job.reviewer.id, "queued");
+        const queuedMessage = "Ready and waiting for an execution slot.";
+        state.recordActivity(job.reviewer.id, queuedMessage);
+        await emit({
+          event: "reviewer.progress",
+          reviewer_id: job.reviewer.id,
+          data: { phase: "queued", message: queuedMessage },
+        });
+        available.push(job);
+      }
     }
 
     let nextJob = 0;
@@ -668,6 +770,14 @@ export async function runReviewRound({
           return;
         }
         state.transition(reviewer.id, "starting");
+        if (
+          !state.reviewers.some(
+            (candidate) =>
+              candidate.status === "queued" || candidate.status === "probing",
+          )
+        ) {
+          clearPreflightHeartbeat();
+        }
         await emit({
           event: "reviewer.started",
           reviewer_id: reviewer.id,
@@ -675,7 +785,11 @@ export async function runReviewRound({
             purpose: reviewer.purpose,
             adapter: reviewer.adapterId,
             model: reviewer.model,
+            ...(reviewer.effort === undefined
+              ? {}
+              : { effort: reviewer.effort }),
             isolation_policy: reviewer.isolationPolicy,
+            timeout_ms: reviewer.timeoutMs,
           },
         });
         state.transition(reviewer.id, "reviewing");
@@ -701,7 +815,10 @@ export async function runReviewRound({
               ),
               ...(current.lastActivity === undefined
                 ? {}
-                : { last_activity_at: current.lastActivity.at.toISOString() }),
+                : {
+                    last_activity_at: current.lastActivity.at.toISOString(),
+                    last_activity_message: current.lastActivity.message,
+                  }),
               suite: heartbeatSuite(),
               ...(current.isolation === undefined
                 ? {}
@@ -873,13 +990,15 @@ export async function runReviewRound({
 
     const workers = Array.from(
       { length: Math.min(config.execution.max_concurrency, available.length) },
-      async () => {
-        while (!interrupted) {
-          const job = available[nextJob];
-          if (job === undefined) return;
-          nextJob += 1;
-          await execute(job);
-        }
+      () => {
+        return (async () => {
+          while (!interrupted) {
+            const job = available[nextJob];
+            if (job === undefined) return;
+            nextJob += 1;
+            await execute(job);
+          }
+        })();
       },
     );
     const workersPromise = Promise.allSettled(workers);
@@ -936,6 +1055,7 @@ export async function runReviewRound({
     } else {
       await workersPromise;
     }
+    await stopPreflightHeartbeat();
     const aggregate = aggregateRun(state);
     const totalElapsedMs = Math.max(
       0,
@@ -961,6 +1081,7 @@ export async function runReviewRound({
     };
   } finally {
     signal.removeEventListener("abort", abortActive);
+    await stopPreflightHeartbeat();
     for (const runtime of active.values()) await stopRuntimeTimers(runtime);
     const closeOutcome = await settleWithin(
       Promise.resolve().then(() => writer.close()),

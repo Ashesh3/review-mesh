@@ -7,6 +7,7 @@ import {
   type ReasoningEffort,
 } from "./schemas.js";
 import type { CopilotAccountService } from "../copilot/account.js";
+import type { JsonValue } from "../protocol/schemas.js";
 import {
   canonicalProjectPath,
   listConfig,
@@ -109,7 +110,7 @@ function reasoningEffort(value: string): ReasoningEffort | undefined {
   return value as ReasoningEffort;
 }
 
-function optionalJson(value: string): unknown {
+function optionalJson(value: string): JsonValue {
   try {
     return JSON.parse(value);
   } catch {

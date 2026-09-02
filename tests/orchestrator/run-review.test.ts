@@ -175,6 +175,118 @@ describe("runReviewRound", () => {
     ).toEqual(["first", "second", "third"]);
   });
 
+  it("reports resolved runtime details and immediate probing and queued progress", async () => {
+    const events: PublicEvent[] = [];
+    const completionPromise = runReviewRound(
+      roundInput({
+        adapters: { detailed: fakeAdapterReturning(passResult(), 1) },
+        onEvent: (event) => events.push(event),
+        config: {
+          execution: {
+            max_concurrency: 1,
+            heartbeat_interval_ms: 25,
+            shutdown_grace_period_ms: 10,
+          },
+          selection: { source: "defaults" },
+          reviewers: [
+            { effort: "high", timeoutMs: 321_000, purpose: "Find regressions" },
+          ],
+        },
+      }),
+    );
+
+    await vi.runAllTimersAsync();
+    await completionPromise;
+
+    expect(
+      events.find((event) => event.event === "suite.resolved"),
+    ).toMatchObject({
+      data: {
+        execution: {
+          max_concurrency: 1,
+          heartbeat_interval_ms: 25,
+          shutdown_grace_period_ms: 10,
+        },
+        reviewers: [
+          {
+            id: "detailed",
+            adapter_type: "command",
+            effort: "high",
+            timeout_ms: 321_000,
+          },
+        ],
+      },
+    });
+    expect(
+      events.filter((event) => event.event === "reviewer.progress"),
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          reviewer_id: "detailed",
+          data: expect.objectContaining({ phase: "probing" }),
+        }),
+        expect.objectContaining({
+          reviewer_id: "detailed",
+          data: expect.objectContaining({ phase: "queued" }),
+        }),
+      ]),
+    );
+    expect(
+      events.find((event) => event.event === "reviewer.started"),
+    ).toMatchObject({
+      reviewer_id: "detailed",
+      data: { effort: "high", timeout_ms: 321_000 },
+    });
+  });
+
+  it("emits liveness while a capability probe is silent", async () => {
+    let releaseProbe!: () => void;
+    const probing = boundaryAdapter(
+      async function* () {
+        yield {
+          type: "result",
+          result: passResult(),
+          isolation: "enforced_read_only",
+        };
+      },
+      {
+        probe: () =>
+          new Promise<AdapterCapabilities>((resolve) => {
+            releaseProbe = () => resolve(availableCapabilities);
+          }),
+      },
+    );
+    const events: PublicEvent[] = [];
+    const completionPromise = runReviewRound(
+      roundInput({
+        adapters: { probing },
+        onEvent: (event) => events.push(event),
+        config: { execution: { heartbeat_interval_ms: 10 } },
+      }),
+    );
+
+    await vi.advanceTimersByTimeAsync(25);
+    expect(
+      events.find(
+        (event) =>
+          event.event === "reviewer.heartbeat" &&
+          event.reviewer_id === "probing",
+      ),
+    ).toMatchObject({
+      data: {
+        phase: "probing",
+        last_activity_message:
+          "Checking the configured adapter, authentication, model, and isolation capability.",
+        suite: { total: 1, queued: 0, running: 1, completed: 0, incomplete: 0 },
+      },
+    });
+    expect(JSON.stringify(events)).not.toMatch(/percent/i);
+
+    releaseProbe();
+    await vi.runAllTimersAsync();
+    await completionPromise;
+  });
+
   it("waits for the full suite after actionable findings", async () => {
     const first = fakeAdapterReturning(failResult("first"), 5);
     const second = fakeAdapterReturning(passResult(), 50);
@@ -336,6 +448,7 @@ describe("runReviewRound", () => {
       data: {
         phase: "reviewing",
         elapsed_ms: 100,
+        last_activity_message: expect.any(String),
         suite: { total: 1, queued: 0, running: 1, completed: 0, incomplete: 0 },
       },
     });
@@ -875,7 +988,7 @@ describe("runReviewRound", () => {
     for (let index = 0; index < 20 && vi.getTimerCount() === 0; index += 1) {
       await Promise.resolve();
     }
-    expect(vi.getTimerCount()).toBe(1);
+    expect(vi.getTimerCount()).toBeGreaterThanOrEqual(1);
     await vi.advanceTimersByTimeAsync(50);
     for (let index = 0; index < 20 && cleanupCalls === 0; index += 1) {
       await Promise.resolve();

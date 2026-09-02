@@ -75,6 +75,32 @@ async function run(
   };
 }
 
+async function runArguments(
+  file: string,
+  args: readonly string[],
+  options: { cwd: string; env: NodeJS.ProcessEnv },
+): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
+  const child = spawn(process.execPath, [file, ...args], {
+    ...options,
+    stdio: "pipe",
+    windowsHide: true,
+  });
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+  child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+  child.stdin.end();
+  const exitCode = await new Promise<number | null>((resolveExit, reject) => {
+    child.once("error", reject);
+    child.once("close", resolveExit);
+  });
+  return {
+    exitCode,
+    stdout: Buffer.concat(stdout).toString("utf8"),
+    stderr: Buffer.concat(stderr).toString("utf8"),
+  };
+}
+
 function completion(stdout: string): Record<string, unknown> {
   return stdout
     .trim()
@@ -119,6 +145,31 @@ describe("portable CLI", () => {
     expect(contents).not.toContain('from "execa"');
     expect(contents).not.toContain('from "smol-toml"');
     expect(contents).not.toContain('from "zod"');
+  });
+
+  it("keeps help, version, and Zod-derived schemas in the copied artifact", async () => {
+    const options = {
+      cwd: root,
+      env: isolatedEnvironment(join(root, "help-home")),
+    };
+    const help = await runArguments(artifact, ["--help"], options);
+    expect(help).toMatchObject({ exitCode: 0, stderr: "" });
+    expect(help.stdout).toContain("AGENT QUICK START");
+
+    const version = await runArguments(artifact, ["--version"], options);
+    expect(version).toMatchObject({ exitCode: 0, stderr: "" });
+    expect(version.stdout).toMatch(/^review-mesh \d+\.\d+\.\d+\n$/);
+
+    const schema = await runArguments(
+      artifact,
+      ["schema", "request", "--json"],
+      options,
+    );
+    expect(schema).toMatchObject({ exitCode: 0, stderr: "" });
+    expect(JSON.parse(schema.stdout)).toMatchObject({
+      name: "request",
+      schema: { $schema: "http://json-schema.org/draft-07/schema#" },
+    });
   });
 
   it("runs the command adapter after being copied outside the project", async () => {

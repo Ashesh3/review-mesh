@@ -211,6 +211,21 @@ export interface ResolvedReviewer {
 export interface ResolvedConfig {
   execution: TrustedConfigV1["execution"];
   diagnostics: TrustedConfigV1["diagnostics"];
+  selection?: {
+    source: "legacy" | "defaults" | "project";
+    matchedProjectPath?: string;
+  };
   project_context?: JsonValue;
   reviewers: ResolvedReviewer[];
 }
+
+export const configRevisionSchema = z.union([
+  z.literal("missing"),
+  z.string().regex(/^[a-f0-9]{64}$/),
+]);
+
+export const configApplyRequestSchema = z.strictObject({
+  schema_version: z.literal("1"),
+  expected_revision: configRevisionSchema,
+  config: trustedConfigV2Schema,
+});

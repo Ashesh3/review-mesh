@@ -14,6 +14,7 @@ const linuxBun = process.env.BUN_LINUX_X64_EXE;
 const expectedBunVersion = "1.4.0";
 const expectedLinuxBunSha256 =
   "33d56b070be6a9e3da0ab013038b43d1645d0534ca811ecdba4472599117eb4b";
+const windowsOnly = process.argv.includes("--windows-only");
 
 const localBun =
   process.platform === "win32"
@@ -85,17 +86,21 @@ build(
   undefined,
   true,
 );
-build(
-  "./scripts/standalone-entry.mjs",
-  "bun-linux-x64",
-  linuxOutput,
-  linuxBun,
-  true,
-);
-if (process.platform !== "win32") await chmod(linuxOutput, 0o755);
+if (!windowsOnly) {
+  build(
+    "./scripts/standalone-entry.mjs",
+    "bun-linux-x64",
+    linuxOutput,
+    linuxBun,
+    true,
+  );
+  if (process.platform !== "win32") await chmod(linuxOutput, 0o755);
+}
 
 const checksumLines = [];
-for (const output of [windowsOutput, linuxOutput]) {
+for (const output of windowsOnly
+  ? [windowsOutput]
+  : [windowsOutput, linuxOutput]) {
   const digest = createHash("sha256")
     .update(await readFile(output))
     .digest("hex");
@@ -104,5 +109,5 @@ for (const output of [windowsOutput, linuxOutput]) {
 await writeFile(checksumOutput, `${checksumLines.join("\n")}\n`, "ascii");
 
 console.log(`Built ${windowsOutput}`);
-console.log(`Built ${linuxOutput}`);
+if (!windowsOnly) console.log(`Built ${linuxOutput}`);
 console.log(`Wrote ${checksumOutput}`);

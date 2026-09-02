@@ -76,6 +76,10 @@ describe("global configuration", () => {
     ]);
     expect(resolved.reviewers[0]?.effort).toBe("high");
     expect(resolved.project_context).toEqual({ project: "demo" });
+    expect(resolved.selection).toEqual({
+      source: "project",
+      matchedProjectPath: workspace,
+    });
   });
 
   it("uses the most-specific configured project containing the workspace", () => {
@@ -123,6 +127,9 @@ describe("global configuration", () => {
         workspace: other,
       }).reviewers.map((reviewer) => reviewer.id),
     ).toEqual(["opus"]);
+    expect(
+      resolveConfig({ trusted: v2(configured), workspace: other }).selection,
+    ).toEqual({ source: "defaults" });
     const withoutDefaults = v2(configured);
     delete withoutDefaults.defaults;
     expect(() =>

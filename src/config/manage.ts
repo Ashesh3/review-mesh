@@ -14,30 +14,34 @@ import {
 import { basename, dirname, resolve } from "node:path";
 import { parse, stringify } from "smol-toml";
 import type { AdapterRegistration, ReasoningEffort } from "./schemas.js";
+import type { JsonValue } from "../protocol/schemas.js";
 import { trustedConfigSchema, validateAdapterEffort } from "./schemas.js";
+import { validateProjectKeys } from "./project-paths.js";
 
-const MAX_CONFIG_BYTES = 4 * 1024 * 1024;
+export const MAX_CONFIG_BYTES = 4 * 1024 * 1024;
 const READ_CHUNK_BYTES = 64 * 1024;
 const SAFE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const ENVIRONMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const CONFIG_LOCK_TIMEOUT_MS = 15_000;
+const CONFIG_LOCK_RETRY_MS = 25;
 
 export interface ManagedAgent {
   adapter: string;
   model: string;
-  effort?: ReasoningEffort;
+  effort?: ReasoningEffort | undefined;
   purpose: string;
-  instructions?: string;
-  instructions_file?: string;
+  instructions?: string | undefined;
+  instructions_file?: string | undefined;
   isolation: "prefer_enforced" | "require_enforced";
   timeout_ms: number;
-  runtime?: Record<string, unknown>;
+  runtime?: Record<string, JsonValue> | undefined;
 }
 
 export interface ManagedProject {
-  agents?: string[];
-  instructions?: string;
-  instructions_file?: string;
-  context?: unknown;
+  agents?: string[] | undefined;
+  instructions?: string | undefined;
+  instructions_file?: string | undefined;
+  context?: JsonValue | undefined;
 }
 
 export interface ManagedConfig {
@@ -50,8 +54,8 @@ export interface ManagedConfig {
   diagnostics: { persist_runs: boolean; max_runs: number };
   adapters: Record<string, AdapterRegistration>;
   agents: Record<string, ManagedAgent>;
-  defaults?: { agents: string[] };
-  projects?: Record<string, ManagedProject>;
+  defaults?: { agents: string[] } | undefined;
+  projects?: Record<string, ManagedProject> | undefined;
 }
 
 export interface ConfigSnapshot {
@@ -59,6 +63,66 @@ export interface ConfigSnapshot {
   hash?: string;
   device?: bigint;
   inode?: bigint;
+}
+
+export class ConfigConflictError extends Error {
+  constructor() {
+    super("configuration changed on disk; reload before saving");
+    this.name = "ConfigConflictError";
+  }
+}
+
+function isAlreadyExists(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "EEXIST"
+  );
+}
+
+async function wait(milliseconds: number): Promise<void> {
+  await new Promise<void>((resolveWait) =>
+    setTimeout(resolveWait, milliseconds),
+  );
+}
+
+async function acquireConfigLock(
+  path: string,
+  pinned: { path: string; device: bigint; inode: bigint },
+): Promise<() => Promise<void>> {
+  const startedAt = Date.now();
+  for (;;) {
+    await assertStableParent(dirname(path), pinned);
+    try {
+      const handle = await open(
+        path,
+        constants.O_WRONLY |
+          constants.O_CREAT |
+          constants.O_EXCL |
+          (constants.O_NOFOLLOW ?? 0),
+        0o600,
+      );
+      await handle.writeFile(
+        `${JSON.stringify({ pid: process.pid, created_at: new Date().toISOString() })}\n`,
+        "utf8",
+      );
+      await handle.sync();
+      let released = false;
+      return async () => {
+        if (released) return;
+        released = true;
+        await handle.close();
+        await rm(path, { force: true });
+      };
+    } catch (error) {
+      if (!isAlreadyExists(error)) throw error;
+      if (Date.now() - startedAt >= CONFIG_LOCK_TIMEOUT_MS) {
+        throw new ConfigConflictError();
+      }
+      await wait(CONFIG_LOCK_RETRY_MS);
+    }
+  }
 }
 
 export interface LoadedManagedConfig {
@@ -109,9 +173,12 @@ function requireManagedConfig(value: unknown): ManagedConfig {
   }
   trustedConfigSchema.parse(value);
   const config = clone(value as ManagedConfig);
+  validateProjectKeys(config.projects);
   requireAssignments(config);
   for (const [id, agent] of Object.entries(config.agents)) {
-    const adapter = config.adapters[agent.adapter];
+    const adapter = Object.hasOwn(config.adapters, agent.adapter)
+      ? config.adapters[agent.adapter]
+      : undefined;
     if (adapter === undefined) {
       throw new Error(
         `agent ${id} references unknown adapter ${agent.adapter}`,
@@ -127,7 +194,7 @@ function requireManagedConfig(value: unknown): ManagedConfig {
   ];
   for (const ids of assignmentLists) {
     for (const id of ids) {
-      if (config.agents[id] === undefined) {
+      if (!Object.hasOwn(config.agents, id)) {
         throw new Error(`assignment references unknown agent ${id}`);
       }
     }
@@ -226,6 +293,9 @@ export function serializeManagedConfig(config: ManagedConfig): string {
   requireAssignments(config);
   const validated = requireManagedConfig(config);
   const text = `${stringify(validated)}\n`;
+  if (Buffer.byteLength(text, "utf8") > MAX_CONFIG_BYTES) {
+    throw new Error("configuration file exceeds the 4 MiB limit");
+  }
   requireManagedConfig(parse(text));
   return text;
 }
@@ -329,6 +399,14 @@ function sameSnapshot(left: ConfigSnapshot, right: ConfigSnapshot): boolean {
   );
 }
 
+export function configRevision(snapshot: ConfigSnapshot): string {
+  return snapshot.exists ? snapshot.hash! : "missing";
+}
+
+export async function readConfigRevision(path: string): Promise<string> {
+  return configRevision((await readSnapshot(path)).snapshot);
+}
+
 export async function loadManagedConfig(
   configFile: string,
   allowMissing = false,
@@ -410,19 +488,21 @@ export async function saveManagedConfig(
   await assertStableParent(parent, pinned);
   const current = (await readSnapshot(target)).snapshot;
   if (!sameSnapshot(current, expected)) {
-    throw new Error("configuration changed on disk; reload before saving");
+    throw new ConfigConflictError();
   }
 
   const temporary = resolve(
     pinned.path,
     `.${basename(configFile)}.${process.pid}.${randomUUID()}.tmp`,
   );
+  const lock = resolve(pinned.path, `.${basename(configFile)}.update.lock`);
   const flags =
     constants.O_WRONLY |
     constants.O_CREAT |
     constants.O_EXCL |
     (constants.O_NOFOLLOW ?? 0);
   let handle;
+  let releaseLock: (() => Promise<void>) | undefined;
   try {
     await assertStableParent(parent, pinned);
     handle = await open(temporary, flags, 0o600);
@@ -434,9 +514,10 @@ export async function saveManagedConfig(
     // Validate the exact bytes that will be published, not just the source
     // object passed to this function.
     parseManagedConfig(await readFile(temporary, "utf8"));
+    releaseLock = await acquireConfigLock(lock, pinned);
     await assertStableParent(parent, pinned);
     if (!sameSnapshot((await readSnapshot(target)).snapshot, expected)) {
-      throw new Error("configuration changed on disk; reload before saving");
+      throw new ConfigConflictError();
     }
     await rename(temporary, target);
     await assertStableParent(parent, pinned);
@@ -444,6 +525,7 @@ export async function saveManagedConfig(
   } finally {
     await handle?.close().catch(() => undefined);
     await rm(temporary, { force: true }).catch(() => undefined);
+    await releaseLock?.().catch(() => undefined);
   }
 }
 

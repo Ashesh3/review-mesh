@@ -5,12 +5,13 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { PassThrough } from "node:stream";
+import { PassThrough, Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { runReviewApplication } from "../../src/app.js";
@@ -292,6 +293,149 @@ afterEach(async () => {
 });
 
 describe("review-mesh review", () => {
+  it.each([
+    ["no arguments", []],
+    ["help", ["help"]],
+    ["long flag", ["--help"]],
+    ["short flag", ["-h"]],
+  ] as const)(
+    "prints agent-first overview help for %j without consuming stdin",
+    async (_case, argv) => {
+      process.exitCode = undefined;
+      const fixture = await createFixture();
+      const input = new PassThrough();
+      const output = new PassThrough();
+      const error = new PassThrough();
+      let stdout = "";
+      let stderr = "";
+      output.on("data", (chunk) => (stdout += chunk.toString()));
+      error.on("data", (chunk) => (stderr += chunk.toString()));
+      input.write("unconsumed review request");
+
+      await runCliEntry(new EventEmitter(), {
+        argv: [...argv],
+        input,
+        output,
+        error,
+        configFile: fixture.configFile,
+      });
+
+      expect(process.exitCode).toBe(0);
+      expect(stdout).toContain("AGENT QUICK START");
+      expect(stdout).toContain("review-mesh describe . --json");
+      expect(stderr).toBe("");
+      expect(input.read()?.toString()).toBe("unconsumed review request");
+      process.exitCode = undefined;
+    },
+  );
+
+  it("prints focused topic help and the application version", async () => {
+    const fixture = await createFixture();
+    const topic = await runCli(fixture, ["help", "events"], "");
+    expect(topic).toMatchObject({ exitCode: 0, stderr: "" });
+    expect(topic.stdout).toContain("REVIEW-MESH EVENTS");
+    expect(topic.stdout).toContain("run.completed");
+
+    const commandHelp = await runCli(fixture, ["review", "--help"], "");
+    expect(commandHelp).toMatchObject({ exitCode: 0, stderr: "" });
+    expect(commandHelp.stdout).toContain("REVIEW-MESH REVIEW");
+
+    const version = await runCli(fixture, ["--version"], "");
+    expect(version).toMatchObject({ exitCode: 0, stderr: "" });
+    expect(version.stdout).toMatch(/^review-mesh \d+\.\d+\.\d+\n$/);
+  });
+
+  it("prints authoritative Zod-derived schemas", async () => {
+    const fixture = await createFixture();
+    for (const name of [
+      "request",
+      "events",
+      "result",
+      "config",
+      "config-apply",
+      "diagnostic",
+      "command-adapter-event",
+    ]) {
+      const result = await runCli(fixture, ["schema", name, "--json"], "");
+      expect(result).toMatchObject({ exitCode: 0, stderr: "" });
+      const document = JSON.parse(result.stdout) as {
+        name: string;
+        schema: Record<string, unknown>;
+      };
+      expect(document.name).toBe(name);
+      expect(document.schema.$schema).toBe(
+        "http://json-schema.org/draft-07/schema#",
+      );
+    }
+    const listed = await runCli(fixture, ["schema", "list"], "");
+    const schemaList = JSON.parse(listed.stdout) as {
+      schemas: Array<{ name: string; command: string }>;
+    };
+    expect(schemaList.schemas.map(({ name }) => name)).toEqual(
+      expect.arrayContaining(["request", "command-adapter-event"]),
+    );
+  });
+
+  it("describes the exact configured suite for a workspace", async () => {
+    const fixture = await createFixture();
+    const canonicalWorkspace = await realpath(fixture.workspace);
+    const result = await runCli(
+      fixture,
+      ["describe", fixture.workspace, "--json"],
+      "",
+    );
+    expect(result).toMatchObject({ exitCode: 0, stderr: "" });
+    const description = JSON.parse(result.stdout);
+    expect(description).toMatchObject({
+      schema_version: "1",
+      kind: "review-mesh.description",
+      tool: { name: "review-mesh", agent_first: true },
+      invocation: {
+        workspace: canonicalWorkspace,
+      },
+      configuration: {
+        valid: true,
+        config_path: fixture.configFile,
+        execution: { max_concurrency: 2 },
+        reviewers: [
+          { id: "fixture-0", model: "fixture-model-0" },
+          { id: "fixture-1", model: "fixture-model-1" },
+        ],
+      },
+      streams: { review: { final_event: "run.completed" } },
+    });
+    expect(description.invocation.default_review).toContain(canonicalWorkspace);
+  });
+
+  it("describes missing configuration as actionable discovery, not a CLI failure", async () => {
+    const fixture = await createFixture();
+    const missing = join(fixture.root, "missing", "config.toml");
+    const output = new PassThrough();
+    const error = new PassThrough();
+    let stdout = "";
+    let stderr = "";
+    output.on("data", (chunk) => (stdout += chunk.toString()));
+    error.on("data", (chunk) => (stderr += chunk.toString()));
+    await runCliEntry(new EventEmitter(), {
+      argv: ["describe", fixture.workspace, "--json"],
+      input: Readable.from([""]),
+      output,
+      error,
+      configFile: missing,
+    });
+    expect(process.exitCode).toBe(0);
+    expect(stderr).toBe("");
+    expect(JSON.parse(stdout)).toMatchObject({
+      kind: "review-mesh.description",
+      configuration: {
+        valid: false,
+        config_path: missing,
+        error: { code: "configuration_missing" },
+      },
+    });
+    process.exitCode = undefined;
+  });
+
   it("dispatches config path without consuming redirected stdin", async () => {
     const fixture = await createFixture();
     const input = new PassThrough();
@@ -385,6 +529,41 @@ describe("review-mesh review", () => {
     await expect(access(join(fixture.root, "runs"))).rejects.toMatchObject({
       code: "ENOENT",
     });
+  });
+
+  it("does not persist arbitrary reviewer runtime values in the run header", async () => {
+    const config = trustedConfig(["pass"])
+      .replace("persist_runs = false", "persist_runs = true")
+      .replace(
+        "timeout_ms = 5000",
+        'timeout_ms = 5000\nruntime = { ordinary = "sensitive-runtime-value" }',
+      );
+    const fixture = await createFixture(["pass"], config);
+    const runsDirectory = join(fixture.root, "injected-app-data", "runs");
+    const stdout = new PassThrough();
+    stdout.resume();
+
+    expect(
+      await runReviewApplication({
+        requestText: fixture.request,
+        configFile: fixture.configFile,
+        stdout,
+        stderr: new PassThrough(),
+        signal: new AbortController().signal,
+        runIdFactory: () => "runtime-redaction-run",
+        appPaths: {
+          configFile: join(fixture.root, "unused-config.toml"),
+          reviewersDirectory: join(fixture.root, "unused-reviewers"),
+          runsDirectory,
+        },
+      }),
+    ).toBe(0);
+    expect(
+      await readFile(
+        join(runsDirectory, "runtime-redaction-run.jsonl"),
+        "utf8",
+      ),
+    ).not.toContain("sensitive-runtime-value");
   });
 
   it("does not create the injected runs directory when persistence is disabled", async () => {
@@ -577,9 +756,7 @@ describe("review-mesh review", () => {
 
   it.each([
     ["malformed JSON", ["review"], "{", undefined, "invalid_request"],
-    ["empty stdin", ["review"], "", undefined, "invalid_request"],
     ["unsupported command", ["inspect"], undefined, undefined, "invalid_usage"],
-    ["a flag", ["--help"], undefined, undefined, "invalid_usage"],
     [
       "additional arguments",
       ["review", "extra"],
@@ -611,6 +788,73 @@ describe("review-mesh review", () => {
       expect(result.stderr).not.toMatch(/\n\s+at\s/);
     },
   );
+
+  it("reviews the current directory with a synthesized request on empty stdin", async () => {
+    const fixture = await createFixture();
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx", cliEntry, "review", fixture.workspace],
+      {
+        cwd: projectRoot,
+        env: fixture.env,
+        stdio: "pipe",
+        windowsHide: true,
+      },
+    );
+    child.stdin.end();
+    const result = await collectProcess(child);
+    expect(result).toMatchObject({ exitCode: 0, stderr: "" });
+    expect(parseEvents(result.stdout).at(-1)).toMatchObject({
+      event: "run.completed",
+      data: { status: "passed" },
+    });
+  });
+
+  it("synthesizes immediately for TTY stdin without consuming it", async () => {
+    const fixture = await createFixture();
+    const input = new PassThrough() as PassThrough & { isTTY?: boolean };
+    input.isTTY = true;
+    input.write("must remain unread");
+    const output = new PassThrough();
+    const error = new PassThrough();
+    let requestText: string | undefined;
+    input.resume = (() => {
+      throw new Error("TTY stdin must not be resumed");
+    }) as typeof input.resume;
+    output.resume();
+    error.resume();
+    await runCliEntry(new EventEmitter(), {
+      argv: ["review", fixture.workspace],
+      input,
+      output,
+      error,
+      configFile: fixture.configFile,
+      cwd: fixture.workspace,
+      runReview: async (options) => {
+        requestText = options.requestText;
+        return 0;
+      },
+    });
+    expect(requestText).toBeDefined();
+    expect(JSON.parse(requestText!)).toMatchObject({
+      schema_version: "1",
+      workspace: resolve(fixture.workspace),
+    });
+  });
+
+  it("rejects a positional workspace combined with piped JSON", async () => {
+    const fixture = await createFixture();
+    const result = await runCli(
+      fixture,
+      ["review", fixture.workspace],
+      fixture.request,
+    );
+    expect(result).toMatchObject({ exitCode: 2, stdout: "" });
+    expect(parseSingleDiagnostic(result.stderr)).toMatchObject({
+      error: "invalid_usage",
+      help_command: "review-mesh help review",
+    });
+  });
 
   it("rejects stdin beyond 8 MiB instead of truncating or beginning a run", async () => {
     const fixture = await createFixture();

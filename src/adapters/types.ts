@@ -83,8 +83,8 @@ export function buildAllowlistedEnvironment(
     if (!ENVIRONMENT_NAME.test(name)) {
       throw new Error(`invalid environment variable name: ${name}`);
     }
-    const value = source[name];
-    if (value !== undefined) environment[name] = value;
+    const value = Object.hasOwn(source, name) ? source[name] : undefined;
+    if (typeof value === "string") environment[name] = value;
   }
   return environment;
 }

@@ -55,7 +55,7 @@ export interface SuiteState {
   reviewer(id: string): ReviewerState;
   transition(
     id: string,
-    next: "probing" | "starting" | "reviewing" | "validating",
+    next: "queued" | "probing" | "starting" | "reviewing" | "validating",
   ): ReviewerState;
   recordActivity(id: string, message: string): ReviewerState;
   setCapabilities(id: string, capabilities: AdapterCapabilities): ReviewerState;
@@ -88,8 +88,8 @@ export interface RunAggregate {
 const transitions: Readonly<
   Record<ReviewerLifecycleStatus, readonly ReviewerLifecycleStatus[]>
 > = {
-  queued: ["probing"],
-  probing: ["starting"],
+  queued: ["probing", "starting"],
+  probing: ["queued", "starting"],
   starting: ["reviewing"],
   reviewing: ["validating"],
   validating: [],
@@ -202,7 +202,9 @@ export function createSuiteState(
       );
     }
     const at = now();
-    if (next === "probing") state.startedAt = at;
+    if (next === "probing" && state.startedAt === undefined) {
+      state.startedAt = at;
+    }
     state.status = next;
     return state;
   };

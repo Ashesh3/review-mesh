@@ -1147,13 +1147,23 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
   }
 
   private configuration(): ProviderConfiguration | AdapterFailure {
-    const apiKey = this.environment[this.registration.api_key_env];
+    const apiKey = Object.hasOwn(
+      this.environment,
+      this.registration.api_key_env,
+    )
+      ? this.environment[this.registration.api_key_env]
+      : undefined;
     if (apiKey === undefined || apiKey.trim() === "") {
       return adapterFailure.authentication(
         "The configured OpenAI-compatible API key environment variable is unavailable.",
       );
     }
-    const configuredBaseUrl = this.environment[this.registration.base_url_env];
+    const configuredBaseUrl = Object.hasOwn(
+      this.environment,
+      this.registration.base_url_env,
+    )
+      ? this.environment[this.registration.base_url_env]
+      : undefined;
     const baseUrl =
       configuredBaseUrl === undefined
         ? undefined

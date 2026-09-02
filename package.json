@@ -1,6 +1,6 @@
 {
   "name": "review-mesh",
-  "version": "2.1.0",
+  "version": "3.0.0",
   "private": true,
   "files": [
     "dist/review-mesh.mjs",
@@ -18,7 +18,9 @@
     "build": "npm run typecheck && npm run build:portable",
     "build:portable": "node scripts/build-portable.mjs",
     "build:standalone": "node scripts/build-standalone.mjs",
-    "verify:standalone": "npm run build:standalone && vitest run tests/acceptance/standalone-cli.test.ts",
+    "build:standalone:windows": "node scripts/build-standalone.mjs --windows-only",
+    "verify:standalone": "npm run build:standalone && node scripts/verify-standalone.mjs",
+    "verify:standalone:windows": "npm run build:standalone:windows && node scripts/verify-standalone.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "test": "vitest run",
     "test:live": "vitest run tests/live --testTimeout=600000",

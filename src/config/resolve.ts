@@ -1,8 +1,6 @@
-import { isAbsolute, normalize, relative, resolve, sep } from "node:path";
 import {
   trustedConfigSchema,
   validateAdapterEffort,
-  type ProjectConfig,
   type ResolvedConfig,
   type ResolvedReviewer,
   type ReviewerProfile,
@@ -10,17 +8,11 @@ import {
   type TrustedConfigV1,
   type TrustedConfigV2,
 } from "./schemas.js";
+import { selectProject } from "./project-paths.js";
 
 export interface ResolveConfigInput {
   trusted: TrustedConfig;
   workspace?: string;
-}
-
-function normalizedProjectPath(path: string): string {
-  if (!isAbsolute(path))
-    throw new Error(`project path must be absolute: ${path}`);
-  const normalized = normalize(resolve(path)).replace(/[\\/]+$/, "");
-  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
 function resolveAgent(
@@ -29,7 +21,9 @@ function resolveAgent(
   adapters: TrustedConfigV2["adapters"],
   projectInstructions?: string,
 ): ResolvedReviewer {
-  const adapter = adapters[profile.adapter];
+  const adapter = Object.hasOwn(adapters, profile.adapter)
+    ? adapters[profile.adapter]
+    : undefined;
   if (adapter === undefined) {
     throw new Error(
       `agent ${id} references unknown adapter ${profile.adapter}`,
@@ -83,60 +77,37 @@ function resolveV1(config: TrustedConfigV1): ResolvedConfig {
   return {
     execution: config.execution,
     diagnostics: config.diagnostics,
+    selection: { source: "legacy" },
     reviewers,
   };
-}
-
-function selectProject(
-  config: TrustedConfigV2,
-  workspace: string | undefined,
-): ProjectConfig | undefined {
-  const entries = Object.entries(config.projects ?? {});
-  const normalized = new Map<string, ProjectConfig>();
-  for (const [path, project] of entries) {
-    const key = normalizedProjectPath(path);
-    if (normalized.has(key)) {
-      throw new Error(`duplicate normalized project path: ${path}`);
-    }
-    normalized.set(key, project);
-  }
-  if (workspace === undefined) return undefined;
-  const key = normalizedProjectPath(workspace);
-  let selected: { path: string; project: ProjectConfig } | undefined;
-  for (const [candidate, project] of normalized) {
-    const remainder = relative(candidate, key);
-    const contains =
-      remainder === "" ||
-      (remainder !== ".." &&
-        !remainder.startsWith(`..${sep}`) &&
-        !isAbsolute(remainder));
-    if (
-      contains &&
-      (selected === undefined || candidate.length > selected.path.length)
-    ) {
-      selected = { path: candidate, project };
-    }
-  }
-  return selected?.project;
 }
 
 function resolveV2(
   config: TrustedConfigV2,
   workspace: string | undefined,
 ): ResolvedConfig {
-  const project = selectProject(config, workspace);
+  const selectedProject = selectProject(config.projects, workspace);
+  const project = selectedProject?.project;
   const agentIds = project?.agents ?? config.defaults?.agents;
   if (agentIds === undefined || agentIds.length === 0) {
     throw new Error("no agents are configured for the requested project");
   }
   const reviewers = agentIds.map((id) => {
-    const agent = config.agents[id];
+    const agent = Object.hasOwn(config.agents, id)
+      ? config.agents[id]
+      : undefined;
     if (agent === undefined) throw new Error(`unknown configured agent: ${id}`);
     return resolveAgent(id, agent, config.adapters, project?.instructions);
   });
   return {
     execution: config.execution,
     diagnostics: config.diagnostics,
+    selection: {
+      source: project?.agents === undefined ? "defaults" : "project",
+      ...(selectedProject === undefined
+        ? {}
+        : { matchedProjectPath: selectedProject.path }),
+    },
     ...(project?.context === undefined
       ? {}
       : { project_context: project.context }),

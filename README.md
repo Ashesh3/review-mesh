@@ -3,7 +3,7 @@
 Review Mesh is an agent-first code-review gate. One command runs every reviewer in a trusted suite, streams machine-readable JSONL progress, and succeeds only when every reviewer completes with zero actionable findings.
 
 ```text
-request on stdin -> review-mesh review -> all configured reviewers -> JSONL result
+current directory or request JSON -> review-mesh review -> trusted project/default roster -> live JSONL -> run.completed
 ```
 
 It is designed for automation, coding agents, CI, and local review loops:
@@ -24,9 +24,28 @@ Requirements:
 - Git, when Git context is desired.
 - A trusted `config.toml` and any provider credentials it references.
 
+The CLI is self-describing. An AI agent can start with these commands and does
+not need this README to discover the contract:
+
+```text
+review-mesh --help
+review-mesh describe . --json
+review-mesh schema request --json
+review-mesh config --help
+```
+
+`review-mesh describe . --json` is the recommended first call. It resolves the
+configuration for the current workspace and reports the selected project or
+default roster, ordered agents, adapter types, exact models, optional effort,
+isolation policies, timeouts, concurrency, heartbeat interval, config revision,
+and whether referenced credential environment variables are present. It never
+prints credential values, instruction bodies, project context, or runtime
+options.
+
 ### Download a standalone executable
 
-Release `v2.1.0` provides self-contained Bun executables that do not require Node.js or Bun:
+Release `v3.0.0` provides the agent-first CLI, public event protocol v2, and
+self-contained Bun executables that do not require Node.js or Bun:
 
 - Windows x64: `review-mesh-windows-x64.exe`
 - Linux x64 (glibc): `review-mesh-linux-x64`
@@ -34,14 +53,14 @@ Release `v2.1.0` provides self-contained Bun executables that do not require Nod
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v2.1.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
+Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v3.0.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
 .\review-mesh.exe review
 ```
 
 Linux:
 
 ```bash
-curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v2.1.0/review-mesh-linux-x64
+curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v3.0.0/review-mesh-linux-x64
 chmod +x ./review-mesh-linux-x64
 ./review-mesh-linux-x64 review
 ```
@@ -83,7 +102,24 @@ Portable means the application is one file and does not need this repository or 
 
 ## Run a review
 
-Review Mesh reads exactly one JSON request from stdin. Stdout is JSONL protocol output only; diagnostics use stderr.
+The simplest invocation reviews the current directory with a built-in,
+evidence-focused instruction:
+
+```powershell
+review-mesh review
+```
+
+You can also name a workspace without constructing JSON:
+
+```powershell
+review-mesh review C:\Projects\example
+```
+
+When stdin is a terminal or redirected stdin is empty/whitespace, Review Mesh
+synthesizes the request. To customize instructions, scope hints, context, or a
+request ID, send exactly one JSON request on stdin instead. Do not combine a
+positional workspace with piped JSON. Review stdout remains JSONL protocol
+output only; diagnostics use stderr.
 
 PowerShell:
 
@@ -358,15 +394,59 @@ The menu can list, add, edit, and remove global agents; create and select adapte
 Useful non-interactive commands:
 
 ```text
+review-mesh config --help
 review-mesh config path
 review-mesh config show
 review-mesh config validate
 review-mesh config list
 review-mesh config list --json
+review-mesh config effective . --json
+review-mesh config export --json
+review-mesh config apply --json
 review-mesh config copilot login
 review-mesh config copilot status --json
 review-mesh config copilot models --json
 ```
+
+`config effective` (also available as `config resolve`) prints the safe,
+effective roster for one workspace without contacting providers. `config
+export --json` returns the complete trusted configuration and a SHA-256
+revision; because it includes instruction and runtime fields, treat that output
+as sensitive. To update configuration non-interactively, edit the exported
+`config` object and pipe this strict request to `config apply --json`:
+
+```json
+{
+  "schema_version": "1",
+  "expected_revision": "<revision from config export>",
+  "config": { "schema_version": "2" }
+}
+```
+
+The `config` value above is abbreviated; send the complete desired v2 document.
+Apply is whole-document, limited to 5 MiB of JSON input (the config file remains
+limited to 4 MiB), validated before publication, and
+uses revision compare-and-swap plus atomic replacement. A stale revision fails
+with `config_conflict` instead of overwriting another Review Mesh writer. Do not
+modify the config simultaneously with an external editor, which does not honor
+Review Mesh's update lock.
+
+Generated structural JSON Schemas are available directly from the executable:
+
+```text
+review-mesh schema request --json
+review-mesh schema events --json
+review-mesh schema result --json
+review-mesh schema config --json
+review-mesh schema config-apply --json
+review-mesh schema diagnostic --json
+review-mesh schema command-adapter-event --json
+```
+
+Runtime semantic validation remains authoritative for cross-field and
+cross-reference policy that generated JSON Schema cannot fully express, such as
+verdict/finding consistency, evidence line pairs, instruction-source choice,
+absolute project paths, assignment references, and provider-specific effort.
 
 ## Other adapters
 
@@ -384,25 +464,25 @@ For a truly one-file deployment, use `openai_compatible`. Provider-native adapte
 
 ## JSONL events
 
-Every non-empty stdout line is one strict schema-version `1` JSON object. All events in a run share one `run_id`; `seq` starts at `1` and increases monotonically; `run.completed` is final once a valid run begins and stdout remains available.
+Every non-empty stdout line is one strict schema-version `2` JSON object. Review request and reviewer-result objects remain schema version `1`. All events in a run share one `run_id`; `seq` starts at `1` and increases monotonically; `run.completed` is final once a valid run begins and stdout remains available. Immediately after suite resolution, each agent reports capability probing, then readiness/queue state. Heartbeats also cover silent probes and queued agents, so a caller can distinguish slow work from a stuck process without relying on invented percentages.
 
-| Event                 | Meaning                                                   |
-| --------------------- | --------------------------------------------------------- |
-| `run.started`         | The live-worktree review began.                           |
-| `context.resolved`    | Workspace and best-effort Git metadata were resolved.     |
-| `suite.resolved`      | The mandatory roster was resolved.                        |
-| `reviewer.started`    | One reviewer job began.                                   |
-| `reviewer.progress`   | Factual phase/activity progress.                          |
-| `reviewer.heartbeat`  | Liveness, elapsed time, and suite summary.                |
-| `reviewer.completed`  | One strict reviewer result.                               |
-| `reviewer.incomplete` | One reviewer failed to return a valid terminal result.    |
-| `run.completed`       | Final classification plus every reviewer terminal record. |
+| Event                 | Meaning                                                     |
+| --------------------- | ----------------------------------------------------------- |
+| `run.started`         | The live-worktree review began.                             |
+| `context.resolved`    | Workspace and best-effort Git metadata were resolved.       |
+| `suite.resolved`      | The roster and execution/heartbeat settings were resolved.  |
+| `reviewer.started`    | One reviewer began, with its model, effort, and timeout.    |
+| `reviewer.progress`   | Factual probing, queued, reviewing, or validating activity. |
+| `reviewer.heartbeat`  | Liveness, elapsed time, and suite summary.                  |
+| `reviewer.completed`  | One strict reviewer result.                                 |
+| `reviewer.incomplete` | One reviewer failed to return a valid terminal result.      |
+| `run.completed`       | Final classification plus every reviewer terminal record.   |
 
 Example final event:
 
 ```json
 {
-  "schema_version": "1",
+  "schema_version": "2",
   "event": "run.completed",
   "run_id": "run_...",
   "seq": 23,

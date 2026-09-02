@@ -132,6 +132,33 @@ append_instructions = "extra"
     );
   });
 
+  it("allows only one concurrent writer to publish from the same revision", async () => {
+    const directory = await root();
+    const file = join(directory, "config.toml");
+    const initial = await loadManagedConfig(file, true);
+    await saveManagedConfig(file, config(), initial.snapshot);
+    const shared = await loadManagedConfig(file);
+    const first = config();
+    first.execution.max_concurrency = 3;
+    const second = config();
+    second.execution.max_concurrency = 4;
+
+    const outcomes = await Promise.allSettled([
+      saveManagedConfig(file, first, shared.snapshot),
+      saveManagedConfig(file, second, shared.snapshot),
+    ]);
+
+    expect(
+      outcomes.filter((outcome) => outcome.status === "fulfilled"),
+    ).toHaveLength(1);
+    expect(
+      outcomes.filter((outcome) => outcome.status === "rejected"),
+    ).toHaveLength(1);
+    expect([3, 4]).toContain(
+      (await loadManagedConfig(file)).config.execution.max_concurrency,
+    );
+  });
+
   it("rejects symlink destinations", async () => {
     const directory = await root();
     const outside = join(directory, "outside.toml");
@@ -180,5 +207,43 @@ append_instructions = "extra"
     expect(() => serializeManagedConfig(invalid)).toThrow(
       /unsupported claude effort ultra/i,
     );
+  });
+
+  it("does not resolve inherited prototype names as configured agents or adapters", () => {
+    const inheritedAgent = config();
+    inheritedAgent.defaults = { agents: ["toString"] };
+    expect(() => serializeManagedConfig(inheritedAgent)).toThrow(
+      /unknown agent/i,
+    );
+
+    const inheritedAdapter = config();
+    inheritedAdapter.agents.gemini!.adapter = "toString";
+    expect(() => serializeManagedConfig(inheritedAdapter)).toThrow(
+      /unknown adapter/i,
+    );
+  });
+
+  it("rejects relative and duplicate normalized project keys before saving", () => {
+    const relative = config();
+    relative.projects = { relative: { agents: ["gemini"] } };
+    expect(() => serializeManagedConfig(relative)).toThrow(/absolute/i);
+
+    const root = process.platform === "win32" ? "C:\\Work\\Demo" : "/work/demo";
+    const duplicate = config();
+    duplicate.projects = {
+      [root]: { agents: ["gemini"] },
+      [`${root}${process.platform === "win32" ? "\\" : "/"}`]: {
+        agents: ["gemini"],
+      },
+    };
+    expect(() => serializeManagedConfig(duplicate)).toThrow(
+      /duplicate normalized project path/i,
+    );
+  });
+
+  it("rejects a serialized configuration above the read limit", () => {
+    const oversized = config();
+    oversized.agents.gemini!.instructions = "x".repeat(4 * 1024 * 1024);
+    expect(() => serializeManagedConfig(oversized)).toThrow(/4 MiB/i);
   });
 });

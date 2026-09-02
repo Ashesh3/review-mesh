@@ -76,6 +76,15 @@ describe("suite state", () => {
     ).toBe("completed");
   });
 
+  it("allows a successfully probed reviewer to wait before starting", () => {
+    const state = createSuiteState([resolvedReviewer({ id: "a" })]);
+
+    state.transition("a", "probing");
+    state.transition("a", "queued");
+
+    expect(state.transition("a", "starting").status).toBe("starting");
+  });
+
   it("rejects a duplicate terminal result", () => {
     const state = createSuiteState([resolvedReviewer({ id: "a" })]);
     state.transition("a", "probing");

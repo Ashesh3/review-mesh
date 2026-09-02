@@ -223,6 +223,7 @@ export function roundInput(
       shutdown_grace_period_ms: 50,
     },
     diagnostics: { persist_runs: false, max_runs: 10 },
+    selection: { source: "defaults" },
     project_context: { source: "project" },
     reviewers,
   };

@@ -121,7 +121,7 @@ describe("publicEventSchema", () => {
     status: "passed" | "findings" | "incomplete",
     reviewers: readonly unknown[],
   ) => ({
-    schema_version: "1",
+    schema_version: "2",
     event: "run.completed",
     run_id: "run-1",
     seq: 1,
@@ -176,5 +176,63 @@ describe("publicEventSchema", () => {
       throw new Error("expected a run.completed event");
     }
     expect(event.data.status).toBe("passed");
+  });
+
+  it("accepts resolved suite and reviewer startup metadata", () => {
+    const envelope = {
+      schema_version: "2" as const,
+      run_id: "run-1",
+      request_id: "request-1",
+      seq: 1,
+      timestamp: "2026-08-30T00:00:00.000Z",
+    };
+
+    expect(
+      publicEventSchema.parse({
+        ...envelope,
+        event: "suite.resolved",
+        data: {
+          total: 1,
+          execution: {
+            max_concurrency: 2,
+            heartbeat_interval_ms: 15_000,
+            shutdown_grace_period_ms: 5_000,
+          },
+          selection: {
+            source: "project",
+            matched_project_path: "/work/project",
+          },
+          reviewers: [
+            {
+              id: "reviewer-1",
+              purpose: "Review correctness",
+              adapter: "gateway",
+              adapter_type: "openai_compatible",
+              model: "test-model",
+              effort: "high",
+              isolation_policy: "prefer_enforced",
+              timeout_ms: 900_000,
+              instruction_sources: ["trusted", "project"],
+            },
+          ],
+        },
+      }).event,
+    ).toBe("suite.resolved");
+
+    expect(
+      publicEventSchema.parse({
+        ...envelope,
+        event: "reviewer.started",
+        reviewer_id: "reviewer-1",
+        data: {
+          purpose: "Review correctness",
+          adapter: "gateway",
+          model: "test-model",
+          effort: "high",
+          isolation_policy: "prefer_enforced",
+          timeout_ms: 900_000,
+        },
+      }).event,
+    ).toBe("reviewer.started");
   });
 });

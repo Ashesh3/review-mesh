@@ -53,7 +53,13 @@ async function writeDiagnostic(
   error: string,
   message: string,
 ): Promise<void> {
-  const line = `${JSON.stringify({ error, message })}\n`;
+  const line = `${JSON.stringify({
+    schema_version: "1",
+    kind: "review-mesh.diagnostic",
+    error,
+    message,
+    retryable: false,
+  })}\n`;
   if (stderr.write(line)) return;
   await new Promise<void>((resolve, reject) => {
     stderr.once("drain", resolve);
@@ -81,7 +87,6 @@ function resolvedRunHeader(config: ReturnType<typeof resolveConfig>) {
       ...(reviewer.effort === undefined ? {} : { effort: reviewer.effort }),
       isolation_policy: reviewer.isolationPolicy,
       timeout_ms: reviewer.timeoutMs,
-      runtime: reviewer.runtime,
       instruction_sources: reviewer.instruction_layers.map(
         (layer) => layer.source,
       ),
