@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
 import {
   lstat,
@@ -56,6 +57,7 @@ type OpenAICompatibleRegistration = Extract<
 export interface OpenAICompatibleAdapterDependencies {
   environment?: NodeJS.ProcessEnv;
   fetch?: typeof fetch;
+  sessionIdFactory?: () => string;
   requestTimeoutMs?: number;
   maxTurns?: number;
   workspaceHooks?: ReadOnlyWorkspaceHooks;
@@ -1115,6 +1117,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
   readonly id = "openai_compatible";
   private readonly environment: NodeJS.ProcessEnv;
   private readonly fetchFacade: typeof fetch;
+  private readonly sessionIdFactory: () => string;
   private readonly requestTimeoutMs: number;
   private readonly maxTurns: number;
   private readonly workspaceHooks: ReadOnlyWorkspaceHooks;
@@ -1131,6 +1134,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
   ) {
     this.environment = dependencies.environment ?? process.env;
     this.fetchFacade = dependencies.fetch ?? globalThis.fetch;
+    this.sessionIdFactory = dependencies.sessionIdFactory ?? randomUUID;
     this.requestTimeoutMs =
       dependencies.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.maxTurns = dependencies.maxTurns ?? DEFAULT_MAX_TURNS;
@@ -1321,6 +1325,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
   private async chat(
     configuration: ProviderConfiguration,
     signal: AbortSignal,
+    sessionId: string,
     body: Record<string, unknown>,
   ) {
     if (
@@ -1342,7 +1347,10 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
       signal,
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-Client-Session-Id": sessionId,
+        },
         body: JSON.stringify(body),
       },
     );
@@ -1518,6 +1526,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
       this.maxSnapshotBytes,
     );
     this.activeWorkspaces.add(workspace);
+    const sessionId = this.sessionIdFactory();
     const system = [
       input.prompt.system,
       "# TRUSTED TOOL POLICY",
@@ -1557,16 +1566,21 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     try {
       let inspectionBudgetReached = false;
       for (let turn = 0; turn < this.maxTurns; turn += 1) {
-        const message = await this.chat(configuration, input.signal, {
-          model: input.reviewer.model,
-          ...(input.reviewer.effort === undefined
-            ? {}
-            : { reasoning_effort: input.reviewer.effort }),
-          messages,
-          tools: READ_ONLY_TOOLS,
-          tool_choice: turn === 0 ? "required" : "auto",
-          max_tokens: 8_192,
-        });
+        const message = await this.chat(
+          configuration,
+          input.signal,
+          sessionId,
+          {
+            model: input.reviewer.model,
+            ...(input.reviewer.effort === undefined
+              ? {}
+              : { reasoning_effort: input.reviewer.effort }),
+            messages,
+            tools: READ_ONLY_TOOLS,
+            tool_choice: turn === 0 ? "required" : "auto",
+            max_tokens: 8_192,
+          },
+        );
         const reserve = finalizationReserve(this.maxConversationBytes);
         const assistant = boundedAssistantMessage(
           message,
@@ -1686,15 +1700,20 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
             schema: relaxedStructuredOutputSchema(input.resultJsonSchema),
           },
         } as const;
-        const finalMessage = await this.chat(configuration, input.signal, {
-          model: input.reviewer.model,
-          ...(input.reviewer.effort === undefined
-            ? {}
-            : { reasoning_effort: input.reviewer.effort }),
-          messages,
-          response_format: responseFormat,
-          max_tokens: 8_192,
-        });
+        const finalMessage = await this.chat(
+          configuration,
+          input.signal,
+          sessionId,
+          {
+            model: input.reviewer.model,
+            ...(input.reviewer.effort === undefined
+              ? {}
+              : { reasoning_effort: input.reviewer.effort }),
+            messages,
+            response_format: responseFormat,
+            max_tokens: 8_192,
+          },
+        );
         let parsedResult = parseReviewerResult(
           normalizedAssistantContent(finalMessage.content),
         );
@@ -1727,15 +1746,20 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           } else {
             messages.push(repairMessage);
           }
-          const repairedMessage = await this.chat(configuration, input.signal, {
-            model: input.reviewer.model,
-            ...(input.reviewer.effort === undefined
-              ? {}
-              : { reasoning_effort: input.reviewer.effort }),
-            messages,
-            response_format: responseFormat,
-            max_tokens: 8_192,
-          });
+          const repairedMessage = await this.chat(
+            configuration,
+            input.signal,
+            sessionId,
+            {
+              model: input.reviewer.model,
+              ...(input.reviewer.effort === undefined
+                ? {}
+                : { reasoning_effort: input.reviewer.effort }),
+              messages,
+              response_format: responseFormat,
+              max_tokens: 8_192,
+            },
+          );
           parsedResult = parseReviewerResult(
             normalizedAssistantContent(repairedMessage.content),
           );

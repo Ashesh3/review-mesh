@@ -195,7 +195,21 @@ describe("OpenAI-compatible adapter", () => {
       expect(requests[0]?.init?.headers).toMatchObject({
         Authorization: "Bearer test-secret",
         "Content-Type": "application/json",
+        "X-Client-Session-Id": expect.stringMatching(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+        ),
       });
+      expect(
+        new Set(
+          requests.map((request) =>
+            new Headers(request.init?.headers).get("x-client-session-id"),
+          ),
+        ),
+      ).toEqual(
+        new Set([
+          new Headers(requests[0]?.init?.headers).get("x-client-session-id"),
+        ]),
+      );
       expect(requests[0]?.body.model).toBe("review-model");
       expect(
         requests.every((request) => request.body.reasoning_effort === "high"),
@@ -233,6 +247,45 @@ describe("OpenAI-compatible adapter", () => {
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  it("uses one distinct routing-affinity session for each reviewer execution", async () => {
+    const sessionIds = ["reviewer-session-a", "reviewer-session-b"];
+    const requestSessionIds: string[] = [];
+    const responses = [
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      assistantResponse({
+        role: "assistant",
+        content: JSON.stringify(passResult("First reviewer passed.")),
+      }),
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      assistantResponse({
+        role: "assistant",
+        content: JSON.stringify(passResult("Second reviewer passed.")),
+      }),
+    ];
+    const prepared = setup("C:\\workspace", {
+      sessionIdFactory: () => sessionIds.shift()!,
+      fetch: fetchMock(async (_input, init) => {
+        requestSessionIds.push(
+          new Headers(init?.headers).get("x-client-session-id") ?? "missing",
+        );
+        return responses.shift()!;
+      }),
+    });
+
+    expect(
+      terminal(await collect(prepared.adapter, prepared.input)),
+    ).toMatchObject({ type: "result" });
+    expect(
+      terminal(await collect(prepared.adapter, prepared.input)),
+    ).toMatchObject({ type: "result" });
+    expect(requestSessionIds).toEqual([
+      "reviewer-session-a",
+      "reviewer-session-a",
+      "reviewer-session-b",
+      "reviewer-session-b",
+    ]);
   });
 
   it("repairs one malformed final result without exposing provider content", async () => {

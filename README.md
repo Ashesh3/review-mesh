@@ -60,8 +60,8 @@ For an AI caller, identity and scope are separate:
 
 ### Download a standalone executable
 
-Release `v4.0.0` provides project-name configuration, multi-model agents, the
-agent-first CLI, public event protocol v3, and
+Release `v4.0.1` provides project-name configuration, multi-model agents,
+per-reviewer gateway session affinity, the agent-first CLI, public event protocol v3, and
 self-contained Bun executables that do not require Node.js or Bun:
 
 - Windows x64: `review-mesh-windows-x64.exe`
@@ -70,14 +70,14 @@ self-contained Bun executables that do not require Node.js or Bun:
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v4.0.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
+Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v4.0.1/review-mesh-windows-x64.exe -OutFile review-mesh.exe
 .\review-mesh.exe review
 ```
 
 Linux:
 
 ```bash
-curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v4.0.0/review-mesh-linux-x64
+curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v4.0.1/review-mesh-linux-x64
 chmod +x ./review-mesh-linux-x64
 ./review-mesh-linux-x64 review
 ```
@@ -215,7 +215,7 @@ codebase audit.
 
 ## Five-model OpenAI-compatible setup
 
-The built-in `openai_compatible` adapter works with an OpenAI Chat Completions-compatible gateway. It is fully embedded in `review-mesh.mjs`, so no external reviewer script is needed.
+The built-in `openai_compatible` adapter works with an OpenAI Chat Completions-compatible gateway. It is fully embedded in `review-mesh.mjs`, so no external reviewer script is needed. Each concrete reviewer execution sends one opaque random `X-Client-Session-Id` across all of its inspection, tool-result, finalization, and repair requests. Gateways such as copilot-api can use that stable per-reviewer affinity key to keep a conversation on one account while distributing independent reviewers across eligible accounts.
 
 Set credentials in environment variables, not TOML.
 
