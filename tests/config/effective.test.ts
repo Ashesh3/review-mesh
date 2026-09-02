@@ -24,7 +24,7 @@ async function fixture() {
   await mkdir(workspace);
   const projectPath = (await realpath(workspace)).replaceAll("\\", "/");
   const config: ManagedConfig = {
-    schema_version: "2",
+    schema_version: "3",
     execution: {
       max_concurrency: 2,
       heartbeat_interval_ms: 5000,
@@ -102,6 +102,33 @@ describe("effective configuration description", () => {
     expect(encoded).not.toContain("SECRET");
     expect(encoded).not.toContain("https://secret.example");
     expect(encoded).not.toContain("private_runtime");
+  });
+
+  it("describes each expanded model run as an independent reviewer", async () => {
+    const { file, workspace } = await fixture();
+    const source = await readFile(file, "utf8");
+    await writeFile(
+      file,
+      source
+        .replace('model = "private-model"\n', "")
+        .replace(
+          'purpose = "Correctness"',
+          'model_runs = [{ id = "opus", model = "claude-opus" }, { id = "grok", model = "grok-code", effort = "high" }]\npurpose = "Correctness"',
+        ),
+    );
+
+    const result = await describeEffectiveConfig({
+      configFile: file,
+      workspace,
+      environment: {},
+    });
+    expect(result).toMatchObject({
+      valid: true,
+      reviewers: [
+        { id: "reviewer::opus", model: "claude-opus" },
+        { id: "reviewer::grok", model: "grok-code", effort: "high" },
+      ],
+    });
   });
 
   it("reports missing and invalid configuration without throwing", async () => {

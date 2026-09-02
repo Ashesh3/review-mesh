@@ -19,7 +19,7 @@ export interface DescribeEffectiveConfigInput {
 export interface DescribeResolvedConfigInput {
   configFile: string;
   revision: string;
-  configSchemaVersion: "1" | "2";
+  configSchemaVersion: "1" | "2" | "3";
   migrated: boolean;
   workspace: string;
   resolved: ReturnType<typeof resolveConfig>;
@@ -41,7 +41,7 @@ export interface EffectiveConfigDescription {
   valid: true;
   config_path: string;
   revision: string;
-  config_schema_version: "1" | "2";
+  config_schema_version: "1" | "2" | "3";
   migrated: boolean;
   workspace: string;
   selection: {

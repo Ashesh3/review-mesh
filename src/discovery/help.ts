@@ -104,7 +104,7 @@ USAGE
   review-mesh config effective [WORKSPACE] --json
                                       Resolve the safe effective agent roster
   review-mesh config export --json   Export full config plus revision
-  review-mesh config apply --json    Atomically apply a full v2 config with CAS
+  review-mesh config apply --json    Atomically apply a full v3 config with CAS
   review-mesh config copilot login [--device-code|--web-flow] [--host URL]
   review-mesh config copilot status [--json]
   review-mesh config copilot models [--json]
@@ -166,7 +166,7 @@ Prints JSON Schema generated from the runtime Zod schemas:
   request  JSON object accepted on review stdin
   events   JSONL event object emitted by a valid review run
   result   Terminal result required from each reviewer
-  config   Trusted global configuration (v1 legacy or v2 current)
+  config   Trusted global configuration (v1/v2 legacy or v3 current)
   config-apply  Revision-guarded full-config update request
   diagnostic    Stable public diagnostic fields
   command-adapter-event  External reviewer JSONL event union
@@ -213,11 +213,16 @@ Supported trusted adapter types:
   codex              Codex SDK reviewer; fails closed if isolation cannot be
                      characterized safely.
 
-Every agent chooses one adapter id, exact model, optional effort, purpose,
-trusted instructions, isolation policy, and timeout. Use 'review-mesh schema
-config --json' for the authoritative shapes, 'review-mesh config copilot models
---json' for account-specific Copilot models, and 'review-mesh describe . --json'
-for the exact effective roster. Provider readiness is probed when review starts.
+Every agent chooses a required default adapter plus either one exact model and
+optional effort, or ordered model_runs with explicit run ids, exact models,
+optional effort, and optional per-run adapter overrides. Multi-model agents
+expand to concrete reviewer ids such as architecture::opus and
+architecture::grok. Existing scalar agents retain their original ids. Global
+max_concurrency determines whether the expanded runs execute in parallel or
+sequentially. Use 'review-mesh schema config --json' for the authoritative
+shapes, 'review-mesh config copilot models --json' for account-specific Copilot
+models, and 'review-mesh describe . --json' for the exact effective roster.
+Provider readiness is probed when review starts.
 `,
   "command-adapter": `REVIEW-MESH COMMAND ADAPTER PROTOCOL
 
@@ -243,11 +248,12 @@ adapter protocol section for full request and limit details.
 Review Mesh uses one trusted global config.toml. Run 'review-mesh config path'
 for its exact platform path. Workspace .review-mesh.toml files are ignored.
 
-Schema version 2 contains:
+Schema version 3 contains:
   execution    max concurrency, heartbeat interval, shutdown grace
   diagnostics  sanitized run persistence and retention
   adapters     trusted runtime registrations and environment-variable names
-  agents       model, effort, purpose, instructions, isolation, timeout
+  agents       scalar model/effort or model_runs, purpose, instructions,
+               isolation, timeout, and optional per-run adapter overrides
   defaults     ordered fallback agent roster
   projects     absolute-path roster/guidance/context overrides
 
@@ -261,8 +267,9 @@ For autonomous changes, use export/apply with revision compare-and-swap:
   review-mesh config apply --json
 
 Export contains instruction and runtime fields and should be treated as
-sensitive. Apply accepts a complete v2 document, not a patch. Use 'review-mesh
-schema config --json' and 'review-mesh config --help' for exact details.
+sensitive. Apply accepts a complete v2 or v3 document, not a patch; v2 is
+promoted to v3 when saved. Use 'review-mesh schema config --json' and
+'review-mesh config --help' for exact details.
 `,
   "exit-codes": `REVIEW-MESH EXIT CODES
 

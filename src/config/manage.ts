@@ -13,9 +13,18 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { parse, stringify } from "smol-toml";
-import type { AdapterRegistration, ReasoningEffort } from "./schemas.js";
+import type {
+  AdapterRegistration,
+  ModelRun,
+  ReasoningEffort,
+  TrustedConfigV2,
+} from "./schemas.js";
 import type { JsonValue } from "../protocol/schemas.js";
-import { trustedConfigSchema, validateAdapterEffort } from "./schemas.js";
+import {
+  trustedConfigSchema,
+  trustedConfigV3Schema,
+  validateAdapterEffort,
+} from "./schemas.js";
 import { validateProjectKeys } from "./project-paths.js";
 
 export const MAX_CONFIG_BYTES = 4 * 1024 * 1024;
@@ -25,10 +34,8 @@ const ENVIRONMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const CONFIG_LOCK_TIMEOUT_MS = 15_000;
 const CONFIG_LOCK_RETRY_MS = 25;
 
-export interface ManagedAgent {
+interface ManagedAgentBase {
   adapter: string;
-  model: string;
-  effort?: ReasoningEffort | undefined;
   purpose: string;
   instructions?: string | undefined;
   instructions_file?: string | undefined;
@@ -36,6 +43,27 @@ export interface ManagedAgent {
   timeout_ms: number;
   runtime?: Record<string, JsonValue> | undefined;
 }
+
+export type ManagedModelRun = {
+  id: ModelRun["id"];
+  adapter?: string | undefined;
+  model: ModelRun["model"];
+  effort?: ReasoningEffort | undefined;
+};
+
+export type ManagedAgent = ManagedAgentBase &
+  (
+    | {
+        model: string;
+        effort?: ReasoningEffort | undefined;
+        model_runs?: never;
+      }
+    | {
+        model_runs: ManagedModelRun[];
+        model?: never;
+        effort?: never;
+      }
+  );
 
 export interface ManagedProject {
   agents?: string[] | undefined;
@@ -45,7 +73,7 @@ export interface ManagedProject {
 }
 
 export interface ManagedConfig {
-  schema_version: "2";
+  schema_version: "3";
   execution: {
     max_concurrency: number;
     heartbeat_interval_ms: number;
@@ -163,28 +191,59 @@ function clone<T>(value: T): T {
 function requireManagedConfig(value: unknown): ManagedConfig {
   const record = asRecord(value);
   if (
-    record?.schema_version !== "2" ||
+    record?.schema_version !== "3" ||
     asRecord(record.execution) === undefined ||
     asRecord(record.diagnostics) === undefined ||
     asRecord(record.adapters) === undefined ||
     asRecord(record.agents) === undefined
   ) {
-    throw new Error("configuration is not a Review Mesh v2 configuration");
+    throw new Error("configuration is not a Review Mesh v3 configuration");
   }
-  trustedConfigSchema.parse(value);
-  const config = clone(value as ManagedConfig);
+  const config = clone(
+    trustedConfigV3Schema.parse(value) as unknown as ManagedConfig,
+  );
   validateProjectKeys(config.projects);
   requireAssignments(config);
+  const expandedReviewerIds = new Set<string>();
   for (const [id, agent] of Object.entries(config.agents)) {
-    const adapter = Object.hasOwn(config.adapters, agent.adapter)
+    const expandedIds =
+      "model_runs" in agent
+        ? agent.model_runs.map((run) => `${id}::${run.id}`)
+        : [id];
+    for (const expandedId of expandedIds) {
+      if (expandedReviewerIds.has(expandedId)) {
+        throw new Error(`expanded reviewer id collision: ${expandedId}`);
+      }
+      expandedReviewerIds.add(expandedId);
+    }
+    const parentAdapter = Object.hasOwn(config.adapters, agent.adapter)
       ? config.adapters[agent.adapter]
       : undefined;
-    if (adapter === undefined) {
+    if (parentAdapter === undefined) {
       throw new Error(
         `agent ${id} references unknown adapter ${agent.adapter}`,
       );
     }
-    validateAdapterEffort(adapter.type, agent.effort, `agent ${id}`);
+    if ("model_runs" in agent) {
+      for (const run of agent.model_runs) {
+        const adapterId = run.adapter ?? agent.adapter;
+        const adapter = Object.hasOwn(config.adapters, adapterId)
+          ? config.adapters[adapterId]
+          : undefined;
+        if (adapter === undefined) {
+          throw new Error(
+            `agent ${id} model run ${run.id} references unknown adapter ${adapterId}`,
+          );
+        }
+        validateAdapterEffort(
+          adapter.type,
+          run.effort,
+          `agent ${id} model run ${run.id}`,
+        );
+      }
+    } else {
+      validateAdapterEffort(parentAdapter.type, agent.effort, `agent ${id}`);
+    }
   }
   const assignmentLists = [
     ...(config.defaults === undefined ? [] : [config.defaults.agents]),
@@ -234,8 +293,7 @@ export function migrateV1Config(value: unknown): ManagedConfig {
   if (record?.schema_version !== "1") {
     throw new Error("configuration is not a Review Mesh v1 configuration");
   }
-  // Validate the legacy document before translating it. During the v2 rollout
-  // the exported schema accepts both the legacy input and the native v2 shape.
+  // Validate the legacy document before translating it.
   trustedConfigSchema.parse(value);
   const profiles = asRecord(record.reviewer_profiles) ?? {};
   const reviewers = Array.isArray(record.reviewers) ? record.reviewers : [];
@@ -268,13 +326,25 @@ export function migrateV1Config(value: unknown): ManagedConfig {
   }
 
   return requireManagedConfig({
-    schema_version: "2",
+    schema_version: "3",
     execution: clone(record.execution as ManagedConfig["execution"]),
     diagnostics: clone(record.diagnostics as ManagedConfig["diagnostics"]),
     adapters: clone(record.adapters as ManagedConfig["adapters"]),
     agents,
     defaults: { agents: defaults },
     projects: {},
+  });
+}
+
+/** Promotes a scalar-agent v2 document to the current managed shape. */
+export function migrateV2Config(value: unknown): ManagedConfig {
+  const parsed = trustedConfigSchema.parse(value);
+  if (parsed.schema_version !== "2") {
+    throw new Error("configuration is not a Review Mesh v2 configuration");
+  }
+  return requireManagedConfig({
+    ...(clone(parsed) as TrustedConfigV2),
+    schema_version: "3",
   });
 }
 
@@ -286,6 +356,8 @@ export function parseManagedConfig(text: string): {
   const version = asRecord(parsed)?.schema_version;
   if (version === "1")
     return { config: migrateV1Config(parsed), migrated: true };
+  if (version === "2")
+    return { config: migrateV2Config(parsed), migrated: true };
   return { config: requireManagedConfig(parsed), migrated: false };
 }
 
@@ -302,7 +374,7 @@ export function serializeManagedConfig(config: ManagedConfig): string {
 
 export function emptyManagedConfig(): ManagedConfig {
   return {
-    schema_version: "2",
+    schema_version: "3",
     execution: {
       max_concurrency: 2,
       heartbeat_interval_ms: 15_000,
@@ -568,8 +640,12 @@ export function listConfig(config: ManagedConfig) {
       .map(([id, agent]) => ({
         id,
         adapter: agent.adapter,
-        model: agent.model,
-        ...(agent.effort === undefined ? {} : { effort: agent.effort }),
+        ...("model_runs" in agent
+          ? { model_runs: clone(agent.model_runs) }
+          : {
+              model: agent.model,
+              ...(agent.effort === undefined ? {} : { effort: agent.effort }),
+            }),
         purpose: agent.purpose,
         default: defaultAgents.has(id),
       })),

@@ -22,6 +22,12 @@ const positiveInteger = z.number().int().positive();
 const maximumTimerMilliseconds = 2_147_483_647;
 const timerMilliseconds = positiveInteger.max(maximumTimerMilliseconds);
 const jsonRecordSchema = z.record(z.string(), z.json());
+const safeModelRunId = z
+  .string()
+  .regex(
+    /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/,
+    "model run id must contain only letters, numbers, underscores, and hyphens",
+  );
 const uniqueAgentIds = z
   .array(nonEmptyString)
   .min(1)
@@ -60,30 +66,69 @@ export const adapterRegistrationSchema = z.discriminatedUnion("type", [
   }),
 ]);
 
+const reviewerProfileBaseShape = {
+  adapter: nonEmptyString,
+  purpose: nonEmptyString,
+  instructions: nonEmptyString.optional(),
+  instructions_file: nonEmptyString.optional(),
+  isolation: isolationPolicySchema,
+  timeout_ms: timerMilliseconds,
+  runtime: jsonRecordSchema.optional(),
+};
+
+function validateInstructionSource(
+  profile: {
+    instructions?: string | undefined;
+    instructions_file?: string | undefined;
+  },
+  ctx: z.RefinementCtx,
+): void {
+  if (
+    (profile.instructions === undefined) ===
+    (profile.instructions_file === undefined)
+  ) {
+    ctx.addIssue({
+      code: "custom",
+      message:
+        "reviewer profile requires exactly one of instructions or instructions_file",
+    });
+  }
+}
+
 export const reviewerProfileSchema = z
   .strictObject({
-    adapter: nonEmptyString,
+    ...reviewerProfileBaseShape,
     model: nonEmptyString,
     effort: reasoningEffortSchema.optional(),
-    purpose: nonEmptyString,
-    instructions: nonEmptyString.optional(),
-    instructions_file: nonEmptyString.optional(),
-    isolation: isolationPolicySchema,
-    timeout_ms: timerMilliseconds,
-    runtime: jsonRecordSchema.optional(),
   })
-  .superRefine((profile, ctx) => {
-    if (
-      (profile.instructions === undefined) ===
-      (profile.instructions_file === undefined)
-    ) {
-      ctx.addIssue({
-        code: "custom",
-        message:
-          "reviewer profile requires exactly one of instructions or instructions_file",
-      });
-    }
-  });
+  .superRefine(validateInstructionSource);
+
+export const modelRunSchema = z.strictObject({
+  id: safeModelRunId,
+  adapter: nonEmptyString.optional(),
+  model: nonEmptyString,
+  effort: reasoningEffortSchema.optional(),
+});
+
+const modelRunsSchema = z
+  .array(modelRunSchema)
+  .min(2, "multi-model agent requires at least two model runs")
+  .refine(
+    (runs) => new Set(runs.map((run) => run.id)).size === runs.length,
+    "model run ids must be unique",
+  );
+
+const multiModelReviewerProfileSchema = z
+  .strictObject({
+    ...reviewerProfileBaseShape,
+    model_runs: modelRunsSchema,
+  })
+  .superRefine(validateInstructionSource);
+
+export const agentProfileSchema = z.union([
+  reviewerProfileSchema,
+  multiModelReviewerProfileSchema,
+]);
 
 export const trustedReviewerDefinitionSchema = z.strictObject({
   id: nonEmptyString,
@@ -141,13 +186,25 @@ export const trustedConfigV2Schema = z.strictObject({
   projects: z.record(nonEmptyString, projectConfigSchema).optional(),
 });
 
+export const trustedConfigV3Schema = z.strictObject({
+  schema_version: z.literal("3"),
+  execution: executionSchema,
+  diagnostics: diagnosticsSchema,
+  adapters: z.record(nonEmptyString, adapterRegistrationSchema),
+  agents: z.record(nonEmptyString, agentProfileSchema),
+  defaults: z.strictObject({ agents: uniqueAgentIds }).optional(),
+  projects: z.record(nonEmptyString, projectConfigSchema).optional(),
+});
+
 export const trustedConfigSchema = z.union([
   trustedConfigV1Schema,
   trustedConfigV2Schema,
+  trustedConfigV3Schema,
 ]);
 
 export type TrustedConfigV1 = z.infer<typeof trustedConfigV1Schema>;
 export type TrustedConfigV2 = z.infer<typeof trustedConfigV2Schema>;
+export type TrustedConfigV3 = z.infer<typeof trustedConfigV3Schema>;
 export type ProjectConfig = z.infer<typeof projectConfigSchema>;
 export type TrustedConfig = z.infer<typeof trustedConfigSchema>;
 
@@ -157,6 +214,8 @@ export type TrustedReviewerDefinition = z.infer<
 
 export type AdapterRegistration = z.infer<typeof adapterRegistrationSchema>;
 export type ReviewerProfile = z.infer<typeof reviewerProfileSchema>;
+export type ModelRun = z.infer<typeof modelRunSchema>;
+export type AgentProfile = z.infer<typeof agentProfileSchema>;
 
 const adapterEffortSupport = {
   claude: ["low", "medium", "high", "xhigh", "max"],
@@ -227,5 +286,5 @@ export const configRevisionSchema = z.union([
 export const configApplyRequestSchema = z.strictObject({
   schema_version: z.literal("1"),
   expected_revision: configRevisionSchema,
-  config: trustedConfigV2Schema,
+  config: z.union([trustedConfigV2Schema, trustedConfigV3Schema]),
 });

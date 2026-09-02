@@ -117,6 +117,46 @@ max_runs = 1
 ${adapters}`;
 }
 
+function multiModelConfig(): string {
+  return `schema_version = "3"
+
+[execution]
+max_concurrency = 2
+heartbeat_interval_ms = 100
+shutdown_grace_period_ms = 100
+
+[diagnostics]
+persist_runs = false
+max_runs = 1
+
+[adapters.opus]
+type = "command"
+command = ${tomlString(process.execPath)}
+args = ["--input-type=module", "-e", ${tomlString(fixtureScript("pass"))}]
+protocol = "review-mesh-command-v1"
+
+[adapters.grok]
+type = "command"
+command = ${tomlString(process.execPath)}
+args = ["--input-type=module", "-e", ${tomlString(fixtureScript("pass"))}]
+protocol = "review-mesh-command-v1"
+
+[agents.architecture]
+adapter = "opus"
+model_runs = [
+  { id = "opus", model = "claude-opus-test", effort = "high" },
+  { id = "grok", adapter = "grok", model = "grok-test", effort = "medium" },
+]
+purpose = "Review architecture twice"
+instructions = "Inspect the controlled fixture architecture."
+isolation = "prefer_enforced"
+timeout_ms = 5000
+
+[defaults]
+agents = ["architecture"]
+`;
+}
+
 async function createFixture(
   modes: readonly string[] = ["pass", "pass"],
   config = trustedConfig(modes),
@@ -293,6 +333,40 @@ afterEach(async () => {
 });
 
 describe("review-mesh review", () => {
+  it("fans one configured agent out into independent model reviewer runs", async () => {
+    const fixture = await createFixture([], multiModelConfig());
+
+    const result = await runCli(fixture);
+    expect(result).toMatchObject({ exitCode: 0, stderr: "" });
+    const events = parseEvents(result.stdout);
+    const suite = events.find((event) => event.event === "suite.resolved");
+    expect(suite).toMatchObject({
+      data: {
+        total: 2,
+        reviewers: [
+          {
+            id: "architecture::opus",
+            adapter: "opus",
+            model: "claude-opus-test",
+            effort: "high",
+          },
+          {
+            id: "architecture::grok",
+            adapter: "grok",
+            model: "grok-test",
+            effort: "medium",
+          },
+        ],
+      },
+    });
+    expect(
+      events
+        .filter((event) => event.event === "reviewer.completed")
+        .map((event) => event.reviewer_id)
+        .sort(),
+    ).toEqual(["architecture::grok", "architecture::opus"]);
+  });
+
   it.each([
     ["no arguments", []],
     ["help", ["help"]],

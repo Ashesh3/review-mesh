@@ -72,6 +72,7 @@ describe("config menu", () => {
       "new",
       "github",
       "copilot",
+      "single",
       "y",
       "gpt-test",
       "high",
@@ -103,6 +104,87 @@ describe("config menu", () => {
     });
   });
 
+  it("adds a multi-model agent with inherited and Copilot run adapters", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "review-mesh-config-tui-"));
+    roots.push(directory);
+    const file = join(directory, "config.toml");
+    const loaded = await loadManagedConfig(file, true);
+    loaded.config.adapters = {
+      gateway: {
+        type: "openai_compatible",
+        base_url_env: "BASE",
+        api_key_env: "KEY",
+      },
+      github: { type: "copilot", use_logged_in_user: true },
+    };
+    const copilotAccount: CopilotAccountService = {
+      status: async () => ({
+        isAuthenticated: true,
+        runtimeVersion: "1.0.11",
+      }),
+      login: async () => undefined,
+      models: async () => ({
+        status: { isAuthenticated: true, runtimeVersion: "1.0.11" },
+        models: [
+          {
+            id: "grok-test",
+            name: "Grok Test",
+            capabilities: { supports: { reasoningEffort: true } },
+            policy: { state: "enabled" },
+            supportedReasoningEfforts: ["high"],
+          },
+        ],
+      }),
+    };
+    const prompt = new Answers([
+      "a",
+      "architecture",
+      "gateway",
+      "multi",
+      "2",
+      "opus",
+      "inherit",
+      "claude-opus-test",
+      "max",
+      "grok",
+      "existing",
+      "github",
+      "grok-test",
+      "high",
+      "Architecture review",
+      "Review architecture and trust boundaries.",
+      "900000",
+      "n",
+      "q",
+    ]);
+
+    await runConfigMenu({
+      configFile: file,
+      config: loaded.config,
+      snapshot: loaded.snapshot,
+      prompt,
+      output: new PassThrough(),
+      copilotAccount,
+    });
+
+    expect((await loadManagedConfig(file)).config.agents.architecture).toEqual({
+      adapter: "gateway",
+      model_runs: [
+        { id: "opus", model: "claude-opus-test", effort: "max" },
+        {
+          id: "grok",
+          adapter: "github",
+          model: "grok-test",
+          effort: "high",
+        },
+      ],
+      purpose: "Architecture review",
+      instructions: "Review architecture and trust boundaries.",
+      isolation: "prefer_enforced",
+      timeout_ms: 900000,
+    });
+  });
+
   it("adds the first agent, then assigns it to a canonical project", async () => {
     const directory = await mkdtemp(join(tmpdir(), "review-mesh-config-tui-"));
     roots.push(directory);
@@ -119,6 +201,7 @@ describe("config menu", () => {
       "openai_compatible",
       "REVIEW_BASE_URL",
       "REVIEW_API_KEY",
+      "single",
       "gemini-flash",
       "high",
       "Correctness",
@@ -163,7 +246,7 @@ describe("config menu", () => {
         : project.replaceAll("\\", "/");
     const file = join(directory, "config.toml");
     const initial: ManagedConfig = {
-      schema_version: "2",
+      schema_version: "3",
       execution: {
         max_concurrency: 1,
         heartbeat_interval_ms: 100,
@@ -213,6 +296,7 @@ describe("config menu", () => {
       "e",
       "two",
       "gateway",
+      "single",
       "model-two-new",
       "xhigh",
       "Purpose two new",
@@ -270,6 +354,220 @@ describe("config menu", () => {
     expect(saved.diagnostics).toEqual({ persist_runs: false, max_runs: 7 });
   });
 
+  it("edits an agent from scalar to multi-model and back to scalar", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "review-mesh-config-tui-"));
+    roots.push(directory);
+    const file = join(directory, "config.toml");
+    const initial: ManagedConfig = {
+      schema_version: "3",
+      execution: {
+        max_concurrency: 2,
+        heartbeat_interval_ms: 100,
+        shutdown_grace_period_ms: 100,
+      },
+      diagnostics: { persist_runs: false, max_runs: 2 },
+      adapters: {
+        gateway: {
+          type: "openai_compatible",
+          base_url_env: "BASE",
+          api_key_env: "KEY",
+        },
+      },
+      agents: {
+        architecture: {
+          adapter: "gateway",
+          model: "opus-old",
+          effort: "high",
+          purpose: "Architecture",
+          instructions: "Review architecture.",
+          isolation: "prefer_enforced",
+          timeout_ms: 1000,
+        },
+      },
+      defaults: { agents: ["architecture"] },
+      projects: {},
+    };
+    await writeFile(file, serializeManagedConfig(initial));
+    let loaded = await loadManagedConfig(file);
+    await runConfigMenu({
+      configFile: file,
+      config: loaded.config,
+      snapshot: loaded.snapshot,
+      prompt: new Answers([
+        "e",
+        "architecture",
+        "gateway",
+        "multi",
+        "2",
+        "opus",
+        "inherit",
+        "opus-new",
+        "max",
+        "grok",
+        "inherit",
+        "grok-new",
+        "high",
+        "Architecture",
+        "",
+        "prefer_enforced",
+        "1000",
+        "y",
+        "q",
+      ]),
+      output: new PassThrough(),
+    });
+    expect(
+      (await loadManagedConfig(file)).config.agents.architecture,
+    ).toMatchObject({
+      model_runs: [
+        { id: "opus", model: "opus-new", effort: "max" },
+        { id: "grok", model: "grok-new", effort: "high" },
+      ],
+    });
+
+    loaded = await loadManagedConfig(file);
+    await runConfigMenu({
+      configFile: file,
+      config: loaded.config,
+      snapshot: loaded.snapshot,
+      prompt: new Answers([
+        "e",
+        "architecture",
+        "gateway",
+        "single",
+        "solo-model",
+        "medium",
+        "Architecture",
+        "",
+        "prefer_enforced",
+        "1000",
+        "y",
+        "q",
+      ]),
+      output: new PassThrough(),
+    });
+    const scalar = (await loadManagedConfig(file)).config.agents.architecture!;
+    expect(scalar).toMatchObject({ model: "solo-model", effort: "medium" });
+    expect("model_runs" in scalar).toBe(false);
+  });
+
+  it("does not reuse model defaults after a model run changes adapters", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "review-mesh-config-tui-"));
+    roots.push(directory);
+    const file = join(directory, "config.toml");
+    const initial: ManagedConfig = {
+      schema_version: "3",
+      execution: {
+        max_concurrency: 2,
+        heartbeat_interval_ms: 100,
+        shutdown_grace_period_ms: 100,
+      },
+      diagnostics: { persist_runs: false, max_runs: 2 },
+      adapters: {
+        gateway: {
+          type: "openai_compatible",
+          base_url_env: "BASE",
+          api_key_env: "KEY",
+        },
+        github: { type: "copilot", use_logged_in_user: true },
+      },
+      agents: {
+        architecture: {
+          adapter: "gateway",
+          model_runs: [
+            { id: "opus", model: "gateway-opus", effort: "high" },
+            {
+              id: "grok",
+              adapter: "github",
+              model: "copilot-grok",
+              effort: "high",
+            },
+          ],
+          purpose: "Architecture",
+          instructions: "Review architecture.",
+          isolation: "prefer_enforced",
+          timeout_ms: 1000,
+        },
+      },
+      defaults: { agents: ["architecture"] },
+      projects: {},
+    };
+    await writeFile(file, serializeManagedConfig(initial));
+    const loaded = await loadManagedConfig(file);
+    await runConfigMenu({
+      configFile: file,
+      config: loaded.config,
+      snapshot: loaded.snapshot,
+      prompt: new Answers([
+        "e",
+        "architecture",
+        "gateway",
+        "multi",
+        "2",
+        "opus",
+        "inherit",
+        "gateway-opus",
+        "high",
+        "grok",
+        "inherit",
+        "gateway-grok",
+        "medium",
+        "Architecture",
+        "",
+        "prefer_enforced",
+        "1000",
+        "y",
+        "q",
+      ]),
+      output: new PassThrough(),
+    });
+
+    expect(
+      (await loadManagedConfig(file)).config.agents.architecture,
+    ).toMatchObject({
+      model_runs: [
+        { id: "opus", model: "gateway-opus", effort: "high" },
+        { id: "grok", model: "gateway-grok", effort: "medium" },
+      ],
+    });
+  });
+
+  it("rolls back duplicate model run ids", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "review-mesh-config-tui-"));
+    roots.push(directory);
+    const file = join(directory, "config.toml");
+    const loaded = await loadManagedConfig(file, true);
+    loaded.config.adapters.gateway = {
+      type: "openai_compatible",
+      base_url_env: "BASE",
+      api_key_env: "KEY",
+    };
+    let transcript = "";
+    const output = new PassThrough();
+    output.on("data", (chunk) => (transcript += chunk.toString()));
+    await runConfigMenu({
+      configFile: file,
+      config: loaded.config,
+      snapshot: loaded.snapshot,
+      prompt: new Answers([
+        "a",
+        "architecture",
+        "gateway",
+        "multi",
+        "2",
+        "same",
+        "inherit",
+        "opus",
+        "high",
+        "same",
+        "q",
+      ]),
+      output,
+    });
+    expect(loaded.config.agents).toEqual({});
+    expect(transcript).toContain("duplicate model run id: same");
+  });
+
   it("rolls back a failed menu mutation", async () => {
     const directory = await mkdtemp(join(tmpdir(), "review-mesh-config-tui-"));
     roots.push(directory);
@@ -285,7 +583,7 @@ describe("config menu", () => {
       output,
     });
     expect(loaded.config).toEqual<ManagedConfig>({
-      schema_version: "2",
+      schema_version: "3",
       execution: {
         max_concurrency: 2,
         heartbeat_interval_ms: 15000,
@@ -337,7 +635,7 @@ describe("config menu", () => {
     const stored = stale.replaceAll("\\", "/").toLowerCase();
     const file = join(directory, "config.toml");
     const initial: ManagedConfig = {
-      schema_version: "2",
+      schema_version: "3",
       execution: {
         max_concurrency: 1,
         heartbeat_interval_ms: 100,

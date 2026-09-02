@@ -6,6 +6,7 @@ import {
   configRevision,
   listConfig,
   loadManagedConfig,
+  migrateV2Config,
   saveManagedConfig,
   serializeManagedConfig,
 } from "./manage.js";
@@ -53,7 +54,9 @@ READ-ONLY COMMANDS
       Validate the global configuration and all project assignments.
 
   review-mesh config list [--json]
-      List declared agents and project assignments.
+      List declared agents, their scalar model or ordered model runs, and
+      project assignments. Multi-model agents expand during review according to
+      the global max_concurrency setting.
 
   review-mesh config export --json
       Export the complete validated configuration, its path, and a revision.
@@ -437,7 +440,7 @@ export async function runConfigCommand(
         options.output,
         `${JSON.stringify({
           schema_version: "1",
-          config_schema_version: "2",
+          config_schema_version: loaded.config.schema_version,
           path: configFile,
           revision: configRevision(loaded.snapshot),
           exists: loaded.snapshot.exists,
@@ -493,7 +496,10 @@ export async function runConfigCommand(
         );
         return 2;
       }
-      const desired = request.config;
+      const desired =
+        request.config.schema_version === "2"
+          ? migrateV2Config(request.config)
+          : request.config;
       const desiredText = serializeManagedConfig(desired);
       if (
         !loaded.migrated &&
@@ -592,10 +598,19 @@ export async function runConfigCommand(
         await write(options.output, `${JSON.stringify(listed)}\n`);
       } else {
         for (const agent of listed.agents) {
-          await write(
-            options.output,
-            `${agent.id}\t${agent.model}\t${agent.effort ?? "default"}\t${agent.adapter}${agent.default ? "\tdefault" : ""}\n`,
-          );
+          if ("model_runs" in agent) {
+            for (const run of agent.model_runs) {
+              await write(
+                options.output,
+                `${agent.id}::${run.id}\t${run.model}\t${run.effort ?? "default"}\t${run.adapter ?? agent.adapter}${agent.default ? "\tdefault" : ""}\n`,
+              );
+            }
+          } else {
+            await write(
+              options.output,
+              `${agent.id}\t${agent.model}\t${agent.effort ?? "default"}\t${agent.adapter}${agent.default ? "\tdefault" : ""}\n`,
+            );
+          }
         }
         for (const project of listed.projects) {
           await write(
@@ -629,7 +644,7 @@ export async function runConfigCommand(
     if (loaded.migrated) {
       await write(
         options.output,
-        "Loaded legacy v1 configuration; the first successful change will save it as v2.\n",
+        "Loaded legacy v1/v2 configuration; the first successful change will save it as v3.\n",
       );
     }
     await runConfigMenu({

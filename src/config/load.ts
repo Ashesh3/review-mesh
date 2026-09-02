@@ -6,6 +6,8 @@ import {
   trustedConfigSchema,
   trustedConfigV1Schema,
   trustedConfigV2Schema,
+  trustedConfigV3Schema,
+  type AgentProfile,
   type ProjectConfig,
   type ReviewerProfile,
   type TrustedConfig,
@@ -204,7 +206,9 @@ async function resolveInstructionFiles(
   readTimeoutMs: number,
 ): Promise<TrustedConfig> {
   const trustedDirectory = dirname(await realpath(configFile));
-  const resolveEntries = async <T extends ReviewerProfile | ProjectConfig>(
+  const resolveEntries = async <
+    T extends ReviewerProfile | AgentProfile | ProjectConfig,
+  >(
     entries: Array<[string, T]>,
   ) =>
     Promise.all(
@@ -243,7 +247,7 @@ async function resolveInstructionFiles(
       ),
     });
   }
-  return trustedConfigV2Schema.parse({
+  const resolved = {
     ...trusted,
     agents: Object.fromEntries(
       await resolveEntries(Object.entries(trusted.agents)),
@@ -251,7 +255,10 @@ async function resolveInstructionFiles(
     projects: Object.fromEntries(
       await resolveEntries(Object.entries(trusted.projects ?? {})),
     ),
-  });
+  };
+  return trusted.schema_version === "2"
+    ? trustedConfigV2Schema.parse(resolved)
+    : trustedConfigV3Schema.parse(resolved);
 }
 
 export async function loadConfigFiles(

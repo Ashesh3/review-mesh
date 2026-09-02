@@ -15,7 +15,7 @@ const roots: string[] = [];
 
 function config(): ManagedConfig {
   return {
-    schema_version: "2",
+    schema_version: "3",
     execution: {
       max_concurrency: 1,
       heartbeat_interval_ms: 100,
@@ -120,7 +120,7 @@ describe("config command", () => {
     expect(
       await runConfigCommand({ args: ["show"], configFile: file, ...shown }),
     ).toBe(0);
-    expect(shown.stdout()).toContain('schema_version = "2"');
+    expect(shown.stdout()).toContain('schema_version = "3"');
 
     const validated = streams();
     expect(
@@ -144,9 +144,60 @@ describe("config command", () => {
       }),
     ).toBe(0);
     expect(JSON.parse(io.stdout())).toMatchObject({
-      schema_version: "2",
+      schema_version: "3",
       agents: [{ id: "gemini", default: true }],
       projects: [],
+    });
+  });
+
+  it("lists every concrete run of a multi-model agent", async () => {
+    const { file } = await fixture();
+    const updated = config();
+    updated.agents.architecture = {
+      adapter: "gateway",
+      model_runs: [
+        { id: "opus", model: "claude-opus", effort: "max" },
+        { id: "grok", model: "grok-code" },
+      ],
+      purpose: "architecture",
+      instructions: "review architecture",
+      isolation: "prefer_enforced",
+      timeout_ms: 1000,
+    };
+    updated.defaults = { agents: ["architecture"] };
+    await writeFile(file, serializeManagedConfig(updated));
+
+    const text = streams();
+    expect(
+      await runConfigCommand({ args: ["list"], configFile: file, ...text }),
+    ).toBe(0);
+    expect(text.stdout()).toContain(
+      "architecture::opus\tclaude-opus\tmax\tgateway\tdefault\n",
+    );
+    expect(text.stdout()).toContain(
+      "architecture::grok\tgrok-code\tdefault\tgateway\tdefault\n",
+    );
+
+    const json = streams();
+    expect(
+      await runConfigCommand({
+        args: ["list", "--json"],
+        configFile: file,
+        ...json,
+      }),
+    ).toBe(0);
+    expect(JSON.parse(json.stdout())).toMatchObject({
+      agents: [
+        {
+          id: "architecture",
+          default: true,
+          model_runs: [
+            { id: "opus", model: "claude-opus", effort: "max" },
+            { id: "grok", model: "grok-code" },
+          ],
+        },
+        { id: "gemini", default: false },
+      ],
     });
   });
 
@@ -184,11 +235,11 @@ describe("config command", () => {
     const exported = JSON.parse(io.stdout());
     expect(exported).toMatchObject({
       schema_version: "1",
-      config_schema_version: "2",
+      config_schema_version: "3",
       path: file,
       exists: true,
       migrated: false,
-      config: { schema_version: "2" },
+      config: { schema_version: "3" },
     });
     expect(exported.revision).toMatch(/^[a-f0-9]{64}$/);
     expect(exported.config.agents.gemini.instructions).toBe("review");
@@ -307,6 +358,33 @@ describe("config command", () => {
       status: "unchanged",
       revision: applied.revision,
     });
+  });
+
+  it("keeps apply protocol v1 compatible with complete v2 configs", async () => {
+    const { file } = await fixture();
+    const loaded = await loadManagedConfig(file);
+    const v2Config = {
+      ...config(),
+      schema_version: "2" as const,
+      execution: { ...config().execution, max_concurrency: 4 },
+    };
+    const io = streams();
+    inputJson(io, {
+      schema_version: "1",
+      expected_revision: loaded.snapshot.hash,
+      config: v2Config,
+    });
+
+    expect(
+      await runConfigCommand({
+        args: ["apply", "--json"],
+        configFile: file,
+        ...io,
+      }),
+    ).toBe(0);
+    const saved = (await loadManagedConfig(file)).config;
+    expect(saved.schema_version).toBe("3");
+    expect(saved.execution.max_concurrency).toBe(4);
   });
 
   it("rejects stale, malformed, oversized, and unsafe apply requests", async () => {

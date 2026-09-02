@@ -30,7 +30,7 @@ async function root(): Promise<string> {
 
 function config(): ManagedConfig {
   return {
-    schema_version: "2",
+    schema_version: "3",
     execution: {
       max_concurrency: 2,
       heartbeat_interval_ms: 15_000,
@@ -75,6 +75,102 @@ describe("managed configuration", () => {
     });
   });
 
+  it("round-trips ordered model runs with inherited and overridden adapters", () => {
+    const multi = config();
+    multi.adapters.claude = { type: "claude" };
+    multi.agents.gemini = {
+      adapter: "gateway",
+      model_runs: [
+        { id: "opus", model: "claude-opus" },
+        {
+          id: "grok",
+          adapter: "claude",
+          model: "grok-code",
+          effort: "high",
+        },
+      ],
+      purpose: "Architecture",
+      instructions: "Review architecture.",
+      isolation: "prefer_enforced",
+      timeout_ms: 900_000,
+    };
+
+    const parsed = parseManagedConfig(serializeManagedConfig(multi));
+    expect(parsed.config.agents.gemini).toEqual(multi.agents.gemini);
+  });
+
+  it("rejects invalid model-run shapes and expanded reviewer id collisions", () => {
+    const invalidId = config();
+    invalidId.agents.gemini = {
+      adapter: "gateway",
+      model_runs: [{ id: "not safe", model: "model" }],
+      purpose: "Architecture",
+      instructions: "Review architecture.",
+      isolation: "prefer_enforced",
+      timeout_ms: 900_000,
+    };
+    expect(() => serializeManagedConfig(invalidId)).toThrow(/model run id/i);
+
+    const duplicateRun = config();
+    duplicateRun.agents.gemini = {
+      adapter: "gateway",
+      model_runs: [
+        { id: "same", model: "one" },
+        { id: "same", model: "two" },
+      ],
+      purpose: "Architecture",
+      instructions: "Review architecture.",
+      isolation: "prefer_enforced",
+      timeout_ms: 900_000,
+    };
+    expect(() => serializeManagedConfig(duplicateRun)).toThrow(/unique/i);
+
+    const bothModes = config() as unknown as Record<string, unknown>;
+    const bothAgents = bothModes.agents as Record<
+      string,
+      Record<string, unknown>
+    >;
+    bothAgents.gemini!.model_runs = [{ id: "extra", model: "other" }];
+    expect(() =>
+      serializeManagedConfig(bothModes as unknown as ManagedConfig),
+    ).toThrow();
+
+    const collision = config();
+    collision.agents.architecture = {
+      adapter: "gateway",
+      model_runs: [
+        { id: "opus", model: "one" },
+        { id: "grok", model: "two" },
+      ],
+      purpose: "Architecture",
+      instructions: "Review architecture.",
+      isolation: "prefer_enforced",
+      timeout_ms: 900_000,
+    };
+    collision.agents["architecture::opus"] = {
+      adapter: "gateway",
+      model: "two",
+      purpose: "Collision",
+      instructions: "Review collisions.",
+      isolation: "prefer_enforced",
+      timeout_ms: 900_000,
+    };
+    expect(() => serializeManagedConfig(collision)).toThrow(
+      /expanded reviewer id collision/i,
+    );
+
+    const singleRun = config();
+    singleRun.agents.gemini = {
+      adapter: "gateway",
+      model_runs: [{ id: "only", model: "one" }],
+      purpose: "Architecture",
+      instructions: "Review architecture.",
+      isolation: "prefer_enforced",
+      timeout_ms: 900_000,
+    };
+    expect(() => serializeManagedConfig(singleRun)).toThrow(/at least two/i);
+  });
+
   it("migrates the ordered v1 roster into v2 default agents", () => {
     const legacy = `schema_version = "1"
 [execution]
@@ -106,6 +202,20 @@ append_instructions = "extra"
     expect(result.config.agents["agent-one"]?.instructions).toBe(
       "base\n\nextra",
     );
+  });
+
+  it("reads scalar v2 configuration and promotes it to managed v3", () => {
+    const legacyV2 = serializeManagedConfig(config()).replace(
+      'schema_version = "3"',
+      'schema_version = "2"',
+    );
+    const result = parseManagedConfig(legacyV2);
+    expect(result.migrated).toBe(true);
+    expect(result.config.schema_version).toBe("3");
+    expect(result.config.agents.gemini).toMatchObject({
+      model: "gemini-flash",
+      effort: "high",
+    });
   });
 
   it("writes a new file atomically and rejects a stale writer", async () => {
@@ -199,13 +309,48 @@ append_instructions = "extra"
   it("rejects an effort that the selected native adapter cannot forward", () => {
     const invalid = config();
     invalid.adapters.claude = { type: "claude" };
+    const current = invalid.agents.gemini!;
+    if (current.model === undefined)
+      throw new Error("expected scalar test agent");
     invalid.agents.gemini = {
-      ...invalid.agents.gemini!,
       adapter: "claude",
+      model: current.model,
       effort: "ultra",
+      purpose: current.purpose,
+      ...(current.instructions === undefined
+        ? { instructions_file: current.instructions_file! }
+        : { instructions: current.instructions }),
+      isolation: current.isolation,
+      timeout_ms: current.timeout_ms,
+      ...(current.runtime === undefined ? {} : { runtime: current.runtime }),
     };
     expect(() => serializeManagedConfig(invalid)).toThrow(
       /unsupported claude effort ultra/i,
+    );
+  });
+
+  it("validates each model run against its effective adapter", () => {
+    const invalid = config();
+    invalid.adapters.claude = { type: "claude" };
+    invalid.agents.gemini = {
+      adapter: "gateway",
+      model_runs: [
+        { id: "valid", model: "gateway-model", effort: "ultra" },
+        {
+          id: "invalid",
+          adapter: "claude",
+          model: "claude-model",
+          effort: "ultra",
+        },
+      ],
+      purpose: "Architecture",
+      instructions: "Review architecture.",
+      isolation: "prefer_enforced",
+      timeout_ms: 900_000,
+    };
+
+    expect(() => serializeManagedConfig(invalid)).toThrow(
+      /agent gemini model run invalid configures unsupported claude effort ultra/i,
     );
   });
 

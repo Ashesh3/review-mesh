@@ -5,6 +5,7 @@ import {
   adapterRegistrationSchema,
   trustedConfigSchema,
   type TrustedConfigV2,
+  type TrustedConfigV3,
 } from "../../src/config/schemas.js";
 import { loadConfigFiles } from "../../src/config/load.js";
 import { resolveConfig } from "../../src/config/resolve.js";
@@ -56,6 +57,10 @@ function v2(workspace: string): TrustedConfigV2 {
   };
 }
 
+function v3(workspace: string): TrustedConfigV3 {
+  return { ...v2(workspace), schema_version: "3" };
+}
+
 describe("global configuration", () => {
   it("keeps v1 trusted configs as global defaults", () => {
     expect(resolveConfig({ trusted: trustedConfig() }).reviewers[0]?.id).toBe(
@@ -80,6 +85,59 @@ describe("global configuration", () => {
       source: "project",
       matchedProjectPath: workspace,
     });
+  });
+
+  it("expands one logical agent into ordered model-run reviewers", () => {
+    const workspace =
+      process.platform === "win32" ? "C:\\work\\demo" : "/work/demo";
+    const config = v3(workspace);
+    config.adapters.claude = { type: "claude" };
+    config.agents.gemini = {
+      adapter: "gateway",
+      model_runs: [
+        { id: "opus", model: "claude-opus", effort: "high" },
+        {
+          id: "grok",
+          adapter: "claude",
+          model: "grok-code",
+          effort: "max",
+        },
+      ],
+      purpose: "Review architecture",
+      instructions: "Global instructions.",
+      isolation: "prefer_enforced",
+      timeout_ms: 60_000,
+    };
+
+    const resolved = resolveConfig({ trusted: config, workspace });
+    expect(
+      resolved.reviewers.map(({ id, adapterId, model, effort }) => ({
+        id,
+        adapterId,
+        model,
+        effort,
+      })),
+    ).toEqual([
+      {
+        id: "gemini::opus",
+        adapterId: "gateway",
+        model: "claude-opus",
+        effort: "high",
+      },
+      {
+        id: "gemini::grok",
+        adapterId: "claude",
+        model: "grok-code",
+        effort: "max",
+      },
+    ]);
+    expect(resolved.reviewers[0]?.instruction_layers).toEqual([
+      { source: "trusted", content: "Global instructions." },
+      { source: "project", content: "Project guidance." },
+    ]);
+    expect(resolved.reviewers[1]?.instruction_layers).toEqual(
+      resolved.reviewers[0]?.instruction_layers,
+    );
   });
 
   it("uses the most-specific configured project containing the workspace", () => {
@@ -187,6 +245,70 @@ describe("global configuration", () => {
     expect(() =>
       resolveConfig({ trusted: config, workspace: "/other" }),
     ).toThrow(/unsupported claude effort ultra/i);
+  });
+
+  it("rejects model-run adapter errors and expanded id collisions", () => {
+    const unknownAdapter = v3("/demo");
+    unknownAdapter.agents.opus = {
+      adapter: "gateway",
+      model_runs: [
+        { id: "default", model: "one" },
+        { id: "other", adapter: "missing", model: "two" },
+      ],
+      purpose: "Review architecture",
+      instructions: "Architecture instructions.",
+      isolation: "prefer_enforced",
+      timeout_ms: 60_000,
+    };
+    expect(() =>
+      resolveConfig({ trusted: unknownAdapter, workspace: "/other" }),
+    ).toThrow(/model run other references unknown adapter missing/i);
+
+    const invalidEffort = v3("/demo");
+    invalidEffort.adapters.claude = { type: "claude" };
+    invalidEffort.agents.opus = {
+      adapter: "gateway",
+      model_runs: [
+        {
+          id: "claude",
+          adapter: "claude",
+          model: "claude-model",
+          effort: "ultra",
+        },
+        { id: "gateway", model: "gateway-model" },
+      ],
+      purpose: "Review architecture",
+      instructions: "Architecture instructions.",
+      isolation: "prefer_enforced",
+      timeout_ms: 60_000,
+    };
+    expect(() =>
+      resolveConfig({ trusted: invalidEffort, workspace: "/other" }),
+    ).toThrow(/model run claude configures unsupported claude effort ultra/i);
+
+    const collision = v3("/demo");
+    collision.agents.architecture = {
+      adapter: "gateway",
+      model_runs: [
+        { id: "opus", model: "one" },
+        { id: "grok", model: "two" },
+      ],
+      purpose: "Review architecture",
+      instructions: "Architecture instructions.",
+      isolation: "prefer_enforced",
+      timeout_ms: 60_000,
+    };
+    collision.agents["architecture::opus"] = {
+      adapter: "gateway",
+      model: "two",
+      purpose: "Collision",
+      instructions: "Collision instructions.",
+      isolation: "prefer_enforced",
+      timeout_ms: 60_000,
+    };
+    expect(() =>
+      resolveConfig({ trusted: collision, workspace: "/other" }),
+    ).toThrow(/expanded reviewer id collision/i);
   });
 });
 

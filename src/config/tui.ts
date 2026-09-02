@@ -35,6 +35,20 @@ export interface ConfigMenuOptions {
   copilotAccount?: CopilotAccountService;
 }
 
+interface ScalarModelSelection {
+  model: string;
+  effort?: ReasoningEffort | undefined;
+}
+
+interface ModelRunSelection extends ScalarModelSelection {
+  id: string;
+  adapter?: string | undefined;
+}
+
+type AgentModelSelection =
+  | (ScalarModelSelection & { model_runs?: never })
+  | { model_runs: ModelRunSelection[]; model?: never; effort?: never };
+
 class SignalPrompter implements ConfigPrompter {
   constructor(
     private readonly inner: ConfigPrompter,
@@ -246,11 +260,11 @@ async function createAdapter(
   return id;
 }
 
-async function copilotModelAndEffort(
+async function modelAndEffort(
   options: ConfigMenuOptions,
   adapterId: string,
-  current?: Pick<ManagedAgent, "model" | "effort">,
-): Promise<{ model: string; effort?: ReasoningEffort }> {
+  current?: ScalarModelSelection,
+): Promise<ScalarModelSelection> {
   const adapter = options.config.adapters[adapterId];
   if (adapter?.type !== "copilot" || options.copilotAccount === undefined) {
     const model = await answer(
@@ -344,6 +358,137 @@ async function copilotModelAndEffort(
   return { model: modelId, ...(effort === undefined ? {} : { effort }) };
 }
 
+function scalarSelection(
+  agent: ManagedAgent,
+): ScalarModelSelection | undefined {
+  return agent.model_runs === undefined
+    ? {
+        model: agent.model,
+        ...(agent.effort === undefined ? {} : { effort: agent.effort }),
+      }
+    : undefined;
+}
+
+async function modelRuns(
+  options: ConfigMenuOptions,
+  parentAdapter: string,
+  current: readonly ModelRunSelection[] = [],
+  previousParentAdapter = parentAdapter,
+): Promise<ModelRunSelection[]> {
+  await write(
+    options.output,
+    `Adapters: ${Object.keys(options.config.adapters).sort().join(", ")}\n`,
+  );
+  const count = positiveInteger(
+    await answer(
+      options.prompt,
+      `Number of model runs [${Math.max(current.length, 2)}]: `,
+      String(Math.max(current.length, 2)),
+    ),
+    "model run count",
+  );
+  if (count < 2) {
+    throw new Error("a multi-model agent requires at least two model runs");
+  }
+
+  const selected: ModelRunSelection[] = [];
+  const ids = new Set<string>();
+  for (let index = 0; index < count; index += 1) {
+    const existing = current[index];
+    const id = requireSafeIdentifier(
+      await answer(
+        options.prompt,
+        existing === undefined
+          ? `Model run ${index + 1} id: `
+          : `Model run ${index + 1} id [${existing.id}]: `,
+        existing?.id,
+      ),
+      "model run id",
+    );
+    if (ids.has(id)) throw new Error(`duplicate model run id: ${id}`);
+    ids.add(id);
+
+    let override: string;
+    const overrideMode = (
+      await answer(
+        options.prompt,
+        `Adapter selection for ${id} (inherit, existing, or create) [${existing?.adapter === undefined ? "inherit" : "existing"}]: `,
+        existing?.adapter === undefined ? "inherit" : "existing",
+      )
+    ).toLowerCase();
+    if (!new Set(["inherit", "existing", "create"]).has(overrideMode)) {
+      throw new Error("adapter selection must be inherit, existing, or create");
+    }
+    if (overrideMode === "existing") {
+      override = await answer(
+        options.prompt,
+        `Adapter id for ${id}${existing?.adapter === undefined ? "" : ` [${existing.adapter}]`}: `,
+        existing?.adapter,
+      );
+    } else if (overrideMode === "create") {
+      override = await createAdapter(options.config, options.prompt);
+    } else {
+      override = parentAdapter;
+    }
+    const effectiveAdapter = override;
+    if (options.config.adapters[effectiveAdapter] === undefined) {
+      throw new Error(`unknown adapter: ${effectiveAdapter}`);
+    }
+    const previousEffectiveAdapter =
+      existing === undefined
+        ? undefined
+        : (existing.adapter ?? previousParentAdapter);
+    const selection = await modelAndEffort(
+      options,
+      effectiveAdapter,
+      previousEffectiveAdapter === effectiveAdapter ? existing : undefined,
+    );
+    selected.push({
+      id,
+      ...(overrideMode === "inherit" ? {} : { adapter: override }),
+      ...selection,
+    });
+  }
+  return selected;
+}
+
+async function agentModelSelection(
+  options: ConfigMenuOptions,
+  parentAdapter: string,
+  current?: ManagedAgent,
+): Promise<AgentModelSelection> {
+  const currentScalar =
+    current === undefined ? undefined : scalarSelection(current);
+  const currentMode = current?.model_runs === undefined ? "single" : "multi";
+  const mode = (
+    await answer(
+      options.prompt,
+      `Model configuration (single or multi) [${currentMode}]: `,
+      currentMode,
+    )
+  ).toLowerCase();
+  if (mode !== "single" && mode !== "multi") {
+    throw new Error("model configuration must be single or multi");
+  }
+  if (mode === "single") {
+    return await modelAndEffort(options, parentAdapter, currentScalar);
+  }
+
+  const existingRuns =
+    current?.model_runs ??
+    (currentScalar === undefined
+      ? []
+      : [{ id: "primary", ...currentScalar } satisfies ModelRunSelection]);
+  return {
+    model_runs: await modelRuns(
+      options,
+      parentAdapter,
+      existingRuns,
+      current?.adapter ?? parentAdapter,
+    ),
+  };
+}
+
 async function addAgent(options: ConfigMenuOptions): Promise<void> {
   const { config, prompt } = options;
   const firstAgent = Object.keys(config.agents).length === 0;
@@ -362,7 +507,7 @@ async function addAgent(options: ConfigMenuOptions): Promise<void> {
   if (adapter === "new") adapter = await createAdapter(config, prompt);
   if (config.adapters[adapter] === undefined)
     throw new Error(`unknown adapter: ${adapter}`);
-  const selection = await copilotModelAndEffort(options, adapter);
+  const selection = await agentModelSelection(options, adapter);
   const purpose = await answer(prompt, "Purpose: ");
   const instructions = await answer(prompt, "Review instructions: ");
   const timeoutText = await answer(
@@ -411,7 +556,7 @@ async function editAgent(options: ConfigMenuOptions): Promise<void> {
   if (config.adapters[adapter] === undefined) {
     throw new Error(`unknown adapter: ${adapter}`);
   }
-  const selection = await copilotModelAndEffort(options, adapter, current);
+  const selection = await agentModelSelection(options, adapter, current);
   const purpose = await answer(
     prompt,
     `Purpose [${current.purpose}]: `,
@@ -436,18 +581,21 @@ async function editAgent(options: ConfigMenuOptions): Promise<void> {
     ),
     "timeout",
   );
+  const instructionSelection =
+    instructions !== ""
+      ? { instructions }
+      : current.instructions !== undefined
+        ? { instructions: current.instructions }
+        : { instructions_file: current.instructions_file! };
   const edited: ManagedAgent = {
-    ...current,
     adapter,
     ...selection,
     purpose,
+    ...instructionSelection,
     isolation,
     timeout_ms: timeout,
+    ...(current.runtime === undefined ? {} : { runtime: current.runtime }),
   };
-  if (instructions !== "") {
-    edited.instructions = instructions;
-    delete edited.instructions_file;
-  }
   config.agents[id] = edited;
   const isDefault = config.defaults?.agents.includes(id) === true;
   const makeDefault = yes(
@@ -672,10 +820,23 @@ async function showList(options: ConfigMenuOptions): Promise<void> {
   await write(options.output, "\nAgents:\n");
   if (listed.agents.length === 0) await write(options.output, "  (none)\n");
   for (const agent of listed.agents) {
-    await write(
-      options.output,
-      `  ${agent.id}${agent.default ? " [default]" : ""}: ${agent.model}${agent.effort === undefined ? "" : ` @ ${agent.effort}`} via ${agent.adapter}\n`,
-    );
+    if ("model_runs" in agent) {
+      await write(
+        options.output,
+        `  ${agent.id}${agent.default ? " [default]" : ""}: ${agent.model_runs.length} model runs\n`,
+      );
+      for (const run of agent.model_runs) {
+        await write(
+          options.output,
+          `    ${agent.id}::${run.id}: ${run.model}${run.effort === undefined ? "" : ` @ ${run.effort}`} via ${run.adapter ?? agent.adapter}\n`,
+        );
+      }
+    } else {
+      await write(
+        options.output,
+        `  ${agent.id}${agent.default ? " [default]" : ""}: ${agent.model}${agent.effort === undefined ? "" : ` @ ${agent.effort}`} via ${agent.adapter}\n`,
+      );
+    }
   }
   await write(options.output, "Projects:\n");
   if (listed.projects.length === 0) await write(options.output, "  (none)\n");

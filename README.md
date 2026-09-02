@@ -44,7 +44,8 @@ options.
 
 ### Download a standalone executable
 
-Release `v3.0.0` provides the agent-first CLI, public event protocol v2, and
+Release `v3.1.0` provides multi-model agents, the agent-first CLI, public event
+protocol v2, and
 self-contained Bun executables that do not require Node.js or Bun:
 
 - Windows x64: `review-mesh-windows-x64.exe`
@@ -53,14 +54,14 @@ self-contained Bun executables that do not require Node.js or Bun:
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v3.0.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
+Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v3.1.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
 .\review-mesh.exe review
 ```
 
 Linux:
 
 ```bash
-curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v3.0.0/review-mesh-linux-x64
+curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v3.1.0/review-mesh-linux-x64
 chmod +x ./review-mesh-linux-x64
 ./review-mesh-linux-x64 review
 ```
@@ -214,7 +215,7 @@ export REVIEW_MESH_OPENAI_API_KEY="your-key"
 Create the global configuration shown below, replacing model IDs and project paths as needed:
 
 ```toml
-schema_version = "2"
+schema_version = "3"
 
 [execution]
 max_concurrency = 2
@@ -288,6 +289,67 @@ agents = ["gemini-3-7-flash", "mai-code-1-1-flash", "kimi-k3"]
 instructions = "Focus on browser compatibility, accessibility, and state-management regressions."
 ```
 
+## Run one agent through multiple models
+
+An agent can keep one purpose and instruction set while creating several
+independent model runs. Use `model_runs` instead of the scalar `model` and
+`effort` fields:
+
+```toml
+schema_version = "3"
+
+[adapters.gateway]
+type = "openai_compatible"
+base_url_env = "REVIEW_MESH_OPENAI_BASE_URL"
+api_key_env = "REVIEW_MESH_OPENAI_API_KEY"
+
+[adapters.github]
+type = "copilot"
+use_logged_in_user = true
+
+[agents.architecture]
+adapter = "gateway"
+model_runs = [
+  { id = "opus", model = "claude-opus-5", effort = "max" },
+  { id = "grok", adapter = "github", model = "grok-code-fast-1", effort = "high" },
+]
+purpose = "Architecture and security review"
+instructions = "Review architecture, trust boundaries, lifecycle ownership, and regressions."
+isolation = "prefer_enforced"
+timeout_ms = 1800000
+
+[defaults]
+agents = ["architecture"]
+```
+
+The parent `adapter` is required and is inherited by a run that omits its own
+`adapter`. A per-run adapter override lets one logical agent span providers.
+Each run has an explicit stable ID, exact model, and optional effort. Run IDs
+use letters, numbers, underscores, and hyphens and must be unique within the
+agent.
+
+Review Mesh expands that example into the concrete reviewer IDs
+`architecture::opus` and `architecture::grok`, in declaration order. Those IDs
+appear in `describe`, JSONL events, command-adapter inputs, diagnostics, and the
+final terminal records; the exact model is also reported separately. Existing
+single-model agents retain their original unqualified reviewer IDs and remain
+fully supported.
+
+Every expanded run is mandatory and receives the same purpose, trusted
+instructions, isolation policy, runtime options, project guidance, and
+per-run timeout. A finding from either model makes the round `findings`; an
+incomplete run makes the round `incomplete`, while completed findings from the
+other model are retained. Review Mesh does not merge or deduplicate findings
+between models.
+
+`execution.max_concurrency` controls scheduling globally. A value of `2` or
+higher allows both runs above to execute in parallel when slots are available;
+`1` runs the entire resolved suite sequentially. There is no separate
+per-agent serial/parallel switch. Each model run is a complete provider request,
+so multi-model agents proportionally increase token usage, provider quota, and
+potential cost. Concurrent live-worktree runs can also observe different file
+states if another process modifies the workspace during the round.
+
 The gateway adapter exposes exactly three bounded reviewer tools:
 
 - `list_files`
@@ -298,7 +360,13 @@ It excludes `.git`, `.git-recovered`, `.worktrees`, `node_modules`, `dist`, `cov
 
 Reviewer models cannot execute shell commands, programs, scripts, Git, builds, tests, web tools, or code, and cannot write files. Review Mesh core separately runs a bounded allowlist of read-only Git discovery commands with optional locks, hooks, fsmonitor, external diff, text conversion, pagers, and interactive prompting disabled to construct the shared context manifest.
 
-`effort` is optional per agent. Review Mesh forwards it as the native reasoning-effort setting for the Copilot, Claude, Codex, and OpenAI-compatible adapters. Command adapters receive `REVIEW_MESH_MODEL` and, when configured, `REVIEW_MESH_REASONING_EFFORT` without changing the version 1 request body. Supported values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, and `persistent`; each provider/model may support only a subset.
+`effort` is optional on a single-model agent or on each `model_runs` entry.
+Review Mesh forwards it as the native reasoning-effort setting for the Copilot,
+Claude, Codex, and OpenAI-compatible adapters. Command adapters receive
+`REVIEW_MESH_MODEL` and, when configured, `REVIEW_MESH_REASONING_EFFORT`
+without changing the version 1 request body. Supported values are `none`,
+`minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, and `persistent`;
+each provider/model may support only a subset.
 
 ## GitHub Copilot login and models
 
@@ -320,7 +388,9 @@ review-mesh config copilot models --json
 
 The login credential is managed by the GitHub Copilot runtime under Review Mesh application data; it is never written to `config.toml`. The runtime may also authenticate through supported environment variables or GitHub CLI credentials. `review-mesh config copilot models` reports account-specific model IDs and their supported effort levels.
 
-Configure one or more Copilot agents with separate model and effort choices:
+Configure one or more Copilot agents with scalar model and effort choices, or
+use `model_runs` as shown above to reuse one agent's instructions across several
+Copilot or mixed-provider models:
 
 ```toml
 [adapters.github]
@@ -349,7 +419,9 @@ timeout_ms = 900000
 agents = ["copilot-architecture", "copilot-correctness"]
 ```
 
-The interactive `review-mesh config` menu performs the same login check and model discovery while adding or editing a Copilot agent, then validates the selected effort against that model's advertised capabilities.
+The interactive `review-mesh config` menu performs the same login check and
+model discovery while adding or editing a scalar or multi-model agent, then
+validates every selected effort against that model's advertised capabilities.
 
 `use_logged_in_user` defaults to `true` for Copilot adapters. Set it to `false` only when the adapter should use explicit allowlisted token environment variables without stored OAuth or GitHub CLI credential fallback.
 
@@ -369,8 +441,8 @@ The global config controls:
 
 - Adapter/runtime registrations.
 - Credential environment-variable names.
-- Globally declared agents and exact models.
-- Optional per-agent reasoning effort.
+- Globally declared scalar or multi-model agents and exact models.
+- Optional per-agent or per-model-run reasoning effort and adapter overrides.
 - The optional default agent roster.
 - Per-project agent rosters, guidance, and context keyed by full path.
 - Concurrency, heartbeat, shutdown grace, diagnostics, and retention.
@@ -389,7 +461,14 @@ Run the rclone-style interactive configuration menu:
 review-mesh config
 ```
 
-The menu can list, add, edit, and remove global agents; create and select adapters; set the ordered default roster; add, edit, or remove full-path project assignments and context; and edit execution/diagnostic settings. Each successful change is validated and saved immediately using an atomic replacement. Existing version 1 configuration is migrated to version 2 when it is saved through the menu; this canonical rewrite does not preserve TOML comments, so keep a backup when migrating a hand-edited file.
+The menu can list, add, edit, and remove global scalar or multi-model agents;
+create and select adapters, including per-run overrides; set the ordered default
+roster; add, edit, or remove full-path project assignments and context; and edit
+execution/diagnostic settings. Each successful change is validated and saved
+immediately using an atomic replacement. Existing version 1 or scalar-agent
+version 2 configuration is read and migrated to version 3 when it is saved
+through the menu; this canonical rewrite does not preserve TOML comments, so
+keep a backup when migrating a hand-edited file.
 
 Useful non-interactive commands:
 
@@ -419,11 +498,11 @@ as sensitive. To update configuration non-interactively, edit the exported
 {
   "schema_version": "1",
   "expected_revision": "<revision from config export>",
-  "config": { "schema_version": "2" }
+  "config": { "schema_version": "3" }
 }
 ```
 
-The `config` value above is abbreviated; send the complete desired v2 document.
+The `config` value above is abbreviated; send the complete desired v3 document.
 Apply is whole-document, limited to 5 MiB of JSON input (the config file remains
 limited to 4 MiB), validated before publication, and
 uses revision compare-and-swap plus atomic replacement. A stale revision fails
@@ -464,7 +543,16 @@ For a truly one-file deployment, use `openai_compatible`. Provider-native adapte
 
 ## JSONL events
 
-Every non-empty stdout line is one strict schema-version `2` JSON object. Review request and reviewer-result objects remain schema version `1`. All events in a run share one `run_id`; `seq` starts at `1` and increases monotonically; `run.completed` is final once a valid run begins and stdout remains available. Immediately after suite resolution, each agent reports capability probing, then readiness/queue state. Heartbeats also cover silent probes and queued agents, so a caller can distinguish slow work from a stuck process without relying on invented percentages.
+Every non-empty stdout line is one strict schema-version `2` JSON object. Review
+request and reviewer-result objects remain schema version `1`. All events in a
+run share one `run_id`; `seq` starts at `1` and increases monotonically;
+`run.completed` is final once a valid run begins and stdout remains available.
+Immediately after suite resolution, each concrete reviewer reports capability
+probing, then readiness/queue state. A multi-model agent contributes one concrete
+reviewer and one unit to `suite.total` for every model run, identified as
+`agent-id::run-id`. Heartbeats also cover silent probes and queued reviewers, so
+a caller can distinguish slow work from a stuck process without relying on
+invented percentages.
 
 | Event                 | Meaning                                                     |
 | --------------------- | ----------------------------------------------------------- |
