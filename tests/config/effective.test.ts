@@ -36,6 +36,7 @@ async function fixture() {
         type: "openai_compatible",
         base_url_env: "MESH_BASE_URL",
         api_key_env: "MESH_API_KEY",
+        streaming: "required",
       },
     },
     agents: {
@@ -91,6 +92,7 @@ describe("effective configuration description", () => {
           id: "reviewer",
           adapter_id: "gateway",
           adapter_type: "openai_compatible",
+          streaming: "required",
           model: "private-model",
           instruction_sources: ["trusted", "project"],
         },

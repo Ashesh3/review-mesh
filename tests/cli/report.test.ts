@@ -1,4 +1,11 @@
-import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  readFile,
+  realpath,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -12,6 +19,7 @@ import {
 } from "../../src/config/manage.js";
 import { runCli } from "../../src/cli.js";
 import type { ReviewApplicationOptions } from "../../src/app.js";
+import { passResult } from "../helpers/fixtures.js";
 
 const roots: string[] = [];
 
@@ -333,8 +341,128 @@ describe("report and findings commands", () => {
     process.exitCode = undefined;
   });
 
-  it("uses adapter doctor checks for the structured-output CLI preflight", async () => {
+  it("uses the real adapter run path, selected effort, tools, and v3 schema for doctor", async () => {
     const root = await mkdtemp(join(tmpdir(), "review-mesh-doctor-cli-"));
+    roots.push(root);
+    const workspace = join(root, "demo");
+    const configFile = join(root, "config.toml");
+    await mkdir(workspace);
+    const config: ManagedConfig = {
+      schema_version: "5",
+      execution: {
+        max_concurrency: 1,
+        heartbeat_interval_ms: 1_000,
+        shutdown_grace_period_ms: 100,
+      },
+      diagnostics: { persist_runs: false, max_runs: 1 },
+      adapters: {
+        fake: {
+          type: "command",
+          command: "unused",
+          protocol: "review-mesh-command-v1",
+        },
+      },
+      agents: {
+        security: {
+          adapter: "fake",
+          model: "review-model",
+          effort: "high",
+          purpose: "Security",
+          instructions: "Review security.",
+          isolation: "prefer_enforced",
+          timeout_ms: 1_000,
+        },
+      },
+      defaults: { agents: ["security"] },
+      projects: {},
+    };
+    await writeFile(configFile, serializeManagedConfig(config));
+
+    let runInput: AdapterReviewInput | undefined;
+    let sentinel = "";
+    const registry = new AdapterRegistry();
+    registry.register("command", () => ({
+      id: "fake",
+      async probe() {
+        return {
+          available: true,
+          authenticated: true,
+          model_available: true,
+          streaming: true,
+          cancellation: true,
+          maximumIsolation: "prompt_only",
+        };
+      },
+      async *run(input) {
+        runInput = input;
+        sentinel = await readFile(
+          join(input.context.workspace, "review-mesh-doctor.txt"),
+          "utf8",
+        );
+        yield { type: "progress", phase: "reviewing" };
+        yield {
+          type: "activity",
+          message: "Read review-mesh-doctor.txt with the adapter tool.",
+        };
+        yield { type: "progress", phase: "validating" };
+        yield {
+          type: "result",
+          result: passResult("Doctor parity."),
+          isolation: "prompt_only",
+        };
+      },
+    }));
+    const stdout = stream();
+    const processLike = Object.assign(new EventEmitter(), { exitCode: 0 });
+    await runCli(processLike, {
+      argv: ["doctor", workspace, "--structured-output"],
+      output: stdout,
+      error: stream(),
+      configFile,
+      cwd: root,
+      adapterRegistry: registry,
+    });
+
+    expect(runInput?.reviewer).toMatchObject({
+      id: "security",
+      model: "review-model",
+      effort: "high",
+    });
+    expect(runInput?.context.workspace).not.toBe(await realpath(workspace));
+    expect(sentinel).toContain("Review Mesh doctor synthetic workspace");
+    expect(
+      (runInput?.resultJsonSchema.properties as Record<string, any>)
+        .schema_version.const,
+    ).toBe("3");
+    expect(JSON.parse(await output(stdout))).toEqual({
+      schema_version: "1",
+      kind: "review-mesh.doctor",
+      workspace: await realpath(workspace),
+      ready: true,
+      reviewers: [
+        {
+          reviewer_id: "security",
+          adapter: "fake",
+          model: "review-model",
+          provider_group: "fake",
+          ready: true,
+          checks: [
+            { name: "authentication", passed: true },
+            { name: "model", passed: true },
+            { name: "streaming_negotiation", passed: true },
+            { name: "read_tool_execution", passed: true },
+            { name: "complete_result_production", passed: true },
+            { name: "schema_validation", passed: true },
+          ],
+        },
+      ],
+    });
+    expect(process.exitCode).toBe(0);
+    process.exitCode = undefined;
+  });
+
+  it("labels a real run tool-stage failure and retains typed diagnostics", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-mesh-doctor-tool-"));
     roots.push(root);
     const workspace = join(root, "demo");
     const configFile = join(root, "config.toml");
@@ -368,70 +496,84 @@ describe("report and findings commands", () => {
       projects: {},
     };
     await writeFile(configFile, serializeManagedConfig(config));
-
-    let doctorInput: AdapterReviewInput["reviewer"] | undefined;
-    let probeCalls = 0;
     const registry = new AdapterRegistry();
     registry.register("command", () => ({
       id: "fake",
       async probe() {
-        probeCalls += 1;
-        throw new Error("doctor should replace the basic probe");
-      },
-      async doctor(reviewer) {
-        doctorInput = reviewer;
         return {
-          ready: true,
-          checks: [
-            { name: "authentication", passed: true },
-            { name: "model", passed: true },
-            { name: "tool_calling", passed: true },
-            { name: "structured_output", passed: true },
-          ],
+          available: true,
+          authenticated: true,
+          model_available: true,
+          streaming: true,
+          cancellation: true,
+          maximumIsolation: "prompt_only",
         };
       },
       async *run() {
-        throw new Error("not used");
+        yield {
+          type: "failure",
+          isolation: "prompt_only",
+          failure: {
+            reason: "read_failure",
+            message: "Synthetic read failed.",
+            retryable: false,
+            fallback_eligible: false,
+            circuit_qualifying: false,
+            diagnostics: {
+              failure_code: "provider_response_invalid",
+              failure_stage: "tool_execution",
+              scope: "model",
+              http_status: 200,
+              provider_request_id: "request-123",
+              validation_issues: [
+                {
+                  path: "$.tool_calls[0]",
+                  code: "invalid_tool_call",
+                  message: "Tool call was invalid.",
+                },
+              ],
+              attempt_count: 2,
+              retry_outcome: "exhausted",
+            },
+          },
+        };
       },
     }));
     const stdout = stream();
-    const processLike = Object.assign(new EventEmitter(), { exitCode: 0 });
-    await runCli(processLike, {
+    await runCli(process, {
       argv: ["doctor", workspace, "--structured-output"],
       output: stdout,
       error: stream(),
       configFile,
-      cwd: root,
       adapterRegistry: registry,
     });
 
-    expect(probeCalls).toBe(0);
-    expect(doctorInput).toMatchObject({
-      id: "security",
-      model: "review-model",
-    });
-    expect(JSON.parse(await output(stdout))).toEqual({
-      schema_version: "1",
-      kind: "review-mesh.doctor",
-      workspace: await realpath(workspace),
-      ready: true,
-      reviewers: [
-        {
-          reviewer_id: "security",
-          adapter: "fake",
-          model: "review-model",
-          provider_group: "fake",
-          ready: true,
-          checks: [
-            { name: "authentication", passed: true },
-            { name: "model", passed: true },
-            { name: "tool_calling", passed: true },
-            { name: "structured_output", passed: true },
+    const result = JSON.parse(await output(stdout));
+    expect(result.ready).toBe(false);
+    expect(result.reviewers[0].checks).toContainEqual({
+      name: "read_tool_execution",
+      passed: false,
+      message: "Synthetic read failed.",
+      failure: expect.objectContaining({
+        reason: "read_failure",
+        diagnostics: expect.objectContaining({
+          failure_stage: "tool_execution",
+          provider_request_id: "request-123",
+          attempt_count: 2,
+          retry_outcome: "exhausted",
+          validation_issues: [
+            expect.objectContaining({ path: "$.tool_calls[0]" }),
           ],
-        },
-      ],
+        }),
+      }),
     });
-    expect(process.exitCode).toBe(0);
+    expect(result.reviewers[0].checks).not.toContainEqual(
+      expect.objectContaining({
+        name: "schema_validation",
+        message: "Synthetic read failed.",
+      }),
+    );
+    expect(process.exitCode).toBe(3);
     process.exitCode = undefined;
   });
 

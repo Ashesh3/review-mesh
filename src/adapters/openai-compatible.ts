@@ -7,10 +7,11 @@ import {
   realpath,
   type FileHandle,
 } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { tmpdir } from "node:os";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import type { AdapterRegistration } from "../config/schemas.js";
-import { reviewerResultV2Schema } from "../protocol/schemas.js";
+import { reviewerResultV3Schema } from "../protocol/schemas.js";
 import {
   adapterFailure,
   type AdapterFailure,
@@ -18,6 +19,15 @@ import {
   type AdapterResponseStructure,
   type AdapterValidationIssue,
 } from "./errors.js";
+import {
+  OpenAIStreamError,
+  parseOpenAIChatStream,
+} from "./openai-stream.js";
+import {
+  createResultSpool,
+  ResultSpoolError,
+  type ResultSpool,
+} from "./result-spool.js";
 import type {
   AdapterCapabilities,
   AdapterEvent,
@@ -45,7 +55,6 @@ const MAX_READ_LINES = 500;
 const MAX_RETURNED_LINE_LENGTH = 1_000;
 const MAX_CONTENT_PARTS = 1_024;
 const DEFAULT_FINALIZATION_MAX_TOKENS = 8_192;
-const TRUNCATION_FINALIZATION_MAX_TOKENS = 16_384;
 const MAX_VALIDATION_ISSUES = 12;
 const SKIPPED_DIRECTORIES = new Set([
   ".git",
@@ -931,6 +940,14 @@ interface ChatResponse {
   diagnostics: AdapterFailureDiagnostics;
 }
 
+interface ProviderHttpResponse {
+  response: Response;
+  diagnostics: AdapterFailureDiagnostics;
+  controller: AbortController;
+  dispose(): void;
+  timedOut(): boolean;
+}
+
 function providerRequestId(headers: Headers): string | undefined {
   for (const name of [
     "x-request-id",
@@ -1274,7 +1291,7 @@ function relaxedStructuredOutputSchema(
 }
 
 type ReviewerResultParse =
-  | { success: true; data: z.infer<typeof reviewerResultV2Schema> }
+  | { success: true; data: z.infer<typeof reviewerResultV3Schema> }
   | {
       success: false;
       diagnostic: string;
@@ -1313,7 +1330,7 @@ function parseReviewerResult(
       ],
     };
   }
-  const parsed = reviewerResultV2Schema.safeParse(value);
+  const parsed = reviewerResultV3Schema.safeParse(value);
   if (parsed.success) return parsed;
   const validationIssues = zodValidationIssues(parsed.error);
   const issues = validationIssues.map(
@@ -1457,6 +1474,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
   private readonly maxConversationBytes: number;
   private readonly activeRequests = new Set<AbortController>();
   private readonly activeWorkspaces = new Set<ReadOnlyWorkspace>();
+  private readonly nonStreamingSessions = new Set<string>();
 
   constructor(
     private readonly registration: OpenAICompatibleRegistration,
@@ -1520,13 +1538,13 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     return { baseUrl, apiKey };
   }
 
-  private async requestJson(
+  private async request(
     configuration: ProviderConfiguration,
     path: string,
     operation: "probe" | "chat",
     signal: AbortSignal,
     init: Omit<RequestInit, "signal">,
-  ): Promise<ProviderJsonResponse> {
+  ): Promise<ProviderHttpResponse> {
     throwIfAborted(signal);
     const contentType = headerValue(init.headers, "content-type");
     if (
@@ -1551,20 +1569,19 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
       );
     }
     const controller = new AbortController();
-    let timedOut = false;
+    let didTimeOut = false;
     const abort = () => controller.abort(signal.reason);
     signal.addEventListener("abort", abort, { once: true });
     const timeout = setTimeout(() => {
-      timedOut = true;
+      didTimeOut = true;
       controller.abort(new Error("Provider request deadline expired."));
     }, this.requestTimeoutMs);
     this.activeRequests.add(controller);
-
-    let responseDiagnostics: AdapterFailureDiagnostics = {
-      failure_stage: "http_request",
-      scope: "provider",
+    const dispose = () => {
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", abort);
+      this.activeRequests.delete(controller);
     };
-    let responseBytes = 0;
     try {
       const response = await this.fetchFacade(
         `${configuration.baseUrl}${path}`,
@@ -1582,7 +1599,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
       const contentTypes = responseContentTypes(response.headers);
       const correlations = correlationHeaders(response.headers);
       const retryAfterMs = retryAfterMilliseconds(response.headers, this.now());
-      responseDiagnostics = {
+      const diagnostics: AdapterFailureDiagnostics = {
         failure_stage: "http_response",
         scope: "provider",
         http_status: response.status,
@@ -1594,19 +1611,93 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         ...(contentTypes === undefined ? {} : { content_types: contentTypes }),
       };
       if (!response.ok) {
-        try {
-          await response.body?.cancel();
-        } catch {
-          // The response body is untrusted and is never published.
-        }
+        await response.body?.cancel().catch(() => undefined);
+        dispose();
         throw new ProviderRequestError(
-          providerFailureForStatus(
-            response.status,
-            operation,
-            responseDiagnostics,
+          providerFailureForStatus(response.status, operation, diagnostics),
+        );
+      }
+      return {
+        response,
+        diagnostics,
+        controller,
+        dispose,
+        timedOut: () => didTimeOut,
+      };
+    } catch (error) {
+      dispose();
+      if (error instanceof ProviderRequestError) throw error;
+      if (signal.aborted) {
+        throw new ProviderRequestError(adapterFailure.cancelled());
+      }
+      if (didTimeOut) {
+        throw new ProviderRequestError(
+          adapterFailure.timeout(
+            "The OpenAI-compatible endpoint exceeded the request deadline.",
+            true,
+            {
+              circuit_qualifying: true,
+              diagnostics: {
+                failure_code: "request_timeout",
+                failure_stage: "http_request",
+                scope: "provider",
+              },
+            },
           ),
         );
       }
+      throw new ProviderRequestError(
+        adapterFailure.unavailable(
+          "The OpenAI-compatible endpoint could not be reached.",
+          true,
+          {
+            circuit_qualifying: true,
+            diagnostics: {
+              failure_code: "transport_error",
+              failure_stage: "http_request",
+              scope: "provider",
+            },
+          },
+        ),
+      );
+    }
+  }
+
+  private async requestJson(
+    configuration: ProviderConfiguration,
+    path: string,
+    operation: "probe" | "chat",
+    signal: AbortSignal,
+    init: Omit<RequestInit, "signal">,
+  ): Promise<ProviderJsonResponse> {
+    const request = await this.request(
+      configuration,
+      path,
+      operation,
+      signal,
+      init,
+    );
+    const responseDiagnostics = request.diagnostics;
+    try {
+      return await this.readJsonResponse(
+        request.response,
+        responseDiagnostics,
+        signal,
+        request.timedOut,
+      );
+    } finally {
+      request.dispose();
+    }
+  }
+
+  private async readJsonResponse(
+    response: Response,
+    responseDiagnostics: AdapterFailureDiagnostics,
+    signal: AbortSignal,
+    timedOut: () => boolean,
+  ): Promise<ProviderJsonResponse> {
+    let responseBytes = 0;
+    try {
       try {
         const contentLength = response.headers.get("content-length");
         const declaredLength =
@@ -1736,7 +1827,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         if (signal.aborted) {
           throw new ProviderRequestError(adapterFailure.cancelled());
         }
-        if (timedOut) {
+        if (timedOut()) {
           throw new ProviderRequestError(
             adapterFailure.timeout(
               "The OpenAI-compatible endpoint exceeded the request deadline.",
@@ -1777,7 +1868,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
       if (signal.aborted) {
         throw new ProviderRequestError(adapterFailure.cancelled());
       }
-      if (timedOut) {
+      if (timedOut()) {
         throw new ProviderRequestError(
           adapterFailure.timeout(
             "The OpenAI-compatible endpoint exceeded the request deadline.",
@@ -1809,10 +1900,6 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           },
         ),
       );
-    } finally {
-      clearTimeout(timeout);
-      signal.removeEventListener("abort", abort);
-      this.activeRequests.delete(controller);
     }
   }
 
@@ -1835,20 +1922,158 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         ),
       );
     }
-    const response = await this.requestJson(
-      configuration,
-      "/chat/completions",
-      "chat",
-      signal,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Client-Session-Id": sessionId,
-        },
-        body: JSON.stringify(body),
+    const configuredStreamingMode = this.registration.streaming ?? "disabled";
+    const streamingMode = this.nonStreamingSessions.has(sessionId)
+      ? "disabled"
+      : configuredStreamingMode;
+    const requestBody =
+      streamingMode === "disabled"
+        ? body
+        : { ...body, stream: true, stream_options: { include_usage: true } };
+    const requestInit = {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Client-Session-Id": sessionId,
       },
-    );
+      body: JSON.stringify(requestBody),
+    } as const;
+    let response: ProviderJsonResponse;
+    if (streamingMode === "disabled") {
+      response = await this.requestJson(
+        configuration,
+        "/chat/completions",
+        "chat",
+        signal,
+        requestInit,
+      );
+    } else {
+      try {
+        const streamed = await this.request(
+          configuration,
+          "/chat/completions",
+          "chat",
+          signal,
+          requestInit,
+        );
+        try {
+          const contentType =
+            streamed.response.headers.get("content-type")?.toLowerCase() ?? "";
+          if (!contentType.includes("text/event-stream")) {
+            response = await this.readJsonResponse(
+              streamed.response,
+              streamed.diagnostics,
+              signal,
+              streamed.timedOut,
+            );
+          } else if (streamed.response.body === null) {
+            throw new OpenAIStreamError(
+              "invalid_stream",
+              "The streaming response had no body.",
+            );
+          } else {
+            const parsed = await parseOpenAIChatStream(
+              streamed.response.body,
+              {
+                signal: streamed.controller.signal,
+                maximumBytes: MAX_PROVIDER_RESPONSE_BYTES,
+              },
+            );
+            const value = {
+              choices: [
+                {
+                  message: parsed.message,
+                  ...(parsed.finish_reason === undefined
+                    ? {}
+                    : { finish_reason: parsed.finish_reason }),
+                },
+              ],
+              ...(parsed.usage === undefined ? {} : { usage: parsed.usage }),
+            };
+            const structure = responseStructure(value);
+            response = {
+              value,
+              diagnostics: {
+                ...streamed.diagnostics,
+                response_bytes: parsed.response_bytes,
+                response_fingerprint: responseFingerprint(
+                  structure,
+                  parsed.response_bytes,
+                ),
+                response_structure: structure,
+                truncated: false,
+              },
+            };
+          }
+        } finally {
+          streamed.dispose();
+        }
+      } catch (error) {
+        const unsupported =
+          error instanceof ProviderRequestError &&
+          (error.failure.diagnostics?.http_status === 400 ||
+            error.failure.diagnostics?.http_status === 406 ||
+            error.failure.diagnostics?.http_status === 415 ||
+            error.failure.diagnostics?.http_status === 422);
+        if (unsupported && streamingMode === "auto") {
+          this.nonStreamingSessions.add(sessionId);
+          response = await this.requestJson(
+            configuration,
+            "/chat/completions",
+            "chat",
+            signal,
+            {
+              ...requestInit,
+              body: JSON.stringify(body),
+            },
+          );
+        } else if (unsupported) {
+          throw new ProviderRequestError(
+            adapterFailure.protocolViolation(
+              "The OpenAI-compatible endpoint does not support required streaming.",
+              false,
+              {
+                fallback_eligible: true,
+                circuit_qualifying: false,
+                diagnostics: {
+                  ...error.failure.diagnostics,
+                  failure_code: "streaming_unsupported",
+                  failure_stage: "streaming_negotiation",
+                  scope: "provider",
+                  attempt_count: 1,
+                  retry_outcome: "not_attempted",
+                },
+              },
+            ),
+          );
+        } else if (error instanceof OpenAIStreamError) {
+          throw new ProviderRequestError(
+            error.code === "cancelled"
+              ? adapterFailure.cancelled()
+              : adapterFailure.protocolViolation(
+                  "The OpenAI-compatible endpoint returned an invalid stream.",
+                  false,
+                  {
+                    fallback_eligible: true,
+                    circuit_qualifying: false,
+                    diagnostics: {
+                      failure_code:
+                        error.code === "response_too_large"
+                          ? "response_too_large"
+                          : "provider_response_invalid",
+                      failure_stage: "stream_decode",
+                      scope: "provider",
+                    },
+                  },
+                ),
+          );
+        } else {
+          throw error;
+        }
+      }
+    }
+    const firstDiagnostics = response.diagnostics;
+    let retriedEnvelope = false;
     const receivedContentTypes = [
       ...(response.diagnostics.content_types ?? []),
       ...assistantContentTypes(response.value),
@@ -1864,7 +2089,37 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         ? {}
         : { finish_reason: receivedFinishReason }),
     };
-    const parsed = chatResponseSchema.safeParse(response.value);
+    let parsed = chatResponseSchema.safeParse(response.value);
+    if (!parsed.success) {
+      const choices =
+        typeof response.value === "object" &&
+        response.value !== null &&
+        !Array.isArray(response.value)
+          ? (response.value as { choices?: unknown }).choices
+          : undefined;
+      if (Array.isArray(choices) && choices.length === 0) {
+        retriedEnvelope = true;
+        const retried = await this.requestJson(
+          configuration,
+          "/chat/completions",
+          "chat",
+          signal,
+          {
+            ...requestInit,
+            body: JSON.stringify(requestBody),
+          },
+        );
+        response = retried;
+        parsed = chatResponseSchema.safeParse(response.value);
+        if (parsed.success) {
+          response.diagnostics = {
+            ...response.diagnostics,
+            attempt_count: 2,
+            retry_outcome: "succeeded",
+          };
+        }
+      }
+    }
     if (!parsed.success) {
       throw new ProviderRequestError(
         adapterFailure.protocolViolation(
@@ -1880,6 +2135,8 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
                 failureDiagnostics.failure_stage ?? "envelope_validation",
               scope: "provider",
               validation_issues: zodValidationIssues(parsed.error),
+              attempt_count: retriedEnvelope ? 2 : 1,
+              retry_outcome: retriedEnvelope ? "exhausted" : "not_attempted",
             },
           },
         ),
@@ -1887,7 +2144,17 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     }
     return {
       message: parsed.data.choices[0]!.message,
-      diagnostics,
+      diagnostics: {
+        ...firstDiagnostics,
+        ...response.diagnostics,
+        ...failureDiagnostics,
+        ...(receivedContentTypes.length === 0
+          ? {}
+          : { content_types: receivedContentTypes }),
+        ...(receivedFinishReason === undefined
+          ? {}
+          : { finish_reason: receivedFinishReason }),
+      },
     };
   }
 
@@ -1898,7 +2165,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     const base: Omit<AdapterCapabilities, "available"> = {
       authenticated: "unknown",
       model_available: "unknown",
-      streaming: false,
+      streaming: (this.registration.streaming ?? "disabled") !== "disabled",
       cancellation: true,
       maximumIsolation: "runtime_read_only",
     };
@@ -1976,106 +2243,6 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         retryable: failure.retryable,
       };
     }
-  }
-
-  async doctor(
-    reviewer: AdapterReviewInput["reviewer"],
-    signal: AbortSignal,
-  ): Promise<{
-    ready: boolean;
-    checks: Array<{ name: string; passed: boolean; message?: string }>;
-  }> {
-    const capabilities = await this.probe(reviewer, signal);
-    const checks = [
-      {
-        name: "authentication",
-        passed: capabilities.authenticated === true,
-        ...(capabilities.authenticated === true ||
-        capabilities.message === undefined
-          ? {}
-          : { message: capabilities.message }),
-      },
-      {
-        name: "model",
-        passed: capabilities.model_available === true,
-        ...(capabilities.model_available === true ||
-        capabilities.message === undefined
-          ? {}
-          : { message: capabilities.message }),
-      },
-    ];
-    if (!capabilities.available) return { ready: false, checks };
-    const configuration = this.configuration();
-    if ("reason" in configuration) return { ready: false, checks };
-    try {
-      const sessionId = this.sessionIdFactory();
-      const toolResponse = await this.chat(configuration, signal, sessionId, {
-        model: reviewer.model,
-        messages: [
-          {
-            role: "user",
-            content:
-              "Call list_files exactly once with an empty object. Do not answer directly.",
-          },
-        ],
-        tools: READ_ONLY_TOOLS,
-        tool_choice: "required",
-        max_tokens: 128,
-      });
-      checks.push({
-        name: "tool_calling",
-        passed:
-          Array.isArray(toolResponse.message.tool_calls) &&
-          toolResponse.message.tool_calls.some(
-            (call) => call.function.name === "list_files",
-          ),
-      });
-      const response = await this.chat(configuration, signal, sessionId, {
-        model: reviewer.model,
-        messages: [
-          {
-            role: "user",
-            content:
-              'Return exactly this JSON object and do not call tools: {"ok":true}',
-          },
-        ],
-        response_format: {
-          type: "json_schema",
-          json_schema: {
-            name: "review_mesh_doctor",
-            strict: false,
-            schema: {
-              type: "object",
-              additionalProperties: false,
-              required: ["ok"],
-              properties: { ok: { const: true } },
-            },
-          },
-        },
-        max_tokens: 64,
-      });
-      const content = normalizedAssistantContent(response.message.content);
-      const parsed =
-        typeof content === "string" ? JSON.parse(content) : undefined;
-      checks.push({
-        name: "structured_output",
-        passed:
-          typeof parsed === "object" &&
-          parsed !== null &&
-          (parsed as { ok?: unknown }).ok === true,
-      });
-    } catch (error) {
-      const failure =
-        error instanceof ProviderRequestError
-          ? error.failure
-          : adapterFailure.unknown("Structured-output preflight failed.");
-      checks.push({
-        name: "structured_output",
-        passed: false,
-        message: failure.message,
-      });
-    }
-    return { ready: checks.every((check) => check.passed), checks };
   }
 
   private async runTool(
@@ -2335,6 +2502,8 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         const finalizationDeadline =
           this.now() + this.requestTimeoutMs * this.finalizationAttempts * 2;
         let lastFinalizationFailure: AdapterFailure | undefined;
+        let continuationSpool: ResultSpool | undefined;
+        let continuationFragments: string[] = [];
         for (
           let finalizationAttempt = 1;
           finalizationAttempt <= this.finalizationAttempts;
@@ -2355,14 +2524,16 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
             break;
           }
           const finalizationMessages = structuredClone(finalizationCheckpoint);
-          const truncationRecovery =
-            lastFinalizationFailure?.diagnostics?.failure_code ===
-            "output_truncated";
-          if (truncationRecovery) {
+          if (continuationFragments.length > 0) {
+            const assembled = await continuationSpool!.readText();
+            finalizationMessages.push({
+              role: "assistant",
+              content: assembled,
+            });
             finalizationMessages.push({
               role: "user",
               content:
-                "The previous structured result reached the provider output limit. Produce a fresh, compact result from the retained inspection evidence. Keep the summary concise, include only actionable findings, shorten descriptions and fixes, return exactly one JSON object, and do not call tools.",
+                "Continue the same JSON object from the exact stopping point. Return only the next bytes: do not repeat, rewrite, condense, or drop any prior content, and do not call tools.",
             });
           }
           let resultDiagnostics: AdapterFailureDiagnostics = {
@@ -2383,9 +2554,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
                   : { reasoning_effort: input.reviewer.effort }),
                 messages: finalizationMessages,
                 response_format: responseFormat,
-                max_tokens: truncationRecovery
-                  ? TRUNCATION_FINALIZATION_MAX_TOKENS
-                  : DEFAULT_FINALIZATION_MAX_TOKENS,
+                max_tokens: DEFAULT_FINALIZATION_MAX_TOKENS,
               },
               {
                 failure_stage: "structured_result_envelope",
@@ -2394,16 +2563,46 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               },
             );
             resultDiagnostics = finalResponse.diagnostics;
-            let parsedResult = parseReviewerResult(
-              normalizedAssistantContent(finalResponse.message.content),
+            const fragment = normalizedAssistantContent(
+              finalResponse.message.content,
             );
             let resultTruncated =
               finalResponse.diagnostics.finish_reason === "length";
+            if (
+              typeof fragment === "string" &&
+              (resultTruncated || continuationSpool !== undefined)
+            ) {
+              if (continuationSpool === undefined) {
+                continuationSpool = await createResultSpool({
+                  directory: join(tmpdir(), "review-mesh-result-spools"),
+                  id: `${input.runId}-${input.reviewer.id}-${randomUUID()}`.replace(
+                    /[^A-Za-z0-9_-]/gu,
+                    "-",
+                  ),
+                  reviewedWorkspace: input.context.workspace,
+                });
+              }
+              await continuationSpool.append(fragment);
+              continuationFragments.push(fragment);
+            }
+            let parsedResult = parseReviewerResult(
+              continuationSpool === undefined
+                ? fragment
+                : await continuationSpool.readText(),
+            );
             if (resultTruncated) {
               lastFinalizationFailure = outputTruncationFailure(
                 finalResponse.diagnostics,
                 false,
               );
+              if (finalizationAttempt < this.finalizationAttempts) {
+                yield {
+                  type: "progress",
+                  phase: "validating",
+                  message: `Continuing the exact structured result from its stopping point (fragment ${finalizationAttempt + 1} of ${this.finalizationAttempts}).`,
+                };
+                continue;
+              }
             } else if (!parsedResult.success) {
               const repairMessage = {
                 role: "user",
@@ -2466,6 +2665,8 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               }
             }
             if (parsedResult.success && !resultTruncated) {
+              await continuationSpool?.cleanup();
+              continuationSpool = undefined;
               yield { type: "result", result: parsedResult.data, isolation };
               return;
             }
@@ -2493,8 +2694,29 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               );
             }
           } catch (error) {
-            if (!(error instanceof ProviderRequestError)) throw error;
-            lastFinalizationFailure = error.failure;
+            if (error instanceof ResultSpoolError) {
+              lastFinalizationFailure =
+                error.code === "result_too_large"
+                  ? adapterFailure.resultTooLarge(error.message, {
+                      fallback_eligible: true,
+                      circuit_qualifying: false,
+                      diagnostics: {
+                        failure_stage: "structured_result_spool",
+                        scope: "model",
+                      },
+                    })
+                  : adapterFailure.invalidResult(error.message, false, {
+                      fallback_eligible: true,
+                      circuit_qualifying: false,
+                      diagnostics: {
+                        failure_stage: "structured_result_spool",
+                        scope: "adapter",
+                      },
+                    });
+            } else {
+              if (!(error instanceof ProviderRequestError)) throw error;
+              lastFinalizationFailure = error.failure;
+            }
           }
           if (
             finalizationAttempt < this.finalizationAttempts &&
@@ -2510,6 +2732,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           }
           break;
         }
+        await continuationSpool?.cleanup().catch(() => undefined);
         throw new ProviderRequestError(
           exhaustedResultProductionFailure(
             lastFinalizationFailure ??

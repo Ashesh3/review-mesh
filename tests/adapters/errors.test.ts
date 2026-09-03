@@ -54,6 +54,8 @@ describe("adapter failure diagnostics", () => {
           truncated: false,
           repair_attempted: true,
           repair_outcome: "failed",
+          attempt_count: 2,
+          retry_outcome: "exhausted",
         },
       },
     );
@@ -95,6 +97,8 @@ describe("adapter failure diagnostics", () => {
         truncated: false,
         repair_attempted: true,
         repair_outcome: "failed",
+        attempt_count: 2,
+        retry_outcome: "exhausted",
       },
     });
     expect(failure.diagnostics?.failure_stage?.length).toBeLessThanOrEqual(64);
@@ -158,6 +162,8 @@ describe("adapter failure diagnostics", () => {
         correlation_headers: { authorization: "Bearer secret-value" },
         validation_issues: [{ path: "", code: "", message: "" }],
         response_structure: { root_type: "" },
+        attempt_count: 0,
+        retry_outcome: "maybe" as never,
       },
     });
 

@@ -201,6 +201,7 @@ describe("config menu", () => {
       "openai_compatible",
       "REVIEW_BASE_URL",
       "REVIEW_API_KEY",
+      "auto",
       "single",
       "gemini-flash",
       "high",
@@ -226,6 +227,10 @@ describe("config menu", () => {
     const saved = await loadManagedConfig(file);
     expect(saved.config.defaults?.agents).toEqual(["gemini"]);
     expect(saved.config.agents.gemini?.effort).toBe("high");
+    expect(saved.config.adapters.gateway).toMatchObject({
+      type: "openai_compatible",
+      streaming: "auto",
+    });
     expect(Object.values(saved.config.projects ?? {})).toEqual([
       {
         agents: ["gemini"],

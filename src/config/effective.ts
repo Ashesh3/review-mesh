@@ -75,6 +75,7 @@ export interface EffectiveConfigDescription {
     purpose: string;
     adapter_id: string;
     adapter_type: AdapterRegistration["type"];
+    streaming?: "auto" | "required" | "disabled";
     model: string;
     effort?: string;
     isolation_policy: "prefer_enforced" | "require_enforced";
@@ -230,6 +231,9 @@ export function describeResolvedConfig(
       purpose: reviewer.purpose,
       adapter_id: reviewer.adapterId,
       adapter_type: reviewer.adapter.type,
+      ...(reviewer.adapter.type === "openai_compatible"
+        ? { streaming: reviewer.adapter.streaming ?? "disabled" }
+        : {}),
       model: reviewer.model,
       ...(reviewer.effort === undefined ? {} : { effort: reviewer.effort }),
       isolation_policy: reviewer.isolationPolicy,

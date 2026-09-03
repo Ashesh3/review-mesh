@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
-import { resolve } from "node:path";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import {
@@ -10,11 +12,13 @@ import {
   type ReviewApplicationOptions,
 } from "./app.js";
 import type { AdapterRegistry } from "./adapters/registry.js";
+import type { AdapterEvent, ReviewAdapter } from "./adapters/types.js";
 import { runConfigCommand } from "./config/command.js";
 import { resolveProjectName } from "./config/project-names.js";
 import { getAppPaths, type AppPaths } from "./config/paths.js";
 import { loadConfigFiles } from "./config/load.js";
 import { resolveConfig } from "./config/resolve.js";
+import { resolveContext } from "./context/resolve.js";
 import { readRunStatus, RunStatusError } from "./diagnostics/run-status.js";
 import {
   readRunFindings,
@@ -31,6 +35,10 @@ import {
 } from "./discovery/help.js";
 import { describeWorkspace, renderDescription } from "./discovery/describe.js";
 import { isSchemaName, renderSchema, schemaNames } from "./discovery/schema.js";
+import { reviewerResultJsonSchema } from "./protocol/json-schema.js";
+import { buildReviewerPrompt } from "./protocol/prompt.js";
+import { reviewerResultV3Schema } from "./protocol/schemas.js";
+import { createGitRunner } from "./context/git.js";
 import {
   openDashboardBrowser,
   startDashboardServer,
@@ -41,6 +49,132 @@ import {
 declare const REVIEW_MESH_STANDALONE: boolean | undefined;
 
 const maximumRequestBytes = 8 * 1024 * 1024;
+
+type DoctorCheck = {
+  name: string;
+  passed: boolean;
+  message?: string;
+  failure?: unknown;
+};
+
+function doctorFailureStage(event: Extract<AdapterEvent, { type: "failure" }>) {
+  const stage = event.failure.diagnostics?.failure_stage ?? "";
+  if (
+    event.failure.reason === "read_failure" ||
+    stage.includes("tool") ||
+    stage.includes("read")
+  ) {
+    return "read_tool_execution";
+  }
+  if (stage.includes("stream")) return "streaming_negotiation";
+  if (
+    event.failure.reason === "invalid_result" ||
+    stage.includes("validation")
+  ) {
+    return "schema_validation";
+  }
+  return "complete_result_production";
+}
+
+async function runDoctorReview(
+  adapter: ReviewAdapter,
+  reviewer: ReturnType<typeof resolveConfig>["reviewers"][number],
+  signal: AbortSignal,
+): Promise<{ ready: boolean; checks: DoctorCheck[] }> {
+  const capabilities = await adapter.probe(reviewer, signal);
+  const checks: DoctorCheck[] = [
+    {
+      name: "authentication",
+      passed: capabilities.authenticated === true,
+      ...(capabilities.authenticated === true || capabilities.message === undefined
+        ? {}
+        : { message: capabilities.message }),
+    },
+    {
+      name: "model",
+      passed: capabilities.model_available === true,
+      ...(capabilities.model_available === true || capabilities.message === undefined
+        ? {}
+        : { message: capabilities.message }),
+    },
+  ];
+  if (!capabilities.available) return { ready: false, checks };
+
+  const directory = await mkdtemp(join(tmpdir(), "review-mesh-doctor-"));
+  const workspace = join(directory, "workspace");
+  try {
+    await mkdir(workspace);
+    await writeFile(
+      join(workspace, "review-mesh-doctor.txt"),
+      "Review Mesh doctor synthetic workspace. Read this file and return a complete v3 pass result.\n",
+      "utf8",
+    );
+    const context = await resolveContext({
+      request: {
+        schema_version: "2",
+        project_name: "review-mesh-doctor",
+        workspace,
+        instructions:
+          "Read review-mesh-doctor.txt using the configured read tools, then return a complete reviewer result.",
+        review_scope: { mode: "full" },
+      },
+      git: createGitRunner(),
+      signal,
+    });
+    const prompt = buildReviewerPrompt({
+      reviewer,
+      context,
+      resultJsonSchema: reviewerResultJsonSchema,
+    });
+    let readToolObserved = false;
+    let terminal: Extract<AdapterEvent, { type: "result" | "failure" }> | undefined;
+    for await (const event of adapter.run({
+      runId: `doctor-${Date.now()}`,
+      reviewer,
+      context,
+      prompt,
+      resultJsonSchema: reviewerResultJsonSchema,
+      isolationPolicy: reviewer.isolationPolicy,
+      signal,
+    })) {
+      if (event.type === "activity") readToolObserved = true;
+      if (event.type === "result" || event.type === "failure") terminal = event;
+    }
+    checks.push({
+      name: "streaming_negotiation",
+      passed:
+        terminal?.type !== "failure" ||
+        doctorFailureStage(terminal) !== "streaming_negotiation",
+    });
+    if (terminal?.type === "failure") {
+      const name = doctorFailureStage(terminal);
+      if (name !== "streaming_negotiation") {
+        checks.push({
+          name,
+          passed: false,
+          message: terminal.failure.message,
+          failure: terminal.failure,
+        });
+      }
+      return { ready: false, checks };
+    }
+    checks.push({ name: "read_tool_execution", passed: readToolObserved });
+    checks.push({
+      name: "complete_result_production",
+      passed: terminal?.type === "result",
+    });
+    checks.push({
+      name: "schema_validation",
+      passed:
+        terminal?.type === "result" &&
+        reviewerResultV3Schema.safeParse(terminal.result).success,
+    });
+    return { ready: checks.every((check) => check.passed), checks };
+  } finally {
+    await adapter.forceCleanup?.().catch(() => undefined);
+    await rm(directory, { recursive: true, force: true });
+  }
+}
 
 async function writeDiagnostic(
   error: string,
@@ -416,8 +550,8 @@ export async function runCli(
         for (const reviewer of reviewers) {
           const adapter = registry.create(reviewer.adapterId, reviewer.adapter);
           const result =
-            structuredOutput && adapter.doctor !== undefined
-              ? await adapter.doctor(reviewer, controller.signal)
+            structuredOutput
+              ? await runDoctorReview(adapter, reviewer, controller.signal)
               : (() => undefined)();
           const capabilities =
             result === undefined

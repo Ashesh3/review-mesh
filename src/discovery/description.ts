@@ -187,6 +187,15 @@ export async function describeTool(options: DescribeToolOptions = {}) {
             : undefined,
         },
       },
+      provider_transport: {
+        openai_compatible_streaming_modes: [
+          "auto",
+          "required",
+          "disabled",
+        ] as const,
+        exact_output_continuation: true as const,
+        provider_envelope_retry_attempts: 1 as const,
+      },
       review_scope: {
         default_mode: "changes" as const,
         full_review_requires_explicit_mode: true as const,

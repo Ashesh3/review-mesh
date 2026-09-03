@@ -490,6 +490,39 @@ describe("global configuration", () => {
         api_key_env: "API_KEY",
       }),
     ).toBeTruthy();
+    for (const streaming of ["auto", "required", "disabled"] as const) {
+      expect(
+        adapterRegistrationSchema.parse({
+          type: "openai_compatible",
+          base_url_env: "BASE_URL",
+          api_key_env: "API_KEY",
+          streaming,
+        }),
+      ).toMatchObject({ streaming });
+    }
+    expect(() =>
+      adapterRegistrationSchema.parse({
+        type: "openai_compatible",
+        base_url_env: "BASE_URL",
+        api_key_env: "API_KEY",
+        streaming: "sometimes",
+      }),
+    ).toThrow();
+  });
+
+  it("preserves the selected OpenAI streaming mode on resolved reviewers", () => {
+    const config = v2("/demo");
+    config.adapters.gateway = {
+      type: "openai_compatible",
+      base_url_env: "BASE_URL",
+      api_key_env: "API_KEY",
+      streaming: "required",
+    };
+    const resolved = resolveConfig({ trusted: config, workspace: "/other" });
+    expect(resolved.reviewers[0]?.adapter).toMatchObject({
+      type: "openai_compatible",
+      streaming: "required",
+    });
   });
 
   it("rejects adapter-specific effort values that cannot be forwarded", () => {

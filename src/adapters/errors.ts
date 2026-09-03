@@ -20,6 +20,7 @@ const FAILURE_CODES = new Set<AdapterFailureCode>([
   "request_timeout",
   "transport_error",
   "response_too_large",
+  "streaming_unsupported",
 ]);
 const CORRELATION_HEADER_NAMES = new Set([
   "x-request-id",
@@ -50,7 +51,13 @@ export type AdapterFailureCode =
   | "output_truncated"
   | "request_timeout"
   | "transport_error"
-  | "response_too_large";
+  | "response_too_large"
+  | "streaming_unsupported";
+
+export type AdapterRetryOutcome =
+  | "not_attempted"
+  | "succeeded"
+  | "exhausted";
 
 export interface AdapterValidationIssue {
   path: string;
@@ -88,6 +95,8 @@ export interface AdapterFailureDiagnostics {
   truncated?: boolean;
   repair_attempted?: boolean;
   repair_outcome?: AdapterRepairOutcome;
+  attempt_count?: number;
+  retry_outcome?: AdapterRetryOutcome;
 }
 
 export interface AdapterFailureOptions {
@@ -204,6 +213,13 @@ function sanitizeDiagnostics(
     input.repair_outcome === "failed"
       ? input.repair_outcome
       : undefined;
+  const attemptCount = finiteInteger(input.attempt_count, 1, 100);
+  const retryOutcome =
+    input.retry_outcome === "not_attempted" ||
+    input.retry_outcome === "succeeded" ||
+    input.retry_outcome === "exhausted"
+      ? input.retry_outcome
+      : undefined;
   const contentTypes = Array.isArray(input.content_types)
     ? [
         ...new Set(
@@ -305,6 +321,8 @@ function sanitizeDiagnostics(
       ? { repair_attempted: input.repair_attempted }
       : {}),
     ...(repairOutcome === undefined ? {} : { repair_outcome: repairOutcome }),
+    ...(attemptCount === undefined ? {} : { attempt_count: attemptCount }),
+    ...(retryOutcome === undefined ? {} : { retry_outcome: retryOutcome }),
   };
   return Object.keys(diagnostics).length === 0 ? undefined : diagnostics;
 }
@@ -445,6 +463,11 @@ export const adapterFailure = {
     options?: AdapterFailureOptions,
   ): AdapterFailure =>
     sanitizeAdapterFailure("invalid_result", message, retryable, options),
+  resultTooLarge: (
+    message: unknown,
+    options?: AdapterFailureOptions,
+  ): AdapterFailure =>
+    sanitizeAdapterFailure("result_too_large", message, false, options),
   cancelled: (
     message: unknown = "Review was cancelled.",
     options?: AdapterFailureOptions,

@@ -68,6 +68,7 @@ export const adapterRegistrationSchema = z.discriminatedUnion("type", [
     type: z.literal("openai_compatible"),
     base_url_env: nonEmptyString,
     api_key_env: nonEmptyString,
+    streaming: z.enum(["auto", "required", "disabled"]).optional(),
   }),
   z.strictObject({
     type: z.literal("command"),

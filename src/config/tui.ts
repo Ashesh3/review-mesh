@@ -204,14 +204,29 @@ async function createAdapter(
   );
   let adapter: AdapterRegistration;
   if (type === "openai_compatible") {
+    const baseUrlEnvironment = requireEnvironmentName(
+      await answer(prompt, "Base URL environment variable: "),
+    );
+    const apiKeyEnvironment = requireEnvironmentName(
+      await answer(prompt, "API key environment variable: "),
+    );
+    const streaming = await answer(
+      prompt,
+      "Streaming mode (auto, required, disabled) [auto]: ",
+      "auto",
+    );
+    if (
+      streaming !== "auto" &&
+      streaming !== "required" &&
+      streaming !== "disabled"
+    ) {
+      throw new Error("streaming mode must be auto, required, or disabled");
+    }
     adapter = {
       type,
-      base_url_env: requireEnvironmentName(
-        await answer(prompt, "Base URL environment variable: "),
-      ),
-      api_key_env: requireEnvironmentName(
-        await answer(prompt, "API key environment variable: "),
-      ),
+      base_url_env: baseUrlEnvironment,
+      api_key_env: apiKeyEnvironment,
+      streaming,
     };
   } else if (type === "command") {
     const encodedArgs = await answer(

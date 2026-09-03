@@ -10,6 +10,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
@@ -46,8 +47,43 @@ function jsonResponse(value: unknown, status = 200): Response {
   });
 }
 
-function assistantResponse(message: Record<string, unknown>): Response {
-  return jsonResponse({ choices: [{ message }] });
+function assistantResponse(
+  message: Record<string, unknown>,
+  finishReason?: string,
+): Response {
+  return jsonResponse({
+    choices: [
+      {
+        message,
+        ...(finishReason === undefined
+          ? {}
+          : { finish_reason: finishReason }),
+      },
+    ],
+  });
+}
+
+function sseResponse(events: readonly unknown[]): Response {
+  const encoded = events
+    .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+    .join("") + "data: [DONE]\n\n";
+  return new Response(encoded, {
+    headers: { "content-type": "text/event-stream; charset=utf-8" },
+  });
+}
+
+function sseAssistant(content: string, finishReason = "stop"): Response {
+  return sseResponse([
+    {
+      choices: [
+        {
+          index: 0,
+          delta: { role: "assistant", content },
+          finish_reason: finishReason,
+        },
+      ],
+    },
+  ]);
 }
 
 function fetchMock(
@@ -77,10 +113,11 @@ function setup(
   workspace: string,
   dependencies: OpenAICompatibleAdapterDependencies,
   overrides?: Partial<AdapterReviewInput>,
+  adapterRegistration: AdapterReviewInput["reviewer"]["adapter"] = registration,
 ) {
   const reviewer = resolvedReviewer({
     adapterId: "gateway",
-    adapter: registration,
+    adapter: adapterRegistration,
     model: "review-model",
   });
   const controller = new AbortController();
@@ -99,7 +136,7 @@ function setup(
     ...overrides,
   };
   return {
-    adapter: createOpenAICompatibleAdapter(registration, {
+    adapter: createOpenAICompatibleAdapter(adapterRegistration, {
       environment: {
         TEST_OPENAI_BASE_URL: "https://gateway.example/v1",
         TEST_OPENAI_API_KEY: "test-secret",
@@ -118,10 +155,296 @@ const nodeIdentity: FileSystemIdentityFacade = {
 };
 
 describe("OpenAI-compatible adapter", () => {
-  it("doctors model readiness, required tool calling, and structured output", async () => {
-    const requests: Array<{ url: string; init?: RequestInit; body?: any }> = [];
+  it("uses SSE transport in auto mode and accepts a complete streamed result", async () => {
+    const requests: any[] = [];
     const responses = [
-      jsonResponse({ data: [{ id: "review-model" }] }),
+      sseResponse([
+        {
+          choices: [
+            {
+              index: 0,
+              delta: { role: "assistant", content: "Inspection complete." },
+              finish_reason: "stop",
+            },
+          ],
+        },
+      ]),
+      sseAssistant(JSON.stringify(passResult("Streamed result."))),
+    ];
+    const prepared = setup(
+      "C:\\workspace",
+      {
+        fetch: fetchMock(async (_input, init) => {
+          requests.push(JSON.parse(String(init?.body)));
+          return responses.shift()!;
+        }),
+      },
+      undefined,
+      { ...registration, streaming: "auto" as const },
+    );
+
+    expect(terminal(await collect(prepared.adapter, prepared.input))).toEqual({
+      type: "result",
+      result: passResult("Streamed result."),
+      isolation: "runtime_read_only",
+    });
+    expect(requests).toHaveLength(2);
+    expect(requests.every((request) => request.stream === true)).toBe(true);
+    expect(
+      requests.every(
+        (request) => request.stream_options?.include_usage === true,
+      ),
+    ).toBe(true);
+  });
+
+  it("falls back once after a clearly unsupported auto-stream request and keeps the fallback for the run", async () => {
+    const bodies: any[] = [];
+    const responses = [
+      jsonResponse({ error: "streaming unsupported" }, 422),
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      assistantResponse({
+        role: "assistant",
+        content: JSON.stringify(passResult("Non-stream fallback.")),
+      }),
+    ];
+    const prepared = setup(
+      "C:\\workspace",
+      {
+        fetch: fetchMock(async (_input, init) => {
+          bodies.push(JSON.parse(String(init?.body)));
+          return responses.shift()!;
+        }),
+      },
+      undefined,
+      { ...registration, streaming: "auto" as const },
+    );
+
+    expect(terminal(await collect(prepared.adapter, prepared.input))).toEqual({
+      type: "result",
+      result: passResult("Non-stream fallback."),
+      isolation: "runtime_read_only",
+    });
+    expect(bodies.map((body) => body.stream ?? false)).toEqual([
+      true,
+      false,
+      false,
+    ]);
+  });
+
+  it("fails required streaming at the negotiation stage without a non-stream retry", async () => {
+    const fetch = fetchMock(async () =>
+      jsonResponse({ error: "streaming unsupported" }, 422),
+    );
+    const prepared = setup(
+      "C:\\workspace",
+      { fetch },
+      undefined,
+      { ...registration, streaming: "required" as const },
+    );
+
+    expect(
+      terminal(await collect(prepared.adapter, prepared.input)),
+    ).toMatchObject({
+      type: "failure",
+      failure: {
+        fallback_eligible: true,
+        circuit_qualifying: false,
+        diagnostics: {
+          failure_code: "streaming_unsupported",
+          failure_stage: "streaming_negotiation",
+          http_status: 422,
+          attempt_count: 1,
+          retry_outcome: "not_attempted",
+        },
+      },
+    });
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  it("accepts a non-streaming JSON response to an auto-stream request", async () => {
+    const bodies: any[] = [];
+    const responses = [
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      assistantResponse({
+        role: "assistant",
+        content: JSON.stringify(passResult("JSON auto response.")),
+      }),
+    ];
+    const prepared = setup(
+      "C:\\workspace",
+      {
+        fetch: fetchMock(async (_input, init) => {
+          bodies.push(JSON.parse(String(init?.body)));
+          return responses.shift()!;
+        }),
+      },
+      undefined,
+      { ...registration, streaming: "auto" as const },
+    );
+
+    expect(terminal(await collect(prepared.adapter, prepared.input))).toEqual({
+      type: "result",
+      result: passResult("JSON auto response."),
+      isolation: "runtime_read_only",
+    });
+    expect(bodies.every((body) => body.stream === true)).toBe(true);
+  });
+
+  it("forwards reasoning effort on every streamed request", async () => {
+    const efforts: unknown[] = [];
+    const responses = [
+      sseResponse([
+        {
+          choices: [
+            {
+              index: 0,
+              delta: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "doctor-list",
+                    type: "function",
+                    function: { name: "list_files", arguments: "{}" },
+                  },
+                ],
+              },
+              finish_reason: "tool_calls",
+            },
+          ],
+        },
+      ]),
+      sseAssistant("Inspection complete."),
+      sseAssistant(JSON.stringify(passResult("Effort forwarded."))),
+    ];
+    const prepared = setup(
+      "C:\\workspace",
+      {
+        fetch: fetchMock(async (_input, init) => {
+          const body = JSON.parse(String(init?.body));
+          efforts.push(body.reasoning_effort);
+          return responses.shift()!;
+        }),
+      },
+      { reviewer: resolvedReviewer({
+        adapterId: "gateway",
+        adapter: { ...registration, streaming: "auto" },
+        model: "review-model",
+        effort: "high",
+      }) },
+      { ...registration, streaming: "auto" as const },
+    );
+
+    expect(terminal(await collect(prepared.adapter, prepared.input)).type).toBe(
+      "result",
+    );
+    expect(efforts).toEqual(["high", "high", "high"]);
+  });
+
+  it("reconstructs streamed tool calls before executing the read-only tool", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mesh-oai-stream-tool-"));
+    await writeFile(join(root, "doctor.txt"), "doctor-visible\n");
+    const bodies: any[] = [];
+    const responses = [
+      sseResponse([
+        {
+          choices: [
+            {
+              index: 0,
+              delta: {
+                role: "assistant",
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "read-",
+                    type: "function",
+                    function: { name: "read_", arguments: '{"pa' },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        },
+        {
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "1",
+                    function: {
+                      name: "file",
+                      arguments: 'th":"doctor.txt"}',
+                    },
+                  },
+                ],
+              },
+              finish_reason: "tool_calls",
+            },
+          ],
+        },
+      ]),
+      sseAssistant("Inspection complete."),
+      sseAssistant(JSON.stringify(passResult("Stream tool."))),
+    ];
+    const prepared = setup(
+      root,
+      {
+        fetch: fetchMock(async (_input, init) => {
+          bodies.push(JSON.parse(String(init?.body)));
+          return responses.shift()!;
+        }),
+      },
+      undefined,
+      { ...registration, streaming: "auto" as const },
+    );
+
+    try {
+      expect(terminal(await collect(prepared.adapter, prepared.input)).type).toBe(
+        "result",
+      );
+      const toolMessage = bodies[1].messages.find(
+        (message: any) => message.role === "tool",
+      );
+      expect(toolMessage.tool_call_id).toBe("read-1");
+      expect(toolMessage.content).toContain("doctor-visible");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses a v3 result schema when requesting structured output", async () => {
+    const bodies: any[] = [];
+    const responses = [
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      assistantResponse({
+        role: "assistant",
+        content: JSON.stringify(passResult("V3 result.")),
+      }),
+    ];
+    const prepared = setup("C:\\workspace", {
+      fetch: fetchMock(async (_input, init) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return responses.shift()!;
+      }),
+    });
+
+    expect(terminal(await collect(prepared.adapter, prepared.input)).type).toBe(
+      "result",
+    );
+    expect(
+      bodies[1].response_format.json_schema.schema.properties.schema_version
+        .const,
+    ).toBe("3");
+  });
+
+  it("retains the same session affinity across streamed tool and result turns", async () => {
+    const sessions: Array<string | null> = [];
+    const responses = [
       assistantResponse({
         role: "assistant",
         content: null,
@@ -133,54 +456,30 @@ describe("OpenAI-compatible adapter", () => {
           },
         ],
       }),
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
       assistantResponse({
         role: "assistant",
-        content: JSON.stringify({ ok: true }),
+        content: JSON.stringify(passResult("Affinity.")),
       }),
     ];
     const prepared = setup("C:\\workspace", {
-      fetch: fetchMock(async (input, init) => {
-        requests.push({
-          url: String(input),
-          ...(init === undefined ? {} : { init }),
-          ...(typeof init?.body === "string"
-            ? { body: JSON.parse(init.body) }
-            : {}),
-        });
+      fetch: fetchMock(async (_input, init) => {
+        sessions.push(
+          new Headers(init?.headers).get("X-Client-Session-Id"),
+        );
         return responses.shift()!;
       }),
       sessionIdFactory: () => "doctor-session",
     });
 
-    expect(prepared.adapter.doctor).toBeDefined();
-    const result = await prepared.adapter.doctor!(
-      prepared.reviewer,
-      prepared.controller.signal,
+    expect(terminal(await collect(prepared.adapter, prepared.input)).type).toBe(
+      "result",
     );
-
-    expect(result).toEqual({
-      ready: true,
-      checks: [
-        { name: "authentication", passed: true },
-        { name: "model", passed: true },
-        { name: "tool_calling", passed: true },
-        { name: "structured_output", passed: true },
-      ],
-    });
-    expect(requests.map((request) => request.url)).toEqual([
-      "https://gateway.example/v1/models",
-      "https://gateway.example/v1/chat/completions",
-      "https://gateway.example/v1/chat/completions",
+    expect(sessions).toEqual([
+      "doctor-session",
+      "doctor-session",
+      "doctor-session",
     ]);
-    expect(requests[1]?.body.tool_choice).toBe("required");
-    expect(requests[2]?.body.response_format?.type).toBe("json_schema");
-    expect(
-      requests
-        .slice(1)
-        .map((request) =>
-          new Headers(request.init?.headers).get("X-Client-Session-Id"),
-        ),
-    ).toEqual(["doctor-session", "doctor-session"]);
   });
 
   it("uses only bounded direct read tools and validates a strict final result", async () => {
@@ -447,7 +746,7 @@ describe("OpenAI-compatible adapter", () => {
     }
   });
 
-  it("retries a finalization envelope failure from the inspection checkpoint", async () => {
+  it("retries an empty HTTP-200 envelope once in place with the identical request", async () => {
     const bodies: any[] = [];
     const responses = [
       assistantResponse({ role: "assistant", content: "Inspection complete." }),
@@ -458,7 +757,7 @@ describe("OpenAI-compatible adapter", () => {
       }),
     ];
     const prepared = setup("C:\\workspace", {
-      finalizationAttempts: 2,
+      finalizationAttempts: 1,
       fetch: fetchMock(async (_input, init) => {
         bodies.push(JSON.parse(String(init?.body)));
         return responses.shift()!;
@@ -472,11 +771,27 @@ describe("OpenAI-compatible adapter", () => {
     });
     expect(bodies).toHaveLength(3);
     expect(bodies[1].messages).toEqual(bodies[2].messages);
+    expect(bodies[1]).toEqual(bodies[2]);
   });
 
-  it("recovers output truncation from the inspection checkpoint with a compact larger-budget finalization", async () => {
+  it("assembles exact continuation fragments without compacting or repeating inspection", async () => {
     const bodies: any[] = [];
+    const encoded = JSON.stringify(passResult("Exact continuation."));
+    const first = encoded.slice(0, 47);
+    const second = encoded.slice(47, 131);
+    const third = encoded.slice(131);
     const responses = [
+      assistantResponse({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "list-1",
+            type: "function",
+            function: { name: "list_files", arguments: "{}" },
+          },
+        ],
+      }),
       assistantResponse({ role: "assistant", content: "Inspection complete." }),
       jsonResponse({
         choices: [
@@ -484,7 +799,18 @@ describe("OpenAI-compatible adapter", () => {
             finish_reason: "length",
             message: {
               role: "assistant",
-              content: '{"schema_version":"2","verdict":',
+              content: first,
+            },
+          },
+        ],
+      }),
+      jsonResponse({
+        choices: [
+          {
+            finish_reason: "length",
+            message: {
+              role: "assistant",
+              content: second,
             },
           },
         ],
@@ -495,14 +821,14 @@ describe("OpenAI-compatible adapter", () => {
             finish_reason: "stop",
             message: {
               role: "assistant",
-              content: JSON.stringify(passResult("Compact recovery.")),
+              content: third,
             },
           },
         ],
       }),
     ];
     const prepared = setup("C:\\workspace", {
-      finalizationAttempts: 2,
+      finalizationAttempts: 3,
       fetch: fetchMock(async (_input, init) => {
         bodies.push(JSON.parse(String(init?.body)));
         return responses.shift()!;
@@ -511,24 +837,20 @@ describe("OpenAI-compatible adapter", () => {
 
     expect(terminal(await collect(prepared.adapter, prepared.input))).toEqual({
       type: "result",
-      result: passResult("Compact recovery."),
+      result: passResult("Exact continuation."),
       isolation: "runtime_read_only",
     });
-    expect(bodies).toHaveLength(3);
-    expect(bodies.filter((body) => body.tools !== undefined)).toHaveLength(1);
-    expect(bodies[1].max_tokens).toBe(8_192);
-    expect(bodies[2].max_tokens).toBe(16_384);
-    expect(bodies[2].messages.slice(0, -1)).toEqual(bodies[1].messages);
-    expect(bodies[2].messages.at(-1).content).toContain(
-      "fresh, compact result",
-    );
-    expect(
-      bodies.some((body) =>
-        body.messages.some((message: any) =>
-          String(message.content).includes("previous final result was invalid"),
-        ),
-      ),
-    ).toBe(false);
+    expect(bodies).toHaveLength(5);
+    expect(bodies.filter((body) => body.tools !== undefined)).toHaveLength(2);
+    for (const body of bodies.slice(3)) {
+      expect(body.tools).toBeUndefined();
+      const text = JSON.stringify(body).toLowerCase();
+      expect(text).not.toContain("compact");
+      expect(text).not.toContain("shorten");
+      expect(text).toContain("exact stopping point");
+    }
+    expect(bodies[3].messages.at(-2).content).toBe(first);
+    expect(bodies[4].messages.at(-2).content).toBe(first + second);
   });
 
   it("reports exhausted output truncation as non-circuit-qualifying", async () => {

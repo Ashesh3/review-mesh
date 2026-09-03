@@ -68,11 +68,19 @@ afterEach(async () => {
 
 describe("managed configuration", () => {
   it("round-trips a native v4 configuration", () => {
-    const text = serializeManagedConfig(config());
-    expect(parseManagedConfig(text)).toEqual({
-      config: config(),
+    const configured = config();
+    configured.adapters.gateway = {
+      type: "openai_compatible",
+      base_url_env: "REVIEW_BASE_URL",
+      api_key_env: "REVIEW_API_KEY",
+      streaming: "required",
+    };
+    const serialized = serializeManagedConfig(configured);
+    expect(parseManagedConfig(serialized)).toEqual({
+      config: configured,
       migrated: false,
     });
+    expect(serialized).toContain('streaming = "required"');
   });
 
   it("round-trips ordered model runs with inherited and overridden adapters", () => {

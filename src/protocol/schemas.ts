@@ -320,6 +320,7 @@ export const adapterFailureDiagnosticsSchema = z.strictObject({
       "request_timeout",
       "transport_error",
       "response_too_large",
+      "streaming_unsupported",
     ])
     .optional(),
   failure_stage: z.string().min(1).max(64).optional(),
@@ -370,6 +371,10 @@ export const adapterFailureDiagnosticsSchema = z.strictObject({
   truncated: z.boolean().optional(),
   repair_attempted: z.boolean().optional(),
   repair_outcome: z.enum(["not_attempted", "succeeded", "failed"]).optional(),
+  attempt_count: positiveInteger.optional(),
+  retry_outcome: z
+    .enum(["not_attempted", "succeeded", "exhausted"])
+    .optional(),
 });
 export const reviewerTerminalRecordSchema = z.discriminatedUnion("status", [
   z.strictObject({

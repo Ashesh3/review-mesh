@@ -199,12 +199,13 @@ USAGE
   review-mesh doctor [WORKSPACE] [--adapter ID] [--model MODEL]
       [--structured-output]
 
-Preflights the resolved adapter/model roster before a long run. The structured
-mode verifies authentication, model availability, response-envelope parsing,
-and schema-constrained output where the adapter supports it. --adapter and
---model are exact, case-sensitive filters over the resolved reviewer roster and
-may be combined. The command fails without contacting a provider when no
-reviewer matches the requested selection.
+Preflights the resolved adapter/model roster before a long run. Structured mode
+runs the real reviewer execution mechanism against a Review Mesh-owned
+synthetic workspace. It verifies authentication/model readiness, streaming
+negotiation, read-tool execution, complete v3 result production, and schema
+validation with the selected model, effort, retry, continuation, and deadline
+rules. --adapter and --model are exact, case-sensitive filters. The command
+fails without contacting a provider when no reviewer matches the selection.
 `,
   config: `REVIEW-MESH CONFIG
 
@@ -335,6 +336,7 @@ that retained conversation without repeating repository tools.
 Supported trusted adapter types:
   openai_compatible  Embedded read-only agent loop. Config references base URL
                      and API key environment-variable names, never their values.
+                     streaming is auto, required, or disabled.
   command            External reviewer using review-mesh-command-v1 JSONL.
   copilot            GitHub Copilot SDK reviewer with login/model discovery.
   claude             Claude Agent SDK reviewer with read/search tools only.
