@@ -26,12 +26,14 @@ agent suite selected for a workspace, streams factual JSONL progress, waits for
 each agent's executed model chain, and exits only after run.completed.
 
 USAGE
-  review-mesh review [WORKSPACE]
+  review-mesh review [WORKSPACE] [--output-mode compact-jsonl] [--no-ansi]
+      [--heartbeat aggregate] [--details-file PATH]
   review-mesh status RUN_ID [REVIEWER_ID] [--json]
   review-mesh report RUN_ID [--format markdown|json]
   review-mesh findings RUN_ID [--deduplicate] [--json]
   review-mesh retry RUN_ID --only-incomplete
-  review-mesh doctor [WORKSPACE] [--structured-output]
+  review-mesh doctor [WORKSPACE] [--adapter ID] [--model MODEL]
+      [--structured-output]
   review-mesh describe [WORKSPACE] [--json]
   review-mesh schema list
   review-mesh schema NAME [--json]
@@ -79,7 +81,8 @@ const pages: Record<Exclude<HelpTopic, "overview">, string> = {
   review: `REVIEW-MESH REVIEW
 
 USAGE
-  review-mesh review [WORKSPACE]
+  review-mesh review [WORKSPACE] [--output-mode compact-jsonl] [--no-ansi]
+      [--heartbeat aggregate] [--details-file PATH]
   <request.json review-mesh review
 
 WORKSPACE defaults to the current directory. If stdin is a terminal or is empty,
@@ -112,6 +115,11 @@ Use mode=full only when the caller explicitly asks for the entire codebase.
 During a run, consume stdout as JSONL until run.completed. The caller cannot
 disable, replace, reorder, or select mandatory reviewers. A positional WORKSPACE
 and a piped non-empty JSON request are mutually exclusive.
+
+Compact JSONL, no ANSI, and aggregate heartbeats are the defaults; the explicit
+flags document and enforce that integration contract. --details-file writes the
+sanitized detailed artifact to a new caller-selected path and fails rather than
+overwriting an existing file.
 
 Exit codes: 0 passed, 1 findings, 2 invalid request/config/usage,
 3 incomplete reviewer/runtime, 4 interrupted.
@@ -161,11 +169,15 @@ private run artifact; completed lens evidence remains available in the parent.
   doctor: `REVIEW-MESH DOCTOR
 
 USAGE
-  review-mesh doctor [WORKSPACE] [--structured-output]
+  review-mesh doctor [WORKSPACE] [--adapter ID] [--model MODEL]
+      [--structured-output]
 
 Preflights the resolved adapter/model roster before a long run. The structured
 mode verifies authentication, model availability, response-envelope parsing,
-and schema-constrained output where the adapter supports it.
+and schema-constrained output where the adapter supports it. --adapter and
+--model are exact, case-sensitive filters over the resolved reviewer roster and
+may be combined. The command fails without contacting a provider when no
+reviewer matches the requested selection.
 `,
   config: `REVIEW-MESH CONFIG
 
@@ -227,7 +239,8 @@ a review.
 The JSON form includes configuration status/path, workspace, resolved
 project_name, project_name_source, matched_project_name when configured,
 execution, diagnostics, and reviewers with id, purpose, adapter,
-adapter_type, model, optional effort, isolation_policy, timeout_ms,
+adapter_type, model, execution-order model_index, configured_model_index,
+optional effort, isolation_policy, timeout_ms,
 and instruction_sources. It never prints instructions, credentials, project
 context, environment values, or runtime option values.
 
@@ -269,7 +282,7 @@ share run_id, have strictly increasing seq values, and include timestamps.
 Sequence and meaning:
   run.started          A valid live-worktree run began.
   context.resolved     Canonical workspace and best-effort Git context.
-  suite.resolved       Exact roster plus concurrency and heartbeat settings.
+  suite.resolved       Lens summaries, model-run count, and execution settings.
   reviewer.progress    Capability probe, queue state, or adapter activity.
   reviewer.started     One reviewer started, with model/effort/timeout.
   suite.heartbeat      Aggregate liveness, deadlines, and stale activity.
@@ -286,7 +299,9 @@ High-frequency adapter activity is retained as latest status instead of being
 emitted once per tool action; query it with
 'review-mesh status RUN_ID [REVIEWER_ID] --json'. Retry count and backoff are
 trusted configuration; each attempt has a bounded deadline and fallback uses the
-remaining logical-lens budget.
+remaining logical-lens budget. The OpenAI-compatible adapter checkpoints its
+completed inspection and retries transient structured finalization/repair from
+that retained conversation without repeating repository tools.
 `,
   adapters: `REVIEW-MESH ADAPTERS
 
@@ -303,11 +318,15 @@ Every agent chooses a required default adapter plus either one exact model and
 optional effort, or ordered model_runs with explicit run ids, exact models,
 optional effort, and optional per-run adapter overrides. Multi-model agents
 expand to concrete reviewer ids such as architecture::opus and
-architecture::grok. Existing scalar agents retain their original ids. Global
-max_concurrency applies across logical agents. Each agent starts only its first
-configured model; it advances to the next model only after a valid pass with no
-actionable findings. Findings or an incomplete run stop that agent's remaining
-models, which are reported as skipped. Use 'review-mesh schema config --json'
+architecture::grok. Current v5 configuration distributes primaries by default:
+successive multi-model logical lenses rotate their configured model runs
+cyclically, while scalar lenses do not consume a rotation slot. Set
+execution.distribute_primaries=false to preserve declaration order for every
+lens; migrated v1-v4 configurations use false for compatibility. Existing
+scalar agents retain their original ids. Global max_concurrency applies across
+logical agents. Each agent starts its effective primary model and advances
+through its cyclic order after a clean pass or operational failure until quorum,
+findings, or exhaustion. Use 'review-mesh schema config --json'
 for the authoritative shapes, 'review-mesh config copilot models --json' for
 account-specific Copilot models, and 'review-mesh describe . --json' for the
 exact effective roster. Provider readiness is probed when each model becomes
@@ -337,8 +356,9 @@ adapter protocol section for full request and limit details.
 Review Mesh uses one trusted global config.toml. Run 'review-mesh config path'
 for its exact platform path. Workspace .review-mesh.toml files are ignored.
 
-Schema version 4 contains:
-  execution    max concurrency, heartbeat interval, shutdown grace
+Schema version 5 contains:
+  execution    max concurrency, heartbeat interval, shutdown grace, primary
+               distribution, provider limits, circuit breaking, and retries
   diagnostics  sanitized run persistence and retention
   adapters     trusted runtime registrations and environment-variable names
   agents       scalar model/effort or model_runs, purpose, instructions,

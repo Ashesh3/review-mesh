@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { dirname } from "node:path";
+import { constants } from "node:fs";
+import { lstat, open, readFile, rm, type FileHandle } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { createCommandAdapter } from "./adapters/command.js";
 import { AdapterRegistry } from "./adapters/registry.js";
 import { loadConfigFiles } from "./config/load.js";
@@ -26,6 +28,7 @@ export interface ReviewApplicationOptions {
   appPaths?: AppPaths;
   parentRunId?: string;
   onlyLensIds?: readonly string[];
+  detailsFile?: string;
 }
 
 export class ReviewRunError extends Error {
@@ -87,6 +90,9 @@ function resolvedRunHeader(config: ReturnType<typeof resolveConfig>) {
       ...(reviewer.modelIndex === undefined
         ? {}
         : { model_index: reviewer.modelIndex }),
+      ...(reviewer.configuredModelIndex === undefined
+        ? {}
+        : { configured_model_index: reviewer.configuredModelIndex }),
       ...(reviewer.modelCount === undefined
         ? {}
         : { model_count: reviewer.modelCount }),
@@ -192,15 +198,63 @@ export async function runReviewApplication(
 
   const runId = (options.runIdFactory ?? (() => `run_${randomUUID()}`))();
   const appPaths = options.appPaths ?? getAppPaths();
-  const recorder = config.diagnostics.persist_runs
-    ? createRunRecorder({
-        runsDirectory: appPaths.runsDirectory,
-        applicationDataRoot: dirname(appPaths.runsDirectory),
-        runId,
-        maxRuns: config.diagnostics.max_runs,
-        resolution: resolvedRunHeader(config),
-      })
-    : undefined;
+  let detailsHandle: FileHandle | undefined;
+  let detailsTargetCreated = false;
+  let detailsIdentity:
+    { dev: number; ino: number; size: number; mtimeMs: number } | undefined;
+  if (options.detailsFile !== undefined) {
+    try {
+      detailsHandle = await open(
+        options.detailsFile,
+        constants.O_WRONLY |
+          constants.O_CREAT |
+          constants.O_EXCL |
+          (constants.O_NOFOLLOW ?? 0),
+        0o600,
+      );
+      detailsTargetCreated = true;
+      const opened = await detailsHandle.stat();
+      const target = await lstat(options.detailsFile);
+      if (
+        !opened.isFile() ||
+        !target.isFile() ||
+        target.isSymbolicLink() ||
+        opened.dev !== target.dev ||
+        opened.ino !== target.ino
+      ) {
+        throw new Error("details file identity is unsafe");
+      }
+      detailsIdentity = {
+        dev: opened.dev,
+        ino: opened.ino,
+        size: opened.size,
+        mtimeMs: opened.mtimeMs,
+      };
+    } catch {
+      await detailsHandle?.close().catch(() => undefined);
+      detailsHandle = undefined;
+      if (detailsTargetCreated) {
+        await rm(options.detailsFile, { force: true }).catch(() => undefined);
+        detailsTargetCreated = false;
+      }
+      await writeDiagnostic(
+        options.stderr,
+        "details_file_unavailable",
+        "The requested details file must be a new writable regular file.",
+      );
+      return 2;
+    }
+  }
+  const recorder =
+    config.diagnostics.persist_runs || options.detailsFile !== undefined
+      ? createRunRecorder({
+          runsDirectory: appPaths.runsDirectory,
+          applicationDataRoot: dirname(appPaths.runsDirectory),
+          runId,
+          maxRuns: config.diagnostics.max_runs,
+          resolution: resolvedRunHeader(config),
+        })
+      : undefined;
   const writer = createEventWriter({
     output: options.stdout,
     runId,
@@ -220,6 +274,7 @@ export async function runReviewApplication(
   });
 
   try {
+    const internalReportPath = join(appPaths.runsDirectory, `${runId}.jsonl`);
     const completion = await runReviewRound({
       runId,
       ...(request.request_id === undefined
@@ -239,12 +294,45 @@ export async function runReviewApplication(
         : { onlyLensIds: options.onlyLensIds }),
       ...(recorder === undefined
         ? {}
-        : { reportPath: `${appPaths.runsDirectory}\\${runId}.jsonl` }),
+        : { reportPath: options.detailsFile ?? internalReportPath }),
     });
+    if (detailsHandle !== undefined) {
+      const current = await detailsHandle.stat();
+      const target = await lstat(options.detailsFile!);
+      if (
+        detailsIdentity === undefined ||
+        !current.isFile() ||
+        !target.isFile() ||
+        target.isSymbolicLink() ||
+        current.dev !== detailsIdentity.dev ||
+        current.ino !== detailsIdentity.ino ||
+        target.dev !== detailsIdentity.dev ||
+        target.ino !== detailsIdentity.ino ||
+        current.size !== detailsIdentity.size ||
+        current.mtimeMs !== detailsIdentity.mtimeMs
+      ) {
+        throw new Error("details file changed before publication");
+      }
+      await detailsHandle.writeFile(await readFile(internalReportPath), {
+        encoding: undefined,
+      });
+      await detailsHandle.sync();
+      await detailsHandle.close();
+      detailsHandle = undefined;
+      detailsTargetCreated = false;
+      if (!config.diagnostics.persist_runs) {
+        await rm(internalReportPath, { force: true });
+      }
+    }
     return completion.exitCode;
   } catch (error) {
     const failure = new ReviewRunError(error);
     await writeDiagnostic(options.stderr, "review_failed", failure.message);
     return 3;
+  } finally {
+    await detailsHandle?.close().catch(() => undefined);
+    if (detailsTargetCreated && options.detailsFile !== undefined) {
+      await rm(options.detailsFile, { force: true }).catch(() => undefined);
+    }
   }
 }

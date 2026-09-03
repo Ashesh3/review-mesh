@@ -199,6 +199,7 @@ append_instructions = "extra"
     const result = parseManagedConfig(legacy);
     expect(result.migrated).toBe(true);
     expect(result.config.defaults?.agents).toEqual(["agent-one"]);
+    expect(result.config.execution.distribute_primaries).toBe(false);
     expect(result.config.agents["agent-one"]?.instructions).toBe(
       "base\n\nextra",
     );
@@ -212,10 +213,21 @@ append_instructions = "extra"
     const result = parseManagedConfig(legacyV2);
     expect(result.migrated).toBe(true);
     expect(result.config.schema_version).toBe("5");
+    expect(result.config.execution.distribute_primaries).toBe(false);
     expect(result.config.agents.gemini).toMatchObject({
       model: "gemini-flash",
       effort: "high",
     });
+  });
+
+  it("preserves configured primary order when promoting v4 to v5", () => {
+    const legacyV4 = serializeManagedConfig(config()).replace(
+      'schema_version = "5"',
+      'schema_version = "4"',
+    );
+    const result = parseManagedConfig(legacyV4);
+    expect(result).toMatchObject({ migrated: true });
+    expect(result.config.execution.distribute_primaries).toBe(false);
   });
 
   it("migrates path-keyed v3 projects to names and rejects collisions", () => {
@@ -226,6 +238,7 @@ append_instructions = "extra"
     };
     const migrated = parseManagedConfig(`${stringify(legacyV3)}\n`);
     expect(migrated.migrated).toBe(true);
+    expect(migrated.config.execution.distribute_primaries).toBe(false);
     expect(migrated.config.projects).toEqual({
       payments: { agents: ["gemini"] },
     });

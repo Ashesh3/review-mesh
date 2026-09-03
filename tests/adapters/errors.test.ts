@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   adapterFailure,
   sanitizeAdapterFailure,
+  sanitizePublicText,
 } from "../../src/adapters/errors.js";
 
 describe("adapter failure diagnostics", () => {
@@ -70,6 +71,16 @@ describe("adapter failure diagnostics", () => {
     expect(encoded).not.toContain("github_pat_");
     expect(encoded).not.toContain("azure-secret");
     expect(encoded).not.toContain("client_secret=value");
+  });
+
+  it("redacts and bounds arbitrary public text without creating a failure", () => {
+    const text = sanitizePublicText(
+      `client_secret=public-secret ${"x".repeat(100)}`,
+      32,
+    );
+    expect(text).toContain("[redacted]");
+    expect(text).not.toContain("public-secret");
+    expect(text?.length).toBeLessThanOrEqual(32);
   });
 
   it("drops invalid numeric and enumerated diagnostic fields", () => {

@@ -332,6 +332,7 @@ const executionSchema = z.strictObject({
   max_concurrency: positiveInteger,
   heartbeat_interval_ms: positiveInteger,
   shutdown_grace_period_ms: positiveInteger,
+  distribute_primaries: z.boolean().optional(),
   default_provider_concurrency: positiveInteger.optional(),
   provider_limits: z.record(nonEmptyString, positiveInteger).optional(),
   circuit_breaker_threshold: positiveInteger.optional(),
@@ -386,38 +387,6 @@ const publicEventSchemas = [
             pass_quorum: positiveInteger,
             minimum_provider_groups: positiveInteger,
             adjudication: z.enum(["off", "required"]),
-          }),
-        )
-        .optional(),
-      total: nonNegativeInteger.optional(),
-      reviewers: z
-        .array(
-          z.strictObject({
-            id: nonEmptyString,
-            agent_id: nonEmptyString,
-            model_index: nonNegativeInteger,
-            model_count: positiveInteger,
-            previous_reviewer_id: nonEmptyString.optional(),
-            activation: z.enum([
-              "immediate",
-              "after_clear_pass",
-              "after_lens_progress",
-            ]),
-            purpose: nonEmptyString,
-            adapter: nonEmptyString,
-            adapter_type: z.enum([
-              "copilot",
-              "claude",
-              "codex",
-              "openai_compatible",
-              "command",
-            ]),
-            model: nonEmptyString,
-            effort: reasoningEffortSchema.optional(),
-            provider_group: nonEmptyString.optional(),
-            isolation_policy: isolationPolicySchema,
-            timeout_ms: positiveInteger,
-            instruction_sources: z.array(nonEmptyString),
           }),
         )
         .optional(),

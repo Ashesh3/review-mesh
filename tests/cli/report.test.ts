@@ -359,4 +359,178 @@ describe("report and findings commands", () => {
     expect(process.exitCode).toBe(0);
     process.exitCode = undefined;
   });
+
+  it("filters doctor by exact adapter and model before creating adapters", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-mesh-doctor-filter-"));
+    roots.push(root);
+    const workspace = join(root, "demo");
+    const configFile = join(root, "config.toml");
+    await mkdir(workspace);
+    const config: ManagedConfig = {
+      schema_version: "5",
+      execution: {
+        max_concurrency: 1,
+        heartbeat_interval_ms: 1_000,
+        shutdown_grace_period_ms: 100,
+      },
+      diagnostics: { persist_runs: false, max_runs: 1 },
+      adapters: {
+        first: {
+          type: "command",
+          command: "first",
+          protocol: "review-mesh-command-v1",
+        },
+        second: {
+          type: "command",
+          command: "second",
+          protocol: "review-mesh-command-v1",
+        },
+      },
+      agents: {
+        first: {
+          adapter: "first",
+          model: "shared-model",
+          purpose: "First",
+          instructions: "First.",
+          isolation: "prefer_enforced",
+          timeout_ms: 1_000,
+        },
+        second: {
+          adapter: "second",
+          model: "shared-model",
+          purpose: "Second",
+          instructions: "Second.",
+          isolation: "prefer_enforced",
+          timeout_ms: 1_000,
+        },
+      },
+      defaults: { agents: ["first", "second"] },
+      projects: {},
+    };
+    await writeFile(configFile, serializeManagedConfig(config));
+
+    const created: string[] = [];
+    const probed: string[] = [];
+    const registry = new AdapterRegistry();
+    registry.register("command", (registration) => {
+      if (registration.type !== "command") throw new Error("expected command");
+      created.push(registration.command);
+      return {
+        id: registration.command,
+        async probe(reviewer) {
+          probed.push(reviewer.id);
+          return {
+            available: true,
+            authenticated: true,
+            model_available: true,
+            streaming: false,
+            cancellation: true,
+            maximumIsolation: "prompt_only",
+          };
+        },
+        async *run() {
+          throw new Error("not used");
+        },
+      };
+    });
+    const stdout = stream();
+    await runCli(process, {
+      argv: [
+        "doctor",
+        workspace,
+        "--adapter",
+        "second",
+        "--model",
+        "shared-model",
+      ],
+      output: stdout,
+      error: stream(),
+      configFile,
+      adapterRegistry: registry,
+    });
+
+    expect(created).toEqual(["second"]);
+    expect(probed).toEqual(["second"]);
+    expect(JSON.parse(await output(stdout))).toMatchObject({
+      ready: true,
+      reviewers: [{ reviewer_id: "second", adapter: "second" }],
+    });
+    process.exitCode = undefined;
+  });
+
+  it("fails doctor selection cleanly when no exact reviewer matches", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-mesh-doctor-empty-"));
+    roots.push(root);
+    const workspace = join(root, "demo");
+    const configFile = join(root, "config.toml");
+    await mkdir(workspace);
+    const config: ManagedConfig = {
+      schema_version: "5",
+      execution: {
+        max_concurrency: 1,
+        heartbeat_interval_ms: 1_000,
+        shutdown_grace_period_ms: 100,
+      },
+      diagnostics: { persist_runs: false, max_runs: 1 },
+      adapters: {
+        fake: {
+          type: "command",
+          command: "unused",
+          protocol: "review-mesh-command-v1",
+        },
+      },
+      agents: {
+        security: {
+          adapter: "fake",
+          model: "review-model",
+          purpose: "Security",
+          instructions: "Review security.",
+          isolation: "prefer_enforced",
+          timeout_ms: 1_000,
+        },
+      },
+      defaults: { agents: ["security"] },
+      projects: {},
+    };
+    await writeFile(configFile, serializeManagedConfig(config));
+    const error = stream();
+    let created = 0;
+    const registry = new AdapterRegistry();
+    registry.register("command", () => {
+      created += 1;
+      throw new Error("must not create an unselected adapter");
+    });
+
+    await runCli(process, {
+      argv: ["doctor", workspace, "--model", "missing-model"],
+      output: stream(),
+      error,
+      configFile,
+      adapterRegistry: registry,
+    });
+
+    expect(created).toBe(0);
+    expect(JSON.parse(await output(error))).toMatchObject({
+      kind: "review-mesh.diagnostic",
+      error: "doctor_selection_empty",
+      retryable: false,
+    });
+    expect(process.exitCode).toBe(2);
+    process.exitCode = undefined;
+  });
+
+  it("rejects missing or repeated doctor selector values as usage errors", async () => {
+    for (const argv of [
+      ["doctor", "--adapter"],
+      ["doctor", "--model", "one", "--model", "two"],
+    ]) {
+      const error = stream();
+      await runCli(process, { argv, output: stream(), error });
+      expect(JSON.parse(await output(error))).toMatchObject({
+        error: "invalid_usage",
+        retryable: false,
+      });
+      process.exitCode = undefined;
+    }
+  });
 });

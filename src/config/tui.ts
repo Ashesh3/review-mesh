@@ -775,6 +775,13 @@ async function editSettings(options: ConfigMenuOptions): Promise<void> {
     ),
     "shutdown grace period",
   );
+  execution.distribute_primaries = yes(
+    await answer(
+      options.prompt,
+      `Distribute multi-model primaries across logical lenses? [${execution.distribute_primaries !== false ? "Y/n" : "y/N"}]: `,
+      execution.distribute_primaries !== false ? "y" : "n",
+    ),
+  );
   diagnostics.persist_runs = yes(
     await answer(
       options.prompt,

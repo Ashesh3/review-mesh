@@ -75,6 +75,8 @@ it("redacts credentials embedded in persisted string values", async () => {
     values: [
       "https://user:password@example.test/path?token=abc",
       "client_secret=super-secret",
+      "Authorization: Bearer spaced-bearer-secret",
+      "Authorization=Bearer equals-bearer-secret",
       "DefaultEndpointsProtocol=https;AccountName=demo;AccountKey=key-value;EndpointSuffix=core.windows.net",
     ],
   });
@@ -85,6 +87,8 @@ it("redacts credentials embedded in persisted string values", async () => {
   );
   expect(persisted).not.toContain("password");
   expect(persisted).not.toContain("super-secret");
+  expect(persisted).not.toContain("spaced-bearer-secret");
+  expect(persisted).not.toContain("equals-bearer-secret");
   expect(persisted).not.toContain("key-value");
 });
 

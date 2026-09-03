@@ -142,6 +142,65 @@ describe("v6 review feedback semantics", () => {
     });
   });
 
+  it("keeps rotated-primary identities out of the compact public suite", async () => {
+    const first = fakeAdapterReturning(passResult("First."));
+    const second = fakeAdapterReturning(passResult("Second."));
+    const third = fakeAdapterReturning(passResult("Third."));
+    const events: PublicEvent[] = [];
+    await runReviewRound(
+      roundInput({
+        adapters: { first, second, third },
+        onEvent: (event) => events.push(event),
+        config: {
+          execution: { distribute_primaries: true },
+          reviewers: [
+            {
+              id: "security::b",
+              agentId: "security",
+              modelIndex: 0,
+              configuredModelIndex: 1,
+              modelCount: 3,
+            },
+            {
+              id: "security::c",
+              agentId: "security",
+              modelIndex: 1,
+              configuredModelIndex: 2,
+              modelCount: 3,
+              previousReviewerId: "security::b",
+            },
+            {
+              id: "security::a",
+              agentId: "security",
+              modelIndex: 2,
+              configuredModelIndex: 0,
+              modelCount: 3,
+              previousReviewerId: "security::c",
+            },
+          ],
+        },
+      }),
+    );
+
+    expect(
+      events.find((event) => event.event === "suite.resolved"),
+    ).toMatchObject({
+      data: {
+        execution: { distribute_primaries: true },
+        lenses: [
+          {
+            id: "security",
+            model_runs: 3,
+          },
+        ],
+      },
+    });
+    const suite = events.find((event) => event.event === "suite.resolved");
+    expect(JSON.stringify(suite)).not.toMatch(
+      /security::a|security::b|security::c|execution_order/u,
+    );
+  });
+
   it("enforces the configured provider concurrency independently of suite concurrency", async () => {
     let active = 0;
     let peak = 0;

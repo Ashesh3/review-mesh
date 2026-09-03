@@ -386,6 +386,270 @@ describe("OpenAI-compatible adapter", () => {
     expect(JSON.stringify(event)).not.toContain("provider-secret");
   });
 
+  it("retries result production from a checkpoint without repeating inspection tools", async () => {
+    const root = await mkdtemp(
+      join(process.env.TEMP ?? "C:\\Temp", "mesh-oai-checkpoint-"),
+    );
+    await writeFile(join(root, "reviewed.txt"), "evidence\n");
+    const bodies: any[] = [];
+    const responses = [
+      assistantResponse({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "inspect-once",
+            type: "function",
+            function: { name: "list_files", arguments: "{}" },
+          },
+        ],
+      }),
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      jsonResponse({ error: "temporary" }, 503),
+      assistantResponse({
+        role: "assistant",
+        content: JSON.stringify(passResult("Recovered finalization.")),
+      }),
+    ];
+    let snapshotBuilds = 0;
+    const prepared = setup(root, {
+      finalizationAttempts: 2,
+      workspaceHooks: {
+        snapshotBuildPaused: () => {
+          snapshotBuilds += 1;
+        },
+      },
+      fetch: fetchMock(async (_input, init) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return responses.shift()!;
+      }),
+    });
+
+    try {
+      expect(terminal(await collect(prepared.adapter, prepared.input))).toEqual(
+        {
+          type: "result",
+          result: passResult("Recovered finalization."),
+          isolation: "runtime_read_only",
+        },
+      );
+      expect(snapshotBuilds).toBe(1);
+      expect(bodies).toHaveLength(4);
+      expect(bodies.filter((body) => body.tools !== undefined)).toHaveLength(2);
+      expect(
+        bodies[1].messages.filter((message: any) => message.role === "tool"),
+      ).toHaveLength(1);
+      expect(bodies[2].messages).toEqual(bodies[3].messages);
+      expect(bodies[2].tools).toBeUndefined();
+      expect(bodies[3].tools).toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("retries a finalization envelope failure from the inspection checkpoint", async () => {
+    const bodies: any[] = [];
+    const responses = [
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      jsonResponse({ choices: [] }),
+      assistantResponse({
+        role: "assistant",
+        content: JSON.stringify(passResult("Recovered envelope.")),
+      }),
+    ];
+    const prepared = setup("C:\\workspace", {
+      finalizationAttempts: 2,
+      fetch: fetchMock(async (_input, init) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return responses.shift()!;
+      }),
+    });
+
+    expect(terminal(await collect(prepared.adapter, prepared.input))).toEqual({
+      type: "result",
+      result: passResult("Recovered envelope."),
+      isolation: "runtime_read_only",
+    });
+    expect(bodies).toHaveLength(3);
+    expect(bodies[1].messages).toEqual(bodies[2].messages);
+  });
+
+  it("retries from the checkpoint when structured-result repair transport fails", async () => {
+    const bodies: any[] = [];
+    const responses = [
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      assistantResponse({ role: "assistant", content: "not json" }),
+      jsonResponse({ error: "temporary" }, 503),
+      assistantResponse({
+        role: "assistant",
+        content: JSON.stringify(passResult("Recovered repair transport.")),
+      }),
+    ];
+    const prepared = setup("C:\\workspace", {
+      finalizationAttempts: 2,
+      fetch: fetchMock(async (_input, init) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return responses.shift()!;
+      }),
+    });
+
+    expect(terminal(await collect(prepared.adapter, prepared.input))).toEqual({
+      type: "result",
+      result: passResult("Recovered repair transport."),
+      isolation: "runtime_read_only",
+    });
+    expect(bodies).toHaveLength(4);
+    expect(bodies[1].messages).toEqual(bodies[3].messages);
+    expect(bodies[2].messages).not.toEqual(bodies[3].messages);
+  });
+
+  it("retries from the checkpoint after one complete invalid-result cycle", async () => {
+    const bodies: any[] = [];
+    const responses = [
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      assistantResponse({ role: "assistant", content: "not json" }),
+      assistantResponse({ role: "assistant", content: "still not json" }),
+      assistantResponse({
+        role: "assistant",
+        content: JSON.stringify(passResult("Recovered invalid result.")),
+      }),
+    ];
+    const prepared = setup("C:\\workspace", {
+      finalizationAttempts: 2,
+      fetch: fetchMock(async (_input, init) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return responses.shift()!;
+      }),
+    });
+
+    expect(terminal(await collect(prepared.adapter, prepared.input))).toEqual({
+      type: "result",
+      result: passResult("Recovered invalid result."),
+      isolation: "runtime_read_only",
+    });
+    expect(bodies).toHaveLength(4);
+    expect(bodies[1].messages).toEqual(bodies[3].messages);
+    expect(bodies[2].messages.at(-1).content).toContain(
+      "previous final result was invalid",
+    );
+  });
+
+  it("does not retry permanent finalization failures", async () => {
+    const mockedFetch = fetchMock(async (_input, init) => {
+      const body = JSON.parse(String(init?.body));
+      return body.tools === undefined
+        ? jsonResponse({ error: "unauthorized" }, 401)
+        : assistantResponse({
+            role: "assistant",
+            content: "Inspection complete.",
+          });
+    });
+    const prepared = setup("C:\\workspace", {
+      finalizationAttempts: 3,
+      fetch: mockedFetch,
+    });
+
+    expect(
+      terminal(await collect(prepared.adapter, prepared.input)),
+    ).toMatchObject({
+      type: "failure",
+      failure: { reason: "authentication_failed", retryable: false },
+      isolation: "runtime_read_only",
+    });
+    expect(mockedFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("bounds checkpoint retries with an explicit finalization deadline", async () => {
+    let now = 1_000;
+    const mockedFetch = fetchMock(async (_input, init) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.tools !== undefined) {
+        return assistantResponse({
+          role: "assistant",
+          content: "Inspection complete.",
+        });
+      }
+      now = 1_100;
+      return jsonResponse({ error: "temporary" }, 503);
+    });
+    const prepared = setup("C:\\workspace", {
+      finalizationAttempts: 3,
+      requestTimeoutMs: 10,
+      now: () => now,
+      fetch: mockedFetch,
+    });
+
+    expect(
+      terminal(await collect(prepared.adapter, prepared.input)),
+    ).toMatchObject({
+      type: "failure",
+      failure: {
+        reason: "timeout",
+        retryable: false,
+        fallback_eligible: true,
+        diagnostics: { failure_stage: "structured_result_deadline" },
+      },
+      isolation: "runtime_read_only",
+    });
+    expect(mockedFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("prevents an outer full-inspection retry after checkpoint recovery is exhausted", async () => {
+    const responses = [
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      jsonResponse({ error: "temporary" }, 503),
+      jsonResponse({ error: "still temporary" }, 503),
+    ];
+    const mockedFetch = fetchMock(async () => responses.shift()!);
+    const prepared = setup("C:\\workspace", {
+      finalizationAttempts: 2,
+      fetch: mockedFetch,
+    });
+
+    expect(
+      terminal(await collect(prepared.adapter, prepared.input)),
+    ).toMatchObject({
+      type: "failure",
+      failure: {
+        reason: "unknown",
+        retryable: false,
+        fallback_eligible: true,
+        diagnostics: { failure_stage: "http_response", http_status: 503 },
+      },
+      isolation: "runtime_read_only",
+    });
+    expect(mockedFetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("cancels during checkpoint recovery without starting another finalization", async () => {
+    const controller = new AbortController();
+    const mockedFetch = fetchMock(async (_input, init) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.tools !== undefined) {
+        return assistantResponse({
+          role: "assistant",
+          content: "Inspection complete.",
+        });
+      }
+      controller.abort(new Error("cancel result production"));
+      return jsonResponse({ error: "temporary" }, 503);
+    });
+    const prepared = setup(
+      "C:\\workspace",
+      { finalizationAttempts: 3, fetch: mockedFetch },
+      { signal: controller.signal },
+    );
+
+    expect(
+      terminal(await collect(prepared.adapter, prepared.input)),
+    ).toMatchObject({
+      type: "failure",
+      failure: { reason: "cancelled", retryable: false },
+      isolation: "runtime_read_only",
+    });
+    expect(mockedFetch).toHaveBeenCalledTimes(2);
+  });
+
   it("repairs a semantic schema mismatch using bounded structural diagnostics", async () => {
     const bodies: any[] = [];
     const secret = "provider-secret-must-not-propagate";
@@ -578,7 +842,10 @@ describe("OpenAI-compatible adapter", () => {
       assistantResponse({ role: "assistant", content: "still not json" }),
     ];
     const mockedFetch = fetchMock(async () => responses.shift()!);
-    const prepared = setup("C:\\workspace", { fetch: mockedFetch });
+    const prepared = setup("C:\\workspace", {
+      fetch: mockedFetch,
+      finalizationAttempts: 1,
+    });
 
     expect(
       terminal(await collect(prepared.adapter, prepared.input)),
@@ -1910,6 +2177,7 @@ describe("OpenAI-compatible adapter", () => {
     ];
     const prepared = setup("C:\\workspace", {
       fetch: fetchMock(async () => responses.shift()!),
+      finalizationAttempts: 1,
     });
 
     expect(

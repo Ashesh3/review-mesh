@@ -43,7 +43,8 @@ not need this README to discover the contract:
 review-mesh --help
 review-mesh describe . --json
 review-mesh schema request --json
-review-mesh doctor . --structured-output
+review-mesh doctor . --adapter gateway --model claude-opus-5 --structured-output
+review-mesh review . --output-mode compact-jsonl --no-ansi --heartbeat aggregate --details-file review-details.jsonl
 review-mesh config --help
 ```
 
@@ -73,7 +74,7 @@ For an AI caller, identity and scope are separate:
 
 ### Download a standalone executable
 
-Release `v6.0.0` provides operational multi-provider fallback, project-name
+Release `v6.1.0` provides operational multi-provider fallback, project-name
 configuration, per-reviewer gateway session affinity, the agent-first CLI,
 public event protocol v5, compact reporting, and
 self-contained Bun executables that do not require Node.js or Bun:
@@ -84,14 +85,14 @@ self-contained Bun executables that do not require Node.js or Bun:
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v5.0.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
+Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v6.1.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
 .\review-mesh.exe review
 ```
 
 Linux:
 
 ```bash
-curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v5.0.0/review-mesh-linux-x64
+curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v6.1.0/review-mesh-linux-x64
 chmod +x ./review-mesh-linux-x64
 ./review-mesh-linux-x64 review
 ```
@@ -231,6 +232,12 @@ codebase audit.
 
 The built-in `openai_compatible` adapter works with an OpenAI Chat Completions-compatible gateway. It is fully embedded in `review-mesh.mjs`, so no external reviewer script is needed. Each concrete reviewer execution sends one opaque random `X-Client-Session-Id` across all of its inspection, tool-result, finalization, and repair requests. Gateways such as copilot-api can use that stable per-reviewer affinity key to keep a conversation on one account while distributing independent reviewers across eligible accounts.
 
+Repository inspection is checkpointed before structured result production. If
+finalization or its bounded repair fails transiently, the adapter retries from
+the retained immutable conversation instead of repeating repository tools and
+inspection. Permanent failures stop immediately, and every finalization cycle
+remains bounded by the reviewer deadline.
+
 Set credentials in environment variables, not TOML.
 
 PowerShell, current session:
@@ -271,6 +278,7 @@ schema_version = "5"
 max_concurrency = 2
 heartbeat_interval_ms = 15000
 shutdown_grace_period_ms = 5000
+distribute_primaries = true
 default_provider_concurrency = 2
 circuit_breaker_threshold = 2
 retry_attempts = 2
@@ -400,15 +408,24 @@ use letters, numbers, underscores, and hyphens and must be unique within the
 agent.
 
 Review Mesh expands that example into the concrete reviewer IDs
-`architecture::opus` and `architecture::grok`, in declaration order. Those IDs
-appear in `describe`, JSONL events, command-adapter inputs, diagnostics, and the
-final terminal records; the exact model is also reported separately. Existing
-single-model agents retain their original unqualified reviewer IDs and remain
-fully supported.
+`architecture::opus` and `architecture::grok`. With
+`execution.distribute_primaries = true` (the v5 default), successive
+multi-model logical lenses rotate their starting run deterministically while
+retaining the configured order cyclically. Configured `a, b, c` chains begin as
+`a, b, c`, then `b, c, a`, then `c, a, b`; scalar lenses do not consume a
+rotation slot. Set the option to `false` to keep every chain in declaration
+order. Migrated v1-v4 configurations are pinned to `false`, so upgrading does
+not silently change their primary model.
+
+The effective roster reports execution-order `model_index` and original
+`configured_model_index`; the persisted private run resolution keeps the same
+ordering detail. Compact public JSONL exposes the distribution policy and lens
+counts without repeating model identities. Existing single-model agents retain
+their original unqualified reviewer IDs and remain fully supported.
 
 The runs form an ordered recovery chain. Review Mesh starts every logical agent
 in parallel (subject to `execution.max_concurrency`) using only that agent's
-first configured model. A later model becomes eligible while the pass quorum is
+effective primary model. A later model becomes eligible while the pass quorum is
 unsatisfied or after an operational failure. A finding
 stops that agent immediately and reports all later models as `skipped` with
 `short_circuited_after_finding` unless adjudication is configured. Operational
@@ -579,11 +596,11 @@ as sensitive. To update configuration non-interactively, edit the exported
 {
   "schema_version": "1",
   "expected_revision": "<revision from config export>",
-  "config": { "schema_version": "4" }
+  "config": { "schema_version": "5" }
 }
 ```
 
-The `config` value above is abbreviated; send the complete desired v4 document.
+The `config` value above is abbreviated; send the complete desired v5 document.
 Apply is whole-document, limited to 5 MiB of JSON input (the config file remains
 limited to 4 MiB), validated before publication, and
 uses revision compare-and-swap plus atomic replacement. A stale revision fails
@@ -624,24 +641,24 @@ For a truly one-file deployment, use `openai_compatible`. Provider-native adapte
 
 ## JSONL events
 
-Every non-empty stdout line is one strict schema-version `4` JSON object. Review
-requests use schema version `2`, while reviewer-result objects remain schema
-version `1`. All events in a
+Every non-empty stdout line is one strict schema-version `5` JSON object. Review
+requests and reviewer-result objects use schema version `2`. All events in a
 run share one `run_id`; `seq` starts at `1` and increases monotonically;
 `run.completed` is final once a valid run begins and stdout remains available.
-Immediately after suite resolution, each concrete model run is listed with its
-logical `agent_id`, zero-based `model_index`, `model_count`, activation policy,
-and predecessor. Only first models probe immediately; later models probe after
-their predecessor passes clearly. A multi-model agent contributes one unit to
-`suite.total` for every configured run, identified as `agent-id::run-id`.
-Heartbeats and suite summaries distinguish deferred, queued, running, completed,
-incomplete, and skipped runs without inventing percentages.
+`suite.resolved` stays compact: it reports logical-lens and model-run totals,
+per-lens quorum/adjudication summaries, and execution settings such as primary
+distribution and provider limits. It does not repeat the complete concrete
+reviewer roster on stdout. The safe effective configuration and private run
+resolution retain exact reviewer identities, cyclic order, models, provider
+groups, execution-order `model_index`, original `configured_model_index`, and
+predecessors. Aggregate heartbeats distinguish deferred, queued, running,
+completed, incomplete, and skipped model runs without inventing percentages.
 
 | Event                 | Meaning                                                       |
 | --------------------- | ------------------------------------------------------------- |
 | `run.started`         | The live-worktree review began.                               |
 | `context.resolved`    | Workspace and best-effort Git metadata were resolved.         |
-| `suite.resolved`      | The roster and execution/heartbeat settings were resolved.    |
+| `suite.resolved`      | Lens summaries, counts, and execution settings were resolved. |
 | `reviewer.started`    | One reviewer began, with its model, effort, and timeout.      |
 | `reviewer.progress`   | Factual probing, queued, reviewing, or validating activity.   |
 | `suite.heartbeat`     | Aggregate liveness, deadlines, stale time, and dual counters. |

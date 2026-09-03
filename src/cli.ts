@@ -321,38 +321,55 @@ export async function runCli(
       return;
     }
     if (argv[0] === "doctor") {
-      if (
-        argv
-          .slice(1)
-          .some(
-            (argument) =>
-              argument.startsWith("--") && argument !== "--structured-output",
-          )
-      ) {
+      const doctorUsage =
+        "Expected: review-mesh doctor [WORKSPACE] [--adapter ID] [--model MODEL] [--structured-output]";
+      let workspaceArgument: string | undefined;
+      let adapterFilter: string | undefined;
+      let modelFilter: string | undefined;
+      let structuredOutput = false;
+      let invalidDoctorUsage = false;
+      for (let index = 1; index < argv.length; index += 1) {
+        const argument = argv[index]!;
+        if (argument === "--structured-output") {
+          if (structuredOutput) invalidDoctorUsage = true;
+          structuredOutput = true;
+          continue;
+        }
+        if (argument === "--adapter" || argument === "--model") {
+          const value = argv[index + 1];
+          if (
+            value === undefined ||
+            value.startsWith("--") ||
+            (argument === "--adapter" && adapterFilter !== undefined) ||
+            (argument === "--model" && modelFilter !== undefined)
+          ) {
+            invalidDoctorUsage = true;
+            continue;
+          }
+          if (argument === "--adapter") adapterFilter = value;
+          else modelFilter = value;
+          index += 1;
+          continue;
+        }
+        if (argument.startsWith("--") || workspaceArgument !== undefined) {
+          invalidDoctorUsage = true;
+          continue;
+        }
+        workspaceArgument = argument;
+      }
+      if (invalidDoctorUsage) {
         await writeUsageDiagnostic(
-          "Expected: review-mesh doctor [WORKSPACE] [--structured-output]",
+          doctorUsage,
           "review-mesh help doctor",
           errorOutput,
         );
         process.exitCode = 2;
         return;
       }
-      const argumentsWithoutFlags = argv
-        .slice(1)
-        .filter((argument) => argument !== "--structured-output");
       const workspace = resolve(
         runtime.cwd ?? process.cwd(),
-        argumentsWithoutFlags[0] ?? ".",
+        workspaceArgument ?? ".",
       );
-      if (argumentsWithoutFlags.length > 1) {
-        await writeUsageDiagnostic(
-          "Expected: review-mesh doctor [WORKSPACE] [--structured-output]",
-          "review-mesh help doctor",
-          errorOutput,
-        );
-        process.exitCode = 2;
-        return;
-      }
       try {
         const loaded = await loadConfigFiles({
           ...(runtime.configFile === undefined
@@ -367,12 +384,27 @@ export async function runCli(
           projectName: loaded.projectName,
           projectNameSource: loaded.projectNameSource,
         });
+        const reviewers = config.reviewers.filter(
+          (reviewer) =>
+            (adapterFilter === undefined ||
+              reviewer.adapterId === adapterFilter) &&
+            (modelFilter === undefined || reviewer.model === modelFilter),
+        );
+        if (reviewers.length === 0) {
+          await writeDiagnostic(
+            "doctor_selection_empty",
+            "No resolved reviewer matches the requested doctor adapter/model selection.",
+            errorOutput,
+          );
+          process.exitCode = 2;
+          return;
+        }
         const registry = runtime.adapterRegistry ?? createDefaultRegistry();
         const results = [];
-        for (const reviewer of config.reviewers) {
+        for (const reviewer of reviewers) {
           const adapter = registry.create(reviewer.adapterId, reviewer.adapter);
           const result =
-            argv.includes("--structured-output") && adapter.doctor !== undefined
+            structuredOutput && adapter.doctor !== undefined
               ? await adapter.doctor(reviewer, controller.signal)
               : (() => undefined)();
           const capabilities =
@@ -620,11 +652,26 @@ export async function runCli(
       }
       return;
     }
-    if (
-      argv[0] !== "review" ||
-      argv.length > 2 ||
-      (argv.length === 2 && argv[1]?.startsWith("-"))
-    ) {
+    if (argv[0] === "review") {
+      const knownStandaloneFlags = new Set([
+        "--no-ansi",
+        "--output-mode",
+        "--heartbeat",
+        "--details-file",
+      ]);
+      for (const argument of argv.slice(1)) {
+        if (argument.startsWith("--") && !knownStandaloneFlags.has(argument)) {
+          await writeUsageDiagnostic(
+            "Expected: review-mesh review [WORKSPACE] [--output-mode compact-jsonl] [--no-ansi] [--heartbeat aggregate] [--details-file PATH]",
+            "review-mesh help review",
+            errorOutput,
+          );
+          process.exitCode = 2;
+          return;
+        }
+      }
+    }
+    if (argv[0] !== "review") {
       await writeUsageDiagnostic(
         "Unknown command. Expected one of: review, status, report, findings, retry, doctor, describe, schema, config, help, or version.",
         "review-mesh --help",
@@ -635,7 +682,54 @@ export async function runCli(
       return;
     }
 
-    const positionalWorkspace = argv[1];
+    let outputMode: string | undefined;
+    let heartbeatMode: string | undefined;
+    let detailsFile: string | undefined;
+    let invalidReviewArguments = false;
+    const positional: string[] = [];
+    for (let index = 1; index < argv.length; index += 1) {
+      const argument = argv[index]!;
+      if (argument === "--no-ansi") continue;
+      if (
+        argument === "--output-mode" ||
+        argument === "--heartbeat" ||
+        argument === "--details-file"
+      ) {
+        const value = argv[index + 1];
+        if (value === undefined || value.startsWith("--")) {
+          invalidReviewArguments = true;
+          break;
+        }
+        if (argument === "--output-mode") {
+          if (outputMode !== undefined) invalidReviewArguments = true;
+          outputMode = value;
+        } else if (argument === "--heartbeat") {
+          if (heartbeatMode !== undefined) invalidReviewArguments = true;
+          heartbeatMode = value;
+        } else {
+          if (detailsFile !== undefined) invalidReviewArguments = true;
+          detailsFile = value;
+        }
+        index += 1;
+        continue;
+      }
+      if (!argument.startsWith("--")) positional.push(argument);
+    }
+    if (
+      invalidReviewArguments ||
+      positional.length > 1 ||
+      (outputMode !== undefined && outputMode !== "compact-jsonl") ||
+      (heartbeatMode !== undefined && heartbeatMode !== "aggregate")
+    ) {
+      await writeUsageDiagnostic(
+        "Expected: review-mesh review [WORKSPACE] [--output-mode compact-jsonl] [--no-ansi] [--heartbeat aggregate] [--details-file PATH]",
+        "review-mesh help review",
+        errorOutput,
+      );
+      process.exitCode = 2;
+      return;
+    }
+    const positionalWorkspace = positional[0];
     const cwd = resolve(runtime.cwd ?? process.cwd());
     let requestText: string;
     try {
@@ -715,6 +809,9 @@ export async function runCli(
           ...(runtime.appPaths === undefined
             ? {}
             : { appPaths: runtime.appPaths }),
+          ...(detailsFile === undefined
+            ? {}
+            : { detailsFile: resolve(cwd, detailsFile) }),
         });
       } catch (error) {
         await writeDiagnostic(

@@ -43,7 +43,8 @@ const commands = [
   },
   {
     name: "doctor",
-    usage: "review-mesh doctor [WORKSPACE] --structured-output",
+    usage:
+      "review-mesh doctor [WORKSPACE] [--adapter ID] [--model MODEL] [--structured-output]",
     help_command: "review-mesh help doctor",
   },
   {
@@ -147,7 +148,10 @@ export async function describeTool(options: DescribeToolOptions = {}) {
       outcomes: ["gate_outcome", "coverage_outcome"] as const,
       model_fallback: {
         parallelism: "across_agents" as const,
-        order: "configured_model_runs" as const,
+        order: "effective_cyclic_model_runs" as const,
+        distribute_primaries: configuration.valid
+          ? configuration.execution.distribute_primaries
+          : undefined,
         advance_after: [
           "clean_pass_until_quorum",
           "operational_failure",

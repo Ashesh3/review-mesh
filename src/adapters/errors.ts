@@ -74,6 +74,17 @@ function sanitizedText(
   ).slice(0, maximumLength);
 }
 
+/** Redacts credential-shaped values and bounds text before public emission. */
+export function sanitizePublicText(
+  value: unknown,
+  maximumLength = MAX_MESSAGE_LENGTH,
+): string | undefined {
+  if (!Number.isSafeInteger(maximumLength) || maximumLength < 1) {
+    throw new Error("maximumLength must be a positive safe integer");
+  }
+  return sanitizedText(value, maximumLength);
+}
+
 function finiteInteger(
   value: unknown,
   minimum: number,
@@ -167,7 +178,7 @@ export function sanitizeAdapterFailure(
   options: AdapterFailureOptions = {},
 ): AdapterFailure {
   const sanitized =
-    sanitizedText(message, MAX_MESSAGE_LENGTH) ??
+    sanitizePublicText(message) ??
     "Adapter failed without a safe diagnostic message.";
   const diagnostics = sanitizeDiagnostics(options.diagnostics);
   const fallbackEligible =

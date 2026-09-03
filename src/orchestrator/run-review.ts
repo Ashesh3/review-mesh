@@ -1,6 +1,7 @@
 import {
   adapterFailure,
   sanitizeAdapterFailure,
+  sanitizePublicText,
   type AdapterFailure,
 } from "../adapters/errors.js";
 import type {
@@ -552,7 +553,9 @@ export async function runReviewRound({
         isolation,
         elapsed_ms: terminal.elapsed_ms,
         verdict: parsed.data.verdict,
-        summary: parsed.data.summary.slice(0, 1_000),
+        summary:
+          sanitizePublicText(parsed.data.summary, 1_000) ??
+          "Reviewer completed without a public summary.",
         actionable_findings: parsed.data.actionable_findings.length,
         gate_findings: gateFindings,
         informational_notes: parsed.data.informational_notes.length,
@@ -976,6 +979,7 @@ export async function runReviewRound({
           max_concurrency: config.execution.max_concurrency,
           heartbeat_interval_ms: config.execution.heartbeat_interval_ms,
           shutdown_grace_period_ms: config.execution.shutdown_grace_period_ms,
+          distribute_primaries: config.execution.distribute_primaries,
           default_provider_concurrency:
             config.execution.default_provider_concurrency,
           provider_limits: { ...config.execution.provider_limits },
@@ -1012,33 +1016,6 @@ export async function runReviewRound({
             adjudication: chain[0]!.reviewer.policy?.adjudication ?? "off",
           };
         }),
-        total: config.reviewers.length,
-        reviewers: config.reviewers.map((reviewer) => ({
-          id: reviewer.id,
-          agent_id: lensId(reviewer),
-          model_index: reviewer.modelIndex ?? 0,
-          model_count: reviewer.modelCount ?? 1,
-          ...(reviewer.previousReviewerId === undefined
-            ? {}
-            : { previous_reviewer_id: reviewer.previousReviewerId }),
-          activation:
-            (reviewer.modelIndex ?? 0) === 0
-              ? ("immediate" as const)
-              : reviewer.policy === undefined
-                ? ("after_clear_pass" as const)
-                : ("after_lens_progress" as const),
-          purpose: reviewer.purpose,
-          adapter: reviewer.adapterId,
-          adapter_type: reviewer.adapter.type,
-          model: reviewer.model,
-          ...(reviewer.effort === undefined ? {} : { effort: reviewer.effort }),
-          provider_group: providerGroup(reviewer),
-          isolation_policy: reviewer.isolationPolicy,
-          timeout_ms: reviewer.timeoutMs,
-          instruction_sources: reviewer.instruction_layers.map(
-            (layer) => layer.source,
-          ),
-        })),
       },
     });
     heartbeat = clock.setInterval(() => {

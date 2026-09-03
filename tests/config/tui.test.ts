@@ -310,6 +310,7 @@ describe("config menu", () => {
       "200",
       "300",
       "n",
+      "n",
       "7",
       "g",
       "two,one",
@@ -346,6 +347,7 @@ describe("config menu", () => {
       max_concurrency: 3,
       heartbeat_interval_ms: 200,
       shutdown_grace_period_ms: 300,
+      distribute_primaries: false,
     });
     expect(saved.diagnostics).toEqual({ persist_runs: false, max_runs: 7 });
   });
@@ -584,6 +586,7 @@ describe("config menu", () => {
         max_concurrency: 2,
         heartbeat_interval_ms: 15000,
         shutdown_grace_period_ms: 5000,
+        distribute_primaries: true,
         default_provider_concurrency: 2,
         provider_limits: {},
         circuit_breaker_threshold: 2,

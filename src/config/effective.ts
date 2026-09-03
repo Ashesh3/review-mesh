@@ -55,6 +55,7 @@ export interface EffectiveConfigDescription {
     max_concurrency: number;
     heartbeat_interval_ms: number;
     shutdown_grace_period_ms: number;
+    distribute_primaries: boolean;
     default_provider_concurrency: number;
     provider_limits: Record<string, number>;
     circuit_breaker_threshold: number;
@@ -66,6 +67,7 @@ export interface EffectiveConfigDescription {
     id: string;
     agent_id: string;
     model_index: number;
+    configured_model_index: number;
     model_count: number;
     previous_reviewer_id?: string;
     activation: "immediate" | "after_clear_pass" | "after_lens_progress";
@@ -151,6 +153,8 @@ export function describeResolvedConfig(
       id: reviewer.id,
       agent_id: reviewer.agentId ?? reviewer.id,
       model_index: reviewer.modelIndex ?? 0,
+      configured_model_index:
+        reviewer.configuredModelIndex ?? reviewer.modelIndex ?? 0,
       model_count: reviewer.modelCount ?? 1,
       ...(reviewer.previousReviewerId === undefined
         ? {}
