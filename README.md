@@ -103,13 +103,12 @@ For an AI caller, identity and scope are separate:
 
 ### Download a standalone executable
 
-Release `v7.1.0` hardens the multi-provider review path with cooldown/half-open
-circuits, `Retry-After`-aware exponential retry, output-truncation recovery,
-safe structured diagnostics, best-effort artifact salvage, causal status, config
-topology warnings, and stronger second-provider adjudication. It also includes
-the embedded read-only dashboard, agent-first CLI, public event protocol v5,
-compact reporting, and self-contained Bun executables that do not require
-Node.js or Bun:
+Release `v7.2.0` refreshes the embedded observer with an Astryx-inspired,
+dependency-free interface: a clearer app shell, accessible inline SVG icons,
+larger interaction targets, responsive review records, improved long-value
+handling, and reduced-motion support. It retains the resilient multi-provider
+review path, agent-first CLI, public event protocol v5, compact reporting, and
+self-contained Bun executables that do not require Node.js or Bun:
 
 - Windows x64: `review-mesh-windows-x64.exe`
 - Linux x64 (glibc): `review-mesh-linux-x64`
@@ -117,14 +116,14 @@ Node.js or Bun:
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v7.1.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
+Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v7.2.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
 .\review-mesh.exe review
 ```
 
 Linux:
 
 ```bash
-curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v7.1.0/review-mesh-linux-x64
+curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v7.2.0/review-mesh-linux-x64
 chmod +x ./review-mesh-linux-x64
 ./review-mesh-linux-x64 review
 ```
