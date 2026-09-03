@@ -245,25 +245,35 @@ export async function runReviewApplication(
       return 2;
     }
   }
-  const recorder =
-    config.diagnostics.persist_runs || options.detailsFile !== undefined
-      ? createRunRecorder({
-          runsDirectory: appPaths.runsDirectory,
-          applicationDataRoot: dirname(appPaths.runsDirectory),
-          runId,
-          maxRuns: config.diagnostics.max_runs,
-          resolution: resolvedRunHeader(config),
-        })
-      : undefined;
+  let recorder: ReturnType<typeof createRunRecorder>;
+  try {
+    recorder = createRunRecorder({
+      runsDirectory: appPaths.runsDirectory,
+      applicationDataRoot: dirname(appPaths.runsDirectory),
+      runId,
+      maxRuns: config.diagnostics.max_runs,
+      resolution: resolvedRunHeader(config),
+      publish:
+        config.diagnostics.persist_runs || options.detailsFile !== undefined,
+    });
+    await recorder.ready();
+  } catch {
+    await writeDiagnostic(
+      options.stderr,
+      "persistence_failed",
+      "The sanitized active run record could not be initialized.",
+    );
+    return 2;
+  }
   const writer = createEventWriter({
     output: options.stdout,
     runId,
     ...(request.request_id === undefined
       ? {}
       : { requestId: request.request_id }),
-    ...(recorder === undefined ? {} : { onEvent: recorder.onEvent }),
-    ...(recorder === undefined ? {} : { onRecord: recorder.onRecord }),
-    ...(recorder === undefined ? {} : { onMirrorClose: recorder.close }),
+    onEvent: recorder.onEvent,
+    onRecord: recorder.onRecord,
+    onMirrorClose: recorder.close,
     onWarning: () => {
       void writeDiagnostic(
         options.stderr,
@@ -292,9 +302,9 @@ export async function runReviewApplication(
       ...(options.onlyLensIds === undefined
         ? {}
         : { onlyLensIds: options.onlyLensIds }),
-      ...(recorder === undefined
-        ? {}
-        : { reportPath: options.detailsFile ?? internalReportPath }),
+      ...(config.diagnostics.persist_runs || options.detailsFile !== undefined
+        ? { reportPath: options.detailsFile ?? internalReportPath }
+        : {}),
     });
     if (detailsHandle !== undefined) {
       const current = await detailsHandle.stat();

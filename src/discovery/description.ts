@@ -48,6 +48,11 @@ const commands = [
     help_command: "review-mesh help doctor",
   },
   {
+    name: "serve",
+    usage: "review-mesh serve [--host 127.0.0.1] [--port 0] [--no-open]",
+    help_command: "review-mesh help serve",
+  },
+  {
     name: "schema",
     usage: "review-mesh schema list | review-mesh schema NAME --json",
     help_command: "review-mesh help schema",

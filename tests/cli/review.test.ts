@@ -5,6 +5,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   realpath,
   rm,
   writeFile,
@@ -899,7 +900,7 @@ describe("review-mesh review", () => {
     ).not.toContain("sensitive-runtime-value");
   });
 
-  it("does not create the injected runs directory when persistence is disabled", async () => {
+  it("removes the transient active record when persistence is disabled", async () => {
     const fixture = await createFixture(["pass"]);
     const runsDirectory = join(fixture.root, "injected-app-data", "runs");
 
@@ -917,9 +918,7 @@ describe("review-mesh review", () => {
     });
 
     expect(exitCode).toBe(0);
-    await expect(access(runsDirectory)).rejects.toMatchObject({
-      code: "ENOENT",
-    });
+    await expect(readdir(runsDirectory)).resolves.toEqual([]);
   });
 
   it("returns runtime failure when the final public event cannot be written", async () => {

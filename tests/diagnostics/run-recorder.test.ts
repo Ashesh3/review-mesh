@@ -93,6 +93,43 @@ it("redacts credentials embedded in persisted string values", async () => {
 });
 
 describe("RunRecorder", () => {
+  it("keeps an active record observable but does not publish it when publish is disabled", async () => {
+    const root = await temporaryRoot();
+    const runsDirectory = join(root, "runs");
+    const recorder = createRunRecorder({
+      applicationDataRoot: root,
+      runsDirectory,
+      runId: "run-transient",
+      maxRuns: 10,
+      resolution: {},
+      publish: false,
+    });
+    await recorder.onEvent({ ...startedEvent(), run_id: "run-transient" });
+    await expect(
+      readFile(await activeRecordPath(runsDirectory), "utf8"),
+    ).resolves.toContain('"event":"run.started"');
+    await recorder.close();
+    await expect(readdir(runsDirectory)).resolves.toEqual([]);
+  });
+
+  it("can initialize the active record before the public run begins", async () => {
+    const root = await temporaryRoot();
+    const runsDirectory = join(root, "runs");
+    const recorder = createRunRecorder({
+      applicationDataRoot: root,
+      runsDirectory,
+      runId: "run-ready",
+      maxRuns: 10,
+      resolution: {},
+      publish: false,
+    });
+    await recorder.ready();
+    expect(
+      await readFile(await activeRecordPath(runsDirectory), "utf8"),
+    ).toContain('"record":"resolution"');
+    await recorder.close();
+  });
+
   it("publishes a sanitized run record at the exact run path only after close", async () => {
     const root = await temporaryRoot();
     const runsDirectory = join(root, "application-data", "runs");

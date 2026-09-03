@@ -1,0 +1,631 @@
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  readDashboardReviewer,
+  readDashboardRun,
+  readDashboardSnapshot,
+} from "../../src/server/dashboard-data.js";
+
+const roots: string[] = [];
+
+async function fixture() {
+  const root = await mkdtemp(join(tmpdir(), "review-mesh-dashboard-data-"));
+  roots.push(root);
+  const appPaths = {
+    configFile: join(root, "config", "config.toml"),
+    reviewersDirectory: join(root, "config", "reviewers"),
+    runsDirectory: join(root, "data", "runs"),
+  };
+  await mkdir(join(root, "config"), { recursive: true });
+  await mkdir(appPaths.runsDirectory, { recursive: true });
+  await writeFile(
+    appPaths.configFile,
+    `schema_version = "5"
+[execution]
+max_concurrency = 2
+heartbeat_interval_ms = 15000
+shutdown_grace_period_ms = 5000
+retry_attempts = 2
+retry_backoff_ms = 1000
+[diagnostics]
+persist_runs = true
+max_runs = 50
+[adapters.command]
+type = "command"
+command = "secret-command"
+args = ["secret-arg"]
+protocol = "review-mesh-command-v1"
+[agents.architecture]
+adapter = "command"
+purpose = "Review architecture"
+instructions = "secret instructions"
+isolation = "prefer_enforced"
+timeout_ms = 5000
+model = "model-a"
+runtime = { secret = "runtime-secret" }
+[defaults]
+agents = ["architecture"]
+[projects.demo]
+agents = ["architecture"]
+instructions = "project secret"
+context = { token = "project-token" }
+`,
+  );
+  return { root, appPaths };
+}
+
+function event(
+  eventName: string,
+  seq: number,
+  timestamp: string,
+  data: Record<string, unknown>,
+  reviewerId?: string,
+) {
+  return {
+    schema_version: "5",
+    event: eventName,
+    run_id: "run-demo",
+    seq,
+    timestamp,
+    ...(reviewerId === undefined ? {} : { reviewer_id: reviewerId }),
+    data,
+  };
+}
+
+async function writeRun(runsDirectory: string): Promise<void> {
+  const records = [
+    {
+      record: "resolution",
+      run_id: "run-demo",
+      resolution: {
+        reviewers: [
+          {
+            id: "architecture::primary",
+            agent_id: "architecture",
+            model_index: 0,
+            configured_model_index: 0,
+            model_count: 2,
+            purpose: "Review architecture",
+            adapter: "command",
+            model: "model-a",
+            provider_group: "primary",
+            isolation_policy: "prefer_enforced",
+            timeout_ms: 5000,
+          },
+          {
+            id: "architecture::fallback",
+            agent_id: "architecture",
+            model_index: 1,
+            configured_model_index: 1,
+            model_count: 2,
+            purpose: "Review architecture",
+            adapter: "command",
+            model: "model-b",
+            provider_group: "fallback",
+            isolation_policy: "prefer_enforced",
+            timeout_ms: 5000,
+          },
+        ],
+      },
+    },
+    event("run.started", 1, "2026-09-03T10:00:00.000Z", {
+      consistency_mode: "live_worktree",
+    }),
+    event("context.resolved", 2, "2026-09-03T10:00:00.100Z", {
+      workspace: "C:/demo",
+      project_name: "demo",
+      review_scope: { mode: "changes" },
+      git: {
+        is_repository: true,
+        branch: "feature/dashboard",
+        head: "abc",
+        merge_base: "def",
+        changed_files_count: 3,
+        changed_files: ["a.ts", "b.ts", "c.ts"],
+        truncated: false,
+      },
+    }),
+    event("suite.resolved", 3, "2026-09-03T10:00:00.200Z", {
+      logical_lenses: 1,
+      model_runs: 2,
+      execution: {
+        max_concurrency: 2,
+        heartbeat_interval_ms: 15000,
+        shutdown_grace_period_ms: 5000,
+      },
+      lenses: [
+        {
+          id: "architecture",
+          purpose: "Review architecture",
+          model_runs: 2,
+          pass_quorum: 1,
+          minimum_provider_groups: 1,
+          adjudication: "off",
+        },
+      ],
+    }),
+    event(
+      "reviewer.started",
+      4,
+      "2026-09-03T10:00:01.000Z",
+      {
+        lens_id: "architecture",
+        purpose: "Review architecture",
+        adapter: "command",
+        model: "model-a",
+        isolation_policy: "prefer_enforced",
+      },
+      "architecture::primary",
+    ),
+    {
+      record: "reviewer.activity",
+      run_id: "run-demo",
+      reviewer_id: "architecture::primary",
+      lens_id: "architecture",
+      phase: "reviewing",
+      type: "activity",
+      timestamp: "2026-09-03T10:00:02.000Z",
+      message: "Inspected the dependency graph.",
+    },
+    event(
+      "reviewer.completed",
+      5,
+      "2026-09-03T10:00:03.000Z",
+      {
+        lens_id: "architecture",
+        adapter: "command",
+        model: "model-a",
+        isolation: "enforced",
+        elapsed_ms: 2000,
+        verdict: "pass",
+        summary: "No architecture defects.",
+        actionable_findings: 0,
+        informational_notes: 0,
+      },
+      "architecture::primary",
+    ),
+    event(
+      "reviewer.skipped",
+      6,
+      "2026-09-03T10:00:03.100Z",
+      {
+        lens_id: "architecture",
+        mode: "full_review",
+        adapter: "command",
+        model: "model-b",
+        provider_group: "fallback",
+        elapsed_ms: 0,
+        reason: "not_needed_after_quorum",
+        blocked_by_reviewer_id: "architecture::primary",
+      },
+      "architecture::fallback",
+    ),
+    event("run.completed", 7, "2026-09-03T10:00:03.200Z", {
+      gate_outcome: "passed",
+      coverage_outcome: "complete",
+      exit_code: 0,
+      consistency_mode: "live_worktree",
+      total_elapsed_ms: 3200,
+      logical_lenses: {
+        total: 1,
+        pending: 0,
+        findings: 0,
+        passed: 1,
+        incomplete: 0,
+        not_applicable: 0,
+        not_evaluated: 0,
+      },
+      model_runs: {
+        total: 2,
+        deferred: 0,
+        queued: 0,
+        running: 0,
+        completed: 1,
+        incomplete: 0,
+        skipped: 1,
+      },
+      status: "passed",
+      suite: {
+        total: 2,
+        deferred: 0,
+        queued: 0,
+        running: 0,
+        completed: 1,
+        incomplete: 0,
+        skipped: 1,
+      },
+    }),
+  ];
+  await writeFile(
+    join(runsDirectory, "run-demo.jsonl"),
+    `${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
+  );
+}
+
+afterEach(async () => {
+  await Promise.all(
+    roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
+  );
+});
+
+describe("dashboard data", () => {
+  it("returns safe configuration, run timelines, and reviewer activity", async () => {
+    const { appPaths } = await fixture();
+    await writeRun(appPaths.runsDirectory);
+    const snapshot = await readDashboardSnapshot({
+      appPaths,
+      server: {
+        host: "127.0.0.1",
+        port: 1234,
+        startedAt: "2026-09-03T09:00:00.000Z",
+      },
+    });
+    expect(snapshot.runs[0]).toMatchObject({
+      run_id: "run-demo",
+      status: "passed",
+      project_name: "demo",
+      branch: "feature/dashboard",
+      changed_files_count: 3,
+    });
+    expect(snapshot.agents[0]).toMatchObject({
+      id: "architecture",
+      purpose: "Review architecture",
+      has_instructions: true,
+    });
+    const encoded = JSON.stringify(snapshot);
+    expect(encoded).not.toContain("secret instructions");
+    expect(encoded).not.toContain("secret-command");
+    expect(encoded).not.toContain("secret-arg");
+    expect(encoded).not.toContain("runtime-secret");
+    expect(encoded).not.toContain("project-token");
+
+    const run = await readDashboardRun({ appPaths, runId: "run-demo" });
+    expect(run).toMatchObject({
+      stage: "complete",
+      lenses: [
+        {
+          id: "architecture",
+          reviewers: [
+            { reviewer_id: "architecture::primary", state: "completed" },
+            { reviewer_id: "architecture::fallback", state: "skipped" },
+          ],
+        },
+      ],
+    });
+    const reviewer = await readDashboardReviewer({
+      appPaths,
+      runId: "run-demo",
+      reviewerId: "architecture::primary",
+    });
+    expect(reviewer.activity).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ message: "Inspected the dependency graph." }),
+      ]),
+    );
+    expect(reviewer.activity_notice).toContain("not the provider's full chat");
+  });
+
+  it("redacts credential-like strings again at the HTTP data boundary", async () => {
+    const { appPaths } = await fixture();
+    await writeFile(
+      join(appPaths.runsDirectory, "run-secret.jsonl"),
+      `${JSON.stringify({
+        schema_version: "5",
+        event: "reviewer.progress",
+        run_id: "run-secret",
+        seq: 1,
+        timestamp: new Date().toISOString(),
+        reviewer_id: "reviewer",
+        data: {
+          phase: "reviewing",
+          message: "Authorization: Bearer should-not-leak",
+        },
+      })}\n`,
+    );
+    const run = await readDashboardRun({ appPaths, runId: "run-secret" });
+    expect(JSON.stringify(run)).not.toContain("should-not-leak");
+    expect(JSON.stringify(run)).toContain("[redacted]");
+  });
+
+  it("redacts credential-like strings from top-level run summary fields", async () => {
+    const { appPaths } = await fixture();
+    await writeFile(
+      join(appPaths.runsDirectory, "run-summary-secret.jsonl"),
+      `${JSON.stringify({
+        schema_version: "5",
+        event: "context.resolved",
+        run_id: "run-summary-secret",
+        seq: 1,
+        timestamp: new Date().toISOString(),
+        data: {
+          workspace: "C:/repo/secret=workspace-token",
+          project_name: "secret=project-token",
+          review_scope: { mode: "changes" },
+          git: {
+            is_repository: true,
+            branch: "secret=branch-token",
+            head: null,
+            merge_base: null,
+            changed_files_count: 0,
+            changed_files: [],
+            truncated: false,
+          },
+        },
+      })}\n`,
+    );
+    const snapshot = await readDashboardSnapshot({
+      appPaths,
+      server: {
+        host: "127.0.0.1",
+        port: 1,
+        startedAt: new Date().toISOString(),
+      },
+    });
+    expect(JSON.stringify(snapshot)).not.toMatch(
+      /workspace-token|project-token|branch-token/u,
+    );
+  });
+
+  it("redacts credential-like strings in retained reviewer metadata", async () => {
+    const { appPaths } = await fixture();
+    await writeFile(
+      join(appPaths.runsDirectory, "run-roster-secret.jsonl"),
+      `${JSON.stringify({
+        record: "resolution",
+        run_id: "run-roster-secret",
+        resolution: {
+          reviewers: [
+            {
+              id: "reviewer-secret=identifier-token",
+              agent_id: "lens-secret=lens-token",
+              purpose: "secret=purpose-token",
+              adapter: "Bearer adapter-token",
+              model: "secret=model-token",
+            },
+          ],
+        },
+      })}\n`,
+    );
+    const run = await readDashboardRun({
+      appPaths,
+      runId: "run-roster-secret",
+    });
+    expect(JSON.stringify(run)).not.toMatch(
+      /identifier-token|lens-token|purpose-token|adapter-token|model-token/u,
+    );
+  });
+
+  it("keeps legacy v1 findings with conservative metadata defaults", async () => {
+    const { appPaths } = await fixture();
+    await writeFile(
+      join(appPaths.runsDirectory, "run-v1.jsonl"),
+      [
+        {
+          record: "resolution",
+          run_id: "run-v1",
+          resolution: {
+            reviewers: [
+              {
+                id: "legacy",
+                agent_id: "legacy",
+                model: "legacy-model",
+                adapter: "command",
+              },
+            ],
+          },
+        },
+        {
+          record: "reviewer.result",
+          run_id: "run-v1",
+          reviewer_id: "legacy",
+          result: {
+            schema_version: "1",
+            verdict: "fail",
+            summary: "Legacy finding",
+            actionable_findings: [
+              {
+                id: "legacy-1",
+                severity: "high",
+                title: "Legacy defect",
+                description: "Legacy detail",
+                evidence: [{ detail: "Legacy evidence" }],
+                suggested_direction: "Fix it",
+              },
+            ],
+            informational_notes: [],
+          },
+        },
+      ]
+        .map((record) => JSON.stringify(record))
+        .join("\n") + "\n",
+    );
+    const run = await readDashboardRun({ appPaths, runId: "run-v1" });
+    expect(run).toMatchObject({
+      findings: {
+        raw: [
+          {
+            title: "Legacy defect",
+            confidence: "medium",
+            classification: "needs_verification",
+          },
+        ],
+      },
+    });
+  });
+
+  it("omits source findings rejected by a clean adjudicator", async () => {
+    const { appPaths } = await fixture();
+    const finding = {
+      id: "candidate",
+      severity: "high",
+      title: "Rejected candidate",
+      description: "The first provider reported this.",
+      evidence: [{ detail: "Candidate evidence" }],
+      suggested_direction: "Fix candidate",
+      confidence: "high",
+      classification: "confirmed_defect",
+      external_assumptions: [],
+    };
+    await writeFile(
+      join(appPaths.runsDirectory, "run-adjudicated.jsonl"),
+      [
+        {
+          record: "resolution",
+          run_id: "run-adjudicated",
+          resolution: {
+            reviewers: [
+              { id: "lens::source", agent_id: "lens", model_index: 0 },
+              {
+                id: "lens::judge",
+                agent_id: "lens",
+                model_index: 1,
+                policy: {
+                  passQuorum: 1,
+                  minimumProviderGroups: 1,
+                  adjudication: "required",
+                  gateMinimumSeverity: "medium",
+                  gateMinimumConfidence: "medium",
+                  mode: "adjudication",
+                  adjudicatesReviewerId: "lens::source",
+                },
+              },
+            ],
+          },
+        },
+        {
+          record: "reviewer.result",
+          run_id: "run-adjudicated",
+          reviewer_id: "lens::source",
+          result: {
+            schema_version: "2",
+            verdict: "fail",
+            summary: "Candidate",
+            actionable_findings: [finding],
+            informational_notes: [],
+          },
+        },
+        {
+          record: "reviewer.result",
+          run_id: "run-adjudicated",
+          reviewer_id: "lens::judge",
+          mode: "adjudication",
+          adjudicates_reviewer_id: "lens::source",
+          result: {
+            schema_version: "2",
+            verdict: "pass",
+            summary: "Rejected",
+            actionable_findings: [],
+            informational_notes: [],
+          },
+        },
+        {
+          schema_version: "5",
+          event: "run.completed",
+          run_id: "run-adjudicated",
+          seq: 1,
+          timestamp: new Date().toISOString(),
+          data: {
+            gate_outcome: "passed",
+            coverage_outcome: "complete",
+            exit_code: 0,
+            consistency_mode: "live_worktree",
+            total_elapsed_ms: 1,
+            unique_findings: 0,
+            status: "passed",
+            suite: {
+              total: 2,
+              deferred: 0,
+              queued: 0,
+              running: 0,
+              completed: 2,
+              incomplete: 0,
+              skipped: 0,
+            },
+          },
+        },
+      ]
+        .map((record) => JSON.stringify(record))
+        .join("\n") + "\n",
+    );
+    const run = await readDashboardRun({
+      appPaths,
+      runId: "run-adjudicated",
+    });
+    expect(run).toMatchObject({ status: "passed", findings: { raw: [] } });
+  });
+
+  it("isolates one malformed run and accepts a partial active tail", async () => {
+    const { appPaths } = await fixture();
+    await writeFile(join(appPaths.runsDirectory, "broken.jsonl"), "not json\n");
+    await writeFile(
+      join(
+        appPaths.runsDirectory,
+        `active.jsonl.active.${process.pid}.${Math.floor(Date.now() - process.uptime() * 1000)}.owner`,
+      ),
+      `${JSON.stringify({
+        schema_version: "5",
+        event: "run.started",
+        run_id: "active",
+        seq: 1,
+        timestamp: new Date().toISOString(),
+        data: { consistency_mode: "live_worktree" },
+      })}\n{"unfinished"`,
+    );
+    const snapshot = await readDashboardSnapshot({
+      appPaths,
+      server: {
+        host: "127.0.0.1",
+        port: 1,
+        startedAt: new Date().toISOString(),
+      },
+    });
+    expect(snapshot.runs).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ run_id: "broken", unreadable: true }),
+        expect.objectContaining({
+          run_id: "active",
+          active: true,
+          status: "running",
+        }),
+      ]),
+    );
+    expect(await readFile(appPaths.configFile, "utf8")).toContain(
+      "secret instructions",
+    );
+  });
+
+  it("marks an orphaned active record stale instead of live", async () => {
+    const { appPaths } = await fixture();
+    await writeFile(
+      join(
+        appPaths.runsDirectory,
+        "orphan.jsonl.active.99999999.1.orphan-owner",
+      ),
+      `${JSON.stringify({
+        schema_version: "5",
+        event: "run.started",
+        run_id: "orphan",
+        seq: 1,
+        timestamp: new Date().toISOString(),
+        data: { consistency_mode: "live_worktree" },
+      })}\n`,
+    );
+    const snapshot = await readDashboardSnapshot({
+      appPaths,
+      server: {
+        host: "127.0.0.1",
+        port: 1,
+        startedAt: new Date().toISOString(),
+      },
+    });
+    expect(snapshot.runs[0]).toMatchObject({
+      run_id: "orphan",
+      active: false,
+      stale: true,
+      status: "stale",
+    });
+    expect(snapshot.counts.active_runs).toBe(0);
+  });
+});

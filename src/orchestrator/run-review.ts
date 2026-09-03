@@ -745,6 +745,16 @@ export async function runReviewRound({
                 state.recordActivity(reviewer.id, message);
                 runtime.lastActivityAt = clock.now();
                 runtime.lastActivityMessage = message;
+                await record({
+                  record: "reviewer.activity",
+                  run_id: runId,
+                  reviewer_id: reviewer.id,
+                  lens_id: lensId(reviewer),
+                  phase: runtime.phase,
+                  type: event.type,
+                  timestamp: runtime.lastActivityAt.toISOString(),
+                  message,
+                });
               }
               if (event.type === "progress") {
                 const phase = reviewerPhaseSchema.safeParse(event.phase);

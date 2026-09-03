@@ -172,6 +172,55 @@ describe("portable CLI", () => {
     });
   });
 
+  it("serves the embedded dashboard from the copied artifact", async () => {
+    const home = join(root, "serve-home");
+    const child = spawn(
+      process.execPath,
+      [artifact, "serve", "--host", "127.0.0.1", "--port", "0", "--no-open"],
+      {
+        cwd: root,
+        env: isolatedEnvironment(home),
+        stdio: "pipe",
+        windowsHide: true,
+      },
+    );
+    try {
+      const url = await new Promise<string>((resolveUrl, reject) => {
+        let stdout = "";
+        const timer = setTimeout(
+          () => reject(new Error("dashboard URL was not printed")),
+          10_000,
+        );
+        child.stdout.setEncoding("utf8");
+        child.stdout.on("data", (chunk: string) => {
+          stdout += chunk;
+          const match = /Review Mesh dashboard: (http:\/\/[^\s]+)/u.exec(
+            stdout,
+          );
+          if (match === null) return;
+          clearTimeout(timer);
+          resolveUrl(match[1]!);
+        });
+        child.once("error", (error) => {
+          clearTimeout(timer);
+          reject(error);
+        });
+      });
+      const page = await fetch(url);
+      expect(page.status).toBe(200);
+      const html = await page.text();
+      expect(html).toContain("Review Mesh");
+      expect(html).not.toMatch(/https?:\/\/.*(?:\.js|\.css)/u);
+      const snapshot = await fetch(new URL("api/snapshot", url));
+      expect(await snapshot.json()).toMatchObject({
+        server: { read_only: true },
+      });
+    } finally {
+      child.kill("SIGTERM");
+      await new Promise((resolveClose) => child.once("close", resolveClose));
+    }
+  });
+
   it("runs the command adapter after being copied outside the project", async () => {
     const workspace = join(root, "command-workspace");
     const reviewer = join(root, "command-reviewer.mjs");
