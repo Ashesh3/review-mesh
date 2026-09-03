@@ -8,6 +8,7 @@ import {
   trustedConfigV2Schema,
   trustedConfigV3Schema,
   trustedConfigV4Schema,
+  trustedConfigV5Schema,
   type AgentProfile,
   type ProjectConfig,
   type ReviewerProfile,
@@ -269,7 +270,9 @@ async function resolveInstructionFiles(
   if (trusted.schema_version === "3") {
     return trustedConfigV3Schema.parse(resolved);
   }
-  return trustedConfigV4Schema.parse(resolved);
+  if (trusted.schema_version === "4")
+    return trustedConfigV4Schema.parse(resolved);
+  return trustedConfigV5Schema.parse(resolved);
 }
 
 export async function loadConfigFiles(

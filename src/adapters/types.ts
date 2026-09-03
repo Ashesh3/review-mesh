@@ -48,6 +48,13 @@ export interface ReviewAdapter {
     signal: AbortSignal,
   ): Promise<AdapterCapabilities>;
   run(input: AdapterReviewInput): AsyncIterable<AdapterEvent>;
+  doctor?(
+    reviewer: ResolvedReviewer,
+    signal: AbortSignal,
+  ): Promise<{
+    ready: boolean;
+    checks: Array<{ name: string; passed: boolean; message?: string }>;
+  }>;
   forceCleanup?(): Promise<void>;
 }
 

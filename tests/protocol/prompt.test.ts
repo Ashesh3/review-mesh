@@ -138,11 +138,13 @@ describe("buildReviewerPrompt", () => {
       reason: "authentication_failed",
       message: "[redacted]",
       retryable: false,
+      fallback_eligible: true,
     });
     expect(adapterFailure.timeout("upstream timeout")).toEqual({
       reason: "timeout",
       message: "upstream timeout",
       retryable: true,
+      fallback_eligible: true,
     });
   });
 

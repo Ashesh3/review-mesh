@@ -24,7 +24,7 @@ async function fixture() {
   await mkdir(workspace);
   const projectName = "project";
   const config: ManagedConfig = {
-    schema_version: "4",
+    schema_version: "5",
     execution: {
       max_concurrency: 2,
       heartbeat_interval_ms: 5000,
@@ -141,7 +141,7 @@ describe("effective configuration description", () => {
           model_index: 1,
           model_count: 2,
           previous_reviewer_id: "reviewer::opus",
-          activation: "after_clear_pass",
+          activation: "after_lens_progress",
           model: "grok-code",
           effort: "high",
         },

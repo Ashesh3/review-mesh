@@ -1,0 +1,362 @@
+import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { PassThrough } from "node:stream";
+import { EventEmitter } from "node:events";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { AdapterRegistry } from "../../src/adapters/registry.js";
+import type { AdapterReviewInput } from "../../src/adapters/types.js";
+import {
+  serializeManagedConfig,
+  type ManagedConfig,
+} from "../../src/config/manage.js";
+import { runCli } from "../../src/cli.js";
+import type { ReviewApplicationOptions } from "../../src/app.js";
+
+const roots: string[] = [];
+
+function stream(): PassThrough {
+  const value = new PassThrough();
+  value.setEncoding("utf8");
+  return value;
+}
+
+async function output(value: PassThrough): Promise<string> {
+  value.end();
+  let result = "";
+  for await (const chunk of value) result += String(chunk);
+  return result;
+}
+
+afterEach(async () => {
+  await Promise.all(
+    roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
+  );
+});
+
+describe("report and findings commands", () => {
+  it("renders a persisted detailed report and deduplicated findings", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-mesh-report-cli-"));
+    roots.push(root);
+    const runsDirectory = join(root, "runs");
+    await mkdir(runsDirectory);
+    const runId = "run-report";
+    const records = [
+      {
+        record: "resolution",
+        run_id: runId,
+        resolution: {
+          reviewers: [
+            { id: "security::one", agent_id: "security" },
+            { id: "security::two", agent_id: "security" },
+          ],
+        },
+      },
+      {
+        record: "reviewer.result",
+        run_id: runId,
+        reviewer_id: "security::one",
+        lens_id: "security",
+        result: {
+          schema_version: "2",
+          verdict: "fail",
+          summary: "Issue found.",
+          actionable_findings: [
+            {
+              id: "f-1",
+              severity: "high",
+              title: "Unsafe trust boundary",
+              description: "Input crosses a trust boundary.",
+              evidence: [{ path: "src/a.ts", detail: "Unvalidated input." }],
+              suggested_direction: "Validate it.",
+              confidence: "high",
+              classification: "confirmed_defect",
+              external_assumptions: [],
+            },
+          ],
+          informational_notes: [],
+        },
+      },
+      {
+        schema_version: "5",
+        event: "run.completed",
+        run_id: runId,
+        seq: 1,
+        timestamp: "2026-09-03T00:00:00.000Z",
+        data: {
+          gate_outcome: "findings",
+          coverage_outcome: "complete",
+          exit_code: 1,
+          consistency_mode: "live_worktree",
+          total_elapsed_ms: 1,
+          logical_lenses: {
+            total: 1,
+            pending: 0,
+            findings: 1,
+            passed: 0,
+            incomplete: 0,
+            not_applicable: 0,
+            not_evaluated: 0,
+            not_selected: 0,
+          },
+          model_runs: {
+            total: 2,
+            deferred: 0,
+            queued: 0,
+            running: 0,
+            completed: 1,
+            incomplete: 0,
+            skipped: 1,
+          },
+          suite: {
+            total: 2,
+            deferred: 0,
+            queued: 0,
+            running: 0,
+            completed: 1,
+            incomplete: 0,
+            skipped: 1,
+          },
+          report_path: join(runsDirectory, `${runId}.jsonl`),
+        },
+      },
+    ];
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      `${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
+    );
+
+    const stdout = stream();
+    const stderr = stream();
+    await runCli(process, {
+      argv: ["report", runId, "--format", "markdown"],
+      output: stdout,
+      error: stderr,
+      appPaths: {
+        configFile: join(root, "config.toml"),
+        reviewersDirectory: join(root, "reviewers"),
+        runsDirectory,
+      },
+    });
+    const reportOutput = await output(stdout);
+    const reportError = await output(stderr);
+    expect(reportError).toBe("");
+    expect(reportOutput).toContain("# Review Mesh Report");
+
+    const findingsOutput = stream();
+    await runCli(process, {
+      argv: ["findings", runId, "--deduplicate", "--json"],
+      output: findingsOutput,
+      error: stream(),
+      appPaths: {
+        configFile: join(root, "config.toml"),
+        reviewersDirectory: join(root, "reviewers"),
+        runsDirectory,
+      },
+    });
+    expect(JSON.parse(await output(findingsOutput))).toMatchObject({
+      run_id: runId,
+      findings: [{ severity: "high", confidence: "high" }],
+    });
+  });
+
+  it("retries only persisted incomplete lenses through trusted application options", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-mesh-retry-cli-"));
+    roots.push(root);
+    const runsDirectory = join(root, "runs");
+    await mkdir(runsDirectory);
+    const runId = "run-incomplete";
+    const request = {
+      schema_version: "2",
+      project_name: "demo",
+      workspace: root,
+      instructions: "Review the changes.",
+      review_scope: { mode: "changes" },
+    };
+    const records = [
+      {
+        record: "resolution",
+        run_id: runId,
+        resolution: { reviewers: [] },
+      },
+      { record: "request", run_id: runId, request },
+      {
+        schema_version: "5",
+        event: "run.completed",
+        run_id: runId,
+        seq: 1,
+        timestamp: "2026-09-03T00:00:00.000Z",
+        data: {
+          gate_outcome: "no_findings",
+          coverage_outcome: "partial",
+          exit_code: 3,
+          consistency_mode: "live_worktree",
+          total_elapsed_ms: 1,
+          logical_lenses: {
+            total: 2,
+            pending: 0,
+            findings: 0,
+            passed: 0,
+            incomplete: 2,
+            not_applicable: 0,
+            not_evaluated: 0,
+            not_selected: 0,
+          },
+          model_runs: {
+            total: 2,
+            deferred: 0,
+            queued: 0,
+            running: 0,
+            completed: 0,
+            incomplete: 2,
+            skipped: 0,
+          },
+          suite: {
+            total: 2,
+            deferred: 0,
+            queued: 0,
+            running: 0,
+            completed: 0,
+            incomplete: 2,
+            skipped: 0,
+          },
+          incomplete_lenses: ["security", "readiness"],
+        },
+      },
+    ];
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      `${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
+    );
+
+    let invocation: ReviewApplicationOptions | undefined;
+    const processLike = Object.assign(new EventEmitter(), { exitCode: 0 });
+    const retryError = stream();
+    await runCli(processLike, {
+      argv: ["retry", runId, "--only-incomplete"],
+      output: stream(),
+      error: retryError,
+      appPaths: {
+        configFile: join(root, "config.toml"),
+        reviewersDirectory: join(root, "reviewers"),
+        runsDirectory,
+      },
+      runReview: vi.fn(async (options) => {
+        invocation = options;
+        return 3;
+      }),
+    });
+
+    expect(await output(retryError)).toBe("");
+    expect(invocation).toMatchObject({
+      parentRunId: runId,
+      onlyLensIds: ["readiness", "security"],
+    });
+    expect(JSON.parse(invocation!.requestText)).toEqual(request);
+    expect(invocation!.requestText).not.toContain("review_mesh_retry");
+    expect(process.exitCode).toBe(3);
+    process.exitCode = undefined;
+  });
+
+  it("uses adapter doctor checks for the structured-output CLI preflight", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-mesh-doctor-cli-"));
+    roots.push(root);
+    const workspace = join(root, "demo");
+    const configFile = join(root, "config.toml");
+    await mkdir(workspace);
+    const config: ManagedConfig = {
+      schema_version: "5",
+      execution: {
+        max_concurrency: 1,
+        heartbeat_interval_ms: 1_000,
+        shutdown_grace_period_ms: 100,
+      },
+      diagnostics: { persist_runs: false, max_runs: 1 },
+      adapters: {
+        fake: {
+          type: "command",
+          command: "unused",
+          protocol: "review-mesh-command-v1",
+        },
+      },
+      agents: {
+        security: {
+          adapter: "fake",
+          model: "review-model",
+          purpose: "Security",
+          instructions: "Review security.",
+          isolation: "prefer_enforced",
+          timeout_ms: 1_000,
+        },
+      },
+      defaults: { agents: ["security"] },
+      projects: {},
+    };
+    await writeFile(configFile, serializeManagedConfig(config));
+
+    let doctorInput: AdapterReviewInput["reviewer"] | undefined;
+    let probeCalls = 0;
+    const registry = new AdapterRegistry();
+    registry.register("command", () => ({
+      id: "fake",
+      async probe() {
+        probeCalls += 1;
+        throw new Error("doctor should replace the basic probe");
+      },
+      async doctor(reviewer) {
+        doctorInput = reviewer;
+        return {
+          ready: true,
+          checks: [
+            { name: "authentication", passed: true },
+            { name: "model", passed: true },
+            { name: "tool_calling", passed: true },
+            { name: "structured_output", passed: true },
+          ],
+        };
+      },
+      async *run() {
+        throw new Error("not used");
+      },
+    }));
+    const stdout = stream();
+    const processLike = Object.assign(new EventEmitter(), { exitCode: 0 });
+    await runCli(processLike, {
+      argv: ["doctor", workspace, "--structured-output"],
+      output: stdout,
+      error: stream(),
+      configFile,
+      cwd: root,
+      adapterRegistry: registry,
+    });
+
+    expect(probeCalls).toBe(0);
+    expect(doctorInput).toMatchObject({
+      id: "security",
+      model: "review-model",
+    });
+    expect(JSON.parse(await output(stdout))).toEqual({
+      schema_version: "1",
+      kind: "review-mesh.doctor",
+      workspace: await realpath(workspace),
+      ready: true,
+      reviewers: [
+        {
+          reviewer_id: "security",
+          adapter: "fake",
+          model: "review-model",
+          provider_group: "fake",
+          ready: true,
+          checks: [
+            { name: "authentication", passed: true },
+            { name: "model", passed: true },
+            { name: "tool_calling", passed: true },
+            { name: "structured_output", passed: true },
+          ],
+        },
+      ],
+    });
+    expect(process.exitCode).toBe(0);
+    process.exitCode = undefined;
+  });
+});

@@ -411,7 +411,7 @@ instructions_file = "project.md"
         configFile: join(configDirectory, "config.toml"),
         workspace,
       });
-      expect(loaded.trusted.schema_version).toBe("4");
+      expect(loaded.trusted.schema_version).toBe("5");
       const resolved = resolveConfig(loaded);
       expect(resolved.reviewers[0]?.instruction_layers).toEqual([
         { source: "trusted", content: "Agent instructions." },

@@ -27,7 +27,7 @@ if (capturePath !== undefined) {
 }
 
 const passResult = {
-  schema_version: "1",
+  schema_version: "2",
   verdict: "pass",
   summary: "clean",
   actionable_findings: [],
@@ -35,7 +35,7 @@ const passResult = {
 };
 
 const failResult = {
-  schema_version: "1",
+  schema_version: "2",
   verdict: "fail",
   summary: "one actionable finding",
   actionable_findings: [
@@ -46,6 +46,9 @@ const failResult = {
       description: "The fixture found a controlled defect.",
       evidence: [{ path: "fixture.ts", detail: "Controlled evidence." }],
       suggested_direction: "Correct the controlled defect.",
+      confidence: "high",
+      classification: "confirmed_defect",
+      external_assumptions: [],
     },
   ],
   informational_notes: [],

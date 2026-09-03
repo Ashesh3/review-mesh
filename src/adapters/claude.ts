@@ -9,7 +9,7 @@ import {
   type WarmQuery,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { AdapterRegistration } from "../config/schemas.js";
-import { reviewerResultSchema } from "../protocol/schemas.js";
+import { reviewerResultV2Schema } from "../protocol/schemas.js";
 import { adapterFailure, type AdapterFailure } from "./errors.js";
 import {
   buildAllowlistedEnvironment,
@@ -587,7 +587,7 @@ class ClaudeAdapter implements ReviewAdapter {
           };
           return;
         }
-        const parsed = reviewerResultSchema.safeParse(
+        const parsed = reviewerResultV2Schema.safeParse(
           message.structured_output,
         );
         if (!parsed.success) {

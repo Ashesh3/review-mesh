@@ -261,15 +261,10 @@ describe("compiled CLI acceptance", () => {
         throw new Error("missing completion");
       expect(completed.data.status).toBe(expectedStatus);
       expect(completed.data.consistency_mode).toBe("live_worktree");
-      expect(completed.data.reviewers).toHaveLength(modes.length);
+      expect(completed.data.model_runs?.total).toBe(modes.length);
       if (expectedStatus === "incomplete") {
-        expect(
-          completed.data.reviewers.some(
-            (reviewer) =>
-              reviewer.status === "completed" &&
-              reviewer.result.actionable_findings.length === 1,
-          ),
-        ).toBe(true);
+        expect(completed.data.gate_outcome).toBe("findings");
+        expect(completed.data.coverage_outcome).toBe("partial");
       }
       expect(await workspaceDigest(fixture.workspace)).toBe(before);
     },
@@ -317,7 +312,8 @@ describe("compiled CLI acceptance", () => {
     expect(completed.data).toMatchObject({
       status: "incomplete",
       exit_code: 4,
-      reviewers: [{ status: "incomplete", reason: "cancelled" }],
+      coverage_outcome: "partial",
+      model_runs: { incomplete: 1 },
     });
     expect(processAlive(captured.pid)).toBe(false);
     expect(processAlive(captured.child_pid)).toBe(false);

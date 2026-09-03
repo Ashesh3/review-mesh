@@ -349,7 +349,7 @@ afterEach(async () => {
 });
 
 describe("review-mesh review", () => {
-  it("runs one agent's models in ordered clear-pass fallback", async () => {
+  it("runs one agent's models in ordered quorum progression", async () => {
     const fixture = await createFixture([], multiModelConfig());
 
     const result = await runCli(fixture);
@@ -376,7 +376,7 @@ describe("review-mesh review", () => {
             model_index: 1,
             model_count: 2,
             previous_reviewer_id: "architecture::opus",
-            activation: "after_clear_pass",
+            activation: "after_lens_progress",
             adapter: "grok",
             model: "grok-test",
             effort: "medium",
@@ -451,7 +451,7 @@ describe("review-mesh review", () => {
     await writeFile(
       join(runsDirectory, "run-query.jsonl.active.12.1.owner"),
       `${JSON.stringify({
-        schema_version: "4",
+        schema_version: "5",
         event: "reviewer.progress",
         run_id: "run-query",
         seq: 1,
@@ -560,12 +560,12 @@ describe("review-mesh review", () => {
       streams: {
         review: {
           stdin: "empty-or-review-request-json-v2",
-          stdout: "public-events-jsonl-v4",
+          stdout: "public-events-jsonl-v5",
           final_event: "run.completed",
         },
       },
       protocol: {
-        version: "4",
+        version: "5",
         request_version: "2",
         review_scope: {
           default_mode: "changes",
@@ -855,14 +855,7 @@ describe("review-mesh review", () => {
       exit_code: 0,
       suite: { total: 2, completed: 2, incomplete: 0 },
     });
-    expect(
-      completed.data.reviewers.map((reviewer) => reviewer.reviewer_id),
-    ).toEqual(["fixture-0", "fixture-1"]);
-    expect(
-      completed.data.reviewers.every(
-        (reviewer) => reviewer.status === "completed",
-      ),
-    ).toBe(true);
+    expect(completed.data.model_runs).toMatchObject({ completed: 2 });
     expect(result.stdout).not.toMatch(/stack|usage|review mesh/i);
   });
 
@@ -878,14 +871,8 @@ describe("review-mesh review", () => {
       throw new Error("missing completion");
     expect(completed.data.status).toBe("findings");
     expect(completed.data.exit_code).toBe(1);
-    expect(completed.data.reviewers).toHaveLength(2);
-    expect(
-      completed.data.reviewers.some(
-        (reviewer) =>
-          reviewer.status === "completed" &&
-          reviewer.result.actionable_findings.length === 1,
-      ),
-    ).toBe(true);
+    expect(completed.data.gate_outcome).toBe("findings");
+    expect(completed.data.unique_findings).toBeGreaterThan(0);
   });
 
   it("exits 3 with a sanitized incomplete record when one reviewer crashes", async () => {
@@ -900,14 +887,8 @@ describe("review-mesh review", () => {
     if (completed?.event !== "run.completed")
       throw new Error("missing completion");
     expect(completed.data.status).toBe("incomplete");
-    expect(completed.data.reviewers).toHaveLength(2);
-    expect(
-      completed.data.reviewers.some(
-        (reviewer) =>
-          reviewer.status === "incomplete" &&
-          reviewer.reason === "process_crashed",
-      ),
-    ).toBe(true);
+    expect(completed.data.coverage_outcome).toBe("partial");
+    expect(completed.data.model_runs?.incomplete).toBe(1);
     expect(result.stdout).not.toContain("fixture-secret");
     expect(result.stdout).not.toContain("Authorization: Bearer");
     expect(result.stdout).not.toMatch(/\n\s+at\s/);
@@ -927,9 +908,8 @@ describe("review-mesh review", () => {
     expect(completed?.event).toBe("run.completed");
     if (completed?.event !== "run.completed")
       throw new Error("missing completion");
-    expect(completed.data.reviewers).toMatchObject([
-      { status: "incomplete", reason: "adapter_unavailable" },
-    ]);
+    expect(completed.data.coverage_outcome).toBe("partial");
+    expect(completed.data.model_runs?.incomplete).toBe(1);
   });
 
   it.each([

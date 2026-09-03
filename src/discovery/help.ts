@@ -6,6 +6,10 @@ export type HelpTopic =
   | "overview"
   | "review"
   | "status"
+  | "report"
+  | "findings"
+  | "retry"
+  | "doctor"
   | "config"
   | "describe"
   | "schema"
@@ -24,6 +28,10 @@ each agent's executed model chain, and exits only after run.completed.
 USAGE
   review-mesh review [WORKSPACE]
   review-mesh status RUN_ID [REVIEWER_ID] [--json]
+  review-mesh report RUN_ID [--format markdown|json]
+  review-mesh findings RUN_ID [--deduplicate] [--json]
+  review-mesh retry RUN_ID --only-incomplete
+  review-mesh doctor [WORKSPACE] [--structured-output]
   review-mesh describe [WORKSPACE] [--json]
   review-mesh schema list
   review-mesh schema NAME [--json]
@@ -43,10 +51,10 @@ AGENT QUICK START
      With empty stdin, Review Mesh reviews only the current Git change set above
      the inferred default branch, including local staged/unstaged/untracked work.
      With JSON on stdin, send the explicit v2 request described below.
-  4. Read stdout one JSON object per line until run.completed. Agents run in
-     parallel, but each multi-model agent advances through model_runs in order
-     only while the previous model completes with a clear pass. A finding or
-     incomplete result stops that agent's fallback chain; other agents continue.
+  4. Read stdout one JSON object per line until run.completed. Logical lenses
+     run in parallel. A transient failure may retry; an operational failure
+     advances to an eligible fallback. Clean runs stop at quorum, while findings
+     can be independently adjudicated.
 
 DISCOVERY COMMANDS
   describe   Resolve the suite selected for a workspace without starting it.
@@ -61,8 +69,8 @@ REVIEW I/O CONTRACT
   stderr     Diagnostics before a run begins or if infrastructure fails.
 
 HELP TOPICS
-  review, status, config, config-file, adapters, command-adapter, describe, schema,
-  events, exit-codes
+  review, status, report, findings, retry, doctor, config, config-file,
+  adapters, command-adapter, describe, schema, events, exit-codes
 
 Run 'review-mesh help TOPIC' or 'review-mesh TOPIC --help' for details.
 `;
@@ -124,6 +132,41 @@ running review. It is available when diagnostics.persist_runs is enabled. Use
 the run_id from run.started; callers can poll this command instead of retaining
 every progress or heartbeat event in their own context.
 `,
+  report: `REVIEW-MESH REPORT
+
+USAGE
+  review-mesh report RUN_ID [--format markdown|json]
+
+Renders the persisted detailed review artifact. Markdown is the default; JSON
+includes logical-lens and model-run coverage, raw findings, deterministic
+deduplication, provenance, confidence, classification, and assumptions.
+`,
+  findings: `REVIEW-MESH FINDINGS
+
+USAGE
+  review-mesh findings RUN_ID [--deduplicate] [--json]
+
+Reads findings from the persisted detailed artifact. --deduplicate returns the
+consolidated set with source reviewer/finding ids and duplicate ids.
+`,
+  retry: `REVIEW-MESH RETRY
+
+USAGE
+  review-mesh retry RUN_ID --only-incomplete
+
+Starts a new review linked to the persisted parent run and targets the logical
+lenses that lacked a verdict. The normalized request is recovered from the
+private run artifact; completed lens evidence remains available in the parent.
+`,
+  doctor: `REVIEW-MESH DOCTOR
+
+USAGE
+  review-mesh doctor [WORKSPACE] [--structured-output]
+
+Preflights the resolved adapter/model roster before a long run. The structured
+mode verifies authentication, model availability, response-envelope parsing,
+and schema-constrained output where the adapter supports it.
+`,
   config: `REVIEW-MESH CONFIG
 
 USAGE
@@ -135,7 +178,7 @@ USAGE
   review-mesh config effective [WORKSPACE] --json
                                       Resolve the safe effective agent roster
   review-mesh config export --json   Export full config plus revision
-  review-mesh config apply --json    Atomically apply a full v4 config with CAS
+  review-mesh config apply --json    Atomically apply a full v5 config with CAS
   review-mesh config copilot login [--device-code|--web-flow] [--host URL]
   review-mesh config copilot status [--json]
   review-mesh config copilot models [--json]
@@ -202,7 +245,7 @@ Prints JSON Schema generated from the runtime Zod schemas:
   events   JSONL event object emitted by a valid review run
   run-status  Compact active or completed run/reviewer status snapshot
   result   Terminal result required from each reviewer
-  config   Trusted global configuration (v1/v2/v3 legacy or v4 current)
+  config   Trusted global configuration (v1-v4 legacy or v5 current)
   config-apply  Revision-guarded full-config update request
   diagnostic    Stable public diagnostic fields
   command-adapter-event  External reviewer JSONL event union
@@ -220,7 +263,7 @@ validation as final authority.
 `,
   events: `REVIEW-MESH EVENTS
 
-Every non-empty review stdout line is one schema-version 4 JSON object. Events
+Every non-empty review stdout line is one schema-version 5 JSON object. Events
 share run_id, have strictly increasing seq values, and include timestamps.
 
 Sequence and meaning:
@@ -229,21 +272,21 @@ Sequence and meaning:
   suite.resolved       Exact roster plus concurrency and heartbeat settings.
   reviewer.progress    Capability probe, queue state, or adapter activity.
   reviewer.started     One reviewer started, with model/effort/timeout.
-  reviewer.heartbeat   Liveness during probes, queueing, and active review.
+  suite.heartbeat      Aggregate liveness, deadlines, and stale activity.
   reviewer.completed   Valid terminal result for one reviewer.
   reviewer.incomplete  Reviewer/runtime did not return a valid result.
   reviewer.skipped     A later fallback was not needed after findings/failure.
-  run.completed        Final status, exit code, and every terminal record.
+  run.completed        Compact gate/coverage outcome and artifact reference.
 
-Always continue reading until run.completed or process termination. A finding
-stops later models only for the same logical agent; other agents continue.
+Always continue reading until run.completed or process termination. Operational
+failures advance to eligible fallbacks; clean passes stop at configured quorum.
 Review Mesh reports factual phases and elapsed time, never invented percentages.
 Use 'review-mesh schema events --json' for the exact machine contract.
 High-frequency adapter activity is retained as latest status instead of being
 emitted once per tool action; query it with
-'review-mesh status RUN_ID [REVIEWER_ID] --json'. Adapter failures explicitly
-marked retryable are retried once within the original reviewer deadline before
-the logical agent's fallback policy is applied.
+'review-mesh status RUN_ID [REVIEWER_ID] --json'. Retry count and backoff are
+trusted configuration; each attempt has a bounded deadline and fallback uses the
+remaining logical-lens budget.
 `,
   adapters: `REVIEW-MESH ADAPTERS
 
@@ -315,8 +358,8 @@ For autonomous changes, use export/apply with revision compare-and-swap:
   review-mesh config apply --json
 
 Export contains instruction and runtime fields and should be treated as
-sensitive. Apply accepts a complete v2, v3, or v4 document, not a patch; legacy
-documents are promoted to v4 when saved. Use 'review-mesh schema config --json' and
+sensitive. Apply accepts a complete v2-v5 document, not a patch; legacy
+documents are promoted to v5 when saved. Use 'review-mesh schema config --json' and
 'review-mesh config --help' for exact details.
 `,
   "exit-codes": `REVIEW-MESH EXIT CODES
@@ -327,8 +370,8 @@ documents are promoted to v4 when saved. Use 'review-mesh schema config --json' 
   3  incomplete   A reviewer/runtime failed to produce a valid terminal result.
   4  interrupted  The caller interrupted configuration or a review round.
 
-Outcome precedence is incomplete > findings > passed. Completed findings remain
-available in run.completed even when another reviewer is incomplete.
+Gate outcome and coverage outcome are independent. Exit 3 remains conservative
+for partial coverage, while the terminal event still exposes any findings.
 `,
 };
 

@@ -242,7 +242,7 @@ describe("config menu", () => {
     await mkdir(project);
     const file = join(directory, "config.toml");
     const initial: ManagedConfig = {
-      schema_version: "4",
+      schema_version: "5",
       execution: {
         max_concurrency: 1,
         heartbeat_interval_ms: 100,
@@ -355,7 +355,7 @@ describe("config menu", () => {
     roots.push(directory);
     const file = join(directory, "config.toml");
     const initial: ManagedConfig = {
-      schema_version: "4",
+      schema_version: "5",
       execution: {
         max_concurrency: 2,
         heartbeat_interval_ms: 100,
@@ -452,7 +452,7 @@ describe("config menu", () => {
     roots.push(directory);
     const file = join(directory, "config.toml");
     const initial: ManagedConfig = {
-      schema_version: "4",
+      schema_version: "5",
       execution: {
         max_concurrency: 2,
         heartbeat_interval_ms: 100,
@@ -579,11 +579,16 @@ describe("config menu", () => {
       output,
     });
     expect(loaded.config).toEqual<ManagedConfig>({
-      schema_version: "4",
+      schema_version: "5",
       execution: {
         max_concurrency: 2,
         heartbeat_interval_ms: 15000,
         shutdown_grace_period_ms: 5000,
+        default_provider_concurrency: 2,
+        provider_limits: {},
+        circuit_breaker_threshold: 2,
+        retry_attempts: 2,
+        retry_backoff_ms: 1000,
       },
       diagnostics: { persist_runs: true, max_runs: 50 },
       adapters: {},
@@ -630,7 +635,7 @@ describe("config menu", () => {
     const stored = "deleted-project";
     const file = join(directory, "config.toml");
     const initial: ManagedConfig = {
-      schema_version: "4",
+      schema_version: "5",
       execution: {
         max_concurrency: 1,
         heartbeat_interval_ms: 100,

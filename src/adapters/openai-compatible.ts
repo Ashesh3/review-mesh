@@ -10,8 +10,12 @@ import {
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import type { AdapterRegistration } from "../config/schemas.js";
-import { reviewerResultSchema } from "../protocol/schemas.js";
-import { adapterFailure, type AdapterFailure } from "./errors.js";
+import { reviewerResultV2Schema } from "../protocol/schemas.js";
+import {
+  adapterFailure,
+  type AdapterFailure,
+  type AdapterFailureDiagnostics,
+} from "./errors.js";
 import type {
   AdapterCapabilities,
   AdapterEvent,
@@ -141,6 +145,7 @@ const chatResponseSchema = z.object({
     .array(
       z.object({
         message: assistantMessageSchema,
+        finish_reason: z.string().nullable().optional(),
       }),
     )
     .min(1),
@@ -754,28 +759,145 @@ class ReadOnlyWorkspace {
 function providerFailureForStatus(
   status: number,
   operation: "probe" | "chat",
+  diagnostics: Partial<AdapterFailureDiagnostics>,
 ): AdapterFailure {
   if (status === 401 || status === 403) {
     return adapterFailure.authentication(
       "The OpenAI-compatible endpoint rejected authentication.",
+      false,
+      {
+        diagnostics: {
+          ...diagnostics,
+          failure_stage: "http_response",
+          scope: "provider",
+        },
+      },
     );
   }
   if (status === 404 && operation === "chat") {
     return adapterFailure.modelUnavailable(
       "The OpenAI-compatible endpoint could not serve the configured model.",
+      false,
+      {
+        diagnostics: {
+          ...diagnostics,
+          failure_stage: "http_response",
+          scope: "model",
+        },
+      },
     );
   }
   if (status === 408 || status === 429 || status >= 500) {
     return adapterFailure.unknown(
       "The OpenAI-compatible endpoint is temporarily unavailable.",
       true,
+      {
+        diagnostics: {
+          ...diagnostics,
+          failure_stage: "http_response",
+          scope: "provider",
+        },
+      },
     );
   }
   return adapterFailure.unavailable(
     operation === "probe"
       ? "The OpenAI-compatible models endpoint rejected the readiness check."
       : "The OpenAI-compatible endpoint rejected the review request.",
+    false,
+    {
+      diagnostics: {
+        ...diagnostics,
+        failure_stage: "http_response",
+        scope: "provider",
+      },
+    },
   );
+}
+
+interface ProviderJsonResponse {
+  value: unknown;
+  diagnostics: AdapterFailureDiagnostics;
+}
+
+interface ChatResponse {
+  message: z.infer<typeof assistantMessageSchema>;
+  diagnostics: AdapterFailureDiagnostics;
+}
+
+function providerRequestId(headers: Headers): string | undefined {
+  for (const name of [
+    "x-request-id",
+    "request-id",
+    "x-correlation-id",
+    "trace-id",
+  ]) {
+    const value = headers.get(name);
+    if (value !== null && value.trim().length > 0) return value;
+  }
+  return undefined;
+}
+
+function responseContentTypes(headers: Headers): string[] | undefined {
+  const contentType = headers.get("content-type")?.split(";", 1)[0]?.trim();
+  return contentType === undefined || contentType.length === 0
+    ? undefined
+    : [contentType];
+}
+
+function assistantContentTypes(value: unknown): string[] {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return [];
+  }
+  const choices = (value as { choices?: unknown }).choices;
+  if (!Array.isArray(choices) || choices.length === 0) return [];
+  const choice = choices[0];
+  if (typeof choice !== "object" || choice === null || Array.isArray(choice)) {
+    return [];
+  }
+  const message = (choice as { message?: unknown }).message;
+  if (
+    typeof message !== "object" ||
+    message === null ||
+    Array.isArray(message)
+  ) {
+    return [];
+  }
+  const labels: string[] = [];
+  const content = (message as { content?: unknown }).content;
+  if (typeof content === "string") labels.push("assistant:text");
+  else if (content === null) labels.push("assistant:null");
+  else if (Array.isArray(content)) {
+    for (const part of content) {
+      const type =
+        typeof part === "object" && part !== null && !Array.isArray(part)
+          ? (part as { type?: unknown }).type
+          : undefined;
+      labels.push(
+        typeof type === "string" && type.trim().length > 0
+          ? `assistant:${type}`
+          : "assistant:unknown_part",
+      );
+    }
+  } else if (content !== undefined) labels.push("assistant:unknown");
+  if (Array.isArray((message as { tool_calls?: unknown }).tool_calls)) {
+    labels.push("assistant:tool_calls");
+  }
+  return [...new Set(labels)];
+}
+
+function finishReason(value: unknown): string | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+  const choices = (value as { choices?: unknown }).choices;
+  if (!Array.isArray(choices) || choices.length === 0) return undefined;
+  const choice = choices[0];
+  if (typeof choice !== "object" || choice === null || Array.isArray(choice)) {
+    return undefined;
+  }
+  const reason = (choice as { finish_reason?: unknown }).finish_reason;
+  return typeof reason === "string" ? reason : undefined;
 }
 
 function headerValue(
@@ -971,7 +1093,7 @@ function relaxedStructuredOutputSchema(
 }
 
 type ReviewerResultParse =
-  | { success: true; data: z.infer<typeof reviewerResultSchema> }
+  | { success: true; data: z.infer<typeof reviewerResultV2Schema> }
   | { success: false; diagnostic: string };
 
 function parseReviewerResult(
@@ -986,7 +1108,7 @@ function parseReviewerResult(
   } catch {
     return { success: false, diagnostic: "The response was not valid JSON." };
   }
-  const parsed = reviewerResultSchema.safeParse(value);
+  const parsed = reviewerResultV2Schema.safeParse(value);
   if (parsed.success) return parsed;
   const issues = parsed.error.issues.slice(0, 12).map((issue) => {
     const path = issue.path.length === 0 ? "$" : `$.${issue.path.join(".")}`;
@@ -1186,7 +1308,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     operation: "probe" | "chat",
     signal: AbortSignal,
     init: Omit<RequestInit, "signal">,
-  ): Promise<unknown> {
+  ): Promise<ProviderJsonResponse> {
     throwIfAborted(signal);
     const contentType = headerValue(init.headers, "content-type");
     if (
@@ -1197,6 +1319,15 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
       throw new ProviderRequestError(
         adapterFailure.protocolViolation(
           "The OpenAI-compatible review request exceeded the size limit.",
+          false,
+          {
+            fallback_eligible: false,
+            diagnostics: {
+              failure_stage: "request_encoding",
+              scope: "run_input",
+              response_bytes: Buffer.byteLength(init.body, "utf8"),
+            },
+          },
         ),
       );
     }
@@ -1210,6 +1341,11 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     }, this.requestTimeoutMs);
     this.activeRequests.add(controller);
 
+    let responseDiagnostics: AdapterFailureDiagnostics = {
+      failure_stage: "http_request",
+      scope: "provider",
+    };
+    let responseBytes = 0;
     try {
       const response = await this.fetchFacade(
         `${configuration.baseUrl}${path}`,
@@ -1223,6 +1359,15 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           },
         },
       );
+      const requestId = providerRequestId(response.headers);
+      const contentTypes = responseContentTypes(response.headers);
+      responseDiagnostics = {
+        failure_stage: "http_response",
+        scope: "provider",
+        http_status: response.status,
+        ...(requestId === undefined ? {} : { provider_request_id: requestId }),
+        ...(contentTypes === undefined ? {} : { content_types: contentTypes }),
+      };
       if (!response.ok) {
         try {
           await response.body?.cancel();
@@ -1230,19 +1375,36 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           // The response body is untrusted and is never published.
         }
         throw new ProviderRequestError(
-          providerFailureForStatus(response.status, operation),
+          providerFailureForStatus(
+            response.status,
+            operation,
+            responseDiagnostics,
+          ),
         );
       }
       try {
         const contentLength = response.headers.get("content-length");
+        const declaredLength =
+          contentLength === null
+            ? undefined
+            : Number.parseInt(contentLength, 10);
         if (
-          contentLength !== null &&
-          Number.parseInt(contentLength, 10) > MAX_PROVIDER_RESPONSE_BYTES
+          declaredLength !== undefined &&
+          declaredLength > MAX_PROVIDER_RESPONSE_BYTES
         ) {
           await response.body?.cancel();
           throw new ProviderRequestError(
             adapterFailure.protocolViolation(
               "The OpenAI-compatible endpoint returned an oversized response.",
+              false,
+              {
+                diagnostics: {
+                  ...responseDiagnostics,
+                  failure_stage: "response_body",
+                  response_bytes: declaredLength,
+                  truncated: true,
+                },
+              },
             ),
           );
         }
@@ -1251,34 +1413,59 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           throw new ProviderRequestError(
             adapterFailure.protocolViolation(
               "The OpenAI-compatible endpoint returned no response body.",
+              false,
+              {
+                diagnostics: {
+                  ...responseDiagnostics,
+                  failure_stage: "response_body",
+                  response_bytes: 0,
+                  truncated: false,
+                },
+              },
             ),
           );
         }
         const chunks: Uint8Array[] = [];
-        let length = 0;
         for (;;) {
           const chunk = await reader.read();
           if (chunk.done) break;
-          length += chunk.value.byteLength;
-          if (length > MAX_PROVIDER_RESPONSE_BYTES) {
+          responseBytes += chunk.value.byteLength;
+          if (responseBytes > MAX_PROVIDER_RESPONSE_BYTES) {
             await reader.cancel();
             throw new ProviderRequestError(
               adapterFailure.protocolViolation(
                 "The OpenAI-compatible endpoint returned an oversized response.",
+                false,
+                {
+                  diagnostics: {
+                    ...responseDiagnostics,
+                    failure_stage: "response_body",
+                    response_bytes: responseBytes,
+                    truncated: true,
+                  },
+                },
               ),
             );
           }
           chunks.push(chunk.value);
         }
-        const bytes = new Uint8Array(length);
+        const bytes = new Uint8Array(responseBytes);
         let offset = 0;
         for (const chunk of chunks) {
           bytes.set(chunk, offset);
           offset += chunk.byteLength;
         }
-        return JSON.parse(
+        const value: unknown = JSON.parse(
           new TextDecoder("utf-8", { fatal: true }).decode(bytes),
         );
+        return {
+          value,
+          diagnostics: {
+            ...responseDiagnostics,
+            response_bytes: responseBytes,
+            truncated: false,
+          },
+        };
       } catch (error) {
         if (error instanceof ProviderRequestError) throw error;
         if (signal.aborted) {
@@ -1288,12 +1475,31 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           throw new ProviderRequestError(
             adapterFailure.timeout(
               "The OpenAI-compatible endpoint exceeded the request deadline.",
+              true,
+              {
+                diagnostics: {
+                  ...responseDiagnostics,
+                  failure_stage: "response_body",
+                  response_bytes: responseBytes,
+                  scope: "provider",
+                },
+              },
             ),
           );
         }
         throw new ProviderRequestError(
           adapterFailure.protocolViolation(
             "The OpenAI-compatible endpoint returned invalid JSON.",
+            false,
+            {
+              diagnostics: {
+                ...responseDiagnostics,
+                failure_stage: "json_decode",
+                response_bytes: responseBytes,
+                truncated: false,
+                scope: "provider",
+              },
+            },
           ),
         );
       }
@@ -1306,6 +1512,15 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         throw new ProviderRequestError(
           adapterFailure.timeout(
             "The OpenAI-compatible endpoint exceeded the request deadline.",
+            true,
+            {
+              diagnostics: {
+                ...responseDiagnostics,
+                failure_stage: "http_request",
+                response_bytes: responseBytes,
+                scope: "provider",
+              },
+            },
           ),
         );
       }
@@ -1313,6 +1528,12 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         adapterFailure.unavailable(
           "The OpenAI-compatible endpoint could not be reached.",
           true,
+          {
+            diagnostics: {
+              failure_stage: "http_request",
+              scope: "provider",
+            },
+          },
         ),
       );
     } finally {
@@ -1327,7 +1548,8 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     signal: AbortSignal,
     sessionId: string,
     body: Record<string, unknown>,
-  ) {
+    failureDiagnostics: Partial<AdapterFailureDiagnostics> = {},
+  ): Promise<ChatResponse> {
     if (
       "messages" in body &&
       Array.isArray(body.messages) &&
@@ -1354,15 +1576,43 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         body: JSON.stringify(body),
       },
     );
-    const parsed = chatResponseSchema.safeParse(response);
+    const receivedContentTypes = [
+      ...(response.diagnostics.content_types ?? []),
+      ...assistantContentTypes(response.value),
+    ];
+    const receivedFinishReason = finishReason(response.value);
+    const diagnostics: AdapterFailureDiagnostics = {
+      ...response.diagnostics,
+      ...failureDiagnostics,
+      ...(receivedContentTypes.length === 0
+        ? {}
+        : { content_types: receivedContentTypes }),
+      ...(receivedFinishReason === undefined
+        ? {}
+        : { finish_reason: receivedFinishReason }),
+    };
+    const parsed = chatResponseSchema.safeParse(response.value);
     if (!parsed.success) {
       throw new ProviderRequestError(
         adapterFailure.protocolViolation(
           "The OpenAI-compatible endpoint returned an invalid chat response.",
+          false,
+          {
+            fallback_eligible: true,
+            diagnostics: {
+              ...diagnostics,
+              failure_stage:
+                failureDiagnostics.failure_stage ?? "envelope_validation",
+              scope: "provider",
+            },
+          },
         ),
       );
     }
-    return parsed.data.choices[0]!.message;
+    return {
+      message: parsed.data.choices[0]!.message,
+      diagnostics,
+    };
   }
 
   async probe(
@@ -1411,7 +1661,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         signal,
         { method: "GET" },
       );
-      const parsed = modelsResponseSchema.safeParse(response);
+      const parsed = modelsResponseSchema.safeParse(response.value);
       if (!parsed.success) {
         return {
           ...base,
@@ -1450,6 +1700,106 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         retryable: failure.retryable,
       };
     }
+  }
+
+  async doctor(
+    reviewer: AdapterReviewInput["reviewer"],
+    signal: AbortSignal,
+  ): Promise<{
+    ready: boolean;
+    checks: Array<{ name: string; passed: boolean; message?: string }>;
+  }> {
+    const capabilities = await this.probe(reviewer, signal);
+    const checks = [
+      {
+        name: "authentication",
+        passed: capabilities.authenticated === true,
+        ...(capabilities.authenticated === true ||
+        capabilities.message === undefined
+          ? {}
+          : { message: capabilities.message }),
+      },
+      {
+        name: "model",
+        passed: capabilities.model_available === true,
+        ...(capabilities.model_available === true ||
+        capabilities.message === undefined
+          ? {}
+          : { message: capabilities.message }),
+      },
+    ];
+    if (!capabilities.available) return { ready: false, checks };
+    const configuration = this.configuration();
+    if ("reason" in configuration) return { ready: false, checks };
+    try {
+      const sessionId = this.sessionIdFactory();
+      const toolResponse = await this.chat(configuration, signal, sessionId, {
+        model: reviewer.model,
+        messages: [
+          {
+            role: "user",
+            content:
+              "Call list_files exactly once with an empty object. Do not answer directly.",
+          },
+        ],
+        tools: READ_ONLY_TOOLS,
+        tool_choice: "required",
+        max_tokens: 128,
+      });
+      checks.push({
+        name: "tool_calling",
+        passed:
+          Array.isArray(toolResponse.message.tool_calls) &&
+          toolResponse.message.tool_calls.some(
+            (call) => call.function.name === "list_files",
+          ),
+      });
+      const response = await this.chat(configuration, signal, sessionId, {
+        model: reviewer.model,
+        messages: [
+          {
+            role: "user",
+            content:
+              'Return exactly this JSON object and do not call tools: {"ok":true}',
+          },
+        ],
+        response_format: {
+          type: "json_schema",
+          json_schema: {
+            name: "review_mesh_doctor",
+            strict: false,
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              required: ["ok"],
+              properties: { ok: { const: true } },
+            },
+          },
+        },
+        max_tokens: 64,
+      });
+      const content = normalizedAssistantContent(response.message.content);
+      const parsed =
+        typeof content === "string" ? JSON.parse(content) : undefined;
+      checks.push({
+        name: "structured_output",
+        passed:
+          typeof parsed === "object" &&
+          parsed !== null &&
+          (parsed as { ok?: unknown }).ok === true,
+      });
+    } catch (error) {
+      const failure =
+        error instanceof ProviderRequestError
+          ? error.failure
+          : adapterFailure.unknown("Structured-output preflight failed.");
+      checks.push({
+        name: "structured_output",
+        passed: false,
+        message: failure.message,
+      });
+    }
+    return { ready: checks.every((check) => check.passed), checks };
   }
 
   private async runTool(
@@ -1567,7 +1917,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     try {
       let inspectionBudgetReached = false;
       for (let turn = 0; turn < this.maxTurns; turn += 1) {
-        const message = await this.chat(
+        const chatResponse = await this.chat(
           configuration,
           input.signal,
           sessionId,
@@ -1582,6 +1932,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
             max_tokens: 8_192,
           },
         );
+        const message = chatResponse.message;
         const reserve = finalizationReserve(this.maxConversationBytes);
         const assistant = boundedAssistantMessage(
           message,
@@ -1701,7 +2052,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
             schema: relaxedStructuredOutputSchema(input.resultJsonSchema),
           },
         } as const;
-        const finalMessage = await this.chat(
+        const finalResponse = await this.chat(
           configuration,
           input.signal,
           sessionId,
@@ -1714,7 +2065,14 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
             response_format: responseFormat,
             max_tokens: 8_192,
           },
+          {
+            failure_stage: "structured_result_envelope",
+            repair_attempted: false,
+            repair_outcome: "not_attempted",
+          },
         );
+        const finalMessage = finalResponse.message;
+        let resultDiagnostics = finalResponse.diagnostics;
         let parsedResult = parseReviewerResult(
           normalizedAssistantContent(finalMessage.content),
         );
@@ -1747,7 +2105,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           } else {
             messages.push(repairMessage);
           }
-          const repairedMessage = await this.chat(
+          const repairedResponse = await this.chat(
             configuration,
             input.signal,
             sessionId,
@@ -1760,7 +2118,14 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               response_format: responseFormat,
               max_tokens: 8_192,
             },
+            {
+              failure_stage: "structured_result_repair_envelope",
+              repair_attempted: true,
+              repair_outcome: "failed",
+            },
           );
+          const repairedMessage = repairedResponse.message;
+          resultDiagnostics = repairedResponse.diagnostics;
           parsedResult = parseReviewerResult(
             normalizedAssistantContent(repairedMessage.content),
           );
@@ -1769,6 +2134,17 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           throw new ProviderRequestError(
             adapterFailure.invalidResult(
               "The OpenAI-compatible endpoint returned a reviewer result that violates the required schema after one repair attempt.",
+              false,
+              {
+                fallback_eligible: true,
+                diagnostics: {
+                  ...resultDiagnostics,
+                  failure_stage: "structured_result_validation",
+                  scope: "model",
+                  repair_attempted: true,
+                  repair_outcome: "failed",
+                },
+              },
             ),
           );
         }

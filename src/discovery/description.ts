@@ -27,6 +27,26 @@ const commands = [
     help_command: "review-mesh help status",
   },
   {
+    name: "report",
+    usage: "review-mesh report RUN_ID --format markdown|json",
+    help_command: "review-mesh help report",
+  },
+  {
+    name: "findings",
+    usage: "review-mesh findings RUN_ID --deduplicate --json",
+    help_command: "review-mesh help findings",
+  },
+  {
+    name: "retry",
+    usage: "review-mesh retry RUN_ID --only-incomplete",
+    help_command: "review-mesh help retry",
+  },
+  {
+    name: "doctor",
+    usage: "review-mesh doctor [WORKSPACE] --structured-output",
+    help_command: "review-mesh help doctor",
+  },
+  {
     name: "schema",
     usage: "review-mesh schema list | review-mesh schema NAME --json",
     help_command: "review-mesh help schema",
@@ -94,7 +114,7 @@ export async function describeTool(options: DescribeToolOptions = {}) {
     streams: {
       review: {
         stdin: "empty-or-review-request-json-v2" as const,
-        stdout: "public-events-jsonl-v4" as const,
+        stdout: "public-events-jsonl-v5" as const,
         stderr: "diagnostic-jsonl-v1" as const,
         final_event: "run.completed" as const,
         status_query: "review-mesh status RUN_ID [REVIEWER_ID] --json" as const,
@@ -120,16 +140,19 @@ export async function describeTool(options: DescribeToolOptions = {}) {
         "Configuration and workspace selection are valid; adapters, credentials, models, and isolation are probed when review starts.",
     },
     protocol: {
-      version: "4" as const,
+      version: "5" as const,
       request_version: "2" as const,
       consistency_mode: "live_worktree" as const,
       maximum_request_bytes: 8 * 1024 * 1024,
-      outcome_precedence: ["incomplete", "findings", "passed"] as const,
+      outcomes: ["gate_outcome", "coverage_outcome"] as const,
       model_fallback: {
         parallelism: "across_agents" as const,
         order: "configured_model_runs" as const,
-        advance_only_after: "completed_pass_with_zero_findings" as const,
-        stop_agent_after: ["findings", "incomplete"] as const,
+        advance_after: [
+          "clean_pass_until_quorum",
+          "operational_failure",
+        ] as const,
+        stop_agent_after: ["confirmed_findings", "quorum"] as const,
       },
       progress: {
         phases: [
@@ -145,8 +168,12 @@ export async function describeTool(options: DescribeToolOptions = {}) {
         adapter_activity_streamed: false as const,
         status_query_available: true as const,
         retryable_adapter_failures: {
-          maximum_attempts: 2 as const,
-          backoff_ms: 1_000 as const,
+          maximum_attempts: configuration.valid
+            ? configuration.execution.retry_attempts
+            : undefined,
+          backoff_ms: configuration.valid
+            ? configuration.execution.retry_backoff_ms
+            : undefined,
         },
       },
       review_scope: {

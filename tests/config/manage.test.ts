@@ -30,7 +30,7 @@ async function root(): Promise<string> {
 
 function config(): ManagedConfig {
   return {
-    schema_version: "4",
+    schema_version: "5",
     execution: {
       max_concurrency: 2,
       heartbeat_interval_ms: 15_000,
@@ -206,12 +206,12 @@ append_instructions = "extra"
 
   it("reads scalar v2 configuration and promotes it to managed v4", () => {
     const legacyV2 = serializeManagedConfig(config()).replace(
-      'schema_version = "4"',
+      'schema_version = "5"',
       'schema_version = "2"',
     );
     const result = parseManagedConfig(legacyV2);
     expect(result.migrated).toBe(true);
-    expect(result.config.schema_version).toBe("4");
+    expect(result.config.schema_version).toBe("5");
     expect(result.config.agents.gemini).toMatchObject({
       model: "gemini-flash",
       effort: "high",

@@ -42,6 +42,8 @@ interface ScalarModelSelection {
 interface ModelRunSelection extends ScalarModelSelection {
   id: string;
   adapter?: string | undefined;
+  provider_group?: string | undefined;
+  timeout_ms?: number | undefined;
 }
 
 type AgentModelSelection =
@@ -432,6 +434,12 @@ async function modelRuns(
       id,
       ...(overrideMode === "inherit" ? {} : { adapter: override }),
       ...selection,
+      ...(existing?.provider_group === undefined
+        ? {}
+        : { provider_group: existing.provider_group }),
+      ...(existing?.timeout_ms === undefined
+        ? {}
+        : { timeout_ms: existing.timeout_ms }),
     });
   }
   return selected;
@@ -580,6 +588,27 @@ async function editAgent(options: ConfigMenuOptions): Promise<void> {
     isolation,
     timeout_ms: timeout,
     ...(current.runtime === undefined ? {} : { runtime: current.runtime }),
+    ...(current.applicability === undefined
+      ? {}
+      : { applicability: current.applicability }),
+    ...(current.required_context === undefined
+      ? {}
+      : { required_context: current.required_context }),
+    ...(current.pass_quorum === undefined
+      ? {}
+      : { pass_quorum: current.pass_quorum }),
+    ...(current.minimum_provider_groups === undefined
+      ? {}
+      : { minimum_provider_groups: current.minimum_provider_groups }),
+    ...(current.adjudication === undefined
+      ? {}
+      : { adjudication: current.adjudication }),
+    ...(current.gate_minimum_severity === undefined
+      ? {}
+      : { gate_minimum_severity: current.gate_minimum_severity }),
+    ...(current.gate_minimum_confidence === undefined
+      ? {}
+      : { gate_minimum_confidence: current.gate_minimum_confidence }),
   };
   config.agents[id] = edited;
   const isDefault = config.defaults?.agents.includes(id) === true;

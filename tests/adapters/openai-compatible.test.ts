@@ -118,6 +118,71 @@ const nodeIdentity: FileSystemIdentityFacade = {
 };
 
 describe("OpenAI-compatible adapter", () => {
+  it("doctors model readiness, required tool calling, and structured output", async () => {
+    const requests: Array<{ url: string; init?: RequestInit; body?: any }> = [];
+    const responses = [
+      jsonResponse({ data: [{ id: "review-model" }] }),
+      assistantResponse({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "doctor-list",
+            type: "function",
+            function: { name: "list_files", arguments: "{}" },
+          },
+        ],
+      }),
+      assistantResponse({
+        role: "assistant",
+        content: JSON.stringify({ ok: true }),
+      }),
+    ];
+    const prepared = setup("C:\\workspace", {
+      fetch: fetchMock(async (input, init) => {
+        requests.push({
+          url: String(input),
+          ...(init === undefined ? {} : { init }),
+          ...(typeof init?.body === "string"
+            ? { body: JSON.parse(init.body) }
+            : {}),
+        });
+        return responses.shift()!;
+      }),
+      sessionIdFactory: () => "doctor-session",
+    });
+
+    expect(prepared.adapter.doctor).toBeDefined();
+    const result = await prepared.adapter.doctor!(
+      prepared.reviewer,
+      prepared.controller.signal,
+    );
+
+    expect(result).toEqual({
+      ready: true,
+      checks: [
+        { name: "authentication", passed: true },
+        { name: "model", passed: true },
+        { name: "tool_calling", passed: true },
+        { name: "structured_output", passed: true },
+      ],
+    });
+    expect(requests.map((request) => request.url)).toEqual([
+      "https://gateway.example/v1/models",
+      "https://gateway.example/v1/chat/completions",
+      "https://gateway.example/v1/chat/completions",
+    ]);
+    expect(requests[1]?.body.tool_choice).toBe("required");
+    expect(requests[2]?.body.response_format?.type).toBe("json_schema");
+    expect(
+      requests
+        .slice(1)
+        .map((request) =>
+          new Headers(request.init?.headers).get("X-Client-Session-Id"),
+        ),
+    ).toEqual(["doctor-session", "doctor-session"]);
+  });
+
   it("uses only bounded direct read tools and validates a strict final result", async () => {
     const root = await mkdtemp(
       join(process.env.TEMP ?? "C:\\Temp", "mesh-oai-"),
@@ -413,6 +478,99 @@ describe("OpenAI-compatible adapter", () => {
     expect(JSON.stringify(event)).not.toContain("provider-secret");
   });
 
+  it("reports bounded envelope diagnostics and makes invalid chat responses fallback eligible", async () => {
+    const prepared = setup("C:\\workspace", {
+      fetch: fetchMock(
+        async () =>
+          new Response(
+            JSON.stringify({
+              choices: [
+                {
+                  finish_reason: "length",
+                  message: {
+                    role: "assistant",
+                    content: [
+                      {
+                        type: "image",
+                        text: "Authorization: Bearer provider-secret",
+                      },
+                    ],
+                  },
+                },
+              ],
+            }),
+            {
+              headers: {
+                "content-type": "application/json; charset=utf-8",
+                "x-request-id":
+                  "request-id Authorization: Bearer diagnostic-secret",
+              },
+            },
+          ),
+      ),
+    });
+
+    const event = terminal(await collect(prepared.adapter, prepared.input));
+    expect(event).toMatchObject({
+      type: "failure",
+      failure: {
+        reason: "protocol_violation",
+        retryable: false,
+        fallback_eligible: true,
+        diagnostics: {
+          failure_stage: "envelope_validation",
+          scope: "provider",
+          http_status: 200,
+          provider_request_id: "request-id [redacted]",
+          finish_reason: "length",
+          content_types: ["application/json", "assistant:image"],
+          response_bytes: expect.any(Number),
+          truncated: false,
+        },
+      },
+    });
+    expect(JSON.stringify(event)).not.toContain("provider-secret");
+    expect(JSON.stringify(event)).not.toContain("diagnostic-secret");
+  });
+
+  it("captures safe HTTP failure metadata without retaining the provider body", async () => {
+    const prepared = setup("C:\\workspace", {
+      fetch: fetchMock(
+        async () =>
+          new Response(
+            JSON.stringify({
+              error: "Authorization: Bearer response-body-secret",
+            }),
+            {
+              status: 503,
+              headers: {
+                "content-type": "application/json",
+                "request-id": "provider-request-123",
+              },
+            },
+          ),
+      ),
+    });
+
+    const event = terminal(await collect(prepared.adapter, prepared.input));
+    expect(event).toMatchObject({
+      type: "failure",
+      failure: {
+        reason: "unknown",
+        retryable: true,
+        fallback_eligible: true,
+        diagnostics: {
+          failure_stage: "http_response",
+          scope: "provider",
+          http_status: 503,
+          provider_request_id: "provider-request-123",
+          content_types: ["application/json"],
+        },
+      },
+    });
+    expect(JSON.stringify(event)).not.toContain("response-body-secret");
+  });
+
   it("fails after exactly one bounded structured-result repair", async () => {
     const responses = [
       assistantResponse({ role: "assistant", content: "Done." }),
@@ -426,7 +584,17 @@ describe("OpenAI-compatible adapter", () => {
       terminal(await collect(prepared.adapter, prepared.input)),
     ).toMatchObject({
       type: "failure",
-      failure: { reason: "invalid_result", retryable: false },
+      failure: {
+        reason: "invalid_result",
+        retryable: false,
+        fallback_eligible: true,
+        diagnostics: {
+          failure_stage: "structured_result_validation",
+          scope: "model",
+          repair_attempted: true,
+          repair_outcome: "failed",
+        },
+      },
       isolation: "runtime_read_only",
     });
     expect(mockedFetch).toHaveBeenCalledTimes(3);

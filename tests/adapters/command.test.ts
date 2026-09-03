@@ -221,7 +221,7 @@ describe("generic command adapter", () => {
       {
         type: "result",
         result: {
-          schema_version: "1",
+          schema_version: "2",
           verdict: "pass",
           summary: "clean",
           actionable_findings: [],

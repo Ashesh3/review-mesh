@@ -5,7 +5,7 @@ import type { AdapterRegistration } from "../config/schemas.js";
 import {
   incompleteReasonSchema,
   isolationLevelSchema,
-  reviewerResultSchema,
+  reviewerResultV2Schema,
   type IsolationLevel,
 } from "../protocol/schemas.js";
 import { adapterFailure, sanitizeAdapterFailure } from "./errors.js";
@@ -76,7 +76,7 @@ const activityEventSchema = z.strictObject({
 });
 const resultEventSchema = z.strictObject({
   type: z.literal("result"),
-  result: reviewerResultSchema,
+  result: reviewerResultV2Schema,
 });
 const failureEventSchema = z.strictObject({
   type: z.literal("failure"),
