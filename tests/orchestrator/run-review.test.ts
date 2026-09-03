@@ -395,6 +395,87 @@ describe("runReviewRound", () => {
     ).toHaveLength(1);
   });
 
+  it("uses Retry-After over exponential jitter while retaining the original deadline", async () => {
+    let attempts = 0;
+    const adapter = new FakeAdapter({
+      onRun: (queue) => {
+        attempts += 1;
+        if (attempts === 1) {
+          queue.push({
+            type: "failure",
+            failure: {
+              reason: "adapter_unavailable",
+              message: "Rate limited.",
+              retryable: true,
+              fallback_eligible: true,
+              circuit_qualifying: true,
+              diagnostics: { retry_after_ms: 2_500 },
+            },
+            isolation: "enforced_read_only",
+          });
+          return;
+        }
+        queue.push({
+          type: "result",
+          result: passResult(),
+          isolation: "enforced_read_only",
+        });
+      },
+    });
+    const completionPromise = runReviewRound({
+      ...roundInput({
+        adapters: { adapter },
+        config: {
+          execution: { retry_backoff_ms: 1_000 },
+          reviewers: [{ timeoutMs: 10_000 }],
+        },
+      }),
+      random: () => 0,
+    });
+
+    await vi.advanceTimersByTimeAsync(2_499);
+    expect(adapter.runCalls).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.runAllTimersAsync();
+    await completionPromise;
+    expect(adapter.runCalls).toBe(2);
+  });
+
+  it("does not wait out an untrusted Retry-After that consumes the remaining deadline", async () => {
+    const adapter = new FakeAdapter({
+      onRun: (queue) => {
+        queue.push({
+          type: "failure",
+          failure: {
+            reason: "adapter_unavailable",
+            message: "Rate limited.",
+            retryable: true,
+            fallback_eligible: true,
+            circuit_qualifying: true,
+            diagnostics: { retry_after_ms: 60_000 },
+          },
+          isolation: "enforced_read_only",
+        });
+      },
+    });
+    const completionPromise = runReviewRound({
+      ...roundInput({
+        adapters: { adapter },
+        config: {
+          execution: { retry_backoff_ms: 1_000 },
+          reviewers: [{ timeoutMs: 10_000 }],
+        },
+      }),
+      random: () => 0,
+    });
+
+    await vi.runAllTimersAsync();
+    const completion = await completionPromise;
+
+    expect(adapter.runCalls).toBe(1);
+    expect(completion.status).toBe("incomplete");
+  });
+
   it("continues to an operational fallback after transient retries are exhausted", async () => {
     const first = new FakeAdapter({
       onRun: (queue) => {

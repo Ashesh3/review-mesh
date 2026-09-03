@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
 import {
   lstat,
@@ -15,6 +15,8 @@ import {
   adapterFailure,
   type AdapterFailure,
   type AdapterFailureDiagnostics,
+  type AdapterResponseStructure,
+  type AdapterValidationIssue,
 } from "./errors.js";
 import type {
   AdapterCapabilities,
@@ -42,6 +44,9 @@ const MAX_QUERY_LENGTH = 500;
 const MAX_READ_LINES = 500;
 const MAX_RETURNED_LINE_LENGTH = 1_000;
 const MAX_CONTENT_PARTS = 1_024;
+const DEFAULT_FINALIZATION_MAX_TOKENS = 8_192;
+const TRUNCATION_FINALIZATION_MAX_TOKENS = 16_384;
+const MAX_VALIDATION_ISSUES = 12;
 const SKIPPED_DIRECTORIES = new Set([
   ".git",
   ".git-recovered",
@@ -769,6 +774,7 @@ function providerFailureForStatus(
       "The OpenAI-compatible endpoint rejected authentication.",
       false,
       {
+        circuit_qualifying: false,
         diagnostics: {
           ...diagnostics,
           failure_stage: "http_response",
@@ -782,6 +788,7 @@ function providerFailureForStatus(
       "The OpenAI-compatible endpoint could not serve the configured model.",
       false,
       {
+        circuit_qualifying: false,
         diagnostics: {
           ...diagnostics,
           failure_stage: "http_response",
@@ -790,13 +797,35 @@ function providerFailureForStatus(
       },
     );
   }
-  if (status === 408 || status === 429 || status >= 500) {
-    return adapterFailure.unknown(
-      "The OpenAI-compatible endpoint is temporarily unavailable.",
+  if (status === 408 || status === 524) {
+    return adapterFailure.timeout(
+      status === 524
+        ? "The OpenAI-compatible gateway timed out waiting for the upstream model."
+        : "The OpenAI-compatible endpoint timed out while processing the request.",
       true,
       {
+        circuit_qualifying: true,
         diagnostics: {
           ...diagnostics,
+          failure_code: status === 524 ? "gateway_timeout" : "request_timeout",
+          failure_stage: "http_response",
+          scope: "provider",
+        },
+      },
+    );
+  }
+  if (status === 429 || status >= 500) {
+    return adapterFailure.unavailable(
+      status === 429
+        ? "The OpenAI-compatible endpoint rate limit was exceeded."
+        : "The OpenAI-compatible endpoint is temporarily unavailable.",
+      true,
+      {
+        circuit_qualifying: true,
+        diagnostics: {
+          ...diagnostics,
+          failure_code:
+            status === 429 ? "rate_limited" : "provider_unavailable",
           failure_stage: "http_response",
           scope: "provider",
         },
@@ -809,6 +838,7 @@ function providerFailureForStatus(
       : "The OpenAI-compatible endpoint rejected the review request.",
     false,
     {
+      circuit_qualifying: false,
       diagnostics: {
         ...diagnostics,
         failure_stage: "http_response",
@@ -816,6 +846,39 @@ function providerFailureForStatus(
       },
     },
   );
+}
+
+function correlationHeaders(
+  headers: Headers,
+): Record<string, string> | undefined {
+  const values: Record<string, string> = {};
+  for (const name of [
+    "x-request-id",
+    "request-id",
+    "x-correlation-id",
+    "trace-id",
+    "cf-ray",
+    "traceparent",
+  ]) {
+    const value = headers.get(name)?.trim();
+    if (value !== undefined && value.length > 0) values[name] = value;
+  }
+  return Object.keys(values).length === 0 ? undefined : values;
+}
+
+function retryAfterMilliseconds(
+  headers: Headers,
+  nowMilliseconds: number,
+): number | undefined {
+  const value = headers.get("retry-after")?.trim();
+  if (value === undefined || value.length === 0) return undefined;
+  if (/^\d+$/u.test(value)) {
+    const seconds = Number.parseInt(value, 10);
+    return Number.isSafeInteger(seconds) ? seconds * 1_000 : undefined;
+  }
+  const date = Date.parse(value);
+  if (!Number.isFinite(date)) return undefined;
+  return Math.max(0, date - nowMilliseconds);
 }
 
 function retryableResultProductionFailure(failure: AdapterFailure): boolean {
@@ -832,6 +895,30 @@ function exhaustedResultProductionFailure(
   failure: AdapterFailure,
 ): AdapterFailure {
   return failure.retryable ? { ...failure, retryable: false } : failure;
+}
+
+function outputTruncationFailure(
+  diagnostics: AdapterFailureDiagnostics,
+  repairAttempted: boolean,
+): AdapterFailure {
+  return adapterFailure.invalidResult(
+    "The OpenAI-compatible endpoint truncated the structured reviewer result at its output limit.",
+    true,
+    {
+      fallback_eligible: true,
+      circuit_qualifying: false,
+      diagnostics: {
+        ...diagnostics,
+        failure_code: "output_truncated",
+        failure_stage: "structured_result_truncation",
+        scope: "model",
+        finish_reason: "length",
+        truncated: true,
+        repair_attempted: repairAttempted,
+        repair_outcome: repairAttempted ? "failed" : "not_attempted",
+      },
+    },
+  );
 }
 
 interface ProviderJsonResponse {
@@ -855,6 +942,81 @@ function providerRequestId(headers: Headers): string | undefined {
     if (value !== null && value.trim().length > 0) return value;
   }
   return undefined;
+}
+
+function valueType(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value;
+}
+
+function sortedObjectKeys(value: unknown): string[] | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? Object.keys(value).sort().slice(0, 32)
+    : undefined;
+}
+
+function responseStructure(value: unknown): AdapterResponseStructure {
+  const structure: AdapterResponseStructure = { root_type: valueType(value) };
+  const topLevelKeys = sortedObjectKeys(value);
+  if (topLevelKeys !== undefined) structure.top_level_keys = topLevelKeys;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return structure;
+  }
+  const choices = (value as { choices?: unknown }).choices;
+  if (!Array.isArray(choices)) return structure;
+  structure.choices_count = choices.length;
+  const firstChoice = choices[0];
+  structure.first_choice_type = valueType(firstChoice);
+  const firstChoiceKeys = sortedObjectKeys(firstChoice);
+  if (firstChoiceKeys !== undefined)
+    structure.first_choice_keys = firstChoiceKeys;
+  if (
+    typeof firstChoice !== "object" ||
+    firstChoice === null ||
+    Array.isArray(firstChoice)
+  ) {
+    return structure;
+  }
+  const message = (firstChoice as { message?: unknown }).message;
+  structure.message_type = valueType(message);
+  const messageKeys = sortedObjectKeys(message);
+  if (messageKeys !== undefined) structure.message_keys = messageKeys;
+  return structure;
+}
+
+function responseFingerprint(
+  structure: AdapterResponseStructure,
+  responseBytes: number,
+): string {
+  const structuralSummary = {
+    response_bytes: responseBytes,
+    root_type: structure.root_type,
+    top_level_key_count: structure.top_level_keys?.length ?? 0,
+    choices_count: structure.choices_count,
+    first_choice_type: structure.first_choice_type,
+    first_choice_key_count: structure.first_choice_keys?.length ?? 0,
+    message_type: structure.message_type,
+    message_key_count: structure.message_keys?.length ?? 0,
+  };
+  return createHash("sha256")
+    .update(JSON.stringify(structuralSummary))
+    .digest("hex");
+}
+
+function zodValidationIssues(error: z.ZodError): AdapterValidationIssue[] {
+  return error.issues.slice(0, MAX_VALIDATION_ISSUES).map((issue) => ({
+    path:
+      issue.path.length === 0
+        ? "$"
+        : `$${issue.path
+            .map((part) =>
+              typeof part === "number" ? `[${part}]` : `.${String(part)}`,
+            )
+            .join("")}`,
+    code: issue.code,
+    message: truncateUtf8(issue.message, 256),
+  }));
 }
 
 function responseContentTypes(headers: Headers): string[] | undefined {
@@ -1113,29 +1275,54 @@ function relaxedStructuredOutputSchema(
 
 type ReviewerResultParse =
   | { success: true; data: z.infer<typeof reviewerResultV2Schema> }
-  | { success: false; diagnostic: string };
+  | {
+      success: false;
+      diagnostic: string;
+      validationIssues: AdapterValidationIssue[];
+    };
 
 function parseReviewerResult(
   content: string | null | undefined,
 ): ReviewerResultParse {
   if (typeof content !== "string" || content.trim() === "") {
-    return { success: false, diagnostic: "No JSON content was returned." };
+    return {
+      success: false,
+      diagnostic: "No JSON content was returned.",
+      validationIssues: [
+        {
+          path: "$",
+          code: "missing_content",
+          message: "No JSON content was returned.",
+        },
+      ],
+    };
   }
   let value: unknown;
   try {
     value = JSON.parse(content);
   } catch {
-    return { success: false, diagnostic: "The response was not valid JSON." };
+    return {
+      success: false,
+      diagnostic: "The response was not valid JSON.",
+      validationIssues: [
+        {
+          path: "$",
+          code: "invalid_json",
+          message: "The response was not valid JSON.",
+        },
+      ],
+    };
   }
   const parsed = reviewerResultV2Schema.safeParse(value);
   if (parsed.success) return parsed;
-  const issues = parsed.error.issues.slice(0, 12).map((issue) => {
-    const path = issue.path.length === 0 ? "$" : `$.${issue.path.join(".")}`;
-    return `${path}: ${truncateUtf8(issue.message, 160)}`;
-  });
+  const validationIssues = zodValidationIssues(parsed.error);
+  const issues = validationIssues.map(
+    (issue) => `${issue.path}: ${truncateUtf8(issue.message, 160)}`,
+  );
   return {
     success: false,
     diagnostic: truncateUtf8(`Schema issues: ${issues.join("; ")}`, 2 * 1_024),
+    validationIssues,
   };
 }
 
@@ -1353,6 +1540,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           false,
           {
             fallback_eligible: false,
+            circuit_qualifying: false,
             diagnostics: {
               failure_stage: "request_encoding",
               scope: "run_input",
@@ -1392,11 +1580,17 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
       );
       const requestId = providerRequestId(response.headers);
       const contentTypes = responseContentTypes(response.headers);
+      const correlations = correlationHeaders(response.headers);
+      const retryAfterMs = retryAfterMilliseconds(response.headers, this.now());
       responseDiagnostics = {
         failure_stage: "http_response",
         scope: "provider",
         http_status: response.status,
         ...(requestId === undefined ? {} : { provider_request_id: requestId }),
+        ...(retryAfterMs === undefined ? {} : { retry_after_ms: retryAfterMs }),
+        ...(correlations === undefined
+          ? {}
+          : { correlation_headers: correlations }),
         ...(contentTypes === undefined ? {} : { content_types: contentTypes }),
       };
       if (!response.ok) {
@@ -1429,8 +1623,10 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               "The OpenAI-compatible endpoint returned an oversized response.",
               false,
               {
+                circuit_qualifying: false,
                 diagnostics: {
                   ...responseDiagnostics,
+                  failure_code: "response_too_large",
                   failure_stage: "response_body",
                   response_bytes: declaredLength,
                   truncated: true,
@@ -1446,8 +1642,10 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               "The OpenAI-compatible endpoint returned no response body.",
               false,
               {
+                circuit_qualifying: false,
                 diagnostics: {
                   ...responseDiagnostics,
+                  failure_code: "provider_response_invalid",
                   failure_stage: "response_body",
                   response_bytes: 0,
                   truncated: false,
@@ -1468,8 +1666,10 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
                 "The OpenAI-compatible endpoint returned an oversized response.",
                 false,
                 {
+                  circuit_qualifying: false,
                   diagnostics: {
                     ...responseDiagnostics,
+                    failure_code: "response_too_large",
                     failure_stage: "response_body",
                     response_bytes: responseBytes,
                     truncated: true,
@@ -1486,14 +1686,48 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           bytes.set(chunk, offset);
           offset += chunk.byteLength;
         }
-        const value: unknown = JSON.parse(
-          new TextDecoder("utf-8", { fatal: true }).decode(bytes),
-        );
+        const decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+        let value: unknown;
+        try {
+          value = JSON.parse(decoded);
+        } catch {
+          throw new ProviderRequestError(
+            adapterFailure.protocolViolation(
+              "The OpenAI-compatible endpoint returned invalid JSON.",
+              false,
+              {
+                circuit_qualifying: false,
+                diagnostics: {
+                  ...responseDiagnostics,
+                  failure_code: "provider_response_invalid",
+                  failure_stage: "json_decode",
+                  response_bytes: responseBytes,
+                  response_fingerprint: responseFingerprint(
+                    { root_type: "invalid_json" },
+                    responseBytes,
+                  ),
+                  truncated: false,
+                  scope: "provider",
+                  validation_issues: [
+                    {
+                      path: "$",
+                      code: "invalid_json",
+                      message: "The response body was not valid JSON.",
+                    },
+                  ],
+                },
+              },
+            ),
+          );
+        }
+        const structure = responseStructure(value);
         return {
           value,
           diagnostics: {
             ...responseDiagnostics,
             response_bytes: responseBytes,
+            response_fingerprint: responseFingerprint(structure, responseBytes),
+            response_structure: structure,
             truncated: false,
           },
         };
@@ -1508,8 +1742,10 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               "The OpenAI-compatible endpoint exceeded the request deadline.",
               true,
               {
+                circuit_qualifying: true,
                 diagnostics: {
                   ...responseDiagnostics,
+                  failure_code: "request_timeout",
                   failure_stage: "response_body",
                   response_bytes: responseBytes,
                   scope: "provider",
@@ -1520,12 +1756,14 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         }
         throw new ProviderRequestError(
           adapterFailure.protocolViolation(
-            "The OpenAI-compatible endpoint returned invalid JSON.",
+            "The OpenAI-compatible endpoint returned an unreadable response body.",
             false,
             {
+              circuit_qualifying: false,
               diagnostics: {
                 ...responseDiagnostics,
-                failure_stage: "json_decode",
+                failure_code: "provider_response_invalid",
+                failure_stage: "response_body",
                 response_bytes: responseBytes,
                 truncated: false,
                 scope: "provider",
@@ -1545,8 +1783,10 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
             "The OpenAI-compatible endpoint exceeded the request deadline.",
             true,
             {
+              circuit_qualifying: true,
               diagnostics: {
                 ...responseDiagnostics,
+                failure_code: "request_timeout",
                 failure_stage: "http_request",
                 response_bytes: responseBytes,
                 scope: "provider",
@@ -1560,7 +1800,9 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           "The OpenAI-compatible endpoint could not be reached.",
           true,
           {
+            circuit_qualifying: true,
             diagnostics: {
+              failure_code: "transport_error",
               failure_stage: "http_request",
               scope: "provider",
             },
@@ -1630,11 +1872,14 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           false,
           {
             fallback_eligible: true,
+            circuit_qualifying: false,
             diagnostics: {
               ...diagnostics,
+              failure_code: "provider_response_invalid",
               failure_stage:
                 failureDiagnostics.failure_stage ?? "envelope_validation",
               scope: "provider",
+              validation_issues: zodValidationIssues(parsed.error),
             },
           },
         ),
@@ -2110,6 +2355,16 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
             break;
           }
           const finalizationMessages = structuredClone(finalizationCheckpoint);
+          const truncationRecovery =
+            lastFinalizationFailure?.diagnostics?.failure_code ===
+            "output_truncated";
+          if (truncationRecovery) {
+            finalizationMessages.push({
+              role: "user",
+              content:
+                "The previous structured result reached the provider output limit. Produce a fresh, compact result from the retained inspection evidence. Keep the summary concise, include only actionable findings, shorten descriptions and fixes, return exactly one JSON object, and do not call tools.",
+            });
+          }
           let resultDiagnostics: AdapterFailureDiagnostics = {
             failure_stage: "structured_result_envelope",
             scope: "provider",
@@ -2128,7 +2383,9 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
                   : { reasoning_effort: input.reviewer.effort }),
                 messages: finalizationMessages,
                 response_format: responseFormat,
-                max_tokens: 8_192,
+                max_tokens: truncationRecovery
+                  ? TRUNCATION_FINALIZATION_MAX_TOKENS
+                  : DEFAULT_FINALIZATION_MAX_TOKENS,
               },
               {
                 failure_stage: "structured_result_envelope",
@@ -2140,7 +2397,14 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
             let parsedResult = parseReviewerResult(
               normalizedAssistantContent(finalResponse.message.content),
             );
-            if (!parsedResult.success) {
+            let resultTruncated =
+              finalResponse.diagnostics.finish_reason === "length";
+            if (resultTruncated) {
+              lastFinalizationFailure = outputTruncationFailure(
+                finalResponse.diagnostics,
+                false,
+              );
+            } else if (!parsedResult.success) {
               const repairMessage = {
                 role: "user",
                 content: `Your previous final result was invalid. ${parsedResult.diagnostic} Return exactly one JSON object that satisfies the supplied reviewer_result schema. Include every required top-level field, use no markdown or commentary, and do not call tools.`,
@@ -2180,7 +2444,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
                     : { reasoning_effort: input.reviewer.effort }),
                   messages: finalizationMessages,
                   response_format: responseFormat,
-                  max_tokens: 8_192,
+                  max_tokens: DEFAULT_FINALIZATION_MAX_TOKENS,
                 },
                 {
                   failure_stage: "structured_result_repair_envelope",
@@ -2192,25 +2456,42 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               parsedResult = parseReviewerResult(
                 normalizedAssistantContent(repairedResponse.message.content),
               );
+              resultTruncated =
+                repairedResponse.diagnostics.finish_reason === "length";
+              if (resultTruncated) {
+                lastFinalizationFailure = outputTruncationFailure(
+                  repairedResponse.diagnostics,
+                  true,
+                );
+              }
             }
-            if (parsedResult.success) {
+            if (parsedResult.success && !resultTruncated) {
               yield { type: "result", result: parsedResult.data, isolation };
               return;
             }
-            lastFinalizationFailure = adapterFailure.invalidResult(
-              "The OpenAI-compatible endpoint returned a reviewer result that violates the required schema after one repair attempt.",
-              false,
-              {
-                fallback_eligible: true,
-                diagnostics: {
-                  ...resultDiagnostics,
-                  failure_stage: "structured_result_validation",
-                  scope: "model",
-                  repair_attempted: true,
-                  repair_outcome: "failed",
+            if (
+              lastFinalizationFailure?.diagnostics?.failure_code !==
+              "output_truncated"
+            ) {
+              lastFinalizationFailure = adapterFailure.invalidResult(
+                "The OpenAI-compatible endpoint returned a reviewer result that violates the required schema after one repair attempt.",
+                false,
+                {
+                  fallback_eligible: true,
+                  circuit_qualifying: false,
+                  diagnostics: {
+                    ...resultDiagnostics,
+                    failure_stage: "structured_result_validation",
+                    scope: "model",
+                    validation_issues: parsedResult.success
+                      ? []
+                      : parsedResult.validationIssues,
+                    repair_attempted: true,
+                    repair_outcome: "failed",
+                  },
                 },
-              },
-            );
+              );
+            }
           } catch (error) {
             if (!(error instanceof ProviderRequestError)) throw error;
             lastFinalizationFailure = error.failure;

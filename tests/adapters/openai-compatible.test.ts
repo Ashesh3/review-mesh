@@ -474,6 +474,106 @@ describe("OpenAI-compatible adapter", () => {
     expect(bodies[1].messages).toEqual(bodies[2].messages);
   });
 
+  it("recovers output truncation from the inspection checkpoint with a compact larger-budget finalization", async () => {
+    const bodies: any[] = [];
+    const responses = [
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      jsonResponse({
+        choices: [
+          {
+            finish_reason: "length",
+            message: {
+              role: "assistant",
+              content: '{"schema_version":"2","verdict":',
+            },
+          },
+        ],
+      }),
+      jsonResponse({
+        choices: [
+          {
+            finish_reason: "stop",
+            message: {
+              role: "assistant",
+              content: JSON.stringify(passResult("Compact recovery.")),
+            },
+          },
+        ],
+      }),
+    ];
+    const prepared = setup("C:\\workspace", {
+      finalizationAttempts: 2,
+      fetch: fetchMock(async (_input, init) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return responses.shift()!;
+      }),
+    });
+
+    expect(terminal(await collect(prepared.adapter, prepared.input))).toEqual({
+      type: "result",
+      result: passResult("Compact recovery."),
+      isolation: "runtime_read_only",
+    });
+    expect(bodies).toHaveLength(3);
+    expect(bodies.filter((body) => body.tools !== undefined)).toHaveLength(1);
+    expect(bodies[1].max_tokens).toBe(8_192);
+    expect(bodies[2].max_tokens).toBe(16_384);
+    expect(bodies[2].messages.slice(0, -1)).toEqual(bodies[1].messages);
+    expect(bodies[2].messages.at(-1).content).toContain(
+      "fresh, compact result",
+    );
+    expect(
+      bodies.some((body) =>
+        body.messages.some((message: any) =>
+          String(message.content).includes("previous final result was invalid"),
+        ),
+      ),
+    ).toBe(false);
+  });
+
+  it("reports exhausted output truncation as non-circuit-qualifying", async () => {
+    const truncated = () =>
+      jsonResponse({
+        choices: [
+          {
+            finish_reason: "length",
+            message: { role: "assistant", content: '{"cut":' },
+          },
+        ],
+      });
+    const responses = [
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      truncated(),
+      truncated(),
+    ];
+    const prepared = setup("C:\\workspace", {
+      finalizationAttempts: 2,
+      fetch: fetchMock(async () => responses.shift()!),
+    });
+
+    expect(
+      terminal(await collect(prepared.adapter, prepared.input)),
+    ).toMatchObject({
+      type: "failure",
+      failure: {
+        reason: "invalid_result",
+        retryable: false,
+        fallback_eligible: true,
+        circuit_qualifying: false,
+        diagnostics: {
+          failure_code: "output_truncated",
+          failure_stage: "structured_result_truncation",
+          scope: "model",
+          finish_reason: "length",
+          truncated: true,
+          repair_attempted: false,
+          repair_outcome: "not_attempted",
+        },
+      },
+      isolation: "runtime_read_only",
+    });
+  });
+
   it("retries from the checkpoint when structured-result repair transport fails", async () => {
     const bodies: any[] = [];
     const responses = [
@@ -611,7 +711,7 @@ describe("OpenAI-compatible adapter", () => {
     ).toMatchObject({
       type: "failure",
       failure: {
-        reason: "unknown",
+        reason: "adapter_unavailable",
         retryable: false,
         fallback_eligible: true,
         diagnostics: { failure_stage: "http_response", http_status: 503 },
@@ -742,7 +842,7 @@ describe("OpenAI-compatible adapter", () => {
     expect(JSON.stringify(event)).not.toContain("provider-secret");
   });
 
-  it("reports bounded envelope diagnostics and makes invalid chat responses fallback eligible", async () => {
+  it("reports safe structural envelope diagnostics without qualifying provider circuits", async () => {
     const prepared = setup("C:\\workspace", {
       fetch: fetchMock(
         async () =>
@@ -768,6 +868,8 @@ describe("OpenAI-compatible adapter", () => {
                 "content-type": "application/json; charset=utf-8",
                 "x-request-id":
                   "request-id Authorization: Bearer diagnostic-secret",
+                "cf-ray": "cf-ray-123",
+                traceparent: "00-trace-id-span-id-01",
               },
             },
           ),
@@ -781,14 +883,38 @@ describe("OpenAI-compatible adapter", () => {
         reason: "protocol_violation",
         retryable: false,
         fallback_eligible: true,
+        circuit_qualifying: false,
         diagnostics: {
+          failure_code: "provider_response_invalid",
           failure_stage: "envelope_validation",
           scope: "provider",
           http_status: 200,
           provider_request_id: "request-id [redacted]",
+          correlation_headers: {
+            "x-request-id": "request-id [redacted]",
+            "cf-ray": "cf-ray-123",
+            traceparent: "00-trace-id-span-id-01",
+          },
           finish_reason: "length",
           content_types: ["application/json", "assistant:image"],
           response_bytes: expect.any(Number),
+          response_fingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+          response_structure: {
+            root_type: "object",
+            top_level_keys: ["choices"],
+            choices_count: 1,
+            first_choice_type: "object",
+            first_choice_keys: ["finish_reason", "message"],
+            message_type: "object",
+            message_keys: ["content", "role"],
+          },
+          validation_issues: [
+            {
+              path: "$.choices[0].message.content[0]",
+              code: "custom",
+              message: expect.any(String),
+            },
+          ],
           truncated: false,
         },
       },
@@ -797,7 +923,28 @@ describe("OpenAI-compatible adapter", () => {
     expect(JSON.stringify(event)).not.toContain("diagnostic-secret");
   });
 
-  it("captures safe HTTP failure metadata without retaining the provider body", async () => {
+  it("fingerprints only response structure, not raw provider content", async () => {
+    const fingerprints: string[] = [];
+    for (const secret of ["short-secret-a", "short-secret-b"]) {
+      const prepared = setup("C:\\workspace", {
+        fetch: fetchMock(async () =>
+          assistantResponse({
+            role: "assistant",
+            content: [{ type: "image", text: secret }],
+          }),
+        ),
+      });
+      const event = terminal(await collect(prepared.adapter, prepared.input));
+      if (event.type !== "failure") throw new Error("expected failure");
+      fingerprints.push(event.failure.diagnostics?.response_fingerprint ?? "");
+      expect(JSON.stringify(event)).not.toContain(secret);
+    }
+
+    expect(fingerprints[0]).toMatch(/^[a-f0-9]{64}$/);
+    expect(fingerprints[1]).toBe(fingerprints[0]);
+  });
+
+  it("classifies HTTP 503 with safe correlation metadata without retaining the provider body", async () => {
     const prepared = setup("C:\\workspace", {
       fetch: fetchMock(
         async () =>
@@ -810,6 +957,7 @@ describe("OpenAI-compatible adapter", () => {
               headers: {
                 "content-type": "application/json",
                 "request-id": "provider-request-123",
+                "cf-ray": "ray-503",
               },
             },
           ),
@@ -820,20 +968,78 @@ describe("OpenAI-compatible adapter", () => {
     expect(event).toMatchObject({
       type: "failure",
       failure: {
-        reason: "unknown",
+        reason: "adapter_unavailable",
         retryable: true,
         fallback_eligible: true,
+        circuit_qualifying: true,
         diagnostics: {
+          failure_code: "provider_unavailable",
           failure_stage: "http_response",
           scope: "provider",
           http_status: 503,
           provider_request_id: "provider-request-123",
+          correlation_headers: {
+            "request-id": "provider-request-123",
+            "cf-ray": "ray-503",
+          },
           content_types: ["application/json"],
         },
       },
     });
     expect(JSON.stringify(event)).not.toContain("response-body-secret");
   });
+
+  it.each([
+    {
+      status: 429,
+      reason: "adapter_unavailable",
+      failureCode: "rate_limited",
+      message: "rate limit",
+      headers: { "retry-after": "3" },
+      retryAfterMs: 3_000,
+    },
+    {
+      status: 524,
+      reason: "timeout",
+      failureCode: "gateway_timeout",
+      message: "gateway timed out",
+      headers: { "cf-ray": "ray-524" },
+      retryAfterMs: undefined,
+    },
+  ])(
+    "classifies HTTP $status as $failureCode",
+    async ({ status, reason, failureCode, message, headers, retryAfterMs }) => {
+      const prepared = setup("C:\\workspace", {
+        fetch: fetchMock(
+          async () =>
+            new Response("untrusted provider body", {
+              status,
+              headers: { "content-type": "text/html", ...headers },
+            }),
+        ),
+      });
+
+      const event = terminal(await collect(prepared.adapter, prepared.input));
+      expect(event).toMatchObject({
+        type: "failure",
+        failure: {
+          reason,
+          message: expect.stringContaining(message),
+          retryable: true,
+          fallback_eligible: true,
+          circuit_qualifying: true,
+          diagnostics: {
+            failure_code: failureCode,
+            http_status: status,
+            ...(retryAfterMs === undefined
+              ? {}
+              : { retry_after_ms: retryAfterMs }),
+          },
+        },
+      });
+      expect(JSON.stringify(event)).not.toContain("untrusted provider body");
+    },
+  );
 
   it("fails after exactly one bounded structured-result repair", async () => {
     const responses = [
@@ -855,9 +1061,17 @@ describe("OpenAI-compatible adapter", () => {
         reason: "invalid_result",
         retryable: false,
         fallback_eligible: true,
+        circuit_qualifying: false,
         diagnostics: {
           failure_stage: "structured_result_validation",
           scope: "model",
+          validation_issues: [
+            {
+              path: "$",
+              code: "invalid_json",
+              message: "The response was not valid JSON.",
+            },
+          ],
           repair_attempted: true,
           repair_outcome: "failed",
         },

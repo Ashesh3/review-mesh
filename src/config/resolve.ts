@@ -337,6 +337,7 @@ function resolveV1(
       default_provider_concurrency: 2,
       provider_limits: {},
       circuit_breaker_threshold: 2,
+      circuit_breaker_cooldown_ms: 30_000,
       retry_attempts: 2,
       retry_backoff_ms: 1_000,
     },
@@ -413,6 +414,10 @@ function resolveV2(
         "circuit_breaker_threshold" in config.execution
           ? (config.execution.circuit_breaker_threshold ?? 2)
           : 2,
+      circuit_breaker_cooldown_ms:
+        "circuit_breaker_cooldown_ms" in config.execution
+          ? (config.execution.circuit_breaker_cooldown_ms ?? 30_000)
+          : 30_000,
       retry_attempts:
         "retry_attempts" in config.execution
           ? (config.execution.retry_attempts ?? 2)

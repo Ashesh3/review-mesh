@@ -232,13 +232,63 @@ export const reviewerPhaseSchema = z.enum([
   "terminal",
 ]);
 export const adapterFailureDiagnosticsSchema = z.strictObject({
+  failure_code: z
+    .enum([
+      "rate_limited",
+      "provider_unavailable",
+      "gateway_timeout",
+      "provider_response_invalid",
+      "output_truncated",
+      "request_timeout",
+      "transport_error",
+      "response_too_large",
+    ])
+    .optional(),
   failure_stage: z.string().min(1).max(64).optional(),
   scope: z.enum(["run_input", "adapter", "provider", "model"]).optional(),
   http_status: z.number().int().min(100).max(599).optional(),
   provider_request_id: nonEmptyString.max(256).optional(),
+  retry_after_ms: nonNegativeInteger.optional(),
+  correlation_headers: z
+    .strictObject({
+      "x-request-id": nonEmptyString.max(256).optional(),
+      "request-id": nonEmptyString.max(256).optional(),
+      "x-correlation-id": nonEmptyString.max(256).optional(),
+      "trace-id": nonEmptyString.max(256).optional(),
+      "cf-ray": nonEmptyString.max(256).optional(),
+      traceparent: nonEmptyString.max(256).optional(),
+    })
+    .optional(),
+  retry_blocked_by_circuit: z.boolean().optional(),
+  circuit_caused_by_reviewer_id: nonEmptyString.max(256).optional(),
   finish_reason: nonEmptyString.max(128).optional(),
   content_types: z.array(nonEmptyString.max(128)).max(32).optional(),
   response_bytes: nonNegativeInteger.optional(),
+  response_fingerprint: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/u)
+    .optional(),
+  response_structure: z
+    .strictObject({
+      root_type: nonEmptyString.max(128),
+      top_level_keys: z.array(nonEmptyString.max(128)).max(32).optional(),
+      choices_count: nonNegativeInteger.optional(),
+      first_choice_type: nonEmptyString.max(128).optional(),
+      first_choice_keys: z.array(nonEmptyString.max(128)).max(32).optional(),
+      message_type: nonEmptyString.max(128).optional(),
+      message_keys: z.array(nonEmptyString.max(128)).max(32).optional(),
+    })
+    .optional(),
+  validation_issues: z
+    .array(
+      z.strictObject({
+        path: z.string().max(256),
+        code: nonEmptyString.max(64),
+        message: nonEmptyString.max(256),
+      }),
+    )
+    .max(12)
+    .optional(),
   truncated: z.boolean().optional(),
   repair_attempted: z.boolean().optional(),
   repair_outcome: z.enum(["not_attempted", "succeeded", "failed"]).optional(),
@@ -270,6 +320,7 @@ export const reviewerTerminalRecordSchema = z.discriminatedUnion("status", [
     message: boundedMessage,
     retryable: z.boolean(),
     fallback_eligible: z.boolean().optional(),
+    circuit_qualifying: z.boolean().optional(),
     diagnostics: adapterFailureDiagnosticsSchema.optional(),
   }),
   z.strictObject({
@@ -336,6 +387,9 @@ const executionSchema = z.strictObject({
   default_provider_concurrency: positiveInteger.optional(),
   provider_limits: z.record(nonEmptyString, positiveInteger).optional(),
   circuit_breaker_threshold: positiveInteger.optional(),
+  circuit_breaker_cooldown_ms: positiveInteger.optional(),
+  retry_attempts: positiveInteger.optional(),
+  retry_backoff_ms: nonNegativeInteger.optional(),
 });
 
 const publicEventSchemas = [
@@ -491,6 +545,7 @@ const publicEventSchemas = [
       message: boundedMessage,
       retryable: z.boolean(),
       fallback_eligible: z.boolean(),
+      circuit_qualifying: z.boolean().optional(),
       diagnostics: adapterFailureDiagnosticsSchema.optional(),
       attempt_count: positiveInteger,
     }),

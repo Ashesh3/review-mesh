@@ -160,6 +160,81 @@ describe("report and findings commands", () => {
     });
   });
 
+  it("keeps strict diagnostics but allows explicit best-effort finding salvage", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-mesh-salvage-cli-"));
+    roots.push(root);
+    const runsDirectory = join(root, "runs");
+    await mkdir(runsDirectory);
+    const runId = "run-salvage";
+    const validResult = {
+      record: "reviewer.result",
+      run_id: runId,
+      reviewer_id: "security",
+      result: {
+        schema_version: "2",
+        verdict: "fail",
+        summary: "Issue found.",
+        actionable_findings: [
+          {
+            id: "f-1",
+            severity: "high",
+            title: "Unsafe trust boundary",
+            description: "Input crosses a trust boundary.",
+            evidence: [{ detail: "Unvalidated input." }],
+            suggested_direction: "Validate it.",
+            confidence: "high",
+            classification: "confirmed_defect",
+            external_assumptions: [],
+          },
+        ],
+        informational_notes: [],
+      },
+    };
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [
+        JSON.stringify(validResult),
+        JSON.stringify({ record: "future.private", run_id: runId }),
+      ].join("\n") + "\n",
+    );
+    const strictError = stream();
+    await runCli(process, {
+      argv: ["findings", runId, "--json"],
+      output: stream(),
+      error: strictError,
+      appPaths: {
+        configFile: join(root, "config.toml"),
+        reviewersDirectory: join(root, "reviewers"),
+        runsDirectory,
+      },
+    });
+    expect(JSON.parse(await output(strictError))).toMatchObject({
+      error: "invalid_run_record",
+      line: 2,
+      record_type: "future.private",
+      schema_paths: expect.any(Array),
+    });
+
+    const salvageOutput = stream();
+    await runCli(process, {
+      argv: ["findings", runId, "--deduplicate", "--json", "--best-effort"],
+      output: salvageOutput,
+      error: stream(),
+      appPaths: {
+        configFile: join(root, "config.toml"),
+        reviewersDirectory: join(root, "reviewers"),
+        runsDirectory,
+      },
+    });
+    expect(JSON.parse(await output(salvageOutput))).toMatchObject({
+      run_id: runId,
+      findings: [expect.objectContaining({ id: "f-1" })],
+      record_warnings: [
+        expect.objectContaining({ line: 2, record_type: "future.private" }),
+      ],
+    });
+  });
+
   it("retries only persisted incomplete lenses through trusted application options", async () => {
     const root = await mkdtemp(join(tmpdir(), "review-mesh-retry-cli-"));
     roots.push(root);

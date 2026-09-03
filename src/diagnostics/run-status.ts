@@ -10,9 +10,20 @@ export class RunStatusError extends Error {
   constructor(
     readonly code: "invalid_run_id" | "run_not_found" | "invalid_run_record",
     message: string,
+    readonly line?: number,
+    readonly recordType?: string,
   ) {
     super(message);
     this.name = "RunStatusError";
+  }
+
+  get diagnosticDetails(): Record<string, unknown> {
+    return {
+      ...(this.line === undefined ? {} : { line: this.line }),
+      ...(this.recordType === undefined
+        ? {}
+        : { record_type: this.recordType }),
+    };
   }
 }
 
@@ -53,7 +64,22 @@ interface ReviewerSnapshot {
   };
   failure?: Record<string, unknown>;
   skipped?: Record<string, unknown>;
+  attempts?: ReviewerAttempt[];
+  cause?: {
+    kind: "root_failure" | "downstream_effect";
+    reviewer_id: string;
+    reason?: string;
+  };
 }
+
+interface ReviewerAttempt {
+  attempt: number;
+  started_at?: string;
+  elapsed_ms: number;
+  failure: Record<string, unknown>;
+}
+
+const MAX_ATTEMPT_HISTORY = 8;
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -146,11 +172,82 @@ function reviewerFor(
   return created;
 }
 
+function addAttempt(
+  reviewers: Map<string, ReviewerSnapshot>,
+  record: Record<string, unknown>,
+): void {
+  const id = text(record.reviewer_id);
+  const attempt = integer(record.attempt);
+  const failure = asRecord(record.failure);
+  if (
+    id === undefined ||
+    attempt === undefined ||
+    attempt === 0 ||
+    failure === undefined
+  ) {
+    return;
+  }
+  const reviewer = reviewerFor(reviewers, id);
+  const history = reviewer.attempts ?? [];
+  const startedAt = text(record.started_at) ?? text(record.startedAt);
+  history.push({
+    attempt,
+    ...(startedAt === undefined ? {} : { started_at: startedAt }),
+    elapsed_ms: integer(record.elapsed_ms) ?? integer(record.elapsedMs) ?? 0,
+    failure: structuredClone(failure),
+  });
+  reviewer.attempts = history.slice(-MAX_ATTEMPT_HISTORY);
+  reviewer.attempt = Math.max(reviewer.attempt ?? 0, attempt);
+}
+
+function applyCause(
+  reviewer: ReviewerSnapshot,
+  reviewers: Map<string, ReviewerSnapshot>,
+): void {
+  if (reviewer.state === "incomplete") {
+    const diagnostics = asRecord(reviewer.failure?.diagnostics);
+    const causedBy = text(diagnostics?.circuit_caused_by_reviewer_id);
+    if (
+      diagnostics?.retry_blocked_by_circuit === true ||
+      causedBy !== undefined
+    ) {
+      const root = causedBy === undefined ? undefined : reviewers.get(causedBy);
+      const reason =
+        text(root?.failure?.reason) ?? text(reviewer.failure?.reason);
+      reviewer.cause = {
+        kind: "downstream_effect",
+        reviewer_id: causedBy ?? reviewer.reviewer_id,
+        ...(reason === undefined ? {} : { reason }),
+      };
+      return;
+    }
+    reviewer.cause = {
+      kind: "root_failure",
+      reviewer_id: reviewer.reviewer_id,
+      ...(text(reviewer.failure?.reason) === undefined
+        ? {}
+        : { reason: text(reviewer.failure?.reason)! }),
+    };
+    return;
+  }
+  if (reviewer.state !== "skipped") return;
+  const reason = text(reviewer.skipped?.reason);
+  const blockedBy = text(reviewer.skipped?.blocked_by_reviewer_id);
+  if (reason !== "circuit_open" && blockedBy === undefined) return;
+  const root = blockedBy === undefined ? undefined : reviewers.get(blockedBy);
+  const rootReason = text(root?.failure?.reason) ?? reason;
+  reviewer.cause = {
+    kind: "downstream_effect",
+    reviewer_id: blockedBy ?? reviewer.reviewer_id,
+    ...(rootReason === undefined ? {} : { reason: rootReason }),
+  };
+}
+
 function applyPrivateTerminal(
   reviewers: Map<string, ReviewerSnapshot>,
   record: Record<string, unknown>,
 ): void {
-  const terminal = asRecord(record.terminal);
+  const terminal = privateTerminal(record);
   const id = text(terminal?.reviewer_id);
   const status = text(terminal?.status);
   if (id === undefined || status === undefined) return;
@@ -195,6 +292,12 @@ function applyPrivateTerminal(
   }
 }
 
+function privateTerminal(
+  record: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  return asRecord(record.terminal) ?? asRecord(record.data);
+}
+
 export async function readRunStatus({
   runsDirectory,
   runId,
@@ -215,9 +318,12 @@ export async function readRunStatus({
       value = JSON.parse(encoded);
     } catch {
       if (location.active && index === lines.length - 1) break;
+      const line = index + 1;
       throw new RunStatusError(
         "invalid_run_record",
-        "The persisted run record contains invalid JSON.",
+        `The persisted run record contains invalid JSON at JSONL line ${line} (invalid_json).`,
+        line,
+        "invalid_json",
       );
     }
     const event = asRecord(value);
@@ -252,6 +358,10 @@ export async function readRunStatus({
           state: (integer(entry?.model_index) ?? 0) > 0 ? "deferred" : "queued",
         });
       }
+      continue;
+    }
+    if (event.record === "reviewer.attempt") {
+      addAttempt(reviewers, event);
       continue;
     }
     if (event.record === "reviewer.terminal") {
@@ -371,6 +481,7 @@ export async function readRunStatus({
   }
 
   const values = [...reviewers.values()];
+  for (const reviewer of values) applyCause(reviewer, reviewers);
   const selected =
     reviewerId === undefined
       ? values

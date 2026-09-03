@@ -71,6 +71,7 @@ export interface RunReviewRoundInput {
   writer: EventWriter;
   signal: AbortSignal;
   clock: OrchestratorClock;
+  random?: () => number;
 }
 
 export interface RunCompletion {
@@ -108,7 +109,10 @@ interface ModelExecution {
 
 interface ProviderCircuit {
   failures: number;
-  open: boolean;
+  state: "closed" | "open" | "half_open";
+  openedAt?: number;
+  causedByReviewerId?: string;
+  halfOpenReviewerId?: string;
 }
 
 interface AttemptRecord {
@@ -119,6 +123,7 @@ interface AttemptRecord {
 }
 
 const MAX_PROBE_TIMEOUT_MS = 30_000;
+const MAX_UNTRUSTED_RETRY_AFTER_MS = 60_000;
 
 const globalClock: OrchestratorClock = {
   now: () => new Date(),
@@ -166,6 +171,9 @@ function normalizeFailure(value: unknown): AdapterFailure {
       ...(candidate.fallback_eligible === undefined
         ? {}
         : { fallback_eligible: candidate.fallback_eligible }),
+      ...(candidate.circuit_qualifying === undefined
+        ? {}
+        : { circuit_qualifying: candidate.circuit_qualifying }),
       ...(candidate.diagnostics === undefined
         ? {}
         : { diagnostics: candidate.diagnostics }),
@@ -342,6 +350,44 @@ function circuitKey(reviewer: ResolvedReviewer): string {
   return providerGroup(reviewer);
 }
 
+function circuitQualifying(failure: AdapterFailure): boolean {
+  if (failure.circuit_qualifying !== undefined)
+    return failure.circuit_qualifying;
+  if (failure.diagnostics?.scope === "run_input") return false;
+  if (
+    failure.reason === "invalid_result" ||
+    failure.reason === "protocol_violation" ||
+    failure.reason === "authentication_failed" ||
+    failure.reason === "model_unavailable" ||
+    failure.reason === "read_failure" ||
+    failure.reason === "cancelled"
+  )
+    return false;
+  return (
+    failure.diagnostics?.scope === "provider" ||
+    failure.retryable === true ||
+    failure.reason === "timeout" ||
+    failure.reason === "process_crashed"
+  );
+}
+
+function retryBackoffMs(
+  failure: AdapterFailure,
+  attempt: number,
+  baseMs: number,
+  random: () => number,
+): number {
+  const exponential = Math.min(2_147_483_647, baseMs * 2 ** (attempt - 1));
+  const jittered = Math.floor(
+    exponential * (0.5 + Math.max(0, Math.min(1, random()))),
+  );
+  const boundedRetryAfter = Math.min(
+    failure.diagnostics?.retry_after_ms ?? 0,
+    Math.max(baseMs, MAX_UNTRUSTED_RETRY_AFTER_MS),
+  );
+  return Math.max(jittered, boundedRetryAfter);
+}
+
 class Semaphore {
   private active = 0;
   private readonly waiting: Array<() => void> = [];
@@ -387,6 +433,7 @@ export async function runReviewRound({
   writer,
   signal,
   clock = globalClock,
+  random = Math.random,
 }: RunReviewRoundInput): Promise<RunCompletion> {
   const startedAt = clock.now();
   const state = createSuiteState(config.reviewers, clock.now);
@@ -397,6 +444,64 @@ export async function runReviewRound({
   let interrupted = signal.aborted;
   let writerUsable = true;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
+
+  const circuitAdmission = (
+    reviewer: ResolvedReviewer,
+  ): { allowed: boolean; causedByReviewerId?: string } => {
+    const circuit = circuits.get(circuitKey(reviewer));
+    if (circuit === undefined || circuit.state === "closed")
+      return { allowed: true };
+    if (circuit.state === "half_open") {
+      if (circuit.halfOpenReviewerId === reviewer.id) return { allowed: true };
+      return {
+        allowed: false,
+        ...(circuit.causedByReviewerId === undefined
+          ? {}
+          : { causedByReviewerId: circuit.causedByReviewerId }),
+      };
+    }
+    if (
+      clock.now().getTime() - (circuit.openedAt ?? 0) <
+      config.execution.circuit_breaker_cooldown_ms
+    ) {
+      return {
+        allowed: false,
+        ...(circuit.causedByReviewerId === undefined
+          ? {}
+          : { causedByReviewerId: circuit.causedByReviewerId }),
+      };
+    }
+    circuit.state = "half_open";
+    circuit.halfOpenReviewerId = reviewer.id;
+    circuits.set(circuitKey(reviewer), circuit);
+    return { allowed: true };
+  };
+
+  const recordCircuitSuccess = (reviewer: ResolvedReviewer): void => {
+    circuits.delete(circuitKey(reviewer));
+  };
+
+  const recordCircuitFailure = (
+    reviewer: ResolvedReviewer,
+    failure: AdapterFailure,
+  ): void => {
+    const key = circuitKey(reviewer);
+    const previous = circuits.get(key);
+    if (!circuitQualifying(failure)) {
+      if (previous?.state === "half_open") circuits.delete(key);
+      return;
+    }
+    const failures = (previous?.failures ?? 0) + 1;
+    const opens =
+      previous?.state === "half_open" ||
+      failures >= config.execution.circuit_breaker_threshold;
+    circuits.set(key, {
+      failures,
+      state: opens ? "open" : "closed",
+      ...(opens ? { openedAt: clock.now().getTime() } : {}),
+      causedByReviewerId: reviewer.id,
+    });
+  };
 
   const emit = async (draft: EventDraft): Promise<void> => {
     if (!writerUsable) return;
@@ -484,6 +589,9 @@ export async function runReviewRound({
         message: failure.message,
         retryable: failure.retryable,
         fallback_eligible: failure.fallback_eligible === true,
+        ...(failure.circuit_qualifying === undefined
+          ? {}
+          : { circuit_qualifying: failure.circuit_qualifying }),
         ...(failure.diagnostics === undefined
           ? {}
           : { diagnostics: failure.diagnostics }),
@@ -601,6 +709,7 @@ export async function runReviewRound({
       attempt <= maximumAttempts && !interrupted;
       attempt += 1
     ) {
+      const priorFailure = lastFailure;
       lastFailure = undefined;
       lastIsolation = undefined;
       const nowMs = clock.now().getTime();
@@ -669,15 +778,28 @@ export async function runReviewRound({
           );
         providerSemaphores.set(providerGroup(reviewer), semaphore);
         releaseProvider = await semaphore.acquire(controller.signal);
-        if (circuits.get(providerGroup(reviewer))?.open === true) {
-          lastFailure = adapterFailure.unavailable(
-            "The provider circuit opened before this queued review could start.",
+        const admission = circuitAdmission(reviewer);
+        if (!admission.allowed) {
+          lastFailure = sanitizeAdapterFailure(
+            priorFailure?.reason ?? "adapter_unavailable",
+            priorFailure === undefined
+              ? "The provider circuit opened before this queued review could start."
+              : `${priorFailure.message} A retry was not attempted because the provider circuit opened.`,
             false,
             {
-              fallback_eligible: true,
+              fallback_eligible: priorFailure?.fallback_eligible ?? true,
+              circuit_qualifying: false,
               diagnostics: {
+                ...(priorFailure?.diagnostics ?? {}),
                 failure_stage: "circuit_breaker",
                 scope: "provider",
+                retry_blocked_by_circuit: true,
+                ...(admission.causedByReviewerId === undefined
+                  ? {}
+                  : {
+                      circuit_caused_by_reviewer_id:
+                        admission.causedByReviewerId,
+                    }),
               },
             },
           );
@@ -816,11 +938,13 @@ export async function runReviewRound({
             lastFailure = normalizeFailure(terminal.failure);
             lastIsolation = terminal.isolation;
           } else if (lastFailure === undefined && terminal?.type === "result") {
-            return await finalizeResult(
+            const result = await finalizeResult(
               reviewer,
               terminal.result,
               terminal.isolation,
             );
+            recordCircuitSuccess(reviewer);
+            return result;
           }
         }
       } finally {
@@ -871,12 +995,15 @@ export async function runReviewRound({
         0,
         lensDeadlineAt - clock.now().getTime(),
       );
-      const backoffMs = Math.min(
+      const backoffMs = retryBackoffMs(
+        lastFailure,
+        attempt,
         config.execution.retry_backoff_ms,
-        remainingAfterAttempt,
+        random,
       );
       if (
         remainingAfterAttempt === 0 ||
+        backoffMs >= remainingAfterAttempt ||
         !(await delay(clock, signal, backoffMs))
       )
         break;
@@ -994,6 +1121,10 @@ export async function runReviewRound({
             config.execution.default_provider_concurrency,
           provider_limits: { ...config.execution.provider_limits },
           circuit_breaker_threshold: config.execution.circuit_breaker_threshold,
+          circuit_breaker_cooldown_ms:
+            config.execution.circuit_breaker_cooldown_ms,
+          retry_attempts: config.execution.retry_attempts,
+          retry_backoff_ms: config.execution.retry_backoff_ms,
         },
         ...(config.selection === undefined
           ? {}
@@ -1197,12 +1328,12 @@ export async function runReviewRound({
                 lastFailedReviewer = reviewer.id;
                 continue;
               }
-              const openCircuit = circuits.get(providerGroup(reviewer));
-              if (openCircuit?.open === true) {
+              const admission = circuitAdmission(reviewer);
+              if (!admission.allowed) {
                 await skipReviewer(
                   reviewer,
                   "circuit_open",
-                  lastFailedReviewer,
+                  admission.causedByReviewerId ?? lastFailedReviewer,
                 );
                 continue;
               }
@@ -1272,19 +1403,8 @@ export async function runReviewRound({
               if (failure !== undefined) {
                 await finalizeIncomplete(reviewer, failure);
                 lastFailedReviewer = reviewer.id;
+                recordCircuitFailure(reviewer, failure);
                 if (failure.fallback_eligible === true) {
-                  const key = circuitKey(reviewer);
-                  const circuit = circuits.get(key) ?? {
-                    failures: 0,
-                    open: false,
-                  };
-                  circuit.failures += 1;
-                  circuit.open =
-                    circuit.failures >=
-                      config.execution.circuit_breaker_threshold ||
-                    failure.reason === "authentication_failed" ||
-                    failure.reason === "model_unavailable";
-                  circuits.set(key, circuit);
                   continue;
                 }
                 for (const remaining of chain.slice(index + 1)) {
@@ -1301,6 +1421,7 @@ export async function runReviewRound({
               state.transition(reviewer.id, "queued");
               const result = await execute(job, lensDeadlineAt);
               if (result.outcome === "pass") {
+                recordCircuitSuccess(reviewer);
                 if (reviewerMode(reviewer) === "adjudication") {
                   pendingAdjudication = undefined;
                   for (const remaining of chain.slice(index + 1)) {
@@ -1326,6 +1447,7 @@ export async function runReviewRound({
                 continue;
               }
               if (result.outcome === "findings") {
+                recordCircuitSuccess(reviewer);
                 const needsAdjudication =
                   reviewerMode(reviewer) === "full_review" &&
                   reviewer.policy?.adjudication === "required";
@@ -1394,17 +1516,9 @@ export async function runReviewRound({
                 break;
               }
               lastFailedReviewer = reviewer.id;
+              if (result.failure !== undefined)
+                recordCircuitFailure(reviewer, result.failure);
               if (result.failure?.fallback_eligible === true) {
-                const key = circuitKey(reviewer);
-                const circuit = circuits.get(key) ?? {
-                  failures: 0,
-                  open: false,
-                };
-                circuit.failures += 1;
-                circuit.open =
-                  circuit.failures >=
-                  config.execution.circuit_breaker_threshold;
-                circuits.set(key, circuit);
                 continue;
               }
               for (const remaining of chain.slice(index + 1)) {

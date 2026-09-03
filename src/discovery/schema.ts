@@ -55,6 +55,24 @@ const runStatusReviewerSchema = z.strictObject({
       missing_inputs: z.array(z.string().min(1)).optional(),
     })
     .optional(),
+  attempts: z
+    .array(
+      z.strictObject({
+        attempt: z.number().int().positive(),
+        started_at: z.iso.datetime({ offset: true }).optional(),
+        elapsed_ms: z.number().int().nonnegative(),
+        failure: z.record(z.string(), z.unknown()),
+      }),
+    )
+    .max(8)
+    .optional(),
+  cause: z
+    .strictObject({
+      kind: z.enum(["root_failure", "downstream_effect"]),
+      reviewer_id: z.string().min(1),
+      reason: z.string().min(1).optional(),
+    })
+    .optional(),
 });
 
 const runStatusSchema = z.strictObject({
@@ -97,6 +115,8 @@ const diagnosticSchema = z.strictObject({
   config_file: z.string().min(1).optional(),
   line: z.number().int().positive().optional(),
   column: z.number().int().positive().optional(),
+  record_type: z.string().min(1).max(128).optional(),
+  schema_paths: z.array(z.string().min(1).max(256)).max(8).optional(),
   issues: z
     .array(
       z.strictObject({

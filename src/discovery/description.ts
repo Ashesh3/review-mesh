@@ -28,12 +28,12 @@ const commands = [
   },
   {
     name: "report",
-    usage: "review-mesh report RUN_ID --format markdown|json",
+    usage: "review-mesh report RUN_ID --format markdown|json [--best-effort]",
     help_command: "review-mesh help report",
   },
   {
     name: "findings",
-    usage: "review-mesh findings RUN_ID --deduplicate --json",
+    usage: "review-mesh findings RUN_ID --deduplicate --json [--best-effort]",
     help_command: "review-mesh help findings",
   },
   {

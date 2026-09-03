@@ -251,6 +251,7 @@ const executionV5Schema = executionSchema.extend({
   default_provider_concurrency: positiveInteger.optional(),
   provider_limits: z.record(nonEmptyString, positiveInteger).optional(),
   circuit_breaker_threshold: positiveInteger.optional(),
+  circuit_breaker_cooldown_ms: timerMilliseconds.optional(),
   retry_attempts: positiveInteger.max(10).optional(),
   retry_backoff_ms: nonNegativeInteger.max(maximumTimerMilliseconds).optional(),
 });
@@ -434,6 +435,7 @@ export interface ResolvedConfig {
     default_provider_concurrency: number;
     provider_limits: Record<string, number>;
     circuit_breaker_threshold: number;
+    circuit_breaker_cooldown_ms: number;
     retry_attempts: number;
     retry_backoff_ms: number;
   };

@@ -59,6 +59,7 @@ export interface EffectiveConfigDescription {
     default_provider_concurrency: number;
     provider_limits: Record<string, number>;
     circuit_breaker_threshold: number;
+    circuit_breaker_cooldown_ms: number;
     retry_attempts: number;
     retry_backoff_ms: number;
   };
@@ -86,6 +87,12 @@ export interface EffectiveConfigDescription {
     >;
   }>;
   credential_environment: Array<{ name: string; present: boolean }>;
+  warnings: Array<{
+    code: "provider_concentration" | "zero_outage_tolerance_quorum";
+    message: string;
+    lens_ids: string[];
+    provider_groups: string[];
+  }>;
 }
 
 export type EffectiveConfigResult =
@@ -128,6 +135,61 @@ export function describeResolvedConfig(
   const selection = input.resolved.selection ?? {
     source: input.configSchemaVersion === "1" ? "legacy" : "defaults",
   };
+  const lenses = new Map<string, typeof input.resolved.reviewers>();
+  for (const reviewer of input.resolved.reviewers) {
+    const id = reviewer.agentId ?? reviewer.id;
+    const members = lenses.get(id) ?? [];
+    members.push(reviewer);
+    lenses.set(id, members);
+  }
+  const primaryGroups = new Set(
+    [...lenses.values()].map((members) => {
+      const primary = members.find(
+        (reviewer) => (reviewer.modelIndex ?? 0) === 0,
+      );
+      return primary?.providerGroup ?? primary?.adapterId ?? "unknown";
+    }),
+  );
+  const warnings: EffectiveConfigDescription["warnings"] = [];
+  if (lenses.size > 1 && primaryGroups.size === 1) {
+    warnings.push({
+      code: "provider_concentration",
+      message:
+        "Every logical lens starts on the same provider group; one provider incident can amplify across the suite.",
+      lens_ids: [...lenses.keys()],
+      provider_groups: [...primaryGroups],
+    });
+  }
+  const zeroToleranceLenses = [...lenses.entries()]
+    .filter(([, members]) => {
+      if (members.length < 2) return false;
+      const policy = members[0]?.policy;
+      const groups = new Set(
+        members.map((reviewer) => reviewer.providerGroup ?? reviewer.adapterId),
+      );
+      return (
+        (policy?.passQuorum ?? members.length) >= members.length ||
+        (policy?.minimumProviderGroups ?? 1) >= groups.size
+      );
+    })
+    .map(([id]) => id);
+  if (zeroToleranceLenses.length > 0) {
+    warnings.push({
+      code: "zero_outage_tolerance_quorum",
+      message:
+        "One or more multi-model lenses require every configured model or provider group to pass, so one outage makes clean coverage impossible.",
+      lens_ids: zeroToleranceLenses,
+      provider_groups: [
+        ...new Set(
+          zeroToleranceLenses.flatMap((id) =>
+            (lenses.get(id) ?? []).map(
+              (reviewer) => reviewer.providerGroup ?? reviewer.adapterId,
+            ),
+          ),
+        ),
+      ],
+    });
+  }
   return {
     valid: true,
     config_path: input.configFile,
@@ -188,6 +250,7 @@ export function describeResolvedConfig(
         typeof environment[name] === "string" &&
         environment[name]!.length > 0,
     })),
+    warnings,
   };
 }
 

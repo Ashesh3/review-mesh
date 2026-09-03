@@ -276,6 +276,211 @@ describe("readRunStatus", () => {
     });
   });
 
+  it("exposes bounded attempt history and separates root failures from circuit effects", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-causal-status";
+    const records = [
+      line({
+        record: "resolution",
+        run_id: runId,
+        resolution: {
+          execution: {
+            max_concurrency: 2,
+            heartbeat_interval_ms: 15_000,
+            shutdown_grace_period_ms: 5_000,
+            distribute_primaries: true,
+          },
+          reviewers: [
+            {
+              id: "security::primary",
+              agent_id: "security",
+              model_index: 0,
+              configured_model_index: 1,
+            },
+            {
+              id: "security::fallback",
+              agent_id: "security",
+              model_index: 1,
+              configured_model_index: 0,
+            },
+          ],
+          future_resolution_field: true,
+        },
+      }),
+    ];
+    for (let attempt = 1; attempt <= 10; attempt += 1) {
+      records.push(
+        line({
+          record: "reviewer.attempt",
+          run_id: runId,
+          reviewer_id: "security::primary",
+          attempt,
+          startedAt: `2026-09-03T00:00:${String(attempt).padStart(2, "0")}.000Z`,
+          elapsedMs: attempt,
+          failure: {
+            reason: "adapter_unavailable",
+            message: "Gateway failed.",
+            retryable: true,
+            fallback_eligible: true,
+            diagnostics: { failure_stage: "http_response", http_status: 503 },
+          },
+        }),
+      );
+    }
+    records.push(
+      line({
+        record: "reviewer.terminal",
+        run_id: runId,
+        data: {
+          reviewer_id: "security::primary",
+          status: "incomplete",
+          adapter: "gateway",
+          model: "primary",
+          elapsed_ms: 10,
+          reason: "adapter_unavailable",
+          message: "Gateway failed.",
+          retryable: true,
+          fallback_eligible: true,
+        },
+      }),
+      line({
+        record: "reviewer.terminal",
+        run_id: runId,
+        terminal: {
+          reviewer_id: "security::fallback",
+          status: "skipped",
+          adapter: "gateway",
+          model: "fallback",
+          elapsed_ms: 0,
+          reason: "circuit_open",
+          blocked_by_reviewer_id: "security::primary",
+        },
+      }),
+    );
+    await writeFile(join(runsDirectory, `${runId}.jsonl`), records.join(""));
+
+    const status = await readRunStatus({ runsDirectory, runId });
+    expect(status).toMatchObject({
+      reviewers: [
+        {
+          reviewer_id: "security::primary",
+          state: "incomplete",
+          cause: {
+            kind: "root_failure",
+            reviewer_id: "security::primary",
+            reason: "adapter_unavailable",
+          },
+        },
+        {
+          reviewer_id: "security::fallback",
+          state: "skipped",
+          cause: {
+            kind: "downstream_effect",
+            reviewer_id: "security::primary",
+            reason: "adapter_unavailable",
+          },
+        },
+      ],
+    });
+    const reviewers = status.reviewers as Array<Record<string, unknown>>;
+    expect(reviewers[0]?.attempts).toHaveLength(8);
+    expect(reviewers[0]?.attempts).toEqual([
+      expect.objectContaining({ attempt: 3 }),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ attempt: 10 }),
+    ]);
+  });
+
+  it("labels a circuit-blocked incomplete retry as a downstream effect", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-circuit-blocked-retry";
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [
+        line({
+          record: "resolution",
+          run_id: runId,
+          resolution: {
+            reviewers: [
+              { id: "first", adapter: "gateway", model: "a" },
+              { id: "second", adapter: "gateway", model: "b" },
+            ],
+          },
+        }),
+        line({
+          record: "reviewer.terminal",
+          run_id: runId,
+          terminal: {
+            reviewer_id: "first",
+            status: "incomplete",
+            adapter: "gateway",
+            model: "a",
+            elapsed_ms: 1,
+            reason: "timeout",
+            message: "Gateway timed out.",
+            retryable: true,
+          },
+        }),
+        line({
+          record: "reviewer.terminal",
+          run_id: runId,
+          terminal: {
+            reviewer_id: "second",
+            status: "incomplete",
+            adapter: "gateway",
+            model: "b",
+            elapsed_ms: 1,
+            reason: "adapter_unavailable",
+            message: "Retry blocked by circuit.",
+            retryable: false,
+            diagnostics: {
+              retry_blocked_by_circuit: true,
+              circuit_caused_by_reviewer_id: "first",
+            },
+          },
+        }),
+      ].join(""),
+    );
+
+    const status = await readRunStatus({ runsDirectory, runId });
+    expect(status).toMatchObject({
+      reviewers: [
+        { reviewer_id: "first", cause: { kind: "root_failure" } },
+        {
+          reviewer_id: "second",
+          cause: {
+            kind: "downstream_effect",
+            reviewer_id: "first",
+            reason: "timeout",
+          },
+        },
+      ],
+    });
+  });
+
+  it("includes the one-based JSONL line and record type for invalid JSON", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-status-invalid-json";
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      `${line({ record: "context", run_id: runId, context: {} })}{bad`,
+    );
+
+    await expect(readRunStatus({ runsDirectory, runId })).rejects.toMatchObject(
+      {
+        code: "invalid_run_record",
+        line: 2,
+        recordType: "invalid_json",
+        message: expect.stringContaining("JSONL line 2 (invalid_json)"),
+      },
+    );
+  });
+
   it("rejects unsafe ids and missing records", async () => {
     const { runsDirectory } = await fixture();
     await expect(

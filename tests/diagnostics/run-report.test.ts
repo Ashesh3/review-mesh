@@ -450,6 +450,196 @@ describe("readRunReport", () => {
     });
   });
 
+  it("reports the JSONL line, record type, and bounded schema paths", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-invalid-details";
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [
+        line({ record: "context", run_id: runId, context: {} }),
+        line({
+          record: "reviewer.attempt",
+          run_id: runId,
+          reviewer_id: "security",
+          attempt: 0,
+          startedAt: "2026-09-03T00:00:00.000Z",
+          elapsedMs: 1,
+          failure: {
+            reason: "timeout",
+            message: "Timed out.",
+            retryable: true,
+          },
+        }),
+      ].join(""),
+    );
+
+    await expect(readRunReport({ runsDirectory, runId })).rejects.toMatchObject(
+      {
+        code: "invalid_run_record",
+        line: 2,
+        recordType: "reviewer.attempt",
+        schemaPaths: expect.arrayContaining([
+          expect.stringContaining("attempt"),
+        ]),
+        message: expect.stringContaining("JSONL line 2 (reviewer.attempt)"),
+      },
+    );
+  });
+
+  it("salvages validated findings only when best effort is explicit", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-best-effort";
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [
+        line({
+          record: "resolution",
+          run_id: runId,
+          resolution: {
+            reviewers: [{ id: "security", agent_id: "security" }],
+          },
+        }),
+        line({
+          record: persistedReviewerResultRecordType,
+          run_id: runId,
+          reviewer_id: "security",
+          result: resultV2([findingV2()]),
+        }),
+        line({
+          record: "future.private-record",
+          run_id: runId,
+          payload: { ignored: true },
+        }),
+        line({
+          record: "run.summary",
+          run_id: runId,
+          summary: {
+            gate_outcome: "findings",
+            coverage_outcome: "complete",
+            exit_code: 1,
+          },
+        }),
+      ].join(""),
+    );
+
+    await expect(readRunReport({ runsDirectory, runId })).rejects.toMatchObject(
+      {
+        code: "invalid_run_record",
+        line: 3,
+        recordType: "future.private-record",
+      },
+    );
+    await expect(
+      readRunReport({ runsDirectory, runId, bestEffort: true }),
+    ).resolves.toMatchObject({
+      status: "incomplete",
+      gate_outcome: "findings",
+      coverage_outcome: "partial",
+      findings: [expect.objectContaining({ id: "mapping-failure" })],
+      record_warnings: [
+        expect.objectContaining({
+          line: 3,
+          record_type: "future.private-record",
+        }),
+      ],
+    });
+  });
+
+  it("accepts v6 private resolution metadata and ignores future nested fields", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-v61-compatibility";
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [
+        line({
+          record: "resolution",
+          run_id: runId,
+          resolution: {
+            execution: {
+              max_concurrency: 2,
+              heartbeat_interval_ms: 15_000,
+              shutdown_grace_period_ms: 5_000,
+              distribute_primaries: true,
+              future_scheduler_policy: "rotate",
+            },
+            reviewers: [
+              {
+                id: "security::primary",
+                agent_id: "security",
+                model_index: 0,
+                configured_model_index: 1,
+                model_count: 2,
+              },
+            ],
+            future_resolution_field: true,
+          },
+          producer_version: "6.1.0",
+        }),
+        line({
+          record: persistedReviewerResultRecordType,
+          run_id: runId,
+          reviewer_id: "security::primary",
+          result: resultV2([]),
+          producer_version: "6.1.0",
+        }),
+        line({
+          record: "run.summary",
+          run_id: runId,
+          summary: {
+            gate_outcome: "no_findings",
+            coverage_outcome: "complete",
+            model_runs: { total: 1, completed: 1, incomplete: 0, skipped: 0 },
+            future_summary_field: "retained by producer",
+          },
+        }),
+      ].join(""),
+    );
+
+    await expect(
+      readRunReport({ runsDirectory, runId }),
+    ).resolves.toMatchObject({
+      status: "passed",
+      coverage_outcome: "complete",
+      model_runs: { total: 1, completed: 1 },
+    });
+  });
+
+  it("bounds best-effort warning output while continuing artifact salvage", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-bounded-warnings";
+    const invalidRecords = Array.from({ length: 150 }, (_, index) =>
+      line({
+        record: `future.record.${index}`,
+        run_id: runId,
+      }),
+    );
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [
+        line({
+          record: persistedReviewerResultRecordType,
+          run_id: runId,
+          reviewer_id: "security",
+          result: resultV2([findingV2()]),
+        }),
+        ...invalidRecords,
+      ].join(""),
+    );
+
+    const report = await readRunReport({
+      runsDirectory,
+      runId,
+      bestEffort: true,
+    });
+
+    expect(report.findings).toHaveLength(1);
+    expect(report.record_warnings).toHaveLength(100);
+    expect(report.omitted_record_warnings).toBe(50);
+    expect(renderRunReportMarkdown(report)).toContain(
+      "50 additional incompatible records were omitted",
+    );
+  });
+
   it("rejects unsafe ids and mismatched records", async () => {
     const { runsDirectory } = await fixture();
     await expect(

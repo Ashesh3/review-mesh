@@ -46,6 +46,7 @@ async function writeDiagnostic(
   error: string,
   message: string,
   output: NodeJS.WritableStream = process.stderr,
+  details: Record<string, unknown> = {},
 ): Promise<void> {
   const line = `${JSON.stringify({
     schema_version: "1",
@@ -53,6 +54,7 @@ async function writeDiagnostic(
     error,
     message,
     retryable: false,
+    ...details,
   })}\n`;
   if (output.write(line)) return;
   await new Promise<void>((resolve, reject) => {
@@ -591,6 +593,7 @@ export async function runCli(
             ? error.message
             : "The persisted Review Mesh run status could not be read.",
           errorOutput,
+          error instanceof RunStatusError ? error.diagnosticDetails : {},
         );
         process.exitCode = 2;
       }
@@ -600,16 +603,20 @@ export async function runCli(
       const runId = argv[1];
       const formatIndex = argv.indexOf("--format");
       const format = formatIndex >= 0 ? argv[formatIndex + 1] : "markdown";
+      const bestEffort = argv.includes("--best-effort");
       if (
         runId === undefined ||
         (format !== "markdown" && format !== "json") ||
         argv.some(
           (argument, index) =>
-            index > 1 && argument.startsWith("--") && argument !== "--format",
+            index > 1 &&
+            argument.startsWith("--") &&
+            argument !== "--format" &&
+            argument !== "--best-effort",
         )
       ) {
         await writeUsageDiagnostic(
-          "Expected: review-mesh report RUN_ID [--format markdown|json]",
+          "Expected: review-mesh report RUN_ID [--format markdown|json] [--best-effort]",
           "review-mesh help report",
           errorOutput,
         );
@@ -620,6 +627,7 @@ export async function runCli(
         const report = await readRunReport({
           runsDirectory: (runtime.appPaths ?? getAppPaths()).runsDirectory,
           runId,
+          bestEffort,
         });
         await writeText(
           output,
@@ -635,6 +643,7 @@ export async function runCli(
             ? error.message
             : "The persisted Review Mesh report could not be read.",
           errorOutput,
+          error instanceof RunReportError ? error.diagnosticDetails : {},
         );
         process.exitCode = 2;
       }
@@ -642,13 +651,13 @@ export async function runCli(
     }
     if (argv[0] === "findings") {
       const runId = argv[1];
-      const allowed = new Set(["--json", "--deduplicate"]);
+      const allowed = new Set(["--json", "--deduplicate", "--best-effort"]);
       if (
         runId === undefined ||
         argv.slice(2).some((argument) => !allowed.has(argument))
       ) {
         await writeUsageDiagnostic(
-          "Expected: review-mesh findings RUN_ID [--deduplicate] [--json]",
+          "Expected: review-mesh findings RUN_ID [--deduplicate] [--json] [--best-effort]",
           "review-mesh help findings",
           errorOutput,
         );
@@ -659,10 +668,33 @@ export async function runCli(
         const findings = await readRunFindings({
           runsDirectory: (runtime.appPaths ?? getAppPaths()).runsDirectory,
           runId,
+          bestEffort: argv.includes("--best-effort"),
         });
         const payload = argv.includes("--deduplicate")
-          ? { run_id: findings.run_id, findings: findings.deduplicated }
-          : { run_id: findings.run_id, findings: findings.raw };
+          ? {
+              run_id: findings.run_id,
+              findings: findings.deduplicated,
+              ...(findings.record_warnings === undefined
+                ? {}
+                : { record_warnings: findings.record_warnings }),
+              ...(findings.omitted_record_warnings === undefined
+                ? {}
+                : {
+                    omitted_record_warnings: findings.omitted_record_warnings,
+                  }),
+            }
+          : {
+              run_id: findings.run_id,
+              findings: findings.raw,
+              ...(findings.record_warnings === undefined
+                ? {}
+                : { record_warnings: findings.record_warnings }),
+              ...(findings.omitted_record_warnings === undefined
+                ? {}
+                : {
+                    omitted_record_warnings: findings.omitted_record_warnings,
+                  }),
+            };
         await writeText(output, `${JSON.stringify(payload)}\n`);
         process.exitCode = 0;
       } catch (error) {
@@ -672,6 +704,7 @@ export async function runCli(
             ? error.message
             : "The persisted Review Mesh findings could not be read.",
           errorOutput,
+          error instanceof RunReportError ? error.diagnosticDetails : {},
         );
         process.exitCode = 2;
       }

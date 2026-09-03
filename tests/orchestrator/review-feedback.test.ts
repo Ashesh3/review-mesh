@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { adapterFailure } from "../../src/adapters/errors.js";
 import { runReviewRound } from "../../src/orchestrator/run-review.js";
 import type { PublicEvent } from "../../src/protocol/schemas.js";
@@ -12,6 +12,7 @@ import {
 } from "../helpers/fixtures.js";
 
 describe("v6 review feedback semantics", () => {
+  afterEach(() => vi.useRealTimers());
   it("fails over after an operational protocol failure and recovers lens coverage", async () => {
     const first = new FakeAdapter({
       onRun: (queue) => {
@@ -247,12 +248,20 @@ describe("v6 review feedback semantics", () => {
     expect(completion.status).toBe("passed");
   });
 
-  it("opens a provider circuit and suppresses later queued calls", async () => {
+  it("opens a provider circuit only for provider-health failures and suppresses later queued calls", async () => {
     const failing = new FakeAdapter({
       onRun: (queue) => {
         queue.push({
           type: "failure",
-          failure: adapterFailure.protocolViolation("Invalid envelope."),
+          failure: adapterFailure.timeout(
+            "Provider request timed out.",
+            false,
+            {
+              circuit_qualifying: true,
+              fallback_eligible: true,
+              diagnostics: { scope: "provider" },
+            },
+          ),
           isolation: "runtime_read_only",
         });
       },
@@ -284,6 +293,99 @@ describe("v6 review feedback semantics", () => {
       reason: "circuit_open",
     });
     expect(completion.coverageOutcome).toBe("partial");
+  });
+
+  it("does not open a provider circuit for fallback-eligible invalid output", async () => {
+    const malformed = new FakeAdapter({
+      onRun: (queue) => {
+        queue.push({
+          type: "failure",
+          failure: {
+            reason: "invalid_result",
+            message: "The model output was truncated.",
+            retryable: false,
+            fallback_eligible: true,
+            circuit_qualifying: false,
+          },
+          isolation: "enforced_read_only",
+        });
+      },
+    });
+    const healthy = fakeAdapterReturning(passResult());
+    const completion = await runReviewRound(
+      roundInput({
+        adapters: { malformed, healthy },
+        config: {
+          execution: {
+            max_concurrency: 1,
+            circuit_breaker_threshold: 1,
+            retry_attempts: 1,
+          },
+          reviewers: [
+            { agentId: "first-lens", providerGroup: "shared" },
+            { agentId: "second-lens", providerGroup: "shared" },
+          ],
+        },
+      }),
+    );
+
+    expect(malformed.runCalls).toBe(1);
+    expect(healthy.runCalls).toBe(1);
+    expect(completion.reviewers[1]).toMatchObject({ status: "completed" });
+  });
+
+  it("admits one half-open recovery call after cooldown and resets on success", async () => {
+    let nowMs = 0;
+    const failing = new FakeAdapter({
+      onRun: (queue) => {
+        queue.push({
+          type: "failure",
+          failure: {
+            reason: "timeout",
+            message: "Provider timed out.",
+            retryable: false,
+            fallback_eligible: true,
+            circuit_qualifying: true,
+          },
+          isolation: "enforced_read_only",
+        });
+      },
+    });
+    const recovery = fakeAdapterReturning(passResult());
+    const afterReset = fakeAdapterReturning(passResult());
+    const completionPromise = runReviewRound(
+      roundInput({
+        adapters: { failing, recovery, afterReset },
+        clock: {
+          now: () => new Date((nowMs += 10)),
+          setTimeout: globalThis.setTimeout.bind(globalThis),
+          clearTimeout: globalThis.clearTimeout.bind(globalThis),
+          setInterval: globalThis.setInterval.bind(globalThis),
+          clearInterval: globalThis.clearInterval.bind(globalThis),
+        },
+        config: {
+          execution: {
+            max_concurrency: 1,
+            circuit_breaker_threshold: 1,
+            circuit_breaker_cooldown_ms: 1,
+            retry_attempts: 1,
+          },
+          reviewers: [
+            { agentId: "first", providerGroup: "shared" },
+            { agentId: "second", providerGroup: "shared" },
+            { agentId: "third", providerGroup: "shared" },
+          ],
+        },
+      }),
+    );
+    const completion = await completionPromise;
+
+    expect(recovery.runCalls).toBe(1);
+    expect(afterReset.runCalls).toBe(1);
+    expect(completion.reviewers.slice(1)).toEqual([
+      expect.objectContaining({ status: "completed" }),
+      expect.objectContaining({ status: "completed" }),
+    ]);
   });
 
   it("runs only trusted retry lens ids and reports the omitted lenses separately", async () => {

@@ -590,6 +590,7 @@ describe("config menu", () => {
         default_provider_concurrency: 2,
         provider_limits: {},
         circuit_breaker_threshold: 2,
+        circuit_breaker_cooldown_ms: 30000,
         retry_attempts: 2,
         retry_backoff_ms: 1000,
       },

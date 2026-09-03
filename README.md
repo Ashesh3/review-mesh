@@ -6,10 +6,11 @@ with independent gate and coverage outcomes. Operational failures advance to
 eligible fallback providers; a logical lens is incomplete only after recovery
 options are exhausted.
 
-Transient failures use bounded same-model retry, while protocol, provider,
-timeout, and schema failures can immediately fail over. Public output is compact
-JSONL with one aggregate suite heartbeat; detailed context and results remain in
-the sanitized persisted artifact.
+Transient failures use bounded same-model retry with jittered exponential
+backoff and bounded provider `Retry-After` guidance. Provider-group circuits count
+only qualifying outages, cool down before one half-open probe, and reset after
+success. Public output is compact JSONL with one aggregate suite heartbeat;
+detailed context and results remain in the sanitized persisted artifact.
 
 ```text
 current directory or request JSON -> review-mesh review -> trusted project/default roster -> live JSONL -> run.completed
@@ -22,7 +23,8 @@ It is designed for automation, coding agents, CI, and local review loops:
 - Parallel logical agents with ordered per-agent model fallback across runtimes.
 - Strict structured findings with evidence and optional file/line locations.
 - Independent `gate_outcome` and `coverage_outcome` dimensions.
-- Configurable diverse pass quorum, provider concurrency, and circuit breaking.
+- Configurable diverse pass quorum, provider concurrency, and cooldown/half-open circuit breaking.
+- Safe failure diagnostics, persisted attempt causality, and best-effort artifact salvage.
 - Changed-surface applicability and required-input checks before provider work.
 - Deterministic finding consolidation with confidence, classification, assumptions, and provenance.
 - No source edits by Review Mesh.
@@ -101,10 +103,13 @@ For an AI caller, identity and scope are separate:
 
 ### Download a standalone executable
 
-Release `v7.0.0` adds the embedded read-only web dashboard and transient active
-run observation to operational multi-provider fallback, project-name
-configuration, the agent-first CLI, public event protocol v5, compact reporting,
-and self-contained Bun executables that do not require Node.js or Bun:
+Release `v7.1.0` hardens the multi-provider review path with cooldown/half-open
+circuits, `Retry-After`-aware exponential retry, output-truncation recovery,
+safe structured diagnostics, best-effort artifact salvage, causal status, config
+topology warnings, and stronger second-provider adjudication. It also includes
+the embedded read-only dashboard, agent-first CLI, public event protocol v5,
+compact reporting, and self-contained Bun executables that do not require
+Node.js or Bun:
 
 - Windows x64: `review-mesh-windows-x64.exe`
 - Linux x64 (glibc): `review-mesh-linux-x64`
@@ -112,14 +117,14 @@ and self-contained Bun executables that do not require Node.js or Bun:
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v7.0.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
+Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v7.1.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
 .\review-mesh.exe review
 ```
 
 Linux:
 
 ```bash
-curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v7.0.0/review-mesh-linux-x64
+curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v7.1.0/review-mesh-linux-x64
 chmod +x ./review-mesh-linux-x64
 ./review-mesh-linux-x64 review
 ```
@@ -265,6 +270,17 @@ the retained immutable conversation instead of repeating repository tools and
 inspection. Permanent failures stop immediately, and every finalization cycle
 remains bounded by the reviewer deadline.
 
+If structured result production ends with `finish_reason = "length"`, the
+adapter retries from that checkpoint with a compact-result instruction and a
+larger output allowance. Exhausted truncation recovery remains fallback-eligible
+but does not count as a provider-circuit outage.
+
+OpenAI-compatible failures use bounded safe diagnostics such as precise failure
+codes, HTTP status, bounded `Retry-After`, allowlisted correlation headers,
+response byte count and a SHA-256 fingerprint of a content-free structural
+summary, response structure, and schema-validation paths.
+Raw provider response bodies are not included in these diagnostics.
+
 Set credentials in environment variables, not TOML.
 
 PowerShell, current session:
@@ -308,12 +324,12 @@ shutdown_grace_period_ms = 5000
 distribute_primaries = true
 default_provider_concurrency = 2
 circuit_breaker_threshold = 2
+circuit_breaker_cooldown_ms = 30000
 retry_attempts = 2
 retry_backoff_ms = 1000
 
 [execution.provider_limits]
-anthropic = 2
-github-copilot = 3
+gateway = 2
 
 [diagnostics]
 persist_runs = true
@@ -453,12 +469,30 @@ their original unqualified reviewer IDs and remain fully supported.
 The runs form an ordered recovery chain. Review Mesh starts every logical agent
 in parallel (subject to `execution.max_concurrency`) using only that agent's
 effective primary model. A later model becomes eligible while the pass quorum is
-unsatisfied or after an operational failure. A finding
-stops that agent immediately and reports all later models as `skipped` with
-`short_circuited_after_finding` unless adjudication is configured. Operational
-incompleteness advances to the next eligible provider. Other agents continue independently through their own
-chains. This preserves broad parallel review while avoiding unnecessary model
-calls once an agent has already found something actionable.
+unsatisfied or after an operational failure. A finding normally stops that agent
+and reports later models as `skipped` with `short_circuited_after_finding`.
+Operational incompleteness advances to the next eligible provider. Other agents
+continue independently through their own chains. This preserves broad parallel
+review while avoiding unnecessary model calls once an agent has already found
+something actionable.
+
+Retryable failures wait for a jittered exponential delay based on
+`retry_backoff_ms`; a provider `Retry-After` value can raise that delay within a
+60-second untrusted-input cap. A retry is skipped when its delay would consume
+the remaining lens deadline. Only explicitly
+circuit-qualifying provider failures increase a provider group's circuit count.
+After `circuit_breaker_threshold` failures, new work is blocked for
+`circuit_breaker_cooldown_ms`; one half-open reviewer is then admitted, and a
+successful result resets the circuit.
+
+With `adjudication = "required"`, the first later run from a different provider
+group performs a focused review of the candidate findings rather than a new
+broad sweep. The adjudication prompt requires medium-or-higher reliability,
+lifecycle, concurrency, cleanup, and control-flow candidates to reconstruct the
+relevant ordering and, when available, compare base-to-head behavior before
+confirming a defect. Missing evidence must remain an external assumption rather
+than a confirmed defect. Configuration validation requires a multi-model lens
+with at least two provider groups for required adjudication.
 
 Every model that actually runs receives the same purpose, trusted instructions,
 isolation policy, runtime options, project guidance, and per-run timeout.
@@ -564,7 +598,7 @@ The global config controls:
 - Optional per-agent or per-model-run reasoning effort and adapter overrides.
 - The optional default agent roster.
 - Per-project agent rosters, guidance, and context keyed by project name.
-- Concurrency, heartbeat, shutdown grace, diagnostics, and retention.
+- Provider-group concurrency, retry/backoff, circuit threshold/cooldown, heartbeat, shutdown grace, diagnostics, and retention.
 
 Project keys are names, not paths—for example, `[projects.payments]`. Review Mesh first prefers the `origin` remote repository name, then another remote repository name, then the Git common-directory or worktree-root name. A non-Git workspace uses its directory name. Matching is case-insensitive, so clones and linked worktrees in different folders share one project entry. If no project name matches, `[defaults].agents` is used; without defaults, the review is rejected.
 
@@ -613,8 +647,13 @@ review-mesh config copilot models --json
 ```
 
 `config effective` (also available as `config resolve`) prints the safe,
-effective roster for one workspace without contacting providers. `config
-export --json` returns the complete trusted configuration and a SHA-256
+effective roster for one workspace without contacting providers. Its `warnings`
+array identifies `provider_concentration` when every logical lens starts on one
+provider group and `zero_outage_tolerance_quorum` when a multi-model policy needs
+every configured model or provider group to pass. The same warnings appear in
+`describe` under `configuration`.
+
+`config export --json` returns the complete trusted configuration and a SHA-256
 revision; because it includes instruction and runtime fields, treat that output
 as sensitive. To update configuration non-interactively, edit the exported
 `config` object and pipe this strict request to `config apply --json`:
@@ -701,13 +740,28 @@ status, but is not emitted once per tool action on public stdout. Use
 for one reviewer. The generated machine contract is available from
 `review-mesh schema run-status --json`.
 
+Status includes up to eight persisted failed attempts per reviewer. Its `cause`
+marks primary incomplete reviewers as `root_failure`; circuit-blocked incomplete
+retries and skipped reviewers that name a blocker are `downstream_effect`,
+preserving the responsible reviewer id and bounded safe reason instead of
+presenting every consequence as an independent failure.
+
 Detailed and retry workflows:
 
 ```text
 review-mesh report RUN_ID --format markdown
 review-mesh findings RUN_ID --deduplicate --json
+review-mesh report RUN_ID --format markdown --best-effort
+review-mesh findings RUN_ID --deduplicate --json --best-effort
 review-mesh retry RUN_ID --only-incomplete
 ```
+
+Report and findings reads are strict by default. Invalid persisted records name
+the JSONL line, record/event type, and bounded schema paths. Explicit
+`--best-effort` skips incompatible records, salvages findings from valid records,
+returns at most 100 `record_warnings` plus `omitted_record_warnings`, and forces
+coverage to `partial`; salvaged output is never reported as a complete clean
+review.
 
 Example final event:
 

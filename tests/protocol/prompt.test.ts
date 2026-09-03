@@ -71,6 +71,38 @@ describe("buildReviewerPrompt", () => {
     );
   });
 
+  it("requires evidence of ordering and base-version impact during adjudication", () => {
+    const prompt = buildReviewerPrompt({
+      reviewer: resolvedReviewer({
+        policy: {
+          passQuorum: 1,
+          minimumProviderGroups: 1,
+          adjudication: "required",
+          gateMinimumSeverity: "medium",
+          gateMinimumConfidence: "medium",
+          mode: "adjudication",
+          adjudicatesReviewerId: "reliability::primary",
+          candidateFindings: {
+            schema_version: "2",
+            verdict: "fail",
+            summary: "Candidate reliability defect.",
+            actionable_findings: [],
+            informational_notes: [],
+          },
+        },
+      }),
+      context: resolvedContext(),
+    });
+
+    expect(prompt.system).toContain(
+      "reconstruct and cite the relevant execution ordering",
+    );
+    expect(prompt.system).toContain("compare the prior and changed behavior");
+    expect(prompt.system).toContain(
+      "do not classify the candidate as a confirmed_defect",
+    );
+  });
+
   it("delimits every untrusted prompt layer without admitting it to the system prompt", () => {
     const prompt = buildReviewerPrompt({
       reviewer: resolvedReviewer({

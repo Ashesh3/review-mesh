@@ -30,8 +30,8 @@ USAGE
   review-mesh review [WORKSPACE] [--output-mode compact-jsonl] [--no-ansi]
       [--heartbeat aggregate] [--details-file PATH]
   review-mesh status RUN_ID [REVIEWER_ID] [--json]
-  review-mesh report RUN_ID [--format markdown|json]
-  review-mesh findings RUN_ID [--deduplicate] [--json]
+  review-mesh report RUN_ID [--format markdown|json] [--best-effort]
+  review-mesh findings RUN_ID [--deduplicate] [--json] [--best-effort]
   review-mesh retry RUN_ID --only-incomplete
   review-mesh doctor [WORKSPACE] [--adapter ID] [--model MODEL]
       [--structured-output]
@@ -165,19 +165,24 @@ every progress or heartbeat event in their own context.
   report: `REVIEW-MESH REPORT
 
 USAGE
-  review-mesh report RUN_ID [--format markdown|json]
+  review-mesh report RUN_ID [--format markdown|json] [--best-effort]
 
 Renders the persisted detailed review artifact. Markdown is the default; JSON
 includes logical-lens and model-run coverage, raw findings, deterministic
 deduplication, provenance, confidence, classification, and assumptions.
+By default every persisted record is validated. --best-effort skips incompatible
+records, marks coverage partial, and returns bounded line/schema warnings; it
+never treats salvaged output as a complete clean review.
 `,
   findings: `REVIEW-MESH FINDINGS
 
 USAGE
-  review-mesh findings RUN_ID [--deduplicate] [--json]
+  review-mesh findings RUN_ID [--deduplicate] [--json] [--best-effort]
 
 Reads findings from the persisted detailed artifact. --deduplicate returns the
 consolidated set with source reviewer/finding ids and duplicate ids.
+--best-effort salvages findings from valid records around incompatible records
+and includes bounded record_warnings in the JSON result.
 `,
   retry: `REVIEW-MESH RETRY
 

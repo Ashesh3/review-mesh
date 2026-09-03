@@ -104,6 +104,7 @@ export interface ManagedConfig {
     default_provider_concurrency?: number | undefined;
     provider_limits?: Record<string, number> | undefined;
     circuit_breaker_threshold?: number | undefined;
+    circuit_breaker_cooldown_ms?: number | undefined;
     retry_attempts?: number | undefined;
     retry_backoff_ms?: number | undefined;
   };
@@ -538,6 +539,7 @@ export function emptyManagedConfig(): ManagedConfig {
       default_provider_concurrency: 2,
       provider_limits: {},
       circuit_breaker_threshold: 2,
+      circuit_breaker_cooldown_ms: 30_000,
       retry_attempts: 2,
       retry_backoff_ms: 1_000,
     },

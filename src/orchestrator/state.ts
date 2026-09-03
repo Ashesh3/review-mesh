@@ -202,6 +202,9 @@ function terminalRecord(state: ReviewerState): ReviewerTerminalRecord {
       message: state.failure.message,
       retryable: state.failure.retryable,
       fallback_eligible: state.failure.fallback_eligible === true,
+      ...(state.failure.circuit_qualifying === undefined
+        ? {}
+        : { circuit_qualifying: state.failure.circuit_qualifying }),
       ...(state.failure.diagnostics === undefined
         ? {}
         : { diagnostics: clone(state.failure.diagnostics) }),

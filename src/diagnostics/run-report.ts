@@ -13,13 +13,13 @@ import {
   reviewerModeSchema,
   reviewerResultSchema,
   reviewerSkipReasonSchema,
-  reviewerTerminalRecordSchema,
   reviewRequestSchema,
 } from "../protocol/schemas.js";
 
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 const ACTIVE_SUFFIX = /^\.jsonl\.active(?:\..+)?$/u;
 const MAX_REPORT_RECORD_BYTES = 64 * 1024 * 1024;
+const MAX_RECORD_WARNINGS = 100;
 const persistedString = z
   .string()
   .min(1)
@@ -289,7 +289,10 @@ const legacyV4PublicEventSchema = z.discriminatedUnion("event", [
   }),
 ]);
 
-const persistedExecutionSchema = legacyV4ExecutionSchema.extend({
+const persistedExecutionSchema = z.looseObject({
+  max_concurrency: positiveIntegerSchema,
+  heartbeat_interval_ms: positiveIntegerSchema,
+  shutdown_grace_period_ms: positiveIntegerSchema,
   distribute_primaries: z.boolean().optional(),
   default_provider_concurrency: positiveIntegerSchema.optional(),
   provider_limits: z.record(persistedString, positiveIntegerSchema).optional(),
@@ -298,9 +301,9 @@ const persistedExecutionSchema = legacyV4ExecutionSchema.extend({
   retry_backoff_ms: nonNegativeIntegerSchema.optional(),
 });
 
-const persistedReviewerPolicySchema = z.strictObject({
+const persistedReviewerPolicySchema = z.looseObject({
   applicability: z
-    .strictObject({
+    .looseObject({
       anyChangedPaths: z.array(persistedString).min(1).max(256),
       caseSensitive: z.boolean().optional(),
     })
@@ -352,10 +355,10 @@ const persistedResolutionLensSchema = z.strictObject({
     .max(1_024),
 });
 
-const persistedResolutionSchema = z.strictObject({
+const persistedResolutionSchema = z.looseObject({
   execution: persistedExecutionSchema.optional(),
   diagnostics: z
-    .strictObject({
+    .looseObject({
       persist_runs: z.boolean(),
       max_runs: positiveIntegerSchema,
     })
@@ -364,15 +367,59 @@ const persistedResolutionSchema = z.strictObject({
   logical_lenses: z.array(persistedResolutionLensSchema).max(1_024).optional(),
 });
 
-const persistedFailureSchema = z.strictObject({
+const persistedFailureSchema = z.looseObject({
   reason: incompleteReasonSchema,
   message: z.string().min(1).max(1_000),
   retryable: z.boolean(),
   fallback_eligible: z.boolean().optional(),
-  diagnostics: adapterFailureDiagnosticsSchema.optional(),
+  diagnostics: adapterFailureDiagnosticsSchema.loose().optional(),
 });
 
-const persistedLogicalLensCountsSchema = z.strictObject({
+const persistedReviewerTerminalSchema = z.discriminatedUnion("status", [
+  z.looseObject({
+    reviewer_id: persistedString,
+    lens_id: persistedString.optional(),
+    status: z.literal("completed"),
+    mode: reviewerModeSchema.optional(),
+    adapter: persistedString,
+    model: persistedString,
+    provider_group: persistedString.optional(),
+    isolation: isolationLevelSchema,
+    elapsed_ms: nonNegativeIntegerSchema,
+    result: persistedReviewerResultSchema,
+  }),
+  z.looseObject({
+    reviewer_id: persistedString,
+    lens_id: persistedString.optional(),
+    status: z.literal("incomplete"),
+    mode: reviewerModeSchema.optional(),
+    adapter: persistedString,
+    model: persistedString,
+    provider_group: persistedString.optional(),
+    isolation: isolationLevelSchema.optional(),
+    elapsed_ms: nonNegativeIntegerSchema,
+    reason: incompleteReasonSchema,
+    message: z.string().min(1).max(1_000),
+    retryable: z.boolean(),
+    fallback_eligible: z.boolean().optional(),
+    diagnostics: adapterFailureDiagnosticsSchema.loose().optional(),
+  }),
+  z.looseObject({
+    reviewer_id: persistedString,
+    lens_id: persistedString.optional(),
+    status: z.literal("skipped"),
+    mode: reviewerModeSchema.optional(),
+    adapter: persistedString,
+    model: persistedString,
+    provider_group: persistedString.optional(),
+    elapsed_ms: nonNegativeIntegerSchema,
+    reason: reviewerSkipReasonSchema,
+    blocked_by_reviewer_id: persistedString.optional(),
+    missing_inputs: z.array(persistedString).optional(),
+  }),
+]);
+
+const persistedLogicalLensCountsSchema = z.looseObject({
   total: nonNegativeIntegerSchema,
   pending: nonNegativeIntegerSchema.optional(),
   findings: nonNegativeIntegerSchema,
@@ -384,7 +431,7 @@ const persistedLogicalLensCountsSchema = z.strictObject({
   incomplete_lenses: z.array(persistedString).max(1_024).optional(),
 });
 
-const persistedModelRunCountsSchema = z.strictObject({
+const persistedModelRunCountsSchema = z.looseObject({
   total: nonNegativeIntegerSchema,
   deferred: nonNegativeIntegerSchema.optional(),
   queued: nonNegativeIntegerSchema.optional(),
@@ -395,7 +442,7 @@ const persistedModelRunCountsSchema = z.strictObject({
   skip_reasons: z.record(persistedString, nonNegativeIntegerSchema).optional(),
 });
 
-const persistedRunSummaryDataSchema = z.strictObject({
+const persistedRunSummaryDataSchema = z.looseObject({
   status: z.enum(["passed", "findings", "incomplete"]).optional(),
   gate_outcome: z
     .enum(["no_findings", "findings", "passed", "clear"])
@@ -412,11 +459,11 @@ const persistedRunSummaryDataSchema = z.strictObject({
   incomplete_lenses: z.array(persistedString).max(1_024).optional(),
   not_evaluated_lenses: z.array(persistedString).max(1_024).optional(),
   report_path: persistedString.optional(),
-  reviewers: z.array(reviewerTerminalRecordSchema).max(1_024).optional(),
+  reviewers: z.array(persistedReviewerTerminalSchema).max(1_024).optional(),
 });
 
 const privateRecordSchema = z.union([
-  z.strictObject({
+  z.looseObject({
     record: z.literal("resolution"),
     run_id: persistedString,
     resolution: persistedResolutionSchema,
@@ -431,7 +478,7 @@ const privateRecordSchema = z.union([
     run_id: persistedString,
     context: z.json(),
   }),
-  z.strictObject({
+  z.looseObject({
     record: z.literal(persistedReviewerResultRecordType),
     run_id: persistedString,
     reviewer_id: persistedString,
@@ -441,7 +488,7 @@ const privateRecordSchema = z.union([
     adjudicates_reviewer_id: persistedString.optional(),
     result: persistedReviewerResultSchema,
   }),
-  z.strictObject({
+  z.looseObject({
     record: z.literal(persistedReviewerResultRecordType),
     run_id: persistedString,
     reviewer_id: persistedString,
@@ -451,17 +498,17 @@ const privateRecordSchema = z.union([
     adjudicates_reviewer_id: persistedString.optional(),
     data: z.strictObject({ result: persistedReviewerResultSchema }),
   }),
-  z.strictObject({
+  z.looseObject({
     record: z.literal(persistedReviewerTerminalRecordType),
     run_id: persistedString,
-    terminal: reviewerTerminalRecordSchema,
+    terminal: persistedReviewerTerminalSchema,
   }),
-  z.strictObject({
+  z.looseObject({
     record: z.literal(persistedReviewerTerminalRecordType),
     run_id: persistedString,
-    data: reviewerTerminalRecordSchema,
+    data: persistedReviewerTerminalSchema,
   }),
-  z.strictObject({
+  z.looseObject({
     record: z.literal("reviewer.attempt"),
     run_id: persistedString,
     reviewer_id: persistedString,
@@ -471,7 +518,7 @@ const privateRecordSchema = z.union([
     elapsedMs: nonNegativeIntegerSchema,
     failure: persistedFailureSchema,
   }),
-  z.strictObject({
+  z.looseObject({
     record: z.literal("reviewer.activity"),
     run_id: persistedString,
     reviewer_id: persistedString,
@@ -493,7 +540,7 @@ const privateRecordSchema = z.union([
       .min(1)
       .max(64 * 1_024),
   }),
-  z.strictObject({
+  z.looseObject({
     record: z.literal("reviewer.attempt"),
     run_id: persistedString,
     reviewer_id: persistedString,
@@ -503,12 +550,12 @@ const privateRecordSchema = z.union([
     elapsed_ms: nonNegativeIntegerSchema,
     failure: persistedFailureSchema,
   }),
-  z.strictObject({
+  z.looseObject({
     record: z.literal("run.summary"),
     run_id: persistedString,
     summary: persistedRunSummaryDataSchema,
   }),
-  z.strictObject({
+  z.looseObject({
     record: z.literal("run.summary"),
     run_id: persistedString,
     data: persistedRunSummaryDataSchema,
@@ -604,17 +651,30 @@ export interface RunReport {
     elapsed_ms: number;
     failure: Record<string, unknown>;
   }>;
+  record_warnings?: RunRecordWarning[];
+  omitted_record_warnings?: number;
 }
 
 export interface RunFindings {
   run_id: string;
   raw: RawRunFinding[];
   deduplicated: ConsolidatedRunFinding[];
+  record_warnings?: RunRecordWarning[];
+  omitted_record_warnings?: number;
 }
 
 export interface ReadRunReportOptions {
   runsDirectory: string;
   runId: string;
+  /** Recover validated data around incompatible records without changing strict defaults. */
+  bestEffort?: boolean;
+}
+
+export interface RunRecordWarning {
+  line: number;
+  record_type: string;
+  message: string;
+  schema_paths?: string[];
 }
 
 export interface RetryRunPlan {
@@ -629,9 +689,24 @@ export class RunReportError extends Error {
   constructor(
     readonly code: "invalid_run_id" | "run_not_found" | "invalid_run_record",
     message: string,
+    readonly line?: number,
+    readonly recordType?: string,
+    readonly schemaPaths?: string[],
   ) {
     super(message);
     this.name = "RunReportError";
+  }
+
+  get diagnosticDetails(): Record<string, unknown> {
+    return {
+      ...(this.line === undefined ? {} : { line: this.line }),
+      ...(this.recordType === undefined
+        ? {}
+        : { record_type: this.recordType }),
+      ...(this.schemaPaths === undefined || this.schemaPaths.length === 0
+        ? {}
+        : { schema_paths: [...this.schemaPaths] }),
+    };
   }
 }
 
@@ -672,6 +747,8 @@ interface ParsedReportRecord {
   terminals: Map<string, ReviewerTerminal>;
   request?: Record<string, unknown>;
   attempts: RunReport["attempts"];
+  recordWarnings: RunRecordWarning[];
+  omittedRecordWarnings: number;
 }
 
 interface ParsedFinding extends RawRunFinding {
@@ -695,6 +772,78 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+const MAX_SCHEMA_PATHS = 8;
+const MAX_SCHEMA_PATH_LENGTH = 256;
+
+function recordType(value: unknown): string {
+  const record = asRecord(value);
+  const type = nonEmptyString(record?.record) ?? nonEmptyString(record?.event);
+  return type === undefined ? "unknown" : type.slice(0, 128);
+}
+
+function schemaPaths(error: z.ZodError): string[] {
+  return uniqueSorted(
+    error.issues
+      .map((issue) => {
+        const path = issue.path
+          .map((part) =>
+            typeof part === "number" ? `[${part}]` : String(part),
+          )
+          .reduce(
+            (current, part) =>
+              part.startsWith("[")
+                ? `${current}${part}`
+                : current.length === 0
+                  ? part
+                  : `${current}.${part}`,
+            "",
+          );
+        return (path.length === 0 ? "$" : path).slice(
+          0,
+          MAX_SCHEMA_PATH_LENGTH,
+        );
+      })
+      .filter((path) => path.length > 0),
+  ).slice(0, MAX_SCHEMA_PATHS);
+}
+
+function invalidRecordError(
+  line: number,
+  type: string,
+  description: string,
+  paths?: string[],
+): RunReportError {
+  const pathSuffix =
+    paths === undefined || paths.length === 0
+      ? ""
+      : ` Schema paths: ${paths.join(", ")}.`;
+  return new RunReportError(
+    "invalid_run_record",
+    `The persisted run record contains ${description} at JSONL line ${line} (${type}).${pathSuffix}`,
+    line,
+    type,
+    paths,
+  );
+}
+
+function addRecordWarning(
+  parsed: ParsedReportRecord,
+  error: RunReportError,
+): void {
+  if (parsed.recordWarnings.length >= MAX_RECORD_WARNINGS) {
+    parsed.omittedRecordWarnings += 1;
+    return;
+  }
+  parsed.recordWarnings.push({
+    line: error.line ?? 1,
+    record_type: error.recordType ?? "unknown",
+    message: error.message,
+    ...(error.schemaPaths === undefined || error.schemaPaths.length === 0
+      ? {}
+      : { schema_paths: [...error.schemaPaths] }),
+  });
 }
 
 function nonEmptyString(value: unknown): string | undefined {
@@ -1116,12 +1265,17 @@ function parsePrivateRecord(
   if (value.record === "context") return;
   if (value.record === "reviewer.activity") return;
   if (value.record === "reviewer.attempt") {
+    const startedAt =
+      nonEmptyString(value.startedAt) ?? nonEmptyString(value.started_at);
+    const elapsedMs =
+      nonNegativeInteger(value.elapsedMs) ??
+      nonNegativeInteger(value.elapsed_ms);
     parsed.attempts.push({
       reviewer_id: value.reviewer_id,
       ...(value.lens_id === undefined ? {} : { lens_id: value.lens_id }),
       attempt: value.attempt,
-      started_at: "startedAt" in value ? value.startedAt : value.started_at,
-      elapsed_ms: "elapsedMs" in value ? value.elapsedMs : value.elapsed_ms,
+      ...(startedAt === undefined ? {} : { started_at: startedAt }),
+      elapsed_ms: elapsedMs ?? 0,
       failure: structuredClone(value.failure) as unknown as Record<
         string,
         unknown
@@ -1130,7 +1284,9 @@ function parsePrivateRecord(
     return;
   }
   if (value.record === persistedReviewerResultRecordType) {
-    const result = "result" in value ? value.result : value.data.result;
+    const result = persistedReviewerResultSchema.parse(
+      value.result ?? asRecord(value.data)?.result,
+    );
     addReviewer(parsed, value, value.reviewer_id);
     const current = parsed.terminals.get(value.reviewer_id);
     parsed.terminals.set(value.reviewer_id, {
@@ -1163,42 +1319,60 @@ function parseRunRecord(
   text: string,
   expectedRunId: string,
   allowPartialTail: boolean,
+  bestEffort = false,
 ): ParsedReportRecord {
   const parsed: ParsedReportRecord = {
     terminalEventSeen: false,
     reviewers: new Map(),
     terminals: new Map(),
     attempts: [],
+    recordWarnings: [],
+    omittedRecordWarnings: 0,
   };
   const lines = text.split(/\r?\n/u);
   for (const [index, encoded] of lines.entries()) {
     if (encoded.trim().length === 0) continue;
+    const line = index + 1;
     let value: unknown;
     try {
       value = JSON.parse(encoded);
     } catch {
       if (allowPartialTail && index === lines.length - 1) break;
-      throw new RunReportError(
-        "invalid_run_record",
-        "The persisted run record contains invalid JSON.",
-      );
+      const error = invalidRecordError(line, "invalid_json", "invalid JSON");
+      if (!bestEffort) throw error;
+      addRecordWarning(parsed, error);
+      continue;
     }
     const record = asRecord(value);
     if (record === undefined) {
-      throw new RunReportError(
-        "invalid_run_record",
-        "The persisted run record contains an invalid record.",
-      );
+      const error = invalidRecordError(line, "unknown", "a non-object record");
+      if (!bestEffort) throw error;
+      addRecordWarning(parsed, error);
+      continue;
     }
     if (typeof record.event === "string") {
       const event =
         record.schema_version === "4"
           ? legacyV4PublicEventSchema.safeParse(record)
           : publicEventSchema.safeParse(record);
-      if (!event.success || event.data.run_id !== expectedRunId) {
-        throw new RunReportError(
-          "invalid_run_record",
-          "The persisted run record contains an invalid public event.",
+      if (!event.success) {
+        const paths = schemaPaths(event.error);
+        const error = invalidRecordError(
+          line,
+          recordType(record),
+          "an invalid public event",
+          paths,
+        );
+        if (!bestEffort) throw error;
+        addRecordWarning(parsed, error);
+        continue;
+      }
+      if (event.data.run_id !== expectedRunId) {
+        throw invalidRecordError(
+          line,
+          recordType(record),
+          `a mismatched run id`,
+          ["run_id"],
         );
       }
       parsePublicEvent(
@@ -1209,24 +1383,36 @@ function parseRunRecord(
     }
     if (typeof record.record === "string") {
       const privateRecord = privateRecordSchema.safeParse(record);
-      if (
-        !privateRecord.success ||
-        privateRecord.data.run_id !== expectedRunId
-      ) {
-        throw new RunReportError(
-          "invalid_run_record",
-          "The persisted run record contains an invalid private record.",
+      if (!privateRecord.success) {
+        const paths = schemaPaths(privateRecord.error);
+        const error = invalidRecordError(
+          line,
+          recordType(record),
+          "an invalid private record",
+          paths,
+        );
+        if (!bestEffort) throw error;
+        addRecordWarning(parsed, error);
+        continue;
+      }
+      if (privateRecord.data.run_id !== expectedRunId) {
+        throw invalidRecordError(
+          line,
+          recordType(record),
+          "a mismatched run id",
+          ["run_id"],
         );
       }
       parsePrivateRecord(parsed, privateRecord.data);
       continue;
     }
-    {
-      throw new RunReportError(
-        "invalid_run_record",
-        "The persisted run record contains an unknown record type.",
-      );
-    }
+    const error = invalidRecordError(
+      line,
+      recordType(record),
+      "an unknown record type",
+    );
+    if (!bestEffort) throw error;
+    addRecordWarning(parsed, error);
   }
   return parsed;
 }
@@ -1638,6 +1824,7 @@ function recognizedCoverageOutcome(
 export async function readRunReport({
   runsDirectory,
   runId,
+  bestEffort = false,
 }: ReadRunReportOptions): Promise<RunReport> {
   requireSafeRunId(runId);
   const recordPath = await resolveRunRecordPath(runsDirectory, runId);
@@ -1650,6 +1837,7 @@ export async function readRunReport({
     ),
     runId,
     recordPath.active,
+    bestEffort,
   );
   const rawFindings = parseRawFindings(parsed).map<RawRunFinding>(
     ({ legacyDeduplicationKey: _legacyKey, ...finding }) => finding,
@@ -1668,8 +1856,10 @@ export async function readRunReport({
       ? "findings"
       : "passed");
   const coverageOutcome =
-    recognizedCoverageOutcome(parsed.reportedCoverageOutcome) ??
-    (incompleteLenses.length > 0 ? "partial" : "complete");
+    parsed.recordWarnings.length > 0
+      ? "partial"
+      : (recognizedCoverageOutcome(parsed.reportedCoverageOutcome) ??
+        (incompleteLenses.length > 0 ? "partial" : "complete"));
   const active = recordPath.active && !parsed.terminalEventSeen;
   const status: RunReport["status"] = active
     ? "running"
@@ -1727,6 +1917,12 @@ export async function readRunReport({
     raw_findings: rawFindings,
     findings,
     attempts: [...parsed.attempts],
+    ...(parsed.recordWarnings.length === 0
+      ? {}
+      : { record_warnings: structuredClone(parsed.recordWarnings) }),
+    ...(parsed.omittedRecordWarnings === 0
+      ? {}
+      : { omitted_record_warnings: parsed.omittedRecordWarnings }),
   };
 }
 
@@ -1738,6 +1934,12 @@ export async function readRunFindings(
     run_id: report.run_id,
     raw: report.raw_findings,
     deduplicated: report.findings,
+    ...(report.record_warnings === undefined
+      ? {}
+      : { record_warnings: structuredClone(report.record_warnings) }),
+    ...(report.omitted_record_warnings === undefined
+      ? {}
+      : { omitted_record_warnings: report.omitted_record_warnings }),
   };
 }
 
@@ -1758,6 +1960,7 @@ export async function readRetryRunPlan(
     ),
     options.runId,
     recordPath.active,
+    false,
   );
   if (parsed.request === undefined) {
     throw new RunReportError(
@@ -1835,6 +2038,27 @@ export function renderRunReportMarkdown(report: RunReport): string {
         (attempt) =>
           `- ${markdownCode(attempt.reviewer_id)} attempt ${attempt.attempt}: ${markdownInline(String(attempt.failure.reason ?? "unknown"))} after ${attempt.elapsed_ms} ms`,
       ),
+    );
+  }
+  if (
+    report.record_warnings !== undefined &&
+    report.record_warnings.length > 0
+  ) {
+    lines.push(
+      "",
+      "## Artifact warnings",
+      "",
+      "This report was salvaged from a partially incompatible artifact; coverage is partial.",
+      "",
+      ...report.record_warnings.map(
+        (warning) =>
+          `- Line ${warning.line} (${markdownCode(warning.record_type)}): ${markdownInline(warning.message)}`,
+      ),
+      ...(report.omitted_record_warnings === undefined
+        ? []
+        : [
+            `- ${report.omitted_record_warnings} additional incompatible records were omitted from this bounded warning list.`,
+          ]),
     );
   }
   lines.push("", "## Findings", "");
