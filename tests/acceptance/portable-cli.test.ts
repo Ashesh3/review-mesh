@@ -181,7 +181,7 @@ describe("portable CLI", () => {
     await writeFile(join(workspace, "source.ts"), "export const value = 1;\n");
     await writeFile(
       reviewer,
-      `for await (const _ of process.stdin) {}\nprocess.stdout.write(JSON.stringify({type:"result",result:{schema_version:"1",verdict:"pass",summary:"portable command",actionable_findings:[],informational_notes:[]}})+"\\n");\n`,
+      `for await (const _ of process.stdin) {}\nprocess.stdout.write(JSON.stringify({type:"result",result:{schema_version:"2",verdict:"pass",summary:"portable command",actionable_findings:[],informational_notes:[]}})+"\\n");\n`,
     );
     await writeFile(
       config,
@@ -252,7 +252,7 @@ profile = "portable"
                 {
                   message: {
                     content: JSON.stringify({
-                      schema_version: "1",
+                      schema_version: "2",
                       verdict: "pass",
                       summary: "portable OpenAI compatible",
                       actionable_findings: [],

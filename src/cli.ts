@@ -5,6 +5,7 @@ import type { Readable, Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import {
   ReviewRunError,
+  createDefaultRegistry,
   runReviewApplication,
   type ReviewApplicationOptions,
 } from "./app.js";
@@ -12,7 +13,17 @@ import type { AdapterRegistry } from "./adapters/registry.js";
 import { runConfigCommand } from "./config/command.js";
 import { resolveProjectName } from "./config/project-names.js";
 import { getAppPaths, type AppPaths } from "./config/paths.js";
+import { loadConfigFiles } from "./config/load.js";
+import { resolveConfig } from "./config/resolve.js";
 import { readRunStatus, RunStatusError } from "./diagnostics/run-status.js";
+import {
+  readRunFindings,
+  readRunReport,
+  readRetryRunPlan,
+  renderRunReportJson,
+  renderRunReportMarkdown,
+  RunReportError,
+} from "./diagnostics/run-report.js";
 import {
   normalizeHelpTopic,
   renderHelp,
@@ -309,6 +320,107 @@ export async function runCli(
       process.exitCode = 0;
       return;
     }
+    if (argv[0] === "doctor") {
+      if (
+        argv
+          .slice(1)
+          .some(
+            (argument) =>
+              argument.startsWith("--") && argument !== "--structured-output",
+          )
+      ) {
+        await writeUsageDiagnostic(
+          "Expected: review-mesh doctor [WORKSPACE] [--structured-output]",
+          "review-mesh help doctor",
+          errorOutput,
+        );
+        process.exitCode = 2;
+        return;
+      }
+      const argumentsWithoutFlags = argv
+        .slice(1)
+        .filter((argument) => argument !== "--structured-output");
+      const workspace = resolve(
+        runtime.cwd ?? process.cwd(),
+        argumentsWithoutFlags[0] ?? ".",
+      );
+      if (argumentsWithoutFlags.length > 1) {
+        await writeUsageDiagnostic(
+          "Expected: review-mesh doctor [WORKSPACE] [--structured-output]",
+          "review-mesh help doctor",
+          errorOutput,
+        );
+        process.exitCode = 2;
+        return;
+      }
+      try {
+        const loaded = await loadConfigFiles({
+          ...(runtime.configFile === undefined
+            ? {}
+            : { configFile: runtime.configFile }),
+          workspace,
+          signal: controller.signal,
+        });
+        const config = resolveConfig({
+          trusted: loaded.trusted,
+          workspace: loaded.workspace,
+          projectName: loaded.projectName,
+          projectNameSource: loaded.projectNameSource,
+        });
+        const registry = runtime.adapterRegistry ?? createDefaultRegistry();
+        const results = [];
+        for (const reviewer of config.reviewers) {
+          const adapter = registry.create(reviewer.adapterId, reviewer.adapter);
+          const result =
+            argv.includes("--structured-output") && adapter.doctor !== undefined
+              ? await adapter.doctor(reviewer, controller.signal)
+              : (() => undefined)();
+          const capabilities =
+            result === undefined
+              ? await adapter.probe(reviewer, controller.signal)
+              : undefined;
+          results.push({
+            reviewer_id: reviewer.id,
+            adapter: reviewer.adapterId,
+            model: reviewer.model,
+            provider_group: reviewer.providerGroup ?? reviewer.adapterId,
+            ...(result === undefined
+              ? {
+                  ready: capabilities!.available,
+                  checks: [
+                    {
+                      name: "readiness",
+                      passed: capabilities!.available,
+                      ...(capabilities!.message === undefined
+                        ? {}
+                        : { message: capabilities!.message }),
+                    },
+                  ],
+                }
+              : result),
+          });
+        }
+        await writeText(
+          output,
+          `${JSON.stringify({
+            schema_version: "1",
+            kind: "review-mesh.doctor",
+            workspace: loaded.workspace,
+            ready: results.every((result) => result.ready),
+            reviewers: results,
+          })}\n`,
+        );
+        process.exitCode = results.every((result) => result.ready) ? 0 : 3;
+      } catch {
+        await writeDiagnostic(
+          "doctor_failed",
+          "Review Mesh could not complete adapter preflight.",
+          errorOutput,
+        );
+        process.exitCode = 2;
+      }
+      return;
+    }
     if (argv[0] === "config") {
       process.exitCode = await runConfigCommand({
         args: argv.slice(1),
@@ -366,13 +478,155 @@ export async function runCli(
       }
       return;
     }
+    if (argv[0] === "report") {
+      const runId = argv[1];
+      const formatIndex = argv.indexOf("--format");
+      const format = formatIndex >= 0 ? argv[formatIndex + 1] : "markdown";
+      if (
+        runId === undefined ||
+        (format !== "markdown" && format !== "json") ||
+        argv.some(
+          (argument, index) =>
+            index > 1 && argument.startsWith("--") && argument !== "--format",
+        )
+      ) {
+        await writeUsageDiagnostic(
+          "Expected: review-mesh report RUN_ID [--format markdown|json]",
+          "review-mesh help report",
+          errorOutput,
+        );
+        process.exitCode = 2;
+        return;
+      }
+      try {
+        const report = await readRunReport({
+          runsDirectory: (runtime.appPaths ?? getAppPaths()).runsDirectory,
+          runId,
+        });
+        await writeText(
+          output,
+          format === "json"
+            ? renderRunReportJson(report)
+            : renderRunReportMarkdown(report),
+        );
+        process.exitCode = 0;
+      } catch (error) {
+        await writeDiagnostic(
+          error instanceof RunReportError ? error.code : "report_failed",
+          error instanceof RunReportError
+            ? error.message
+            : "The persisted Review Mesh report could not be read.",
+          errorOutput,
+        );
+        process.exitCode = 2;
+      }
+      return;
+    }
+    if (argv[0] === "findings") {
+      const runId = argv[1];
+      const allowed = new Set(["--json", "--deduplicate"]);
+      if (
+        runId === undefined ||
+        argv.slice(2).some((argument) => !allowed.has(argument))
+      ) {
+        await writeUsageDiagnostic(
+          "Expected: review-mesh findings RUN_ID [--deduplicate] [--json]",
+          "review-mesh help findings",
+          errorOutput,
+        );
+        process.exitCode = 2;
+        return;
+      }
+      try {
+        const findings = await readRunFindings({
+          runsDirectory: (runtime.appPaths ?? getAppPaths()).runsDirectory,
+          runId,
+        });
+        const payload = argv.includes("--deduplicate")
+          ? { run_id: findings.run_id, findings: findings.deduplicated }
+          : { run_id: findings.run_id, findings: findings.raw };
+        await writeText(output, `${JSON.stringify(payload)}\n`);
+        process.exitCode = 0;
+      } catch (error) {
+        await writeDiagnostic(
+          error instanceof RunReportError ? error.code : "report_failed",
+          error instanceof RunReportError
+            ? error.message
+            : "The persisted Review Mesh findings could not be read.",
+          errorOutput,
+        );
+        process.exitCode = 2;
+      }
+      return;
+    }
+    if (argv[0] === "retry") {
+      const runId = argv[1];
+      if (
+        runId === undefined ||
+        argv.length !== 3 ||
+        argv[2] !== "--only-incomplete"
+      ) {
+        await writeUsageDiagnostic(
+          "Expected: review-mesh retry RUN_ID --only-incomplete",
+          "review-mesh help retry",
+          errorOutput,
+        );
+        process.exitCode = 2;
+        return;
+      }
+      try {
+        const plan = await readRetryRunPlan({
+          runsDirectory: (runtime.appPaths ?? getAppPaths()).runsDirectory,
+          runId,
+        });
+        if (plan.incomplete_lenses.length === 0) {
+          await writeDiagnostic(
+            "nothing_to_retry",
+            "The persisted run has no incomplete logical lenses.",
+            errorOutput,
+          );
+          process.exitCode = 2;
+          return;
+        }
+        const request = plan.request;
+        const lifecycle = setInterval(() => undefined, 60_000);
+        try {
+          process.exitCode = await (runtime.runReview ?? runReviewApplication)({
+            requestText: JSON.stringify(request),
+            stdout: output,
+            stderr: errorOutput,
+            signal: controller.signal,
+            parentRunId: plan.parent_run_id,
+            onlyLensIds: plan.incomplete_lenses,
+            ...(runtime.adapterRegistry === undefined
+              ? {}
+              : { adapterRegistry: runtime.adapterRegistry }),
+            ...(runtime.appPaths === undefined
+              ? {}
+              : { appPaths: runtime.appPaths }),
+          });
+        } finally {
+          clearInterval(lifecycle);
+        }
+      } catch (error) {
+        await writeDiagnostic(
+          error instanceof RunReportError ? error.code : "retry_failed",
+          error instanceof RunReportError
+            ? error.message
+            : "The incomplete review lenses could not be retried.",
+          errorOutput,
+        );
+        process.exitCode = 2;
+      }
+      return;
+    }
     if (
       argv[0] !== "review" ||
       argv.length > 2 ||
       (argv.length === 2 && argv[1]?.startsWith("-"))
     ) {
       await writeUsageDiagnostic(
-        "Unknown command. Expected one of: review, status, describe, schema, config, help, or version.",
+        "Unknown command. Expected one of: review, status, report, findings, retry, doctor, describe, schema, config, help, or version.",
         "review-mesh --help",
         errorOutput,
         ["Run review-mesh --help for the complete command manual."],

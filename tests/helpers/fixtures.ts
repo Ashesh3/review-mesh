@@ -145,7 +145,7 @@ export function passResult(
   summary = "No actionable findings.",
 ): ReviewerResult {
   return {
-    schema_version: "1",
+    schema_version: "2",
     verdict: "pass",
     summary,
     actionable_findings: [],
@@ -155,7 +155,7 @@ export function passResult(
 
 export function failResult(id = "f-1"): ReviewerResult {
   return {
-    schema_version: "1",
+    schema_version: "2",
     verdict: "fail",
     summary: "An actionable finding was found.",
     actionable_findings: [
@@ -166,6 +166,9 @@ export function failResult(id = "f-1"): ReviewerResult {
         description: "Broken invariant",
         evidence: [{ detail: "Evidence." }],
         suggested_direction: "Restore the invariant.",
+        confidence: "high",
+        classification: "confirmed_defect",
+        external_assumptions: [],
       },
     ],
     informational_notes: [],
@@ -225,6 +228,11 @@ export function roundInput(
       max_concurrency: 2,
       heartbeat_interval_ms: 100,
       shutdown_grace_period_ms: 50,
+      default_provider_concurrency: 2,
+      provider_limits: {},
+      circuit_breaker_threshold: 2,
+      retry_attempts: 2,
+      retry_backoff_ms: 1_000,
     },
     diagnostics: { persist_runs: false, max_runs: 10 },
     selection: { source: "defaults" },

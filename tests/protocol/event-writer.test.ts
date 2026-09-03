@@ -144,7 +144,7 @@ describe("EventWriter", () => {
     expect(events.map((event) => event.seq)).toEqual(
       Array.from({ length: 50 }, (_, index) => index + 1),
     );
-    expect(events.every((event) => event.schema_version === "4")).toBe(true);
+    expect(events.every((event) => event.schema_version === "5")).toBe(true);
     expect(events.every((event) => event.request_id === "caller-1")).toBe(true);
   });
 

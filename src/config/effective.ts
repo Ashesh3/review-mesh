@@ -19,7 +19,7 @@ export interface DescribeEffectiveConfigInput {
 export interface DescribeResolvedConfigInput {
   configFile: string;
   revision: string;
-  configSchemaVersion: "1" | "2" | "3" | "4";
+  configSchemaVersion: "1" | "2" | "3" | "4" | "5";
   migrated: boolean;
   workspace: string;
   resolved: ReturnType<typeof resolveConfig>;
@@ -41,7 +41,7 @@ export interface EffectiveConfigDescription {
   valid: true;
   config_path: string;
   revision: string;
-  config_schema_version: "1" | "2" | "3" | "4";
+  config_schema_version: "1" | "2" | "3" | "4" | "5";
   migrated: boolean;
   workspace: string;
   selection: {
@@ -55,6 +55,11 @@ export interface EffectiveConfigDescription {
     max_concurrency: number;
     heartbeat_interval_ms: number;
     shutdown_grace_period_ms: number;
+    default_provider_concurrency: number;
+    provider_limits: Record<string, number>;
+    circuit_breaker_threshold: number;
+    retry_attempts: number;
+    retry_backoff_ms: number;
   };
   diagnostics: { persist_runs: boolean; max_runs: number };
   reviewers: Array<{
@@ -63,7 +68,7 @@ export interface EffectiveConfigDescription {
     model_index: number;
     model_count: number;
     previous_reviewer_id?: string;
-    activation: "immediate" | "after_clear_pass";
+    activation: "immediate" | "after_clear_pass" | "after_lens_progress";
     purpose: string;
     adapter_id: string;
     adapter_type: AdapterRegistration["type"];
@@ -72,6 +77,11 @@ export interface EffectiveConfigDescription {
     isolation_policy: "prefer_enforced" | "require_enforced";
     timeout_ms: number;
     instruction_sources: Array<"trusted" | "project">;
+    provider_group: string;
+    attempt_timeout_ms: number;
+    policy?: NonNullable<
+      ReturnType<typeof resolveConfig>["reviewers"][number]["policy"]
+    >;
   }>;
   credential_environment: Array<{ name: string; present: boolean }>;
 }
@@ -146,7 +156,11 @@ export function describeResolvedConfig(
         ? {}
         : { previous_reviewer_id: reviewer.previousReviewerId }),
       activation:
-        (reviewer.modelIndex ?? 0) === 0 ? "immediate" : "after_clear_pass",
+        (reviewer.modelIndex ?? 0) === 0
+          ? "immediate"
+          : reviewer.policy === undefined
+            ? "after_clear_pass"
+            : "after_lens_progress",
       purpose: reviewer.purpose,
       adapter_id: reviewer.adapterId,
       adapter_type: reviewer.adapter.type,
@@ -157,6 +171,11 @@ export function describeResolvedConfig(
       instruction_sources: reviewer.instruction_layers.map(
         (layer) => layer.source,
       ),
+      provider_group: reviewer.providerGroup ?? reviewer.adapterId,
+      attempt_timeout_ms: reviewer.attemptTimeoutMs ?? reviewer.timeoutMs,
+      ...(reviewer.policy === undefined
+        ? {}
+        : { policy: structuredClone(reviewer.policy) }),
     })),
     credential_environment: names.map((name) => ({
       name,

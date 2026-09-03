@@ -46,6 +46,7 @@ export interface RunRecorderFileSystem {
 
 export interface RunRecorder {
   onEvent(event: PublicEvent): Promise<void>;
+  onRecord(record: unknown): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -287,8 +288,31 @@ function boundedText(value: string, suffix = ""): string {
   return encodedValue.subarray(0, end).toString("utf8") + marker;
 }
 
+function redactString(value: string): string {
+  return value
+    .replace(/(https?:\/\/)[^\s/@:]+:[^\s/@]+@/giu, "$1[redacted]@")
+    .replace(
+      /\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/gu,
+      REDACTED,
+    )
+    .replace(
+      /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/gu,
+      REDACTED,
+    )
+    .replace(
+      /\b(?:authorization|api[_-]?key|access[_-]?token|client[_-]?secret|password|secret|accountkey)\s*[:=]\s*[^\s,;]+/giu,
+      REDACTED,
+    )
+    .replace(
+      /\b(?:DefaultEndpointsProtocol|AccountName|AccountKey|EndpointSuffix)=[^;\s]+(?:;[^\s]*)?/giu,
+      REDACTED,
+    )
+    .replace(/\bBearer\s+[^\s,;]+/giu, REDACTED)
+    .replace(/(https?:\/\/[^\s/?#]+\/[^\s?#]*)\?[^\s#]*/giu, "$1?[redacted]");
+}
+
 function sanitize(value: unknown): unknown {
-  if (typeof value === "string") return boundedText(value);
+  if (typeof value === "string") return boundedText(redactString(value));
   if (
     value === null ||
     typeof value === "boolean" ||
@@ -568,6 +592,15 @@ export function createRunRecorder({
       return enqueue(async () => {
         const handle = await initialize();
         await handle.appendFile(line(event));
+      });
+    },
+    onRecord(record) {
+      if (state !== "open") {
+        return Promise.reject(new Error("Run recorder is closing or closed"));
+      }
+      return enqueue(async () => {
+        const handle = await initialize();
+        await handle.appendFile(line(record));
       });
     },
     close(): Promise<void> {

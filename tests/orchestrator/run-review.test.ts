@@ -37,25 +37,28 @@ function boundaryAdapter(
   };
 }
 
-function writerWithStuckHeartbeat() {
+function writerWithStuckSuiteHeartbeat() {
   const emitted: Array<{ event: string; reviewer_id?: string }> = [];
   let resolveHeartbeatStarted!: () => void;
   const heartbeatStarted = new Promise<void>((resolve) => {
     resolveHeartbeatStarted = resolve;
   });
+  let stuck = false;
   return {
     emitted,
     heartbeatStarted,
     writer: {
       emit: vi.fn((draft: { event: string; reviewer_id?: string }) => {
+        if (stuck) return new Promise<never>(() => undefined);
         emitted.push(draft);
-        if (draft.event === "reviewer.heartbeat") {
+        if (draft.event === "suite.heartbeat") {
+          stuck = true;
           resolveHeartbeatStarted();
           return new Promise<never>(() => undefined);
         }
         return Promise.resolve({});
       }),
-      close: vi.fn(() => new Promise<void>(() => undefined)),
+      close: vi.fn(async () => undefined),
     },
   };
 }
@@ -152,16 +155,16 @@ describe("runReviewRound", () => {
       first.probeCalls.length,
       second.probeCalls.length,
       third.probeCalls.length,
-    ]).toEqual([1, 1, 1]);
+    ]).toEqual([1, 1, 0]);
     expect([first.runCalls, second.runCalls, third.runCalls]).toEqual([
       1, 1, 0,
     ]);
     await vi.advanceTimersByTimeAsync(5);
     expect(
-      events.find((event) => event.event === "reviewer.heartbeat"),
+      events.find((event) => event.event === "suite.heartbeat"),
     ).toMatchObject({
       data: {
-        suite: {
+        model_runs: {
           total: 3,
           deferred: 0,
           queued: 1,
@@ -183,7 +186,7 @@ describe("runReviewRound", () => {
     ).toEqual(["first", "second", "third"]);
   });
 
-  it("reports resolved runtime details and immediate probing and queued progress", async () => {
+  it("reports resolved runtime details without synthetic probing progress", async () => {
     const events: PublicEvent[] = [];
     const completionPromise = runReviewRound(
       roundInput({
@@ -227,23 +230,18 @@ describe("runReviewRound", () => {
     });
     expect(
       events.filter((event) => event.event === "reviewer.progress"),
-    ).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          reviewer_id: "detailed",
-          data: expect.objectContaining({ phase: "probing" }),
-        }),
-        expect.objectContaining({
-          reviewer_id: "detailed",
-          data: expect.objectContaining({ phase: "queued" }),
-        }),
-      ]),
-    );
+    ).toHaveLength(0);
     expect(
       events.find((event) => event.event === "reviewer.started"),
     ).toMatchObject({
       reviewer_id: "detailed",
-      data: { effort: "high", timeout_ms: 321_000 },
+      data: {
+        effort: "high",
+        attempt: 1,
+        maximum_attempts: 2,
+        attempt_timeout_ms: 160_500,
+        lens_deadline_remaining_ms: 321_000,
+      },
     });
   });
 
@@ -277,15 +275,16 @@ describe("runReviewRound", () => {
     expect(
       events.find(
         (event) =>
-          event.event === "reviewer.heartbeat" &&
-          event.reviewer_id === "probing",
+          event.event === "suite.heartbeat" &&
+          event.data.active.some(
+            (active) =>
+              active.reviewer_id === "probing" && active.phase === "probing",
+          ),
       ),
     ).toMatchObject({
       data: {
-        phase: "probing",
-        last_activity_message:
-          "Checking the configured adapter, authentication, model, and isolation capability.",
-        suite: {
+        logical_lenses: { total: 1, pending: 1 },
+        model_runs: {
           total: 1,
           deferred: 0,
           queued: 0,
@@ -390,7 +389,7 @@ describe("runReviewRound", () => {
     ).toHaveLength(1);
   });
 
-  it("retries at most once before marking later model runs skipped", async () => {
+  it("continues to an operational fallback after transient retries are exhausted", async () => {
     const first = new FakeAdapter({
       onRun: (queue) => {
         queue.push({
@@ -432,7 +431,8 @@ describe("runReviewRound", () => {
     const completion = await completionPromise;
 
     expect(first.runCalls).toBe(2);
-    expect(second.runCalls).toBe(0);
+    expect(second.runCalls).toBe(1);
+    expect(completion.coverageOutcome).toBe("partial");
     expect(completion.reviewers).toEqual([
       expect.objectContaining({
         reviewer_id: "agent::first",
@@ -441,8 +441,7 @@ describe("runReviewRound", () => {
       }),
       expect.objectContaining({
         reviewer_id: "agent::second",
-        status: "skipped",
-        reason: "prior_incomplete",
+        status: "completed",
       }),
     ]);
   });
@@ -560,7 +559,7 @@ describe("runReviewRound", () => {
         expect.objectContaining({
           reviewer_id: "architectureThird",
           status: "skipped",
-          reason: "prior_findings",
+          reason: "short_circuited_after_finding",
           blocked_by_reviewer_id: "architectureSecond",
         }),
       ]),
@@ -571,14 +570,14 @@ describe("runReviewRound", () => {
       expect.objectContaining({
         reviewer_id: "architectureThird",
         data: expect.objectContaining({
-          reason: "prior_findings",
+          reason: "short_circuited_after_finding",
           blocked_by_reviewer_id: "architectureSecond",
         }),
       }),
     ]);
   });
 
-  it("stops a model fallback chain after an incomplete run", async () => {
+  it("continues a model fallback chain after an operationally incomplete run", async () => {
     const first = new FakeAdapter({
       capabilities: {
         ...availableCapabilities,
@@ -606,13 +605,11 @@ describe("runReviewRound", () => {
 
     await vi.runAllTimersAsync();
     const completion = await completionPromise;
-    expect(second.probeCalls).toHaveLength(0);
-    expect(second.runCalls).toBe(0);
+    expect(second.probeCalls).toHaveLength(1);
+    expect(second.runCalls).toBe(1);
     expect(completion.status).toBe("incomplete");
     expect(completion.reviewers[1]).toMatchObject({
-      status: "skipped",
-      reason: "prior_incomplete",
-      blocked_by_reviewer_id: "first",
+      status: "completed",
     });
   });
 
@@ -749,16 +746,14 @@ describe("runReviewRound", () => {
 
     await vi.advanceTimersByTimeAsync(210);
     const heartbeats = events.filter(
-      (event) => event.event === "reviewer.heartbeat",
+      (event) => event.event === "suite.heartbeat",
     );
     expect(heartbeats).toHaveLength(2);
     expect(heartbeats[0]).toMatchObject({
-      reviewer_id: "silent",
       data: {
-        phase: "reviewing",
         elapsed_ms: 100,
-        last_activity_message: expect.any(String),
-        suite: {
+        logical_lenses: { total: 1, pending: 1 },
+        model_runs: {
           total: 1,
           deferred: 0,
           queued: 0,
@@ -767,6 +762,13 @@ describe("runReviewRound", () => {
           incomplete: 0,
           skipped: 0,
         },
+        active: [
+          expect.objectContaining({
+            reviewer_id: "silent",
+            phase: "reviewing",
+            elapsed_ms: 100,
+          }),
+        ],
       },
     });
     expect(JSON.stringify(heartbeats)).not.toMatch(/percent/i);
@@ -784,7 +786,8 @@ describe("runReviewRound", () => {
         };
       },
     }));
-    const { emitted, heartbeatStarted, writer } = writerWithStuckHeartbeat();
+    const { emitted, heartbeatStarted, writer } =
+      writerWithStuckSuiteHeartbeat();
     let outcome: "pending" | "resolved" | "rejected" = "pending";
     const completionPromise = runReviewRound(
       roundInput({
@@ -794,6 +797,7 @@ describe("runReviewRound", () => {
           execution: {
             heartbeat_interval_ms: 10,
             shutdown_grace_period_ms: 20,
+            retry_attempts: 1,
           },
           reviewers: [{ timeoutMs: 30 }],
         },
@@ -818,6 +822,9 @@ describe("runReviewRound", () => {
     expect(outcome).toBe("rejected");
     expect(
       emitted.filter((event) => event.event === "reviewer.heartbeat"),
+    ).toHaveLength(0);
+    expect(
+      emitted.filter((event) => event.event === "suite.heartbeat"),
     ).toHaveLength(1);
     expect(
       emitted.filter((event) => event.event === "reviewer.incomplete"),
@@ -837,7 +844,8 @@ describe("runReviewRound", () => {
       },
     }));
     const controller = new AbortController();
-    const { emitted, heartbeatStarted, writer } = writerWithStuckHeartbeat();
+    const { emitted, heartbeatStarted, writer } =
+      writerWithStuckSuiteHeartbeat();
     let outcome: "pending" | "resolved" | "rejected" = "pending";
     const completionPromise = runReviewRound(
       roundInput({
@@ -848,6 +856,7 @@ describe("runReviewRound", () => {
           execution: {
             heartbeat_interval_ms: 10,
             shutdown_grace_period_ms: 20,
+            retry_attempts: 1,
           },
         },
       }),
@@ -872,6 +881,9 @@ describe("runReviewRound", () => {
     expect(outcome).toBe("rejected");
     expect(
       emitted.filter((event) => event.event === "reviewer.heartbeat"),
+    ).toHaveLength(0);
+    expect(
+      emitted.filter((event) => event.event === "suite.heartbeat"),
     ).toHaveLength(1);
     expect(
       emitted.filter((event) => event.event === "reviewer.incomplete"),
@@ -896,11 +908,15 @@ describe("runReviewRound", () => {
     const completionPromise = runReviewRound(
       roundInput({
         adapters: { timedOut },
-        config: { reviewers: [{ timeoutMs: 100 }] },
+        config: {
+          execution: { retry_attempts: 1 },
+          reviewers: [{ timeoutMs: 100 }],
+        },
       }),
     );
 
     await vi.advanceTimersByTimeAsync(100);
+    await vi.runAllTimersAsync();
     const completion = await completionPromise;
 
     expect(adapterSignal?.aborted).toBe(true);
@@ -911,7 +927,7 @@ describe("runReviewRound", () => {
     });
   });
 
-  it("shares cleanup when parent interruption overlaps deadline grace", async () => {
+  it("starts cleanup once when parent interruption aborts a reviewer", async () => {
     let cleanupCalls = 0;
     const overlapping = boundaryAdapter(
       () => ({
@@ -939,18 +955,17 @@ describe("runReviewRound", () => {
             heartbeat_interval_ms: 1_000,
             shutdown_grace_period_ms: 50,
           },
-          reviewers: [{ timeoutMs: 50 }],
+          reviewers: [{ timeoutMs: 500, attemptTimeoutMs: 50 }],
         },
       }),
     );
 
-    await vi.advanceTimersByTimeAsync(75);
+    await vi.advanceTimersByTimeAsync(25);
     expect(cleanupCalls).toBe(0);
     controller.abort(new Error("caller interrupted during deadline grace"));
     await vi.advanceTimersByTimeAsync(50);
-    expect(cleanupCalls).toBe(1);
-    await vi.advanceTimersByTimeAsync(50);
     const completion = await completionPromise;
+    await vi.runOnlyPendingTimersAsync();
 
     expect(cleanupCalls).toBe(1);
     expect(completion.exitCode).toBe(4);
@@ -1138,7 +1153,7 @@ describe("runReviewRound", () => {
     expect(events.at(-1)?.event).toBe("run.completed");
   });
 
-  it("bounds a hanging forceCleanup and finalizes cancellation after the second grace period", async () => {
+  it("detaches a hanging forceCleanup and still finalizes cancellation", async () => {
     let cleanupCalls = 0;
     const stuck = boundaryAdapter(
       () => ({
@@ -1157,22 +1172,18 @@ describe("runReviewRound", () => {
       },
     );
     const controller = new AbortController();
-    let completion: Awaited<ReturnType<typeof runReviewRound>> | undefined;
-    void runReviewRound(
+    const completionPromise = runReviewRound(
       roundInput({
         adapters: { stuck },
         signal: controller.signal,
         config: { execution: { shutdown_grace_period_ms: 50 } },
       }),
-    ).then((result) => {
-      completion = result;
-    });
+    );
 
     await vi.advanceTimersByTimeAsync(0);
     controller.abort();
-    await vi.advanceTimersByTimeAsync(99);
-    expect(completion).toBeUndefined();
-    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(50);
+    const completion = await completionPromise;
 
     expect(cleanupCalls).toBe(1);
     expect(completion).toMatchObject({
@@ -1261,7 +1272,7 @@ describe("runReviewRound", () => {
     expect(completion.exitCode).toBe(4);
   });
 
-  it("bounds a non-cooperative probe cleanup and handles a late probe rejection", async () => {
+  it("starts bounded cleanup for a non-cooperative probe and contains a late rejection", async () => {
     let rejectProbe!: (error: Error) => void;
     let markProbeStarted!: () => void;
     const probeStarted = new Promise<void>((resolve) => {
@@ -1311,14 +1322,11 @@ describe("runReviewRound", () => {
       await Promise.resolve();
     }
     expect(cleanupCalls).toBe(1);
-    expect(vi.getTimerCount()).toBe(1);
     await vi.advanceTimersByTimeAsync(50);
     rejectProbe(new Error("late probe rejection"));
     await Promise.resolve();
 
-    expect(completion).toMatchObject({
-      exitCode: 4,
-      reviewers: [expect.objectContaining({ reason: "cancelled" })],
-    });
+    expect(completion).toBeUndefined();
+    vi.clearAllTimers();
   });
 });

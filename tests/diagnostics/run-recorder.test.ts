@@ -34,7 +34,7 @@ async function temporaryRoot(): Promise<string> {
 
 function startedEvent(): PublicEvent {
   return {
-    schema_version: "4",
+    schema_version: "5",
     event: "run.started",
     run_id: "run-current",
     seq: 1,
@@ -57,6 +57,35 @@ afterEach(async () => {
       .splice(0)
       .map((root) => rm(root, { recursive: true, force: true })),
   );
+});
+
+it("redacts credentials embedded in persisted string values", async () => {
+  const root = await temporaryRoot();
+  const runsDirectory = join(root, "runs");
+  const recorder = createRunRecorder({
+    applicationDataRoot: root,
+    runsDirectory,
+    runId: "run-redaction",
+    maxRuns: 10,
+    resolution: {},
+  });
+  await recorder.onRecord({
+    record: "context",
+    run_id: "run-redaction",
+    values: [
+      "https://user:password@example.test/path?token=abc",
+      "client_secret=super-secret",
+      "DefaultEndpointsProtocol=https;AccountName=demo;AccountKey=key-value;EndpointSuffix=core.windows.net",
+    ],
+  });
+  await recorder.close();
+  const persisted = await readFile(
+    join(runsDirectory, "run-redaction.jsonl"),
+    "utf8",
+  );
+  expect(persisted).not.toContain("password");
+  expect(persisted).not.toContain("super-secret");
+  expect(persisted).not.toContain("key-value");
 });
 
 describe("RunRecorder", () => {

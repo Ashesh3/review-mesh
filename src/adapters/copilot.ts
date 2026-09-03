@@ -5,7 +5,7 @@ import {
   loadCopilotSdkModule,
   resolveCopilotRuntimePath,
 } from "../copilot/runtime.js";
-import { reviewerResultSchema } from "../protocol/schemas.js";
+import { reviewerResultV2Schema } from "../protocol/schemas.js";
 import { adapterFailure } from "./errors.js";
 import {
   buildAllowlistedEnvironment,
@@ -673,7 +673,7 @@ class CopilotAdapter implements ReviewAdapter {
         };
         return;
       }
-      const parsedResult = reviewerResultSchema.safeParse(parsedJson);
+      const parsedResult = reviewerResultV2Schema.safeParse(parsedJson);
       if (!parsedResult.success) {
         yield {
           type: "failure",

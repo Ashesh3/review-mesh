@@ -24,6 +24,8 @@ export interface ReviewApplicationOptions {
   adapterRegistry?: AdapterRegistry;
   runIdFactory?: () => string;
   appPaths?: AppPaths;
+  parentRunId?: string;
+  onlyLensIds?: readonly string[];
 }
 
 export class ReviewRunError extends Error {
@@ -67,7 +69,7 @@ async function writeDiagnostic(
   });
 }
 
-function defaultRegistry(): AdapterRegistry {
+export function createDefaultRegistry(): AdapterRegistry {
   const registry = new AdapterRegistry();
   registry.register("command", (registration) =>
     createCommandAdapter(registration),
@@ -100,6 +102,11 @@ function resolvedRunHeader(config: ReturnType<typeof resolveConfig>) {
       instruction_sources: reviewer.instruction_layers.map(
         (layer) => layer.source,
       ),
+      provider_group: reviewer.providerGroup ?? reviewer.adapterId,
+      attempt_timeout_ms: reviewer.attemptTimeoutMs ?? reviewer.timeoutMs,
+      ...(reviewer.policy === undefined
+        ? {}
+        : { policy: structuredClone(reviewer.policy) }),
     })),
   };
 }
@@ -201,6 +208,7 @@ export async function runReviewApplication(
       ? {}
       : { requestId: request.request_id }),
     ...(recorder === undefined ? {} : { onEvent: recorder.onEvent }),
+    ...(recorder === undefined ? {} : { onRecord: recorder.onRecord }),
     ...(recorder === undefined ? {} : { onMirrorClose: recorder.close }),
     onWarning: () => {
       void writeDiagnostic(
@@ -219,10 +227,19 @@ export async function runReviewApplication(
         : { requestId: request.request_id }),
       config,
       context,
-      registry: options.adapterRegistry ?? defaultRegistry(),
+      registry: options.adapterRegistry ?? createDefaultRegistry(),
       writer,
       signal: options.signal,
       clock,
+      ...(options.parentRunId === undefined
+        ? {}
+        : { parentRunId: options.parentRunId }),
+      ...(options.onlyLensIds === undefined
+        ? {}
+        : { onlyLensIds: options.onlyLensIds }),
+      ...(recorder === undefined
+        ? {}
+        : { reportPath: `${appPaths.runsDirectory}\\${runId}.jsonl` }),
     });
     return completion.exitCode;
   } catch (error) {

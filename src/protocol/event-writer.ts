@@ -22,6 +22,7 @@ export type EventDraft = PublicEvent extends infer Event
 
 export interface EventWriter {
   emit(draft: EventDraft): Promise<PublicEvent>;
+  record?(record: unknown): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -31,6 +32,7 @@ export interface CreateEventWriterOptions {
   requestId?: string;
   now?: () => Date;
   onEvent?: (event: PublicEvent) => Promise<void>;
+  onRecord?: (record: unknown) => Promise<void>;
   onMirrorClose?: () => Promise<void>;
   onWarning?: (error: Error) => void;
   mirrorFlushTimeoutMs?: number;
@@ -49,6 +51,7 @@ export function createEventWriter({
   requestId,
   now = () => new Date(),
   onEvent,
+  onRecord,
   onMirrorClose,
   onWarning,
   mirrorFlushTimeoutMs = 1_000,
@@ -254,7 +257,7 @@ export function createEventWriter({
 
         const event = publicEventSchema.parse({
           ...draft,
-          schema_version: "4",
+          schema_version: "5",
           run_id: runId,
           ...(requestId === undefined ? {} : { request_id: requestId }),
           seq: ++sequence,
@@ -268,6 +271,11 @@ export function createEventWriter({
 
         return event;
       });
+    },
+
+    record(record) {
+      if (onRecord === undefined) return Promise.resolve();
+      return onRecord(record);
     },
 
     close() {

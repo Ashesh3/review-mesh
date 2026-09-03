@@ -1,6 +1,6 @@
 import { z } from "zod";
-import { reviewerResultSchema } from "./schemas.js";
+import { reviewerResultV2Schema } from "./schemas.js";
 
-export const reviewerResultJsonSchema = z.toJSONSchema(reviewerResultSchema, {
+export const reviewerResultJsonSchema = z.toJSONSchema(reviewerResultV2Schema, {
   target: "draft-07",
 });

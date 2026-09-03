@@ -3,9 +3,11 @@ import { z } from "zod";
 export type JsonValue =
   null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
-export const protocolVersionSchema = z.literal("1");
-export const publicEventVersionSchema = z.literal("4");
+export const protocolVersionSchema = z.enum(["1", "2"]);
+export const publicEventVersionSchema = z.enum(["4", "5"]);
 export const runStatusSchema = z.enum(["passed", "findings", "incomplete"]);
+export const gateOutcomeSchema = z.enum(["no_findings", "findings"]);
+export const coverageOutcomeSchema = z.enum(["complete", "partial"]);
 export const isolationPolicySchema = z.enum([
   "prefer_enforced",
   "require_enforced",
@@ -27,20 +29,44 @@ export const incompleteReasonSchema = z.enum([
   "cancelled",
   "unknown",
 ]);
+export const findingSeveritySchema = z.enum([
+  "critical",
+  "high",
+  "medium",
+  "low",
+]);
+export const findingConfidenceSchema = z.enum(["high", "medium", "low"]);
+export const findingClassificationSchema = z.enum([
+  "confirmed_defect",
+  "needs_verification",
+  "advisory",
+]);
+export const reviewerModeSchema = z.enum(["full_review", "adjudication"]);
+export const reviewerSkipReasonSchema = z.enum([
+  "prior_findings",
+  "prior_incomplete",
+  "short_circuited_after_finding",
+  "not_needed_after_quorum",
+  "not_selected_for_retry",
+  "not_applicable",
+  "not_evaluated_missing_input",
+  "blocked_by_infrastructure_failure",
+  "circuit_open",
+]);
 
-const nonEmptyString = z.string().min(1);
+const nonEmptyString = z
+  .string()
+  .min(1)
+  .max(16 * 1_024);
+const findingText = z
+  .string()
+  .min(1)
+  .max(8 * 1_024);
 const nonNegativeInteger = z.number().int().nonnegative();
 const positiveInteger = z.number().int().positive();
 const boundedMessage = z.string().min(1).max(1_000);
 const timestampSchema = z.iso.datetime({ offset: true });
 const consistencyModeSchema = z.literal("live_worktree");
-const adapterTypeSchema = z.enum([
-  "copilot",
-  "claude",
-  "codex",
-  "openai_compatible",
-  "command",
-]);
 const reasoningEffortSchema = z.enum([
   "none",
   "minimal",
@@ -60,9 +86,6 @@ const projectNameSchema = z
   .regex(
     /^(?!\.{1,2}$)(?!\s)(?!.*\s$)[^\u0000-\u001f/\\]+$/u,
     "project name must be trimmed and contain no path separators or control characters",
-  )
-  .describe(
-    "Project identity copied from review-mesh describe WORKSPACE --json at configuration.selection.project_name. This is an assertion, not a settings selector; runtime rejects a mismatch with the workspace's derived identity.",
   );
 const gitRefSchema = nonEmptyString
   .max(1_024)
@@ -83,98 +106,49 @@ const reviewPathSchema = nonEmptyString
       !/[\u0000-\u001f]/u.test(value),
     "review paths must be literal forward-slash workspace-relative paths without '..' or pathspec magic",
   );
-const reviewPathsSchema = z
-  .array(reviewPathSchema)
-  .min(1)
-  .describe(
-    "Optional workspace-relative path filter. It only narrows the authorized changes/full scope and never broadens it.",
-  )
-  .optional();
+const reviewPathsSchema = z.array(reviewPathSchema).min(1).optional();
 
-export const reviewScopeSchema = z
-  .discriminatedUnion("mode", [
-    z.strictObject({
-      mode: z
-        .literal("changes")
-        .describe(
-          "Review only committed changes above the merge base plus staged, unstaged, and untracked work.",
-        ),
-      base: gitRefSchema
-        .describe(
-          "Optional comparison base ref, normally the PR base such as origin/main. When omitted, Review Mesh infers the remote/default main or master branch without fetching.",
-        )
-        .optional(),
-      head: gitRefSchema
-        .describe(
-          "Optional head ref. Defaults to HEAD and must resolve to the checked-out workspace HEAD.",
-        )
-        .optional(),
-      branch: gitRefSchema
-        .describe(
-          "Optional short checked-out branch-name assertion. A mismatch rejects the request before reviewers start.",
-        )
-        .optional(),
-      paths: reviewPathsSchema,
-    }),
-    z.strictObject({
-      mode: z
-        .literal("full")
-        .describe(
-          "Explicitly authorize a whole-codebase review. Review Mesh never infers this mode from an ordinary branch or worktree request.",
-        ),
-      paths: reviewPathsSchema,
-    }),
-  ])
-  .describe(
-    "Required review boundary. Use changes by default; use full only when the caller explicitly requested the entire codebase.",
-  );
+export const reviewScopeSchema = z.discriminatedUnion("mode", [
+  z.strictObject({
+    mode: z.literal("changes"),
+    base: gitRefSchema.optional(),
+    head: gitRefSchema.optional(),
+    branch: gitRefSchema.optional(),
+    paths: reviewPathsSchema,
+  }),
+  z.strictObject({ mode: z.literal("full"), paths: reviewPathsSchema }),
+]);
 
 export const reviewRequestV2Schema = z.strictObject({
-  schema_version: z.literal("2").describe("The current review request schema."),
-  request_id: nonEmptyString
-    .describe("Optional caller correlation id copied into public events.")
-    .optional(),
+  schema_version: z.literal("2"),
+  request_id: nonEmptyString.optional(),
   project_name: projectNameSchema,
-  workspace: nonEmptyString.describe(
-    "Existing local worktree or clone to inspect. Review Mesh never checks out or fetches a branch.",
-  ),
-  instructions: nonEmptyString.describe(
-    "Caller review focus applied within the authorized review_scope; it cannot broaden that scope or change the configured reviewer roster.",
-  ),
+  workspace: nonEmptyString,
+  instructions: nonEmptyString,
   review_scope: reviewScopeSchema,
-  context: z
-    .json()
-    .describe("Optional lower-priority caller metadata.")
-    .optional(),
+  context: z.json().optional(),
 });
-
 export const reviewRequestSchema = reviewRequestV2Schema;
 
-const findingEvidenceSchema = z
+export const findingEvidenceSchema = z
   .strictObject({
     path: nonEmptyString.optional(),
-    start_line: z.number().int().positive().optional(),
-    end_line: z.number().int().positive().optional(),
-    detail: nonEmptyString,
+    start_line: positiveInteger.optional(),
+    end_line: positiveInteger.optional(),
+    detail: findingText,
   })
   .superRefine((value, ctx) => {
-    const hasStartLine = value.start_line !== undefined;
-    const hasEndLine = value.end_line !== undefined;
-
-    if ((hasStartLine || hasEndLine) && value.path === undefined) {
-      ctx.addIssue({
-        code: "custom",
-        message: "line ranges require a path",
-      });
+    const hasStart = value.start_line !== undefined;
+    const hasEnd = value.end_line !== undefined;
+    if ((hasStart || hasEnd) && value.path === undefined) {
+      ctx.addIssue({ code: "custom", message: "line ranges require a path" });
     }
-
-    if (hasStartLine !== hasEndLine) {
+    if (hasStart !== hasEnd) {
       ctx.addIssue({
         code: "custom",
         message: "line ranges require both start_line and end_line",
       });
     }
-
     if (
       value.start_line !== undefined &&
       value.end_line !== undefined &&
@@ -187,42 +161,67 @@ const findingEvidenceSchema = z
     }
   });
 
-const actionableFindingSchema = z.strictObject({
+const actionableFindingBase = {
   id: nonEmptyString,
-  severity: z.enum(["critical", "high", "medium", "low"]),
-  title: nonEmptyString,
-  description: nonEmptyString,
-  evidence: z.array(findingEvidenceSchema).min(1),
-  suggested_direction: nonEmptyString,
+  severity: findingSeveritySchema,
+  title: findingText,
+  description: findingText,
+  evidence: z.array(findingEvidenceSchema).min(1).max(256),
+  suggested_direction: findingText,
+};
+export const actionableFindingV1Schema = z.strictObject(actionableFindingBase);
+export const actionableFindingV2Schema = z.strictObject({
+  ...actionableFindingBase,
+  confidence: findingConfidenceSchema,
+  classification: findingClassificationSchema,
+  external_assumptions: z.array(findingText).max(128),
+  root_issue_id: nonEmptyString.optional(),
+  duplicate_of: nonEmptyString.optional(),
+  duplicate_finding_ids: z.array(nonEmptyString).optional(),
 });
-
 const informationalNoteSchema = z.strictObject({
   title: nonEmptyString,
   description: nonEmptyString,
 });
-
-export const reviewerResultSchema = z
+function validateVerdict(
+  value: { verdict: "pass" | "fail"; actionable_findings: unknown[] },
+  ctx: z.RefinementCtx,
+): void {
+  if (value.verdict === "pass" && value.actionable_findings.length !== 0) {
+    ctx.addIssue({
+      code: "custom",
+      message: "pass requires an empty actionable_findings array",
+    });
+  }
+  if (value.verdict === "fail" && value.actionable_findings.length === 0) {
+    ctx.addIssue({
+      code: "custom",
+      message: "fail requires at least one actionable finding",
+    });
+  }
+}
+export const reviewerResultV1Schema = z
   .strictObject({
-    schema_version: protocolVersionSchema,
+    schema_version: z.literal("1"),
     verdict: z.enum(["pass", "fail"]),
-    summary: nonEmptyString,
-    actionable_findings: z.array(actionableFindingSchema),
-    informational_notes: z.array(informationalNoteSchema),
+    summary: findingText,
+    actionable_findings: z.array(actionableFindingV1Schema).max(256),
+    informational_notes: z.array(informationalNoteSchema).max(256),
   })
-  .superRefine((value, ctx) => {
-    if (value.verdict === "pass" && value.actionable_findings.length !== 0) {
-      ctx.addIssue({
-        code: "custom",
-        message: "pass requires an empty actionable_findings array",
-      });
-    }
-    if (value.verdict === "fail" && value.actionable_findings.length === 0) {
-      ctx.addIssue({
-        code: "custom",
-        message: "fail requires at least one actionable finding",
-      });
-    }
-  });
+  .superRefine(validateVerdict);
+export const reviewerResultV2Schema = z
+  .strictObject({
+    schema_version: z.literal("2"),
+    verdict: z.enum(["pass", "fail"]),
+    summary: findingText,
+    actionable_findings: z.array(actionableFindingV2Schema).max(256),
+    informational_notes: z.array(informationalNoteSchema).max(256),
+  })
+  .superRefine(validateVerdict);
+export const reviewerResultSchema = z.union([
+  reviewerResultV2Schema,
+  reviewerResultV1Schema,
+]);
 
 export const reviewerPhaseSchema = z.enum([
   "queued",
@@ -232,8 +231,63 @@ export const reviewerPhaseSchema = z.enum([
   "validating",
   "terminal",
 ]);
+export const adapterFailureDiagnosticsSchema = z.strictObject({
+  failure_stage: z.string().min(1).max(64).optional(),
+  scope: z.enum(["run_input", "adapter", "provider", "model"]).optional(),
+  http_status: z.number().int().min(100).max(599).optional(),
+  provider_request_id: nonEmptyString.max(256).optional(),
+  finish_reason: nonEmptyString.max(128).optional(),
+  content_types: z.array(nonEmptyString.max(128)).max(32).optional(),
+  response_bytes: nonNegativeInteger.optional(),
+  truncated: z.boolean().optional(),
+  repair_attempted: z.boolean().optional(),
+  repair_outcome: z.enum(["not_attempted", "succeeded", "failed"]).optional(),
+});
+export const reviewerTerminalRecordSchema = z.discriminatedUnion("status", [
+  z.strictObject({
+    reviewer_id: nonEmptyString,
+    lens_id: nonEmptyString.optional(),
+    status: z.literal("completed"),
+    mode: reviewerModeSchema.optional(),
+    adapter: nonEmptyString,
+    model: nonEmptyString,
+    provider_group: nonEmptyString.optional(),
+    isolation: isolationLevelSchema,
+    elapsed_ms: nonNegativeInteger,
+    result: reviewerResultSchema,
+  }),
+  z.strictObject({
+    reviewer_id: nonEmptyString,
+    lens_id: nonEmptyString.optional(),
+    status: z.literal("incomplete"),
+    mode: reviewerModeSchema.optional(),
+    adapter: nonEmptyString,
+    model: nonEmptyString,
+    provider_group: nonEmptyString.optional(),
+    isolation: isolationLevelSchema.optional(),
+    elapsed_ms: nonNegativeInteger,
+    reason: incompleteReasonSchema,
+    message: boundedMessage,
+    retryable: z.boolean(),
+    fallback_eligible: z.boolean().optional(),
+    diagnostics: adapterFailureDiagnosticsSchema.optional(),
+  }),
+  z.strictObject({
+    reviewer_id: nonEmptyString,
+    lens_id: nonEmptyString.optional(),
+    status: z.literal("skipped"),
+    mode: reviewerModeSchema.optional(),
+    adapter: nonEmptyString,
+    model: nonEmptyString,
+    provider_group: nonEmptyString.optional(),
+    elapsed_ms: nonNegativeInteger,
+    reason: reviewerSkipReasonSchema,
+    blocked_by_reviewer_id: nonEmptyString.optional(),
+    missing_inputs: z.array(nonEmptyString).optional(),
+  }),
+]);
 
-const suiteSchema = z.strictObject({
+export const modelRunCountsSchema = z.strictObject({
   total: nonNegativeInteger,
   deferred: nonNegativeInteger,
   queued: nonNegativeInteger,
@@ -241,68 +295,31 @@ const suiteSchema = z.strictObject({
   completed: nonNegativeInteger,
   incomplete: nonNegativeInteger,
   skipped: nonNegativeInteger,
+  skip_reasons: z
+    .partialRecord(reviewerSkipReasonSchema, nonNegativeInteger)
+    .optional(),
 });
-
-const reviewerTerminalRecordSchema = z.discriminatedUnion("status", [
-  z.strictObject({
-    reviewer_id: nonEmptyString,
-    status: z.literal("completed"),
-    adapter: nonEmptyString,
-    model: nonEmptyString,
-    isolation: isolationLevelSchema,
-    elapsed_ms: nonNegativeInteger,
-    result: reviewerResultSchema,
-  }),
-  z.strictObject({
-    reviewer_id: nonEmptyString,
-    status: z.literal("incomplete"),
-    adapter: nonEmptyString,
-    model: nonEmptyString,
-    isolation: isolationLevelSchema.optional(),
-    elapsed_ms: nonNegativeInteger,
-    reason: incompleteReasonSchema,
-    message: boundedMessage,
-    retryable: z.boolean(),
-  }),
-  z.strictObject({
-    reviewer_id: nonEmptyString,
-    status: z.literal("skipped"),
-    adapter: nonEmptyString,
-    model: nonEmptyString,
-    elapsed_ms: nonNegativeInteger,
-    reason: z.enum(["prior_findings", "prior_incomplete"]),
-    blocked_by_reviewer_id: nonEmptyString,
-  }),
-]);
+export const logicalLensCountsSchema = z.strictObject({
+  total: nonNegativeInteger,
+  pending: nonNegativeInteger,
+  findings: nonNegativeInteger,
+  passed: nonNegativeInteger,
+  incomplete: nonNegativeInteger,
+  not_applicable: nonNegativeInteger,
+  not_evaluated: nonNegativeInteger,
+  not_selected: nonNegativeInteger.optional(),
+});
 
 const eventEnvelopeSchema = z.strictObject({
   schema_version: publicEventVersionSchema,
   event: z.string(),
   run_id: nonEmptyString,
   request_id: nonEmptyString.optional(),
-  seq: z.number().int().positive(),
+  seq: positiveInteger,
   timestamp: timestampSchema,
   reviewer_id: nonEmptyString.optional(),
   data: z.unknown(),
 });
-
-const suiteReviewerSchema = z.strictObject({
-  id: nonEmptyString,
-  agent_id: nonEmptyString,
-  model_index: nonNegativeInteger,
-  model_count: positiveInteger,
-  previous_reviewer_id: nonEmptyString.optional(),
-  activation: z.enum(["immediate", "after_clear_pass"]),
-  purpose: nonEmptyString,
-  adapter: nonEmptyString,
-  adapter_type: adapterTypeSchema,
-  model: nonEmptyString,
-  effort: reasoningEffortSchema.optional(),
-  isolation_policy: isolationPolicySchema,
-  timeout_ms: positiveInteger,
-  instruction_sources: z.array(nonEmptyString),
-});
-
 const suiteSelectionSchema = z.strictObject({
   source: z.enum(["legacy", "defaults", "project"]),
   project_name: nonEmptyString.optional(),
@@ -311,107 +328,146 @@ const suiteSelectionSchema = z.strictObject({
     .optional(),
   matched_project_name: nonEmptyString.optional(),
 });
-
 const executionSchema = z.strictObject({
   max_concurrency: positiveInteger,
   heartbeat_interval_ms: positiveInteger,
   shutdown_grace_period_ms: positiveInteger,
+  default_provider_concurrency: positiveInteger.optional(),
+  provider_limits: z.record(nonEmptyString, positiveInteger).optional(),
+  circuit_breaker_threshold: positiveInteger.optional(),
 });
-
-const runCompletedDataSchema = z
-  .strictObject({
-    status: runStatusSchema,
-    exit_code: nonNegativeInteger,
-    consistency_mode: consistencyModeSchema,
-    total_elapsed_ms: nonNegativeInteger,
-    suite: suiteSchema,
-    reviewers: z.array(reviewerTerminalRecordSchema),
-  })
-  .superRefine((value, ctx) => {
-    const hasIncomplete = value.reviewers.some(
-      (reviewer) => reviewer.status === "incomplete",
-    );
-    const hasFindings = value.reviewers.some(
-      (reviewer) =>
-        reviewer.status === "completed" &&
-        reviewer.result.actionable_findings.length > 0,
-    );
-    const expectedStatus = hasIncomplete
-      ? "incomplete"
-      : hasFindings
-        ? "findings"
-        : "passed";
-
-    const terminalCounts = {
-      completed: value.reviewers.filter(
-        (reviewer) => reviewer.status === "completed",
-      ).length,
-      incomplete: value.reviewers.filter(
-        (reviewer) => reviewer.status === "incomplete",
-      ).length,
-      skipped: value.reviewers.filter(
-        (reviewer) => reviewer.status === "skipped",
-      ).length,
-    };
-
-    if (
-      value.suite.total !== value.reviewers.length ||
-      value.suite.deferred !== 0 ||
-      value.suite.queued !== 0 ||
-      value.suite.running !== 0 ||
-      value.suite.completed !== terminalCounts.completed ||
-      value.suite.incomplete !== terminalCounts.incomplete ||
-      value.suite.skipped !== terminalCounts.skipped
-    ) {
-      ctx.addIssue({
-        code: "custom",
-        message:
-          "run.completed suite counts must match its terminal reviewer records",
-      });
-    }
-
-    if (value.status !== expectedStatus) {
-      ctx.addIssue({
-        code: "custom",
-        message: `run.completed status must be ${expectedStatus} for its reviewer terminal records`,
-      });
-    }
-  });
 
 const publicEventSchemas = [
   eventEnvelopeSchema.extend({
     event: z.literal("run.started"),
-    data: z.strictObject({ consistency_mode: consistencyModeSchema }),
+    data: z.strictObject({
+      consistency_mode: consistencyModeSchema,
+      parent_run_id: nonEmptyString.optional(),
+    }),
   }),
   eventEnvelopeSchema.extend({
     event: z.literal("context.resolved"),
-    data: z.strictObject({ context: z.json() }),
+    data: z.strictObject({
+      workspace: nonEmptyString,
+      project_name: nonEmptyString,
+      review_scope: z.strictObject({
+        mode: z.enum(["changes", "full"]),
+        paths: z.array(nonEmptyString).optional(),
+      }),
+      git: z.strictObject({
+        is_repository: z.boolean(),
+        branch: z.string().nullable().optional(),
+        head: z.string().nullable().optional(),
+        merge_base: z.string().nullable().optional(),
+        changed_files_count: nonNegativeInteger,
+        changed_files: z.array(nonEmptyString).max(25),
+        diff_stat: z
+          .string()
+          .max(4 * 1_024)
+          .optional(),
+        truncated: z.boolean(),
+      }),
+      detail_ref: nonEmptyString.optional(),
+    }),
   }),
   eventEnvelopeSchema.extend({
     event: z.literal("suite.resolved"),
     data: z.strictObject({
-      total: nonNegativeInteger,
+      logical_lenses: nonNegativeInteger.optional(),
+      model_runs: nonNegativeInteger.optional(),
       execution: executionSchema,
       selection: suiteSelectionSchema.optional(),
-      reviewers: z.array(suiteReviewerSchema),
+      lenses: z
+        .array(
+          z.strictObject({
+            id: nonEmptyString,
+            purpose: nonEmptyString,
+            model_runs: positiveInteger,
+            pass_quorum: positiveInteger,
+            minimum_provider_groups: positiveInteger,
+            adjudication: z.enum(["off", "required"]),
+          }),
+        )
+        .optional(),
+      total: nonNegativeInteger.optional(),
+      reviewers: z
+        .array(
+          z.strictObject({
+            id: nonEmptyString,
+            agent_id: nonEmptyString,
+            model_index: nonNegativeInteger,
+            model_count: positiveInteger,
+            previous_reviewer_id: nonEmptyString.optional(),
+            activation: z.enum([
+              "immediate",
+              "after_clear_pass",
+              "after_lens_progress",
+            ]),
+            purpose: nonEmptyString,
+            adapter: nonEmptyString,
+            adapter_type: z.enum([
+              "copilot",
+              "claude",
+              "codex",
+              "openai_compatible",
+              "command",
+            ]),
+            model: nonEmptyString,
+            effort: reasoningEffortSchema.optional(),
+            provider_group: nonEmptyString.optional(),
+            isolation_policy: isolationPolicySchema,
+            timeout_ms: positiveInteger,
+            instruction_sources: z.array(nonEmptyString),
+          }),
+        )
+        .optional(),
     }),
   }),
   eventEnvelopeSchema.extend({
     event: z.literal("reviewer.started"),
     data: z.strictObject({
+      lens_id: nonEmptyString.optional(),
+      mode: reviewerModeSchema.optional(),
+      attempt: positiveInteger.optional(),
+      maximum_attempts: positiveInteger.optional(),
       purpose: nonEmptyString,
       adapter: nonEmptyString,
       model: nonEmptyString,
+      provider_group: nonEmptyString.optional(),
       effort: reasoningEffortSchema.optional(),
       isolation_policy: isolationPolicySchema,
-      timeout_ms: positiveInteger,
+      attempt_timeout_ms: positiveInteger.optional(),
+      lens_deadline_remaining_ms: nonNegativeInteger.optional(),
+      timeout_ms: positiveInteger.optional(),
     }),
   }),
   eventEnvelopeSchema.extend({
     event: z.literal("reviewer.progress"),
     data: z.strictObject({
+      lens_id: nonEmptyString.optional(),
+      mode: reviewerModeSchema.optional(),
       phase: reviewerPhaseSchema,
       message: boundedMessage.optional(),
+    }),
+  }),
+  eventEnvelopeSchema.extend({
+    event: z.literal("suite.heartbeat"),
+    data: z.strictObject({
+      elapsed_ms: nonNegativeInteger,
+      logical_lenses: logicalLensCountsSchema,
+      model_runs: modelRunCountsSchema,
+      active: z.array(
+        z.strictObject({
+          reviewer_id: nonEmptyString,
+          lens_id: nonEmptyString,
+          mode: reviewerModeSchema,
+          phase: reviewerPhaseSchema,
+          elapsed_ms: nonNegativeInteger,
+          stale_ms: nonNegativeInteger,
+          deadline_remaining_ms: nonNegativeInteger,
+          last_activity_message: boundedMessage.optional(),
+        }),
+      ),
     }),
   }),
   eventEnvelopeSchema.extend({
@@ -421,48 +477,121 @@ const publicEventSchemas = [
       elapsed_ms: nonNegativeInteger,
       last_activity_at: timestampSchema.optional(),
       last_activity_message: boundedMessage.optional(),
-      suite: suiteSchema,
+      suite: z.strictObject({
+        total: nonNegativeInteger,
+        deferred: nonNegativeInteger,
+        queued: nonNegativeInteger,
+        running: nonNegativeInteger,
+        completed: nonNegativeInteger,
+        incomplete: nonNegativeInteger,
+        skipped: nonNegativeInteger,
+      }),
       isolation: isolationLevelSchema.optional(),
     }),
   }),
   eventEnvelopeSchema.extend({
     event: z.literal("reviewer.completed"),
     data: z.strictObject({
+      lens_id: nonEmptyString.optional(),
+      mode: reviewerModeSchema.optional(),
       adapter: nonEmptyString,
       model: nonEmptyString,
+      provider_group: nonEmptyString.optional(),
       isolation: isolationLevelSchema,
       elapsed_ms: nonNegativeInteger,
-      result: reviewerResultSchema,
+      verdict: z.enum(["pass", "fail"]).optional(),
+      summary: boundedMessage.optional(),
+      actionable_findings: nonNegativeInteger.optional(),
+      gate_findings: nonNegativeInteger.optional(),
+      informational_notes: nonNegativeInteger.optional(),
+      detail_ref: nonEmptyString.optional(),
+      result: reviewerResultSchema.optional(),
     }),
   }),
   eventEnvelopeSchema.extend({
     event: z.literal("reviewer.incomplete"),
     data: z.strictObject({
+      lens_id: nonEmptyString,
+      mode: reviewerModeSchema,
       adapter: nonEmptyString,
       model: nonEmptyString,
+      provider_group: nonEmptyString,
       isolation: isolationLevelSchema.optional(),
       elapsed_ms: nonNegativeInteger,
       reason: incompleteReasonSchema,
       message: boundedMessage,
       retryable: z.boolean(),
+      fallback_eligible: z.boolean(),
+      diagnostics: adapterFailureDiagnosticsSchema.optional(),
+      attempt_count: positiveInteger,
     }),
   }),
   eventEnvelopeSchema.extend({
     event: z.literal("reviewer.skipped"),
     data: z.strictObject({
+      lens_id: nonEmptyString,
+      mode: reviewerModeSchema,
       adapter: nonEmptyString,
       model: nonEmptyString,
+      provider_group: nonEmptyString,
       elapsed_ms: nonNegativeInteger,
-      reason: z.enum(["prior_findings", "prior_incomplete"]),
-      blocked_by_reviewer_id: nonEmptyString,
+      reason: reviewerSkipReasonSchema,
+      blocked_by_reviewer_id: nonEmptyString.optional(),
+      missing_inputs: z.array(nonEmptyString).optional(),
     }),
   }),
   eventEnvelopeSchema.extend({
     event: z.literal("run.completed"),
-    data: runCompletedDataSchema,
+    data: z
+      .strictObject({
+        gate_outcome: gateOutcomeSchema.optional(),
+        coverage_outcome: coverageOutcomeSchema.optional(),
+        exit_code: nonNegativeInteger,
+        consistency_mode: consistencyModeSchema,
+        total_elapsed_ms: nonNegativeInteger,
+        logical_lenses: logicalLensCountsSchema.optional(),
+        model_runs: modelRunCountsSchema.optional(),
+        unique_findings: nonNegativeInteger.optional(),
+        advisory_findings: nonNegativeInteger.optional(),
+        incomplete_lenses: z.array(nonEmptyString).optional(),
+        not_evaluated_lenses: z.array(nonEmptyString).optional(),
+        report_path: nonEmptyString.optional(),
+        status: runStatusSchema.optional(),
+        suite: modelRunCountsSchema,
+        reviewers: z.array(reviewerTerminalRecordSchema).optional(),
+      })
+      .superRefine((value, ctx) => {
+        if (
+          value.status === undefined ||
+          value.gate_outcome !== undefined ||
+          value.coverage_outcome !== undefined ||
+          value.reviewers === undefined
+        )
+          return;
+        const reviewers = value.reviewers;
+        if (reviewers === undefined) return;
+        const hasIncomplete = reviewers.some(
+          (reviewer) => reviewer.status === "incomplete",
+        );
+        const hasFindings = reviewers.some(
+          (reviewer) =>
+            reviewer.status === "completed" &&
+            reviewer.result.actionable_findings.length > 0,
+        );
+        const expected = hasIncomplete
+          ? "incomplete"
+          : hasFindings
+            ? "findings"
+            : "passed";
+        if (value.status !== expected) {
+          ctx.addIssue({
+            code: "custom",
+            message: `run.completed status must be ${expected}`,
+          });
+        }
+      }),
   }),
 ] as const;
-
 export const publicEventSchema = z.discriminatedUnion(
   "event",
   publicEventSchemas,
@@ -470,12 +599,21 @@ export const publicEventSchema = z.discriminatedUnion(
 
 export type ReviewRequest = z.infer<typeof reviewRequestSchema>;
 export type ReviewerResult = z.infer<typeof reviewerResultSchema>;
+export type ReviewerResultV1 = z.infer<typeof reviewerResultV1Schema>;
+export type ReviewerResultV2 = z.infer<typeof reviewerResultV2Schema>;
 export type PublicEvent = z.infer<typeof publicEventSchema>;
 export type ReviewerPhase = z.infer<typeof reviewerPhaseSchema>;
 export type ReviewerTerminalRecord = z.infer<
   typeof reviewerTerminalRecordSchema
 >;
+export type ReviewerSkipReason = z.infer<typeof reviewerSkipReasonSchema>;
 export type RunStatus = z.infer<typeof runStatusSchema>;
+export type GateOutcome = z.infer<typeof gateOutcomeSchema>;
+export type CoverageOutcome = z.infer<typeof coverageOutcomeSchema>;
 export type IsolationPolicy = z.infer<typeof isolationPolicySchema>;
 export type IsolationLevel = z.infer<typeof isolationLevelSchema>;
 export type IncompleteReason = z.infer<typeof incompleteReasonSchema>;
+export type FindingSeverity = z.infer<typeof findingSeveritySchema>;
+export type FindingConfidence = z.infer<typeof findingConfidenceSchema>;
+export type FindingClassification = z.infer<typeof findingClassificationSchema>;
+export type ReviewerMode = z.infer<typeof reviewerModeSchema>;

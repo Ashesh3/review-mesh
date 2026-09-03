@@ -1,0 +1,1892 @@
+import { constants } from "node:fs";
+import { lstat, open, readdir, realpath } from "node:fs/promises";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import { z } from "zod";
+import {
+  adapterFailureDiagnosticsSchema,
+  findingEvidenceSchema,
+  findingSeveritySchema,
+  incompleteReasonSchema,
+  isolationLevelSchema,
+  isolationPolicySchema,
+  publicEventSchema,
+  reviewerModeSchema,
+  reviewerResultSchema,
+  reviewerSkipReasonSchema,
+  reviewerTerminalRecordSchema,
+  reviewRequestSchema,
+} from "../protocol/schemas.js";
+
+const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
+const ACTIVE_SUFFIX = /^\.jsonl\.active(?:\..+)?$/u;
+const MAX_REPORT_RECORD_BYTES = 64 * 1024 * 1024;
+const persistedString = z
+  .string()
+  .min(1)
+  .max(16 * 1_024);
+const persistedFindingText = z
+  .string()
+  .min(1)
+  .max(8 * 1_024);
+const nonNegativeIntegerSchema = z.number().int().nonnegative();
+const positiveIntegerSchema = z.number().int().positive();
+const timestampSchema = z.iso.datetime({ offset: true });
+const reasoningEffortSchema = z.enum([
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+  "persistent",
+]);
+
+export const persistedReviewerResultRecordType = "reviewer.result" as const;
+export const persistedReviewerTerminalRecordType = "reviewer.terminal" as const;
+
+const legacyInformationalNoteSchema = z.strictObject({
+  title: persistedString,
+  description: persistedString,
+});
+
+const legacyActionableFindingSchema = z.strictObject({
+  id: persistedString,
+  severity: findingSeveritySchema,
+  title: persistedFindingText,
+  description: persistedFindingText,
+  evidence: z.array(findingEvidenceSchema).min(1).max(256),
+  suggested_direction: persistedFindingText,
+});
+
+/** v4 accepted schema_version=2 before the richer v2 finding shape existed. */
+const legacyReviewerResultSchema = z
+  .strictObject({
+    schema_version: z.enum(["1", "2"]),
+    verdict: z.enum(["pass", "fail"]),
+    summary: persistedFindingText,
+    actionable_findings: z.array(legacyActionableFindingSchema).max(256),
+    informational_notes: z.array(legacyInformationalNoteSchema).max(256),
+  })
+  .superRefine((value, ctx) => {
+    if (value.verdict === "pass" && value.actionable_findings.length !== 0) {
+      ctx.addIssue({
+        code: "custom",
+        message: "pass requires an empty actionable_findings array",
+      });
+    }
+    if (value.verdict === "fail" && value.actionable_findings.length === 0) {
+      ctx.addIssue({
+        code: "custom",
+        message: "fail requires at least one actionable finding",
+      });
+    }
+  });
+
+const persistedReviewerResultSchema = z.union([
+  reviewerResultSchema,
+  legacyReviewerResultSchema,
+]);
+type PersistedReviewerResult = z.infer<typeof persistedReviewerResultSchema>;
+
+const legacySuiteCountsSchema = z.strictObject({
+  total: nonNegativeIntegerSchema,
+  deferred: nonNegativeIntegerSchema,
+  queued: nonNegativeIntegerSchema,
+  running: nonNegativeIntegerSchema,
+  completed: nonNegativeIntegerSchema,
+  incomplete: nonNegativeIntegerSchema,
+  skipped: nonNegativeIntegerSchema,
+});
+
+const legacyReviewerTerminalRecordSchema = z.discriminatedUnion("status", [
+  z.strictObject({
+    reviewer_id: persistedString,
+    status: z.literal("completed"),
+    adapter: persistedString,
+    model: persistedString,
+    isolation: isolationLevelSchema,
+    elapsed_ms: nonNegativeIntegerSchema,
+    result: legacyReviewerResultSchema,
+  }),
+  z.strictObject({
+    reviewer_id: persistedString,
+    status: z.literal("incomplete"),
+    adapter: persistedString,
+    model: persistedString,
+    isolation: isolationLevelSchema.optional(),
+    elapsed_ms: nonNegativeIntegerSchema,
+    reason: incompleteReasonSchema,
+    message: z.string().min(1).max(1_000),
+    retryable: z.boolean(),
+  }),
+  z.strictObject({
+    reviewer_id: persistedString,
+    status: z.literal("skipped"),
+    adapter: persistedString,
+    model: persistedString,
+    elapsed_ms: nonNegativeIntegerSchema,
+    reason: z.enum(["prior_findings", "prior_incomplete"]),
+    blocked_by_reviewer_id: persistedString,
+  }),
+]);
+
+const legacyV4EnvelopeSchema = z.strictObject({
+  schema_version: z.literal("4"),
+  event: z.string(),
+  run_id: persistedString,
+  request_id: persistedString.optional(),
+  seq: positiveIntegerSchema,
+  timestamp: timestampSchema,
+  reviewer_id: persistedString.optional(),
+  data: z.unknown(),
+});
+
+const legacyV4SuiteReviewerSchema = z.strictObject({
+  id: persistedString,
+  agent_id: persistedString,
+  model_index: nonNegativeIntegerSchema,
+  model_count: positiveIntegerSchema,
+  previous_reviewer_id: persistedString.optional(),
+  activation: z.enum(["immediate", "after_clear_pass"]),
+  purpose: persistedString,
+  adapter: persistedString,
+  adapter_type: z.enum([
+    "copilot",
+    "claude",
+    "codex",
+    "openai_compatible",
+    "command",
+  ]),
+  model: persistedString,
+  effort: reasoningEffortSchema.optional(),
+  isolation_policy: isolationPolicySchema,
+  timeout_ms: positiveIntegerSchema,
+  instruction_sources: z.array(persistedString).max(256),
+});
+
+const legacyV4SelectionSchema = z.strictObject({
+  source: z.enum(["legacy", "defaults", "project"]),
+  project_name: persistedString.optional(),
+  project_name_source: z
+    .enum(["git_remote", "git_common_directory", "git_root", "workspace"])
+    .optional(),
+  matched_project_name: persistedString.optional(),
+});
+
+const legacyV4ExecutionSchema = z.strictObject({
+  max_concurrency: positiveIntegerSchema,
+  heartbeat_interval_ms: positiveIntegerSchema,
+  shutdown_grace_period_ms: positiveIntegerSchema,
+});
+
+const legacyV4RunCompletedDataSchema = z.strictObject({
+  status: z.enum(["passed", "findings", "incomplete"]),
+  exit_code: nonNegativeIntegerSchema,
+  consistency_mode: z.literal("live_worktree"),
+  total_elapsed_ms: nonNegativeIntegerSchema,
+  suite: legacySuiteCountsSchema,
+  reviewers: z.array(legacyReviewerTerminalRecordSchema).max(1_024),
+});
+
+const legacyV4PublicEventSchema = z.discriminatedUnion("event", [
+  legacyV4EnvelopeSchema.extend({
+    event: z.literal("run.started"),
+    data: z.strictObject({ consistency_mode: z.literal("live_worktree") }),
+  }),
+  legacyV4EnvelopeSchema.extend({
+    event: z.literal("context.resolved"),
+    data: z.strictObject({ context: z.json() }),
+  }),
+  legacyV4EnvelopeSchema.extend({
+    event: z.literal("suite.resolved"),
+    data: z.strictObject({
+      total: nonNegativeIntegerSchema,
+      execution: legacyV4ExecutionSchema,
+      selection: legacyV4SelectionSchema.optional(),
+      reviewers: z.array(legacyV4SuiteReviewerSchema).max(1_024),
+    }),
+  }),
+  legacyV4EnvelopeSchema.extend({
+    event: z.literal("reviewer.started"),
+    data: z.strictObject({
+      purpose: persistedString,
+      adapter: persistedString,
+      model: persistedString,
+      effort: reasoningEffortSchema.optional(),
+      isolation_policy: isolationPolicySchema,
+      timeout_ms: positiveIntegerSchema,
+    }),
+  }),
+  legacyV4EnvelopeSchema.extend({
+    event: z.literal("reviewer.progress"),
+    data: z.strictObject({
+      phase: z.enum([
+        "queued",
+        "probing",
+        "starting",
+        "reviewing",
+        "validating",
+        "terminal",
+      ]),
+      message: z.string().min(1).max(1_000).optional(),
+    }),
+  }),
+  legacyV4EnvelopeSchema.extend({
+    event: z.literal("reviewer.heartbeat"),
+    data: z.strictObject({
+      phase: z.enum([
+        "queued",
+        "probing",
+        "starting",
+        "reviewing",
+        "validating",
+        "terminal",
+      ]),
+      elapsed_ms: nonNegativeIntegerSchema,
+      last_activity_at: timestampSchema.optional(),
+      last_activity_message: z.string().min(1).max(1_000).optional(),
+      suite: legacySuiteCountsSchema,
+      isolation: isolationLevelSchema.optional(),
+    }),
+  }),
+  legacyV4EnvelopeSchema.extend({
+    event: z.literal("reviewer.completed"),
+    data: z.strictObject({
+      adapter: persistedString,
+      model: persistedString,
+      isolation: isolationLevelSchema,
+      elapsed_ms: nonNegativeIntegerSchema,
+      result: legacyReviewerResultSchema,
+    }),
+  }),
+  legacyV4EnvelopeSchema.extend({
+    event: z.literal("reviewer.incomplete"),
+    data: z.strictObject({
+      adapter: persistedString,
+      model: persistedString,
+      isolation: isolationLevelSchema.optional(),
+      elapsed_ms: nonNegativeIntegerSchema,
+      reason: incompleteReasonSchema,
+      message: z.string().min(1).max(1_000),
+      retryable: z.boolean(),
+    }),
+  }),
+  legacyV4EnvelopeSchema.extend({
+    event: z.literal("reviewer.skipped"),
+    data: z.strictObject({
+      adapter: persistedString,
+      model: persistedString,
+      elapsed_ms: nonNegativeIntegerSchema,
+      reason: z.enum(["prior_findings", "prior_incomplete"]),
+      blocked_by_reviewer_id: persistedString,
+    }),
+  }),
+  legacyV4EnvelopeSchema.extend({
+    event: z.literal("run.completed"),
+    data: legacyV4RunCompletedDataSchema,
+  }),
+]);
+
+const persistedExecutionSchema = legacyV4ExecutionSchema.extend({
+  default_provider_concurrency: positiveIntegerSchema.optional(),
+  provider_limits: z.record(persistedString, positiveIntegerSchema).optional(),
+  circuit_breaker_threshold: positiveIntegerSchema.optional(),
+  retry_attempts: positiveIntegerSchema.optional(),
+  retry_backoff_ms: nonNegativeIntegerSchema.optional(),
+});
+
+const persistedReviewerPolicySchema = z.strictObject({
+  applicability: z
+    .strictObject({
+      anyChangedPaths: z.array(persistedString).min(1).max(256),
+      caseSensitive: z.boolean().optional(),
+    })
+    .optional(),
+  requiredCallerContext: z.array(persistedString).max(256).optional(),
+  passQuorum: positiveIntegerSchema,
+  minimumProviderGroups: positiveIntegerSchema,
+  adjudication: z.enum(["off", "required"]),
+  gateMinimumSeverity: findingSeveritySchema,
+  gateMinimumConfidence: z.enum(["high", "medium", "low"]),
+  mode: reviewerModeSchema.optional(),
+  adjudicatesReviewerId: persistedString.optional(),
+  candidateFindings: z.json().optional(),
+});
+
+const persistedResolutionReviewerSchema = z.strictObject({
+  id: persistedString,
+  agent_id: persistedString.optional(),
+  model_index: nonNegativeIntegerSchema.optional(),
+  model_count: positiveIntegerSchema.optional(),
+  previous_reviewer_id: persistedString.optional(),
+  purpose: persistedString.optional(),
+  adapter: persistedString.optional(),
+  model: persistedString.optional(),
+  effort: reasoningEffortSchema.optional(),
+  isolation_policy: isolationPolicySchema.optional(),
+  timeout_ms: positiveIntegerSchema.optional(),
+  runtime: z.record(z.string(), z.json()).optional(),
+  instruction_sources: z
+    .array(z.enum(["trusted", "project"]))
+    .max(256)
+    .optional(),
+  provider_group: persistedString.optional(),
+  attempt_timeout_ms: positiveIntegerSchema.optional(),
+  policy: persistedReviewerPolicySchema.optional(),
+});
+
+const persistedResolutionLensSchema = z.strictObject({
+  id: persistedString.optional(),
+  lens_id: persistedString.optional(),
+  reviewers: z
+    .array(
+      z.strictObject({
+        id: persistedString.optional(),
+        reviewer_id: persistedString.optional(),
+      }),
+    )
+    .max(1_024),
+});
+
+const persistedResolutionSchema = z.strictObject({
+  execution: persistedExecutionSchema.optional(),
+  diagnostics: z
+    .strictObject({
+      persist_runs: z.boolean(),
+      max_runs: positiveIntegerSchema,
+    })
+    .optional(),
+  reviewers: z.array(persistedResolutionReviewerSchema).max(1_024),
+  logical_lenses: z.array(persistedResolutionLensSchema).max(1_024).optional(),
+});
+
+const persistedFailureSchema = z.strictObject({
+  reason: incompleteReasonSchema,
+  message: z.string().min(1).max(1_000),
+  retryable: z.boolean(),
+  fallback_eligible: z.boolean().optional(),
+  diagnostics: adapterFailureDiagnosticsSchema.optional(),
+});
+
+const persistedLogicalLensCountsSchema = z.strictObject({
+  total: nonNegativeIntegerSchema,
+  pending: nonNegativeIntegerSchema.optional(),
+  findings: nonNegativeIntegerSchema,
+  passed: nonNegativeIntegerSchema,
+  incomplete: nonNegativeIntegerSchema,
+  not_applicable: nonNegativeIntegerSchema.optional(),
+  not_evaluated: nonNegativeIntegerSchema.optional(),
+  not_selected: nonNegativeIntegerSchema.optional(),
+  incomplete_lenses: z.array(persistedString).max(1_024).optional(),
+});
+
+const persistedModelRunCountsSchema = z.strictObject({
+  total: nonNegativeIntegerSchema,
+  deferred: nonNegativeIntegerSchema.optional(),
+  queued: nonNegativeIntegerSchema.optional(),
+  running: nonNegativeIntegerSchema.optional(),
+  completed: nonNegativeIntegerSchema,
+  incomplete: nonNegativeIntegerSchema,
+  skipped: nonNegativeIntegerSchema,
+  skip_reasons: z.record(persistedString, nonNegativeIntegerSchema).optional(),
+});
+
+const persistedRunSummaryDataSchema = z.strictObject({
+  status: z.enum(["passed", "findings", "incomplete"]).optional(),
+  gate_outcome: z
+    .enum(["no_findings", "findings", "passed", "clear"])
+    .optional(),
+  coverage_outcome: z.enum(["complete", "partial", "incomplete"]).optional(),
+  exit_code: nonNegativeIntegerSchema.optional(),
+  consistency_mode: z.literal("live_worktree").optional(),
+  total_elapsed_ms: nonNegativeIntegerSchema.optional(),
+  logical_lenses: persistedLogicalLensCountsSchema.optional(),
+  model_runs: persistedModelRunCountsSchema.optional(),
+  suite: persistedModelRunCountsSchema.optional(),
+  unique_findings: nonNegativeIntegerSchema.optional(),
+  advisory_findings: nonNegativeIntegerSchema.optional(),
+  incomplete_lenses: z.array(persistedString).max(1_024).optional(),
+  not_evaluated_lenses: z.array(persistedString).max(1_024).optional(),
+  report_path: persistedString.optional(),
+  reviewers: z.array(reviewerTerminalRecordSchema).max(1_024).optional(),
+});
+
+const privateRecordSchema = z.union([
+  z.strictObject({
+    record: z.literal("resolution"),
+    run_id: persistedString,
+    resolution: persistedResolutionSchema,
+  }),
+  z.strictObject({
+    record: z.literal("request"),
+    run_id: persistedString,
+    request: reviewRequestSchema,
+  }),
+  z.strictObject({
+    record: z.literal("context"),
+    run_id: persistedString,
+    context: z.json(),
+  }),
+  z.strictObject({
+    record: z.literal(persistedReviewerResultRecordType),
+    run_id: persistedString,
+    reviewer_id: persistedString,
+    lens_id: persistedString.optional(),
+    agent_id: persistedString.optional(),
+    mode: reviewerModeSchema.optional(),
+    adjudicates_reviewer_id: persistedString.optional(),
+    result: persistedReviewerResultSchema,
+  }),
+  z.strictObject({
+    record: z.literal(persistedReviewerResultRecordType),
+    run_id: persistedString,
+    reviewer_id: persistedString,
+    lens_id: persistedString.optional(),
+    agent_id: persistedString.optional(),
+    mode: reviewerModeSchema.optional(),
+    adjudicates_reviewer_id: persistedString.optional(),
+    data: z.strictObject({ result: persistedReviewerResultSchema }),
+  }),
+  z.strictObject({
+    record: z.literal(persistedReviewerTerminalRecordType),
+    run_id: persistedString,
+    terminal: reviewerTerminalRecordSchema,
+  }),
+  z.strictObject({
+    record: z.literal(persistedReviewerTerminalRecordType),
+    run_id: persistedString,
+    data: reviewerTerminalRecordSchema,
+  }),
+  z.strictObject({
+    record: z.literal("reviewer.attempt"),
+    run_id: persistedString,
+    reviewer_id: persistedString,
+    lens_id: persistedString.optional(),
+    attempt: positiveIntegerSchema,
+    startedAt: timestampSchema,
+    elapsedMs: nonNegativeIntegerSchema,
+    failure: persistedFailureSchema,
+  }),
+  z.strictObject({
+    record: z.literal("reviewer.attempt"),
+    run_id: persistedString,
+    reviewer_id: persistedString,
+    lens_id: persistedString.optional(),
+    attempt: positiveIntegerSchema,
+    started_at: timestampSchema,
+    elapsed_ms: nonNegativeIntegerSchema,
+    failure: persistedFailureSchema,
+  }),
+  z.strictObject({
+    record: z.literal("run.summary"),
+    run_id: persistedString,
+    summary: persistedRunSummaryDataSchema,
+  }),
+  z.strictObject({
+    record: z.literal("run.summary"),
+    run_id: persistedString,
+    data: persistedRunSummaryDataSchema,
+  }),
+]);
+type PrivateRecord = z.infer<typeof privateRecordSchema>;
+
+export type FindingSeverity = "critical" | "high" | "medium" | "low";
+export type FindingConfidence = "high" | "medium" | "low";
+export type FindingClassification =
+  "confirmed_defect" | "needs_verification" | "advisory";
+
+export interface RunFindingEvidence {
+  path?: string;
+  start_line?: number;
+  end_line?: number;
+  detail: string;
+}
+
+export interface FindingSource {
+  reviewer_id: string;
+  finding_id: string;
+}
+
+export interface RawRunFinding {
+  source_ref: string;
+  reviewer_id: string;
+  lens_id: string;
+  finding_id: string;
+  severity: FindingSeverity;
+  title: string;
+  description: string;
+  evidence: RunFindingEvidence[];
+  suggested_direction: string;
+  confidence: FindingConfidence;
+  classification: FindingClassification;
+  external_assumptions: string[];
+  source_findings: FindingSource[];
+  duplicate_finding_ids: string[];
+  deduplication_key?: string;
+  duplicate_of?: string;
+}
+
+export interface ConsolidatedRunFinding {
+  id: string;
+  severity: FindingSeverity;
+  title: string;
+  description: string;
+  evidence: RunFindingEvidence[];
+  suggested_direction: string;
+  confidence: FindingConfidence;
+  classification: FindingClassification;
+  external_assumptions: string[];
+  source_findings: FindingSource[];
+  duplicate_finding_ids: string[];
+}
+
+export interface RunReport {
+  schema_version: "1";
+  kind: "review-mesh.run-report";
+  run_id: string;
+  active: boolean;
+  status: "running" | "passed" | "findings" | "incomplete";
+  gate_outcome: "passed" | "findings";
+  coverage_outcome: "complete" | "partial";
+  exit_code?: number;
+  total_elapsed_ms?: number;
+  report_path: string;
+  logical_lenses: {
+    total: number;
+    findings: number;
+    passed: number;
+    incomplete: number;
+    not_applicable: number;
+    not_evaluated: number;
+    not_selected?: number;
+    unknown: number;
+  };
+  model_runs: {
+    total: number;
+    completed: number;
+    incomplete: number;
+    skipped: number;
+  };
+  incomplete_lenses: string[];
+  raw_findings: RawRunFinding[];
+  findings: ConsolidatedRunFinding[];
+  attempts: Array<{
+    reviewer_id: string;
+    lens_id?: string;
+    attempt: number;
+    started_at?: string;
+    elapsed_ms: number;
+    failure: Record<string, unknown>;
+  }>;
+}
+
+export interface RunFindings {
+  run_id: string;
+  raw: RawRunFinding[];
+  deduplicated: ConsolidatedRunFinding[];
+}
+
+export interface ReadRunReportOptions {
+  runsDirectory: string;
+  runId: string;
+}
+
+export interface RetryRunPlan {
+  schema_version: "1";
+  kind: "review-mesh.retry-plan";
+  parent_run_id: string;
+  request: Record<string, unknown>;
+  incomplete_lenses: string[];
+}
+
+export class RunReportError extends Error {
+  constructor(
+    readonly code: "invalid_run_id" | "run_not_found" | "invalid_run_record",
+    message: string,
+  ) {
+    super(message);
+    this.name = "RunReportError";
+  }
+}
+
+interface RunRecordPath {
+  path: string;
+  active: boolean;
+  root: string;
+  name: string;
+}
+
+interface ReviewerMetadata {
+  reviewerId: string;
+  lensId: string;
+  mode?: "full_review" | "adjudication";
+  adjudicatesReviewerId?: string;
+}
+
+interface ReviewerTerminal {
+  reviewerId: string;
+  status: "completed" | "incomplete" | "skipped";
+  reason?: string;
+  result?: PersistedReviewerResult;
+  resultPriority: number;
+}
+
+interface ParsedReportRecord {
+  terminalEventSeen: boolean;
+  reportedStatus?: string;
+  reportedGateOutcome?: string;
+  reportedCoverageOutcome?: string;
+  reportedExitCode?: number;
+  reportedElapsedMs?: number;
+  reportedPath?: string;
+  reportedIncompleteLenses?: string[];
+  reportedModelTotal?: number;
+  reportedLogicalLenses?: RunReport["logical_lenses"];
+  reviewers: Map<string, ReviewerMetadata>;
+  terminals: Map<string, ReviewerTerminal>;
+  request?: Record<string, unknown>;
+  attempts: RunReport["attempts"];
+}
+
+interface ParsedFinding extends RawRunFinding {
+  legacyDeduplicationKey: string;
+}
+
+const severityRank: Readonly<Record<FindingSeverity, number>> = {
+  critical: 4,
+  high: 3,
+  medium: 2,
+  low: 1,
+};
+
+const confidenceRank: Readonly<Record<FindingConfidence, number>> = {
+  high: 3,
+  medium: 2,
+  low: 1,
+};
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim()
+    : undefined;
+}
+
+function nonNegativeInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return uniqueSorted(
+    value
+      .map(nonEmptyString)
+      .filter((item): item is string => item !== undefined),
+  );
+}
+
+function uniqueSorted(values: readonly string[]): string[] {
+  return [...new Set(values)].sort((left, right) => left.localeCompare(right));
+}
+
+function normalizedText(value: string): string {
+  return value
+    .normalize("NFKC")
+    .toLocaleLowerCase("en-US")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .replace(/\s+/gu, " ");
+}
+
+function sourceReference(reviewerId: string, findingId: string): string {
+  return `${reviewerId}#${findingId}`;
+}
+
+function inferredLensId(reviewerId: string): string {
+  const separator = reviewerId.indexOf("::");
+  return separator > 0 ? reviewerId.slice(0, separator) : reviewerId;
+}
+
+function requireSafeRunId(runId: string): void {
+  if (!SAFE_RUN_ID.test(runId) || runId === "." || runId === "..") {
+    throw new RunReportError(
+      "invalid_run_id",
+      "Run id must be a safe single filename component.",
+    );
+  }
+}
+
+function isWithinDirectory(directory: string, target: string): boolean {
+  const path = relative(directory, target);
+  return path === "" || (!path.startsWith("..") && !isAbsolute(path));
+}
+
+async function resolveRunRecordPath(
+  runsDirectory: string,
+  runId: string,
+): Promise<RunRecordPath> {
+  const root = await realpath(resolve(runsDirectory)).catch(() => undefined);
+  if (root === undefined) {
+    throw new RunReportError("run_not_found", `Run ${runId} was not found.`);
+  }
+  const names = await readdir(root);
+  const finalName = `${runId}.jsonl`;
+  const activePrefix = `${runId}.jsonl.active`;
+  const candidates = names.filter(
+    (name) =>
+      name === finalName ||
+      (name.startsWith(activePrefix) &&
+        ACTIVE_SUFFIX.test(name.slice(runId.length))),
+  );
+  const selected = candidates.includes(finalName)
+    ? finalName
+    : candidates.sort().at(-1);
+  if (selected === undefined) {
+    throw new RunReportError("run_not_found", `Run ${runId} was not found.`);
+  }
+  const path = join(root, selected);
+  const canonical = await realpath(path).catch(() => undefined);
+  if (
+    canonical === undefined ||
+    !isWithinDirectory(root, canonical) ||
+    basename(canonical) !== selected
+  ) {
+    throw new RunReportError(
+      "invalid_run_record",
+      "The persisted run record path is unsafe.",
+    );
+  }
+  return {
+    path: canonical,
+    active: selected !== finalName,
+    root,
+    name: selected,
+  };
+}
+
+async function readBoundedFile(
+  path: string,
+  active: boolean,
+  root?: string,
+  expectedName?: string,
+): Promise<string> {
+  const flags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
+  const handle = await open(path, flags).catch(() => undefined);
+  if (handle === undefined) {
+    throw new RunReportError(
+      "invalid_run_record",
+      "The persisted run record could not be opened safely.",
+    );
+  }
+  try {
+    const metadata = await handle.stat();
+    if (!metadata.isFile() || metadata.size > MAX_REPORT_RECORD_BYTES) {
+      throw new RunReportError(
+        "invalid_run_record",
+        "The persisted run record is unavailable or exceeds the report limit.",
+      );
+    }
+    const text = await handle.readFile("utf8");
+    const current = await handle.stat();
+    if (root !== undefined && expectedName !== undefined) {
+      const canonical = await realpath(path).catch(() => undefined);
+      const pathMetadata = await lstat(path, { bigint: true }).catch(
+        () => undefined,
+      );
+      if (
+        canonical === undefined ||
+        pathMetadata === undefined ||
+        pathMetadata.isSymbolicLink() ||
+        !isWithinDirectory(root, canonical) ||
+        basename(canonical) !== expectedName ||
+        (process.platform !== "win32" &&
+          metadata.dev !== 0 &&
+          pathMetadata.dev !== 0n &&
+          BigInt(metadata.dev) !== pathMetadata.dev) ||
+        (process.platform !== "win32" &&
+          metadata.ino !== 0 &&
+          pathMetadata.ino !== 0n &&
+          BigInt(metadata.ino) !== pathMetadata.ino)
+      ) {
+        throw new RunReportError(
+          "invalid_run_record",
+          "The persisted run record identity changed while being read.",
+        );
+      }
+    }
+    if (
+      !active &&
+      (current.size !== metadata.size || current.mtimeMs !== metadata.mtimeMs)
+    ) {
+      throw new RunReportError(
+        "invalid_run_record",
+        "The completed run record changed while the report was being read.",
+      );
+    }
+    return text;
+  } finally {
+    await handle.close();
+  }
+}
+
+function reviewerMetadata(
+  value: unknown,
+  fallbackReviewerId?: string,
+): ReviewerMetadata | undefined {
+  const record = asRecord(value);
+  const reviewerId =
+    nonEmptyString(record?.id) ??
+    nonEmptyString(record?.reviewer_id) ??
+    fallbackReviewerId;
+  if (reviewerId === undefined) return undefined;
+  const lensId =
+    nonEmptyString(record?.agent_id) ??
+    nonEmptyString(record?.lens_id) ??
+    nonEmptyString(record?.logical_lens_id) ??
+    inferredLensId(reviewerId);
+  const mode = record?.mode === "adjudication" ? "adjudication" : undefined;
+  const adjudicatesReviewerId = nonEmptyString(record?.adjudicates_reviewer_id);
+  return {
+    reviewerId,
+    lensId,
+    ...(mode === undefined ? {} : { mode }),
+    ...(adjudicatesReviewerId === undefined ? {} : { adjudicatesReviewerId }),
+  };
+}
+
+function addReviewer(
+  parsed: ParsedReportRecord,
+  value: unknown,
+  fallbackReviewerId?: string,
+): void {
+  const metadata = reviewerMetadata(value, fallbackReviewerId);
+  if (metadata === undefined) return;
+  const current = parsed.reviewers.get(metadata.reviewerId);
+  parsed.reviewers.set(metadata.reviewerId, {
+    reviewerId: metadata.reviewerId,
+    lensId:
+      metadata.lensId === metadata.reviewerId && current !== undefined
+        ? current.lensId
+        : metadata.lensId,
+    ...(metadata.mode === undefined
+      ? current?.mode === undefined
+        ? {}
+        : { mode: current.mode }
+      : { mode: metadata.mode }),
+    ...(metadata.adjudicatesReviewerId === undefined
+      ? current?.adjudicatesReviewerId === undefined
+        ? {}
+        : { adjudicatesReviewerId: current.adjudicatesReviewerId }
+      : { adjudicatesReviewerId: metadata.adjudicatesReviewerId }),
+  });
+}
+
+function terminalResult(value: unknown): PersistedReviewerResult | undefined {
+  const record = asRecord(value);
+  const candidate = record?.result ?? record?.detailed_result;
+  const result = persistedReviewerResultSchema.safeParse(candidate);
+  return result.success ? structuredClone(result.data) : undefined;
+}
+
+function upsertTerminal(
+  parsed: ParsedReportRecord,
+  reviewerId: string,
+  status: ReviewerTerminal["status"],
+  value: unknown,
+  resultPriority: number,
+): void {
+  addReviewer(parsed, value, reviewerId);
+  const record = asRecord(value) ?? {};
+  const result = terminalResult(record);
+  const current = parsed.terminals.get(reviewerId);
+  const reason = nonEmptyString(record.reason) ?? current?.reason;
+  const resultFields =
+    result !== undefined && resultPriority >= (current?.resultPriority ?? -1)
+      ? { result, resultPriority }
+      : current?.result === undefined
+        ? {
+            resultPriority: Math.max(
+              resultPriority,
+              current?.resultPriority ?? 0,
+            ),
+          }
+        : { result: current.result, resultPriority: current.resultPriority };
+  const terminal: ReviewerTerminal = {
+    reviewerId,
+    status,
+    ...(reason === undefined ? {} : { reason }),
+    ...resultFields,
+  };
+  parsed.terminals.set(reviewerId, terminal);
+}
+
+function parseTerminalRecord(
+  parsed: ParsedReportRecord,
+  value: unknown,
+  resultPriority: number,
+): void {
+  const record = asRecord(value);
+  const reviewerId = nonEmptyString(record?.reviewer_id);
+  const status = nonEmptyString(record?.status);
+  if (
+    reviewerId === undefined ||
+    (status !== "completed" && status !== "incomplete" && status !== "skipped")
+  ) {
+    return;
+  }
+  upsertTerminal(parsed, reviewerId, status, record, resultPriority);
+}
+
+function parseReportedSummary(
+  parsed: ParsedReportRecord,
+  value: unknown,
+): void {
+  const data = asRecord(value);
+  if (data === undefined) return;
+  const status = nonEmptyString(data.status);
+  if (status !== undefined) parsed.reportedStatus = status;
+  const gateOutcome = nonEmptyString(data.gate_outcome);
+  if (gateOutcome !== undefined) parsed.reportedGateOutcome = gateOutcome;
+  const coverageOutcome = nonEmptyString(data.coverage_outcome);
+  if (coverageOutcome !== undefined) {
+    parsed.reportedCoverageOutcome = coverageOutcome;
+  }
+  const exitCode = nonNegativeInteger(data.exit_code);
+  if (exitCode !== undefined) parsed.reportedExitCode = exitCode;
+  const elapsedMs = nonNegativeInteger(data.total_elapsed_ms);
+  if (elapsedMs !== undefined) parsed.reportedElapsedMs = elapsedMs;
+  const reportPath = nonEmptyString(data.report_path);
+  if (reportPath !== undefined) parsed.reportedPath = reportPath;
+  const logicalLenses = asRecord(data.logical_lenses);
+  if (logicalLenses !== undefined) {
+    const total = nonNegativeInteger(logicalLenses.total);
+    const findings = nonNegativeInteger(logicalLenses.findings);
+    const passed = nonNegativeInteger(logicalLenses.passed);
+    const incomplete = nonNegativeInteger(logicalLenses.incomplete);
+    const notApplicable = nonNegativeInteger(logicalLenses.not_applicable);
+    const notEvaluated = nonNegativeInteger(logicalLenses.not_evaluated);
+    if (
+      total !== undefined &&
+      findings !== undefined &&
+      passed !== undefined &&
+      incomplete !== undefined &&
+      notApplicable !== undefined &&
+      notEvaluated !== undefined
+    ) {
+      parsed.reportedLogicalLenses = {
+        total,
+        findings,
+        passed,
+        incomplete,
+        not_applicable: notApplicable,
+        not_evaluated: notEvaluated,
+        ...(nonNegativeInteger(logicalLenses.not_selected) === undefined
+          ? {}
+          : {
+              not_selected: nonNegativeInteger(logicalLenses.not_selected)!,
+            }),
+        unknown: nonNegativeInteger(logicalLenses.pending) ?? 0,
+      };
+    }
+  }
+  const incompleteLenses =
+    Array.isArray(data.incomplete_lenses) && data.incomplete_lenses.length >= 0
+      ? stringArray(data.incomplete_lenses)
+      : Array.isArray(logicalLenses?.incomplete_lenses)
+        ? stringArray(logicalLenses.incomplete_lenses)
+        : undefined;
+  if (incompleteLenses !== undefined) {
+    parsed.reportedIncompleteLenses = incompleteLenses;
+  }
+  const modelRuns = asRecord(data.model_runs);
+  const modelTotal =
+    nonNegativeInteger(modelRuns?.total) ??
+    nonNegativeInteger(asRecord(data.suite)?.total);
+  if (modelTotal !== undefined) parsed.reportedModelTotal = modelTotal;
+  if (Array.isArray(data.reviewers)) {
+    for (const reviewer of data.reviewers) {
+      parseTerminalRecord(parsed, reviewer, 1);
+    }
+  }
+}
+
+function parseResolution(
+  parsed: ParsedReportRecord,
+  resolution: z.infer<typeof persistedResolutionSchema>,
+): void {
+  for (const reviewer of resolution.reviewers) {
+    addReviewer(parsed, reviewer);
+  }
+  if (resolution.logical_lenses !== undefined) {
+    for (const lensValue of resolution.logical_lenses) {
+      const lensId = lensValue.id ?? lensValue.lens_id;
+      if (lensId === undefined) continue;
+      for (const reviewerValue of lensValue.reviewers) {
+        const reviewerId = reviewerValue.id ?? reviewerValue.reviewer_id;
+        if (reviewerId === undefined) continue;
+        parsed.reviewers.set(reviewerId, { reviewerId, lensId });
+      }
+    }
+  }
+}
+
+function parsePublicEvent(
+  parsed: ParsedReportRecord,
+  value: Record<string, unknown>,
+): void {
+  const event = nonEmptyString(value.event);
+  const reviewerId = nonEmptyString(value.reviewer_id);
+  const data = asRecord(value.data);
+  if (event === undefined || data === undefined) return;
+  if (event === "suite.resolved") {
+    if (Array.isArray(data.reviewers)) {
+      for (const reviewer of data.reviewers) addReviewer(parsed, reviewer);
+    }
+    const total = nonNegativeInteger(data.total);
+    if (total !== undefined) parsed.reportedModelTotal = total;
+    return;
+  }
+  if (reviewerId !== undefined && event === "reviewer.completed") {
+    upsertTerminal(parsed, reviewerId, "completed", data, 1);
+    return;
+  }
+  if (reviewerId !== undefined && event === "reviewer.incomplete") {
+    upsertTerminal(parsed, reviewerId, "incomplete", data, 1);
+    return;
+  }
+  if (reviewerId !== undefined && event === "reviewer.skipped") {
+    upsertTerminal(parsed, reviewerId, "skipped", data, 1);
+    return;
+  }
+  if (event === "run.completed") {
+    parsed.terminalEventSeen = true;
+    parseReportedSummary(parsed, data);
+  }
+}
+
+function parsePrivateRecord(
+  parsed: ParsedReportRecord,
+  value: PrivateRecord,
+): void {
+  if (value.record === "resolution") {
+    parseResolution(parsed, value.resolution);
+    return;
+  }
+  if (value.record === "request") {
+    parsed.request = structuredClone(value.request) as unknown as Record<
+      string,
+      unknown
+    >;
+    return;
+  }
+  if (value.record === "context") return;
+  if (value.record === "reviewer.attempt") {
+    parsed.attempts.push({
+      reviewer_id: value.reviewer_id,
+      ...(value.lens_id === undefined ? {} : { lens_id: value.lens_id }),
+      attempt: value.attempt,
+      started_at: "startedAt" in value ? value.startedAt : value.started_at,
+      elapsed_ms: "elapsedMs" in value ? value.elapsedMs : value.elapsed_ms,
+      failure: structuredClone(value.failure) as unknown as Record<
+        string,
+        unknown
+      >,
+    });
+    return;
+  }
+  if (value.record === persistedReviewerResultRecordType) {
+    const result = "result" in value ? value.result : value.data.result;
+    addReviewer(parsed, value, value.reviewer_id);
+    const current = parsed.terminals.get(value.reviewer_id);
+    parsed.terminals.set(value.reviewer_id, {
+      reviewerId: value.reviewer_id,
+      status: current?.status ?? "completed",
+      ...(current?.reason === undefined ? {} : { reason: current.reason }),
+      result: structuredClone(result),
+      resultPriority: 2,
+    });
+    return;
+  }
+  if (value.record === persistedReviewerTerminalRecordType) {
+    parseTerminalRecord(
+      parsed,
+      "terminal" in value ? value.terminal : value.data,
+      2,
+    );
+    return;
+  }
+  if (value.record === "run.summary") {
+    parsed.terminalEventSeen = true;
+    parseReportedSummary(
+      parsed,
+      "summary" in value ? value.summary : value.data,
+    );
+  }
+}
+
+function parseRunRecord(
+  text: string,
+  expectedRunId: string,
+  allowPartialTail: boolean,
+): ParsedReportRecord {
+  const parsed: ParsedReportRecord = {
+    terminalEventSeen: false,
+    reviewers: new Map(),
+    terminals: new Map(),
+    attempts: [],
+  };
+  const lines = text.split(/\r?\n/u);
+  for (const [index, encoded] of lines.entries()) {
+    if (encoded.trim().length === 0) continue;
+    let value: unknown;
+    try {
+      value = JSON.parse(encoded);
+    } catch {
+      if (allowPartialTail && index === lines.length - 1) break;
+      throw new RunReportError(
+        "invalid_run_record",
+        "The persisted run record contains invalid JSON.",
+      );
+    }
+    const record = asRecord(value);
+    if (record === undefined) {
+      throw new RunReportError(
+        "invalid_run_record",
+        "The persisted run record contains an invalid record.",
+      );
+    }
+    if (typeof record.event === "string") {
+      const event =
+        record.schema_version === "4"
+          ? legacyV4PublicEventSchema.safeParse(record)
+          : publicEventSchema.safeParse(record);
+      if (!event.success || event.data.run_id !== expectedRunId) {
+        throw new RunReportError(
+          "invalid_run_record",
+          "The persisted run record contains an invalid public event.",
+        );
+      }
+      parsePublicEvent(
+        parsed,
+        event.data as unknown as Record<string, unknown>,
+      );
+      continue;
+    }
+    if (typeof record.record === "string") {
+      const privateRecord = privateRecordSchema.safeParse(record);
+      if (
+        !privateRecord.success ||
+        privateRecord.data.run_id !== expectedRunId
+      ) {
+        throw new RunReportError(
+          "invalid_run_record",
+          "The persisted run record contains an invalid private record.",
+        );
+      }
+      parsePrivateRecord(parsed, privateRecord.data);
+      continue;
+    }
+    {
+      throw new RunReportError(
+        "invalid_run_record",
+        "The persisted run record contains an unknown record type.",
+      );
+    }
+  }
+  return parsed;
+}
+
+function evidenceKey(value: RunFindingEvidence): string {
+  return [
+    value.path ?? "",
+    String(value.start_line ?? 0),
+    String(value.end_line ?? 0),
+    normalizedText(value.detail),
+  ].join("\u0000");
+}
+
+function runFindingEvidence(
+  values: readonly z.infer<typeof findingEvidenceSchema>[],
+): RunFindingEvidence[] {
+  return values.map((value) => ({
+    ...(value.path === undefined ? {} : { path: value.path }),
+    ...(value.start_line === undefined ? {} : { start_line: value.start_line }),
+    ...(value.end_line === undefined ? {} : { end_line: value.end_line }),
+    detail: value.detail,
+  }));
+}
+
+function compareEvidence(
+  left: RunFindingEvidence,
+  right: RunFindingEvidence,
+): number {
+  return (
+    (left.path ?? "\uffff").localeCompare(right.path ?? "\uffff") ||
+    (left.start_line ?? Number.MAX_SAFE_INTEGER) -
+      (right.start_line ?? Number.MAX_SAFE_INTEGER) ||
+    (left.end_line ?? Number.MAX_SAFE_INTEGER) -
+      (right.end_line ?? Number.MAX_SAFE_INTEGER) ||
+    left.detail.localeCompare(right.detail)
+  );
+}
+
+function uniqueEvidence(
+  values: readonly RunFindingEvidence[],
+): RunFindingEvidence[] {
+  const byKey = new Map<string, RunFindingEvidence>();
+  for (const value of values) byKey.set(evidenceKey(value), value);
+  return [...byKey.values()].sort(compareEvidence);
+}
+
+function sourceKey(value: FindingSource): string {
+  return `${value.reviewer_id}\u0000${value.finding_id}`;
+}
+
+function compareSources(left: FindingSource, right: FindingSource): number {
+  return (
+    left.reviewer_id.localeCompare(right.reviewer_id) ||
+    left.finding_id.localeCompare(right.finding_id)
+  );
+}
+
+function uniqueSources(values: readonly FindingSource[]): FindingSource[] {
+  const byKey = new Map<string, FindingSource>();
+  for (const value of values) byKey.set(sourceKey(value), value);
+  return [...byKey.values()].sort(compareSources);
+}
+
+function parseRawFindings(parsed: ParsedReportRecord): ParsedFinding[] {
+  const findings: ParsedFinding[] = [];
+  const rejectedSources = new Set(
+    [...parsed.reviewers.values()].flatMap((metadata) => {
+      if (
+        metadata.mode !== "adjudication" ||
+        metadata.adjudicatesReviewerId === undefined
+      )
+        return [];
+      const terminal = parsed.terminals.get(metadata.reviewerId);
+      const result = terminal?.result;
+      const actionable = Array.isArray(result?.actionable_findings)
+        ? result.actionable_findings
+        : [];
+      return actionable.length === 0 ? [metadata.adjudicatesReviewerId] : [];
+    }),
+  );
+  for (const terminal of parsed.terminals.values()) {
+    if (rejectedSources.has(terminal.reviewerId)) continue;
+    if (terminal.result === undefined) continue;
+    const candidates = terminal.result.actionable_findings;
+    const metadata = parsed.reviewers.get(terminal.reviewerId) ?? {
+      reviewerId: terminal.reviewerId,
+      lensId: inferredLensId(terminal.reviewerId),
+    };
+    for (const finding of candidates) {
+      const findingId = finding.id;
+      const currentSource = {
+        reviewer_id: terminal.reviewerId,
+        finding_id: findingId,
+      };
+      const richer = "confidence" in finding ? finding : undefined;
+      const deduplicationKey = richer?.root_issue_id;
+      const duplicateOf = richer?.duplicate_of;
+      const duplicateFindingIds = richer?.duplicate_finding_ids ?? [];
+      findings.push({
+        source_ref: sourceReference(terminal.reviewerId, findingId),
+        reviewer_id: terminal.reviewerId,
+        lens_id: metadata.lensId,
+        finding_id: findingId,
+        severity: finding.severity,
+        title: finding.title,
+        description: finding.description,
+        evidence: uniqueEvidence(runFindingEvidence(finding.evidence)),
+        suggested_direction: finding.suggested_direction,
+        confidence: richer?.confidence ?? "medium",
+        classification: richer?.classification ?? "needs_verification",
+        external_assumptions: uniqueSorted(richer?.external_assumptions ?? []),
+        source_findings: [currentSource],
+        duplicate_finding_ids: uniqueSorted(duplicateFindingIds),
+        ...(deduplicationKey === undefined
+          ? {}
+          : { deduplication_key: deduplicationKey }),
+        ...(duplicateOf === undefined ? {} : { duplicate_of: duplicateOf }),
+        legacyDeduplicationKey: `${normalizedText(finding.title)}\u0000${normalizedText(finding.description)}`,
+      });
+    }
+  }
+  return findings.sort(compareRawFindings);
+}
+
+function compareRawFindings(
+  left: Pick<RawRunFinding, "lens_id" | "reviewer_id" | "finding_id" | "title">,
+  right: Pick<
+    RawRunFinding,
+    "lens_id" | "reviewer_id" | "finding_id" | "title"
+  >,
+): number {
+  return (
+    left.lens_id.localeCompare(right.lens_id) ||
+    left.reviewer_id.localeCompare(right.reviewer_id) ||
+    left.finding_id.localeCompare(right.finding_id) ||
+    left.title.localeCompare(right.title)
+  );
+}
+
+class DisjointSet {
+  private readonly parents: number[];
+
+  constructor(size: number) {
+    this.parents = Array.from({ length: size }, (_, index) => index);
+  }
+
+  find(index: number): number {
+    const parent = this.parents[index]!;
+    if (parent === index) return index;
+    const root = this.find(parent);
+    this.parents[index] = root;
+    return root;
+  }
+
+  union(left: number, right: number): void {
+    const leftRoot = this.find(left);
+    const rightRoot = this.find(right);
+    if (leftRoot === rightRoot) return;
+    if (leftRoot < rightRoot) this.parents[rightRoot] = leftRoot;
+    else this.parents[leftRoot] = rightRoot;
+  }
+}
+
+function compareCanonicalCandidates(
+  left: RawRunFinding,
+  right: RawRunFinding,
+): number {
+  return (
+    severityRank[right.severity] - severityRank[left.severity] ||
+    confidenceRank[right.confidence] - confidenceRank[left.confidence] ||
+    (left.classification === "confirmed_defect" ? 0 : 1) -
+      (right.classification === "confirmed_defect" ? 0 : 1) ||
+    compareRawFindings(left, right)
+  );
+}
+
+function consolidatedConfidence(
+  findings: readonly RawRunFinding[],
+): FindingConfidence {
+  return findings.reduce<FindingConfidence>(
+    (lowest, finding) =>
+      confidenceRank[finding.confidence] < confidenceRank[lowest]
+        ? finding.confidence
+        : lowest,
+    "high",
+  );
+}
+
+function consolidatedClassification(
+  findings: readonly RawRunFinding[],
+): FindingClassification {
+  const classifications = new Set(
+    findings.map((finding) => finding.classification),
+  );
+  if (classifications.size === 1) return findings[0]!.classification;
+  return "needs_verification";
+}
+
+/**
+ * Consolidates explicit duplicate groups and conservative exact legacy matches.
+ * Legacy findings merge only when their normalized title and description match;
+ * semantic similarity is deliberately left to an adjudication/consolidation stage.
+ */
+export function consolidateFindings(
+  values: readonly RawRunFinding[],
+): ConsolidatedRunFinding[] {
+  const findings = values.map<ParsedFinding>((finding) => ({
+    ...structuredClone(finding),
+    legacyDeduplicationKey: `${normalizedText(finding.title)}\u0000${normalizedText(finding.description)}`,
+  }));
+  const sets = new DisjointSet(findings.length);
+  const explicitGroups = new Map<string, number>();
+  const legacyGroups = new Map<string, number>();
+  const sourceRefs = new Map<string, number>();
+  const findingIds = new Map<string, number[]>();
+
+  for (const [index, finding] of findings.entries()) {
+    sourceRefs.set(finding.source_ref, index);
+    findingIds.set(finding.finding_id, [
+      ...(findingIds.get(finding.finding_id) ?? []),
+      index,
+    ]);
+    if (finding.deduplication_key !== undefined) {
+      const key = normalizedText(finding.deduplication_key);
+      const previous = explicitGroups.get(key);
+      if (previous === undefined) explicitGroups.set(key, index);
+      else sets.union(previous, index);
+      continue;
+    }
+    const previous = legacyGroups.get(finding.legacyDeduplicationKey);
+    if (previous === undefined) {
+      legacyGroups.set(finding.legacyDeduplicationKey, index);
+    } else {
+      sets.union(previous, index);
+    }
+  }
+
+  for (const [index, finding] of findings.entries()) {
+    const references = [
+      ...(finding.duplicate_of === undefined ? [] : [finding.duplicate_of]),
+      ...finding.duplicate_finding_ids,
+    ];
+    for (const reference of references) {
+      const sourceIndex = sourceRefs.get(reference);
+      if (sourceIndex !== undefined) {
+        sets.union(index, sourceIndex);
+        continue;
+      }
+      const matchingIds = findingIds.get(reference);
+      if (matchingIds?.length === 1) sets.union(index, matchingIds[0]!);
+    }
+  }
+
+  const groups = new Map<number, RawRunFinding[]>();
+  for (const [index, finding] of findings.entries()) {
+    const root = sets.find(index);
+    groups.set(root, [...(groups.get(root) ?? []), finding]);
+  }
+
+  const consolidated = [...groups.values()].map((group) => {
+    const ordered = [...group].sort(compareCanonicalCandidates);
+    const canonical = ordered[0]!;
+    const sources = uniqueSources(
+      ordered.flatMap((finding) => finding.source_findings),
+    );
+    const sourceIds = uniqueSorted(
+      ordered.flatMap((finding) => [
+        finding.finding_id,
+        ...finding.duplicate_finding_ids,
+      ]),
+    );
+    return {
+      id: canonical.finding_id,
+      severity: ordered.reduce<FindingSeverity>(
+        (highest, finding) =>
+          severityRank[finding.severity] > severityRank[highest]
+            ? finding.severity
+            : highest,
+        "low",
+      ),
+      title: canonical.title,
+      description: canonical.description,
+      evidence: uniqueEvidence(ordered.flatMap((finding) => finding.evidence)),
+      suggested_direction: canonical.suggested_direction,
+      confidence: consolidatedConfidence(ordered),
+      classification: consolidatedClassification(ordered),
+      external_assumptions: uniqueSorted(
+        ordered.flatMap((finding) => finding.external_assumptions),
+      ),
+      source_findings: sources,
+      duplicate_finding_ids: sourceIds.filter(
+        (id) => id !== canonical.finding_id,
+      ),
+    } satisfies ConsolidatedRunFinding;
+  });
+
+  consolidated.sort(
+    (left, right) =>
+      severityRank[right.severity] - severityRank[left.severity] ||
+      left.id.localeCompare(right.id) ||
+      left.title.localeCompare(right.title),
+  );
+  const usedIds = new Map<string, number>();
+  for (const finding of consolidated) {
+    const occurrence = (usedIds.get(finding.id) ?? 0) + 1;
+    usedIds.set(finding.id, occurrence);
+    if (occurrence > 1) finding.id = `${finding.id}~${occurrence}`;
+  }
+  return consolidated;
+}
+
+type LensState =
+  | "findings"
+  | "passed"
+  | "incomplete"
+  | "not_applicable"
+  | "not_evaluated"
+  | "unknown";
+
+function logicalLensStates(
+  parsed: ParsedReportRecord,
+  rawFindings: readonly RawRunFinding[],
+): Map<string, LensState> {
+  const reviewersByLens = new Map<string, string[]>();
+  for (const reviewer of parsed.reviewers.values()) {
+    reviewersByLens.set(reviewer.lensId, [
+      ...(reviewersByLens.get(reviewer.lensId) ?? []),
+      reviewer.reviewerId,
+    ]);
+  }
+  for (const terminal of parsed.terminals.values()) {
+    if (parsed.reviewers.has(terminal.reviewerId)) continue;
+    const lensId = inferredLensId(terminal.reviewerId);
+    reviewersByLens.set(lensId, [
+      ...(reviewersByLens.get(lensId) ?? []),
+      terminal.reviewerId,
+    ]);
+  }
+  const findingsByLens = new Set(rawFindings.map((finding) => finding.lens_id));
+  const states = new Map<string, LensState>();
+  for (const [lensId, reviewerIds] of reviewersByLens) {
+    const terminals = reviewerIds
+      .map((reviewerId) => parsed.terminals.get(reviewerId))
+      .filter(
+        (terminal): terminal is ReviewerTerminal => terminal !== undefined,
+      );
+    if (findingsByLens.has(lensId)) {
+      states.set(lensId, "findings");
+      continue;
+    }
+    if (terminals.some((terminal) => terminal.result !== undefined)) {
+      states.set(lensId, "passed");
+      continue;
+    }
+    const reasons = terminals.map((terminal) => terminal.reason);
+    if (
+      terminals.length > 0 &&
+      terminals.every(
+        (terminal) =>
+          terminal.status === "skipped" && terminal.reason === "not_applicable",
+      )
+    ) {
+      states.set(lensId, "not_applicable");
+      continue;
+    }
+    if (
+      terminals.length > 0 &&
+      terminals.every(
+        (terminal) =>
+          terminal.status === "skipped" &&
+          terminal.reason === "not_evaluated_missing_input",
+      )
+    ) {
+      states.set(lensId, "not_evaluated");
+      continue;
+    }
+    if (
+      terminals.some((terminal) => terminal.status === "incomplete") ||
+      reasons.includes("blocked_by_infrastructure_failure") ||
+      reasons.includes("prior_incomplete") ||
+      (parsed.terminalEventSeen && terminals.length === 0)
+    ) {
+      states.set(lensId, "incomplete");
+      continue;
+    }
+    states.set(lensId, "unknown");
+  }
+  return states;
+}
+
+function recognizedGateOutcome(
+  value: string | undefined,
+): "passed" | "findings" | undefined {
+  if (value === "findings") return "findings";
+  if (value === "passed" || value === "no_findings" || value === "clear") {
+    return "passed";
+  }
+  return undefined;
+}
+
+function recognizedCoverageOutcome(
+  value: string | undefined,
+): "complete" | "partial" | undefined {
+  if (value === "complete") return "complete";
+  if (value === "partial" || value === "incomplete") return "partial";
+  return undefined;
+}
+
+export async function readRunReport({
+  runsDirectory,
+  runId,
+}: ReadRunReportOptions): Promise<RunReport> {
+  requireSafeRunId(runId);
+  const recordPath = await resolveRunRecordPath(runsDirectory, runId);
+  const parsed = parseRunRecord(
+    await readBoundedFile(
+      recordPath.path,
+      recordPath.active,
+      recordPath.root,
+      recordPath.name,
+    ),
+    runId,
+    recordPath.active,
+  );
+  const rawFindings = parseRawFindings(parsed).map<RawRunFinding>(
+    ({ legacyDeduplicationKey: _legacyKey, ...finding }) => finding,
+  );
+  const findings = consolidateFindings(rawFindings);
+  const lensStates = logicalLensStates(parsed, rawFindings);
+  const derivedIncompleteLenses = [...lensStates]
+    .filter(([, state]) => state === "incomplete")
+    .map(([lensId]) => lensId)
+    .sort((left, right) => left.localeCompare(right));
+  const incompleteLenses =
+    parsed.reportedIncompleteLenses ?? derivedIncompleteLenses;
+  const gateOutcome =
+    recognizedGateOutcome(parsed.reportedGateOutcome) ??
+    (findings.length > 0 || parsed.reportedStatus === "findings"
+      ? "findings"
+      : "passed");
+  const coverageOutcome =
+    recognizedCoverageOutcome(parsed.reportedCoverageOutcome) ??
+    (incompleteLenses.length > 0 ? "partial" : "complete");
+  const active = recordPath.active && !parsed.terminalEventSeen;
+  const status: RunReport["status"] = active
+    ? "running"
+    : coverageOutcome === "partial"
+      ? "incomplete"
+      : gateOutcome;
+  const lensCount = (state: LensState): number =>
+    [...lensStates.values()].filter((value) => value === state).length;
+  const completedRuns = [...parsed.terminals.values()].filter(
+    (terminal) =>
+      terminal.status === "completed" || terminal.result !== undefined,
+  ).length;
+  const incompleteRuns = [...parsed.terminals.values()].filter(
+    (terminal) => terminal.status === "incomplete",
+  ).length;
+  const skippedRuns = [...parsed.terminals.values()].filter(
+    (terminal) => terminal.status === "skipped",
+  ).length;
+
+  return {
+    schema_version: "1",
+    kind: "review-mesh.run-report",
+    run_id: runId,
+    active,
+    status,
+    gate_outcome: gateOutcome,
+    coverage_outcome: coverageOutcome,
+    ...(parsed.reportedExitCode === undefined
+      ? {}
+      : { exit_code: parsed.reportedExitCode }),
+    ...(parsed.reportedElapsedMs === undefined
+      ? {}
+      : { total_elapsed_ms: parsed.reportedElapsedMs }),
+    report_path: parsed.reportedPath ?? recordPath.path,
+    logical_lenses: parsed.reportedLogicalLenses ?? {
+      total: lensStates.size,
+      findings: lensCount("findings"),
+      passed: lensCount("passed"),
+      incomplete: incompleteLenses.length,
+      not_applicable: lensCount("not_applicable"),
+      not_evaluated: lensCount("not_evaluated"),
+      unknown: lensCount("unknown"),
+    },
+    model_runs: {
+      total: Math.max(
+        parsed.reportedModelTotal ?? 0,
+        parsed.reviewers.size,
+        parsed.terminals.size,
+      ),
+      completed: completedRuns,
+      incomplete: incompleteRuns,
+      skipped: skippedRuns,
+    },
+    incomplete_lenses: [...incompleteLenses],
+    raw_findings: rawFindings,
+    findings,
+    attempts: [...parsed.attempts],
+  };
+}
+
+export async function readRunFindings(
+  options: ReadRunReportOptions,
+): Promise<RunFindings> {
+  const report = await readRunReport(options);
+  return {
+    run_id: report.run_id,
+    raw: report.raw_findings,
+    deduplicated: report.findings,
+  };
+}
+
+export async function readRetryRunPlan(
+  options: ReadRunReportOptions,
+): Promise<RetryRunPlan> {
+  requireSafeRunId(options.runId);
+  const recordPath = await resolveRunRecordPath(
+    options.runsDirectory,
+    options.runId,
+  );
+  const parsed = parseRunRecord(
+    await readBoundedFile(
+      recordPath.path,
+      recordPath.active,
+      recordPath.root,
+      recordPath.name,
+    ),
+    options.runId,
+    recordPath.active,
+  );
+  if (parsed.request === undefined) {
+    throw new RunReportError(
+      "invalid_run_record",
+      "The persisted run does not contain a retryable normalized request.",
+    );
+  }
+  if (recordPath.active || !parsed.terminalEventSeen) {
+    throw new RunReportError(
+      "invalid_run_record",
+      "Only a completed immutable run can be retried.",
+    );
+  }
+  const request = reviewRequestSchema.safeParse(parsed.request);
+  if (!request.success) {
+    throw new RunReportError(
+      "invalid_run_record",
+      "The persisted run request does not satisfy the current request schema.",
+    );
+  }
+  const report = await readRunReport(options);
+  return {
+    schema_version: "1",
+    kind: "review-mesh.retry-plan",
+    parent_run_id: options.runId,
+    request: structuredClone(request.data),
+    incomplete_lenses: [...report.incomplete_lenses],
+  };
+}
+
+export function renderRunReportJson(report: RunReport): string {
+  return `${JSON.stringify(report, null, 2)}\n`;
+}
+
+function markdownInline(value: string): string {
+  return value.replace(/[\\`*_[\]<>#]/gu, (character) => `\\${character}`);
+}
+
+function markdownCode(value: string): string {
+  return `\`${value.replaceAll("`", "\\`")}\``;
+}
+
+function uppercaseLabel(value: string): string {
+  return value.replaceAll("_", " ").toLocaleUpperCase("en-US");
+}
+
+export function renderRunReportMarkdown(report: RunReport): string {
+  const lines = [
+    "# Review Mesh Report",
+    "",
+    `Run: ${markdownCode(report.run_id)}`,
+    "",
+    `Gate outcome: **${uppercaseLabel(report.gate_outcome)}**`,
+    "",
+    `Coverage outcome: **${uppercaseLabel(report.coverage_outcome)}**`,
+    "",
+    `Logical lenses: ${report.logical_lenses.findings} findings, ${report.logical_lenses.passed} passed, ${report.logical_lenses.incomplete} incomplete, ${report.logical_lenses.not_applicable} not applicable, ${report.logical_lenses.not_evaluated} not evaluated, ${report.logical_lenses.not_selected ?? 0} not selected for retry (${report.logical_lenses.total} total).`,
+    "",
+    `Model runs: ${report.model_runs.completed} completed, ${report.model_runs.incomplete} incomplete, ${report.model_runs.skipped} skipped (${report.model_runs.total} total).`,
+  ];
+  if (report.incomplete_lenses.length > 0) {
+    lines.push(
+      "",
+      "## Incomplete lenses",
+      "",
+      ...report.incomplete_lenses.map((lens) => `- ${markdownCode(lens)}`),
+    );
+  }
+  if (report.attempts.length > 0) {
+    lines.push(
+      "",
+      "## Failed attempts",
+      "",
+      ...report.attempts.map(
+        (attempt) =>
+          `- ${markdownCode(attempt.reviewer_id)} attempt ${attempt.attempt}: ${markdownInline(String(attempt.failure.reason ?? "unknown"))} after ${attempt.elapsed_ms} ms`,
+      ),
+    );
+  }
+  lines.push("", "## Findings", "");
+  const gateFindings = report.findings.filter(
+    (finding) =>
+      finding.severity !== "low" && finding.classification !== "advisory",
+  );
+  const advisories = report.findings.filter(
+    (finding) =>
+      finding.severity === "low" || finding.classification === "advisory",
+  );
+  if (gateFindings.length === 0) {
+    lines.push("No findings were available in the persisted report.");
+  } else {
+    for (const finding of gateFindings) {
+      lines.push(
+        `### ${uppercaseLabel(finding.severity)} — ${markdownInline(finding.title)}`,
+        "",
+        `${markdownInline(finding.description)}`,
+        "",
+        `Classification: ${markdownCode(finding.classification)}  `,
+        `Confidence: ${markdownCode(finding.confidence)}  `,
+        `Sources: ${finding.source_findings
+          .map((source) =>
+            markdownCode(`${source.reviewer_id}#${source.finding_id}`),
+          )
+          .join(", ")}`,
+      );
+      if (finding.duplicate_finding_ids.length > 0) {
+        lines.push(
+          `Duplicate finding IDs: ${finding.duplicate_finding_ids
+            .map(markdownCode)
+            .join(", ")}`,
+        );
+      }
+      if (finding.external_assumptions.length > 0) {
+        lines.push(
+          "",
+          "External assumptions:",
+          "",
+          ...finding.external_assumptions.map(
+            (assumption) => `- ${markdownInline(assumption)}`,
+          ),
+        );
+      }
+      if (finding.evidence.length > 0) {
+        lines.push("", "Evidence:", "");
+        for (const evidence of finding.evidence) {
+          const location =
+            evidence.path === undefined
+              ? ""
+              : evidence.start_line === undefined
+                ? `${markdownCode(evidence.path)}: `
+                : `${markdownCode(
+                    `${evidence.path}:${evidence.start_line}${
+                      evidence.end_line === undefined ||
+                      evidence.end_line === evidence.start_line
+                        ? ""
+                        : `-${evidence.end_line}`
+                    }`,
+                  )}: `;
+          lines.push(`- ${location}${markdownInline(evidence.detail)}`);
+        }
+      }
+      lines.push(
+        "",
+        `Suggested direction: ${markdownInline(finding.suggested_direction)}`,
+        "",
+      );
+    }
+  }
+  if (advisories.length > 0) {
+    lines.push("", "## Advisories", "");
+    for (const finding of advisories) {
+      lines.push(
+        `- **${uppercaseLabel(finding.severity)}** ${markdownInline(finding.title)} (${markdownCode(finding.classification)}, ${markdownCode(finding.confidence)})`,
+      );
+    }
+  }
+  return `${lines.join("\n").trimEnd()}\n`;
+}

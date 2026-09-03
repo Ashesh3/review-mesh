@@ -50,29 +50,36 @@ const runStatusReviewerSchema = z.strictObject({
     .optional(),
   skipped: z
     .strictObject({
-      reason: z.enum(["prior_findings", "prior_incomplete"]),
-      blocked_by_reviewer_id: z.string().min(1),
+      reason: z.string().min(1),
+      blocked_by_reviewer_id: z.string().min(1).optional(),
+      missing_inputs: z.array(z.string().min(1)).optional(),
     })
     .optional(),
 });
 
 const runStatusSchema = z.strictObject({
-  schema_version: z.literal("1"),
+  schema_version: z.enum(["1", "2"]),
   kind: z.literal("review-mesh.run-status"),
   run_id: z.string().min(1),
   active: z.boolean(),
   status: z.enum(["running", "passed", "findings", "incomplete"]),
+  gate_outcome: z.enum(["no_findings", "findings"]).optional(),
+  coverage_outcome: z.enum(["complete", "partial"]).optional(),
   exit_code: z.number().int().nonnegative().optional(),
   total_elapsed_ms: z.number().int().nonnegative().optional(),
-  suite: z.strictObject({
-    total: z.number().int().nonnegative(),
-    deferred: z.number().int().nonnegative(),
-    queued: z.number().int().nonnegative(),
-    running: z.number().int().nonnegative(),
-    completed: z.number().int().nonnegative(),
-    incomplete: z.number().int().nonnegative(),
-    skipped: z.number().int().nonnegative(),
-  }),
+  suite: z
+    .strictObject({
+      total: z.number().int().nonnegative(),
+      deferred: z.number().int().nonnegative(),
+      queued: z.number().int().nonnegative(),
+      running: z.number().int().nonnegative(),
+      completed: z.number().int().nonnegative(),
+      incomplete: z.number().int().nonnegative(),
+      skipped: z.number().int().nonnegative(),
+    })
+    .optional(),
+  model_runs: z.record(z.string(), z.unknown()).optional(),
+  logical_lenses: z.record(z.string(), z.unknown()).optional(),
   reviewers: z.array(runStatusReviewerSchema),
   reviewer_id: z.string().min(1).optional(),
   last_seq: z.number().int().nonnegative(),

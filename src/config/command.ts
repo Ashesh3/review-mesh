@@ -500,7 +500,8 @@ export async function runConfigCommand(
       }
       const desired =
         request.config.schema_version === "2" ||
-        request.config.schema_version === "3"
+        request.config.schema_version === "3" ||
+        request.config.schema_version === "4"
           ? await migrateLegacyConfig(request.config)
           : request.config;
       const desiredText = serializeManagedConfig(desired);

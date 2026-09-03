@@ -18,11 +18,13 @@ import type {
   ReasoningEffort,
   TrustedConfigV2,
   TrustedConfigV3,
+  TrustedConfigV4,
 } from "./schemas.js";
 import type { JsonValue } from "../protocol/schemas.js";
 import {
   trustedConfigSchema,
   trustedConfigV4Schema,
+  trustedConfigV5Schema,
   validateAdapterEffort,
 } from "./schemas.js";
 import { validateProjectKeys } from "./project-paths.js";
@@ -47,6 +49,18 @@ interface ManagedAgentBase {
   isolation: "prefer_enforced" | "require_enforced";
   timeout_ms: number;
   runtime?: Record<string, JsonValue> | undefined;
+  applicability?:
+    | {
+        any_changed_paths: string[];
+        case_sensitive?: boolean | undefined;
+      }
+    | undefined;
+  required_context?: string[] | undefined;
+  pass_quorum?: number | undefined;
+  minimum_provider_groups?: number | undefined;
+  adjudication?: "off" | "required" | undefined;
+  gate_minimum_severity?: "critical" | "high" | "medium" | "low" | undefined;
+  gate_minimum_confidence?: "high" | "medium" | "low" | undefined;
 }
 
 export type ManagedModelRun = {
@@ -54,6 +68,8 @@ export type ManagedModelRun = {
   adapter?: string | undefined;
   model: ModelRun["model"];
   effort?: ReasoningEffort | undefined;
+  provider_group?: string | undefined;
+  timeout_ms?: number | undefined;
 };
 
 export type ManagedAgent = ManagedAgentBase &
@@ -61,6 +77,7 @@ export type ManagedAgent = ManagedAgentBase &
     | {
         model: string;
         effort?: ReasoningEffort | undefined;
+        provider_group?: string | undefined;
         model_runs?: never;
       }
     | {
@@ -78,11 +95,16 @@ export interface ManagedProject {
 }
 
 export interface ManagedConfig {
-  schema_version: "4";
+  schema_version: "5";
   execution: {
     max_concurrency: number;
     heartbeat_interval_ms: number;
     shutdown_grace_period_ms: number;
+    default_provider_concurrency?: number | undefined;
+    provider_limits?: Record<string, number> | undefined;
+    circuit_breaker_threshold?: number | undefined;
+    retry_attempts?: number | undefined;
+    retry_backoff_ms?: number | undefined;
   };
   diagnostics: { persist_runs: boolean; max_runs: number };
   adapters: Record<string, AdapterRegistration>;
@@ -194,18 +216,25 @@ function clone<T>(value: T): T {
 }
 
 function requireManagedConfig(value: unknown): ManagedConfig {
-  const record = asRecord(value);
+  let record = asRecord(value);
+  if (record?.schema_version === "4") {
+    record = {
+      ...(clone(trustedConfigV4Schema.parse(value)) as TrustedConfigV4),
+      schema_version: "5",
+    };
+    value = record;
+  }
   if (
-    record?.schema_version !== "4" ||
+    record?.schema_version !== "5" ||
     asRecord(record.execution) === undefined ||
     asRecord(record.diagnostics) === undefined ||
     asRecord(record.adapters) === undefined ||
     asRecord(record.agents) === undefined
   ) {
-    throw new Error("configuration is not a Review Mesh v4 configuration");
+    throw new Error("configuration is not a Review Mesh v5 configuration");
   }
   const config = clone(
-    trustedConfigV4Schema.parse(value) as unknown as ManagedConfig,
+    trustedConfigV5Schema.parse(value) as unknown as ManagedConfig,
   );
   validateProjectNames(config.projects);
   requireAssignments(config);
@@ -331,7 +360,7 @@ export function migrateV1Config(value: unknown): ManagedConfig {
   }
 
   return requireManagedConfig({
-    schema_version: "4",
+    schema_version: "5",
     execution: clone(record.execution as ManagedConfig["execution"]),
     diagnostics: clone(record.diagnostics as ManagedConfig["diagnostics"]),
     adapters: clone(record.adapters as ManagedConfig["adapters"]),
@@ -349,7 +378,7 @@ export function migrateV2Config(value: unknown): ManagedConfig {
   }
   return requireManagedConfig({
     ...(clone(parsed) as TrustedConfigV2),
-    schema_version: "4",
+    schema_version: "5",
     projects: migrateLegacyProjects(parsed.projects),
   });
 }
@@ -408,7 +437,7 @@ export function migrateV3Config(value: unknown): ManagedConfig {
   validateProjectKeys(parsed.projects);
   return requireManagedConfig({
     ...(clone(parsed) as TrustedConfigV3),
-    schema_version: "4",
+    schema_version: "5",
     projects: migrateLegacyProjects(parsed.projects),
   });
 }
@@ -423,7 +452,7 @@ export async function migrateLegacyConfig(
     validateProjectKeys(parsed.projects);
     return requireManagedConfig({
       ...(clone(parsed) as TrustedConfigV2),
-      schema_version: "4",
+      schema_version: "5",
       projects: await migrateLegacyProjectsByIdentity(parsed.projects),
     });
   }
@@ -431,8 +460,14 @@ export async function migrateLegacyConfig(
     validateProjectKeys(parsed.projects);
     return requireManagedConfig({
       ...(clone(parsed) as TrustedConfigV3),
-      schema_version: "4",
+      schema_version: "5",
       projects: await migrateLegacyProjectsByIdentity(parsed.projects),
+    });
+  }
+  if (parsed.schema_version === "4") {
+    return requireManagedConfig({
+      ...(clone(parsed) as TrustedConfigV4),
+      schema_version: "5",
     });
   }
   return requireManagedConfig(parsed);
@@ -450,6 +485,16 @@ export function parseManagedConfig(text: string): {
     return { config: migrateV2Config(parsed), migrated: true };
   if (version === "3")
     return { config: migrateV3Config(parsed), migrated: true };
+  if (version === "4") {
+    const legacy = trustedConfigV4Schema.parse(parsed);
+    return {
+      config: requireManagedConfig({
+        ...(clone(legacy) as TrustedConfigV4),
+        schema_version: "5",
+      }),
+      migrated: true,
+    };
+  }
   return { config: requireManagedConfig(parsed), migrated: false };
 }
 
@@ -466,11 +511,16 @@ export function serializeManagedConfig(config: ManagedConfig): string {
 
 export function emptyManagedConfig(): ManagedConfig {
   return {
-    schema_version: "4",
+    schema_version: "5",
     execution: {
       max_concurrency: 2,
       heartbeat_interval_ms: 15_000,
       shutdown_grace_period_ms: 5_000,
+      default_provider_concurrency: 2,
+      provider_limits: {},
+      circuit_breaker_threshold: 2,
+      retry_attempts: 2,
+      retry_backoff_ms: 1_000,
     },
     diagnostics: { persist_runs: true, max_runs: 50 },
     adapters: {},

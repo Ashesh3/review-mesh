@@ -2,10 +2,14 @@
 
 Review Mesh is an agent-first code-review gate. One command runs every logical
 agent in a trusted suite, streams machine-readable JSONL progress, and succeeds
-only when every agent's executed model chain completes with zero actionable
-findings and no incomplete runs.
+with independent gate and coverage outcomes. Operational failures advance to
+eligible fallback providers; a logical lens is incomplete only after recovery
+options are exhausted.
 
-Transient reviewer failures explicitly marked `retryable: true` are retried once after a one-second backoff before a reviewer is declared incomplete. Native per-tool activity is retained as the reviewer's latest status instead of emitting one public record per tool action; query a persisted run with `review-mesh status RUN_ID [REVIEWER_ID] --json`.
+Transient failures use bounded same-model retry, while protocol, provider,
+timeout, and schema failures can immediately fail over. Public output is compact
+JSONL with one aggregate suite heartbeat; detailed context and results remain in
+the sanitized persisted artifact.
 
 ```text
 current directory or request JSON -> review-mesh review -> trusted project/default roster -> live JSONL -> run.completed
@@ -17,7 +21,10 @@ It is designed for automation, coding agents, CI, and local review loops:
 - Trusted global/default or project-specific agent rosters; callers cannot override them through review input.
 - Parallel logical agents with ordered per-agent model fallback across runtimes.
 - Strict structured findings with evidence and optional file/line locations.
-- `incomplete > findings > passed` outcome precedence.
+- Independent `gate_outcome` and `coverage_outcome` dimensions.
+- Configurable diverse pass quorum, provider concurrency, and circuit breaking.
+- Changed-surface applicability and required-input checks before provider work.
+- Deterministic finding consolidation with confidence, classification, assumptions, and provenance.
 - No source edits by Review Mesh.
 - Portable single-file builds: a Node.js script and standalone Windows/Linux executables.
 
@@ -36,6 +43,7 @@ not need this README to discover the contract:
 review-mesh --help
 review-mesh describe . --json
 review-mesh schema request --json
+review-mesh doctor . --structured-output
 review-mesh config --help
 ```
 
@@ -65,9 +73,9 @@ For an AI caller, identity and scope are separate:
 
 ### Download a standalone executable
 
-Release `v5.0.0` provides ordered multi-model fallback, project-name
+Release `v6.0.0` provides operational multi-provider fallback, project-name
 configuration, per-reviewer gateway session affinity, the agent-first CLI,
-public event protocol v4, and
+public event protocol v5, compact reporting, and
 self-contained Bun executables that do not require Node.js or Bun:
 
 - Windows x64: `review-mesh-windows-x64.exe`
@@ -257,12 +265,20 @@ export REVIEW_MESH_OPENAI_API_KEY="your-key"
 Create the global configuration shown below, replacing model IDs and project names as needed:
 
 ```toml
-schema_version = "4"
+schema_version = "5"
 
 [execution]
 max_concurrency = 2
 heartbeat_interval_ms = 15000
 shutdown_grace_period_ms = 5000
+default_provider_concurrency = 2
+circuit_breaker_threshold = 2
+retry_attempts = 2
+retry_backoff_ms = 1000
+
+[execution.provider_limits]
+anthropic = 2
+github-copilot = 3
 
 [diagnostics]
 persist_runs = true
@@ -338,7 +354,7 @@ ordered model fallbacks. Use `model_runs` instead of the scalar `model` and
 `effort` fields:
 
 ```toml
-schema_version = "4"
+schema_version = "5"
 
 [adapters.gateway]
 type = "openai_compatible"
@@ -352,13 +368,24 @@ use_logged_in_user = true
 [agents.architecture]
 adapter = "gateway"
 model_runs = [
-  { id = "opus", model = "claude-opus-5", effort = "max" },
-  { id = "grok", adapter = "github", model = "grok-code-fast-1", effort = "high" },
+  { id = "opus", model = "claude-opus-5", effort = "max", provider_group = "anthropic" },
+  { id = "grok", adapter = "github", model = "grok-code-fast-1", effort = "high", provider_group = "github-copilot" },
 ]
+pass_quorum = 2
+minimum_provider_groups = 2
+adjudication = "required"
+gate_minimum_severity = "medium"
+gate_minimum_confidence = "medium"
 purpose = "Architecture and security review"
 instructions = "Review architecture, trust boundaries, lifecycle ownership, and regressions."
 isolation = "prefer_enforced"
 timeout_ms = 1800000
+
+[agents.architecture.applicability]
+any_changed_paths = ["src/**", "tests/**", "package.json"]
+
+# A metadata-dependent lens can additionally declare:
+# required_context = ["/pull_request/number", "/work_items"]
 
 [defaults]
 agents = ["architecture"]
@@ -366,7 +393,9 @@ agents = ["architecture"]
 
 The parent `adapter` is required and is inherited by a run that omits its own
 `adapter`. A per-run adapter override lets one logical agent span providers.
-Each run has an explicit stable ID, exact model, and optional effort. Run IDs
+Each run has an explicit stable ID, exact model, optional effort, optional
+per-attempt timeout, and a public `provider_group` used for diversity/concurrency
+policy. Run IDs
 use letters, numbers, underscores, and hyphens and must be unique within the
 agent.
 
@@ -377,19 +406,21 @@ final terminal records; the exact model is also reported separately. Existing
 single-model agents retain their original unqualified reviewer IDs and remain
 fully supported.
 
-The runs form an ordered fallback chain. Review Mesh starts every logical agent
+The runs form an ordered recovery chain. Review Mesh starts every logical agent
 in parallel (subject to `execution.max_concurrency`) using only that agent's
-first configured model. A later model becomes eligible only after the previous
-model completed with a valid `pass` and zero actionable findings. A finding
+first configured model. A later model becomes eligible while the pass quorum is
+unsatisfied or after an operational failure. A finding
 stops that agent immediately and reports all later models as `skipped` with
-`prior_findings`; an incomplete result likewise stops the chain with
-`prior_incomplete`. Other agents continue independently through their own
+`short_circuited_after_finding` unless adjudication is configured. Operational
+incompleteness advances to the next eligible provider. Other agents continue independently through their own
 chains. This preserves broad parallel review while avoiding unnecessary model
 calls once an agent has already found something actionable.
 
 Every model that actually runs receives the same purpose, trusted instructions,
 isolation policy, runtime options, project guidance, and per-run timeout.
-Review Mesh does not merge or deduplicate findings between models. Each fallback
+Review Mesh preserves raw findings and builds a deterministic consolidated set
+with provenance, duplicate ids, reconciled severity, confidence, classification,
+and external assumptions. Each fallback
 is a complete provider request, so agents that repeatedly pass can still consume
 additional tokens, quota, and cost. Concurrent logical agents can also observe
 different live-worktree states if another process modifies the workspace.
@@ -606,18 +637,18 @@ their predecessor passes clearly. A multi-model agent contributes one unit to
 Heartbeats and suite summaries distinguish deferred, queued, running, completed,
 incomplete, and skipped runs without inventing percentages.
 
-| Event                 | Meaning                                                     |
-| --------------------- | ----------------------------------------------------------- |
-| `run.started`         | The live-worktree review began.                             |
-| `context.resolved`    | Workspace and best-effort Git metadata were resolved.       |
-| `suite.resolved`      | The roster and execution/heartbeat settings were resolved.  |
-| `reviewer.started`    | One reviewer began, with its model, effort, and timeout.    |
-| `reviewer.progress`   | Factual probing, queued, reviewing, or validating activity. |
-| `reviewer.heartbeat`  | Liveness, elapsed time, and suite summary.                  |
-| `reviewer.completed`  | One strict reviewer result.                                 |
-| `reviewer.incomplete` | One reviewer failed to return a valid terminal result.      |
-| `reviewer.skipped`    | A later model was bypassed after prior findings/failure.    |
-| `run.completed`       | Final classification plus every reviewer terminal record.   |
+| Event                 | Meaning                                                       |
+| --------------------- | ------------------------------------------------------------- |
+| `run.started`         | The live-worktree review began.                               |
+| `context.resolved`    | Workspace and best-effort Git metadata were resolved.         |
+| `suite.resolved`      | The roster and execution/heartbeat settings were resolved.    |
+| `reviewer.started`    | One reviewer began, with its model, effort, and timeout.      |
+| `reviewer.progress`   | Factual probing, queued, reviewing, or validating activity.   |
+| `suite.heartbeat`     | Aggregate liveness, deadlines, stale time, and dual counters. |
+| `reviewer.completed`  | One strict reviewer result.                                   |
+| `reviewer.incomplete` | One reviewer failed to return a valid terminal result.        |
+| `reviewer.skipped`    | A later model was bypassed after prior findings/failure.      |
+| `run.completed`       | Compact gate/coverage summary and report artifact path.       |
 
 `reviewer.progress` is phase-level. High-frequency adapter activity updates the
 reviewer's persisted latest activity and appears in heartbeats/status snapshots,
@@ -625,62 +656,52 @@ but is not emitted once per tool action. Use `review-mesh status RUN_ID --json`
 for the compact roster or add a reviewer id for one reviewer. The generated
 machine contract is available from `review-mesh schema run-status --json`.
 
+Detailed and retry workflows:
+
+```text
+review-mesh report RUN_ID --format markdown
+review-mesh findings RUN_ID --deduplicate --json
+review-mesh retry RUN_ID --only-incomplete
+```
+
 Example final event:
 
 ```json
 {
-  "schema_version": "4",
+  "schema_version": "5",
   "event": "run.completed",
   "run_id": "run_...",
   "seq": 23,
   "timestamp": "2026-08-31T11:45:35.446Z",
   "data": {
-    "status": "findings",
+    "gate_outcome": "findings",
+    "coverage_outcome": "partial",
     "exit_code": 1,
     "consistency_mode": "live_worktree",
     "total_elapsed_ms": 26895,
-    "suite": {
-      "total": 1,
+    "logical_lenses": {
+      "total": 8,
+      "pending": 0,
+      "findings": 4,
+      "passed": 1,
+      "incomplete": 3,
+      "not_applicable": 0,
+      "not_evaluated": 0
+    },
+    "model_runs": {
+      "total": 40,
       "deferred": 0,
       "queued": 0,
       "running": 0,
-      "completed": 1,
-      "incomplete": 0,
-      "skipped": 0
+      "completed": 9,
+      "incomplete": 3,
+      "skipped": 28
     },
-    "reviewers": [
-      {
-        "reviewer_id": "correctness",
-        "status": "completed",
-        "adapter": "gateway",
-        "model": "example-model",
-        "isolation": "runtime_read_only",
-        "elapsed_ms": 26880,
-        "result": {
-          "schema_version": "1",
-          "verdict": "fail",
-          "summary": "One actionable defect was found.",
-          "actionable_findings": [
-            {
-              "id": "zero-count",
-              "severity": "high",
-              "title": "Zero count is not rejected",
-              "description": "The implementation violates the documented contract.",
-              "evidence": [
-                {
-                  "path": "calculator.js",
-                  "start_line": 1,
-                  "end_line": 3,
-                  "detail": "The function divides without validating count."
-                }
-              ],
-              "suggested_direction": "Reject zero before division and add tests."
-            }
-          ],
-          "informational_notes": []
-        }
-      }
-    ]
+    "unique_findings": 8,
+    "advisory_findings": 4,
+    "incomplete_lenses": ["event-reliability", "security-compliance"],
+    "not_evaluated_lenses": ["change-readiness"],
+    "report_path": ".../run_....jsonl"
   }
 }
 ```
@@ -696,6 +717,9 @@ Example final event:
 |  `4` | interrupted    | Caller interrupted the round.                                   |
 
 Completed findings are retained even when another reviewer is incomplete.
+Exit code 3 remains conservative when coverage is partial; read the independent
+`gate_outcome` to distinguish partial coverage with findings from partial
+coverage without findings.
 
 ## Reviewer result shape
 
@@ -703,13 +727,16 @@ Each completed reviewer returns:
 
 ```json
 {
-  "schema_version": "1",
+  "schema_version": "2",
   "verdict": "fail",
   "summary": "One actionable defect was found.",
   "actionable_findings": [
     {
       "id": "zero-count",
       "severity": "high",
+      "confidence": "high",
+      "classification": "confirmed_defect",
+      "external_assumptions": [],
       "title": "Zero count is not rejected",
       "description": "The implementation violates the documented contract.",
       "evidence": [

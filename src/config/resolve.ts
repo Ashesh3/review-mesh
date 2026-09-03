@@ -11,7 +11,13 @@ import {
   type TrustedConfigV2,
   type TrustedConfigV3,
   type TrustedConfigV4,
+  type TrustedConfigV5,
 } from "./schemas.js";
+import {
+  DEFAULT_GATE_THRESHOLDS,
+  DEFAULT_PASS_QUORUM_POLICY,
+  validateLensPolicy,
+} from "../orchestrator/lens-policy.js";
 import { selectProject } from "./project-paths.js";
 import {
   projectNameFromLegacyPath,
@@ -63,6 +69,11 @@ function resolveReviewer(
   effort: ModelRun["effort"],
   adapters: TrustedConfigV2["adapters"],
   projectInstructions?: string,
+  options?: {
+    providerGroup?: string;
+    attemptTimeoutMs?: number;
+    policy?: ResolvedReviewer["policy"];
+  },
 ): ResolvedReviewer {
   const adapter = configuredAdapter(id, adapterId, adapters);
   if (profile.instructions === undefined) {
@@ -75,6 +86,12 @@ function resolveReviewer(
     modelIndex,
     modelCount,
     ...(previousReviewerId === undefined ? {} : { previousReviewerId }),
+    ...(options?.providerGroup === undefined
+      ? {}
+      : { providerGroup: options.providerGroup }),
+    ...(options?.attemptTimeoutMs === undefined
+      ? {}
+      : { attemptTimeoutMs: options.attemptTimeoutMs }),
     purpose: profile.purpose,
     adapterId,
     adapter,
@@ -89,7 +106,90 @@ function resolveReviewer(
     isolationPolicy: profile.isolation,
     timeoutMs: profile.timeout_ms,
     runtime: profile.runtime ?? {},
+    ...(options?.policy === undefined ? {} : { policy: options.policy }),
   };
+}
+
+function resolvedPolicy(profile: AgentProfile): ResolvedReviewer["policy"] {
+  const candidate = profile as AgentProfile & {
+    applicability?: {
+      any_changed_paths: string[];
+      case_sensitive?: boolean;
+    };
+    required_context?: string[];
+    pass_quorum?: number;
+    minimum_provider_groups?: number;
+    adjudication?: "off" | "required";
+    gate_minimum_severity?: "critical" | "high" | "medium" | "low";
+    gate_minimum_confidence?: "high" | "medium" | "low";
+  };
+  if (
+    !("model_runs" in profile) &&
+    !("pass_quorum" in profile) &&
+    !("applicability" in profile) &&
+    !("required_context" in profile) &&
+    !("adjudication" in profile) &&
+    !("gate_minimum_severity" in profile) &&
+    !("gate_minimum_confidence" in profile)
+  )
+    return undefined;
+  const passQuorum =
+    candidate.pass_quorum ??
+    ("model_runs" in profile
+      ? Math.min(2, profile.model_runs.length)
+      : DEFAULT_PASS_QUORUM_POLICY.passQuorum);
+  const distinctProviderGroups =
+    "model_runs" in profile
+      ? new Set(
+          profile.model_runs.map(
+            (run) => run.provider_group ?? run.adapter ?? profile.adapter,
+          ),
+        ).size
+      : 1;
+  const minimumProviderGroups =
+    candidate.minimum_provider_groups ?? Math.min(2, distinctProviderGroups);
+  const policy: NonNullable<ResolvedReviewer["policy"]> = {
+    ...(candidate.applicability === undefined
+      ? {}
+      : {
+          applicability: {
+            anyChangedPaths: [...candidate.applicability.any_changed_paths],
+            ...(candidate.applicability.case_sensitive === undefined
+              ? {}
+              : { caseSensitive: candidate.applicability.case_sensitive }),
+          },
+        }),
+    ...(candidate.required_context === undefined
+      ? {}
+      : { requiredCallerContext: [...candidate.required_context] }),
+    passQuorum,
+    minimumProviderGroups,
+    adjudication:
+      candidate.adjudication ?? ("model_runs" in profile ? "required" : "off"),
+    gateMinimumSeverity:
+      candidate.gate_minimum_severity ??
+      DEFAULT_GATE_THRESHOLDS.minimumSeverity,
+    gateMinimumConfidence:
+      candidate.gate_minimum_confidence ??
+      DEFAULT_GATE_THRESHOLDS.minimumConfidence,
+  };
+  validateLensPolicy({
+    ...(policy.applicability === undefined
+      ? {}
+      : { applicability: policy.applicability }),
+    ...(policy.requiredCallerContext === undefined
+      ? {}
+      : { requiredCallerContext: policy.requiredCallerContext }),
+    pass: {
+      passQuorum: policy.passQuorum,
+      minimumProviderGroups: policy.minimumProviderGroups,
+    },
+    gate: {
+      minimumSeverity: policy.gateMinimumSeverity,
+      minimumConfidence: policy.gateMinimumConfidence,
+    },
+  });
+  return policy;
 }
 
 function resolveAgent(
@@ -100,6 +200,7 @@ function resolveAgent(
 ): ResolvedReviewer[] {
   configuredAdapter(id, profile.adapter, adapters);
   if ("model_runs" in profile) {
+    const policy = resolvedPolicy(profile);
     return profile.model_runs.map((run, index) => {
       const adapterId = run.adapter ?? profile.adapter;
       const label = `agent ${id} model run ${run.id}`;
@@ -118,9 +219,17 @@ function resolveAgent(
         run.effort,
         adapters,
         projectInstructions,
+        {
+          providerGroup: run.provider_group ?? adapterId,
+          ...(run.timeout_ms === undefined
+            ? {}
+            : { attemptTimeoutMs: run.timeout_ms }),
+          ...(policy === undefined ? {} : { policy }),
+        },
       );
     });
   }
+  const policy = resolvedPolicy(profile);
   return [
     resolveReviewer(
       id,
@@ -134,6 +243,12 @@ function resolveAgent(
       profile.effort,
       adapters,
       projectInstructions,
+      {
+        providerGroup:
+          ("provider_group" in profile ? profile.provider_group : undefined) ??
+          profile.adapter,
+        ...(policy === undefined ? {} : { policy }),
+      },
     ),
   ];
 }
@@ -151,7 +266,7 @@ function requireUniqueResolvedIds(
 }
 
 function requireUniqueExpandedAgentIds(
-  config: TrustedConfigV3 | TrustedConfigV4,
+  config: TrustedConfigV3 | TrustedConfigV4 | TrustedConfigV5,
 ): void {
   const ids = new Set<string>();
   for (const [agentId, profile] of Object.entries(config.agents)) {
@@ -204,7 +319,14 @@ function resolveV1(
     return reviewer;
   });
   return {
-    execution: config.execution,
+    execution: {
+      ...config.execution,
+      default_provider_concurrency: 2,
+      provider_limits: {},
+      circuit_breaker_threshold: 2,
+      retry_attempts: 2,
+      retry_backoff_ms: 1_000,
+    },
     diagnostics: config.diagnostics,
     selection: {
       source: "legacy",
@@ -216,20 +338,24 @@ function resolveV1(
 }
 
 function resolveV2(
-  config: TrustedConfigV2 | TrustedConfigV3 | TrustedConfigV4,
+  config: TrustedConfigV2 | TrustedConfigV3 | TrustedConfigV4 | TrustedConfigV5,
   workspace: string | undefined,
   projectName: string | undefined,
   projectNameSource: ResolveConfigInput["projectNameSource"],
 ): ResolvedConfig {
-  if (config.schema_version === "3" || config.schema_version === "4") {
+  if (
+    config.schema_version === "3" ||
+    config.schema_version === "4" ||
+    config.schema_version === "5"
+  ) {
     requireUniqueExpandedAgentIds(config);
   }
   const selectedByName =
-    config.schema_version === "4"
+    config.schema_version === "4" || config.schema_version === "5"
       ? selectProjectByName(config.projects, projectName)
       : undefined;
   const selectedByPath =
-    config.schema_version === "4"
+    config.schema_version === "4" || config.schema_version === "5"
       ? undefined
       : selectProject(config.projects, workspace);
   const project = (selectedByName ?? selectedByPath)?.project;
@@ -246,7 +372,29 @@ function resolveV2(
   });
   requireUniqueResolvedIds(reviewers);
   return {
-    execution: config.execution,
+    execution: {
+      ...config.execution,
+      default_provider_concurrency:
+        "default_provider_concurrency" in config.execution
+          ? (config.execution.default_provider_concurrency ?? 2)
+          : 2,
+      provider_limits:
+        "provider_limits" in config.execution
+          ? (config.execution.provider_limits ?? {})
+          : {},
+      circuit_breaker_threshold:
+        "circuit_breaker_threshold" in config.execution
+          ? (config.execution.circuit_breaker_threshold ?? 2)
+          : 2,
+      retry_attempts:
+        "retry_attempts" in config.execution
+          ? (config.execution.retry_attempts ?? 2)
+          : 2,
+      retry_backoff_ms:
+        "retry_backoff_ms" in config.execution
+          ? (config.execution.retry_backoff_ms ?? 1_000)
+          : 1_000,
+    },
     diagnostics: config.diagnostics,
     selection: {
       source: project?.agents === undefined ? "defaults" : "project",
