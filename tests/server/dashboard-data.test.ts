@@ -455,7 +455,7 @@ describe("dashboard data", () => {
     });
   });
 
-  it("omits source findings rejected by a clean adjudicator", async () => {
+  it("retains source findings rejected by an adjudicator while excluding them from canonical counts", async () => {
     const { appPaths } = await fixture();
     const finding = {
       id: "candidate",
@@ -513,10 +513,21 @@ describe("dashboard data", () => {
           mode: "adjudication",
           adjudicates_reviewer_id: "lens::source",
           result: {
-            schema_version: "2",
+            schema_version: "1",
+            kind: "review-mesh.adjudication-result",
             verdict: "pass",
+            review_markdown: "# Adjudication\n\nRejected.",
             summary: "Rejected",
             actionable_findings: [],
+            decisions: [
+              {
+                source_finding_id: "candidate",
+                decision: "rejected",
+                rationale: "The candidate is not supported by the code.",
+                cited_evidence: [{ detail: "Contradictory code evidence." }],
+                unverified_assumptions: [],
+              },
+            ],
             informational_notes: [],
           },
         },
@@ -553,7 +564,14 @@ describe("dashboard data", () => {
       appPaths,
       runId: "run-adjudicated",
     });
-    expect(run).toMatchObject({ status: "passed", findings: { raw: [] } });
+    expect(run).toMatchObject({
+      status: "passed",
+      findings: {
+        raw: [expect.objectContaining({ finding_id: "candidate" })],
+        consolidated: [],
+        counts: { raw: 1, unique: 0, gate: 0, advisory: 0 },
+      },
+    });
   });
 
   it("isolates one malformed run and accepts a partial active tail", async () => {

@@ -301,6 +301,63 @@ export const reviewerResultSchema = z.union([
   reviewerResultV1Schema,
 ]);
 
+const adjudicationCitationSchema = findingEvidenceV3Schema;
+const orderedExecutionProofSchema = z.strictObject({
+  steps: z
+    .array(
+      z.strictObject({
+        order: positiveInteger,
+        description: completeResultText,
+        citation: adjudicationCitationSchema,
+      }),
+    )
+    .min(2)
+    .max(32),
+  failure_point: z.strictObject({
+    step_order: positiveInteger,
+    detail: completeResultText,
+  }),
+});
+const baseHeadComparisonSchema = z.strictObject({
+  base: z.strictObject({
+    behavior: completeResultText,
+    citation: adjudicationCitationSchema,
+  }),
+  head: z.strictObject({
+    behavior: completeResultText,
+    citation: adjudicationCitationSchema,
+  }),
+  impact: completeResultText,
+});
+export const adjudicationDecisionSchema = z.strictObject({
+  source_finding_id: nonEmptyString,
+  decision: z.enum(["confirmed", "rejected", "adjusted"]),
+  rationale: completeResultText,
+  cited_evidence: z.array(adjudicationCitationSchema).max(256),
+  adjusted_finding: actionableFindingV3Schema.optional(),
+  ordered_execution_proof: orderedExecutionProofSchema.optional(),
+  base_head_comparison: baseHeadComparisonSchema.optional(),
+  unverified_assumptions: z.array(completeResultText).max(128),
+});
+export const adjudicationResultSchema = z.strictObject({
+  schema_version: z.literal("1"),
+  kind: z.literal("review-mesh.adjudication-result"),
+  verdict: z.enum(["pass", "fail"]),
+  review_markdown: completeResultText,
+  summary: completeResultText,
+  actionable_findings: z.tuple([]),
+  decisions: z.array(adjudicationDecisionSchema).max(256),
+  informational_notes: z.array(informationalNoteV3Schema).max(256),
+});
+export const currentReviewerOutputSchema = z.union([
+  reviewerResultV3Schema,
+  adjudicationResultSchema,
+]);
+export const reviewerOutputSchema = z.union([
+  reviewerResultSchema,
+  adjudicationResultSchema,
+]);
+
 export const reviewerPhaseSchema = z.enum([
   "queued",
   "probing",
@@ -387,7 +444,7 @@ export const reviewerTerminalRecordSchema = z.discriminatedUnion("status", [
     provider_group: nonEmptyString.optional(),
     isolation: isolationLevelSchema,
     elapsed_ms: nonNegativeInteger,
-    result: reviewerResultSchema,
+    result: reviewerOutputSchema,
   }),
   z.strictObject({
     reviewer_id: nonEmptyString,
@@ -611,7 +668,7 @@ const publicEventSchemas = [
       gate_findings: nonNegativeInteger.optional(),
       informational_notes: nonNegativeInteger.optional(),
       detail_ref: nonEmptyString.optional(),
-      result: reviewerResultSchema.optional(),
+      result: reviewerOutputSchema.optional(),
     }),
   }),
   eventEnvelopeSchema.extend({
@@ -622,7 +679,7 @@ const publicEventSchemas = [
       digest: z.string().regex(/^[a-f0-9]{64}$/u),
       byte_count: nonNegativeInteger,
       artifact_path: nonEmptyString.optional(),
-      result: reviewerResultV3Schema,
+      result: currentReviewerOutputSchema,
     }),
   }),
   eventEnvelopeSchema.extend({
@@ -669,7 +726,9 @@ const publicEventSchemas = [
         total_elapsed_ms: nonNegativeInteger,
         logical_lenses: logicalLensCountsSchema.optional(),
         model_runs: modelRunCountsSchema.optional(),
+        raw_findings: nonNegativeInteger.optional(),
         unique_findings: nonNegativeInteger.optional(),
+        gate_findings: nonNegativeInteger.optional(),
         advisory_findings: nonNegativeInteger.optional(),
         incomplete_lenses: z.array(nonEmptyString).optional(),
         not_evaluated_lenses: z.array(nonEmptyString).optional(),
@@ -706,6 +765,7 @@ const publicEventSchemas = [
         const hasFindings = reviewers.some(
           (reviewer) =>
             reviewer.status === "completed" &&
+            "actionable_findings" in reviewer.result &&
             reviewer.result.actionable_findings.length > 0,
         );
         const expected = hasIncomplete
@@ -732,6 +792,10 @@ export type ReviewerResult = z.infer<typeof reviewerResultSchema>;
 export type ReviewerResultV1 = z.infer<typeof reviewerResultV1Schema>;
 export type ReviewerResultV2 = z.infer<typeof reviewerResultV2Schema>;
 export type ReviewerResultV3 = z.infer<typeof reviewerResultV3Schema>;
+export type AdjudicationDecision = z.infer<typeof adjudicationDecisionSchema>;
+export type AdjudicationResult = z.infer<typeof adjudicationResultSchema>;
+export type CurrentReviewerOutput = z.infer<typeof currentReviewerOutputSchema>;
+export type ReviewerOutput = z.infer<typeof reviewerOutputSchema>;
 export type PublicEvent = z.infer<typeof publicEventSchema>;
 export type ReviewerPhase = z.infer<typeof reviewerPhaseSchema>;
 export type ReviewerTerminalRecord = z.infer<

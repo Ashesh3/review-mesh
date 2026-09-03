@@ -6,11 +6,16 @@ import type {
   GateOutcome,
   IsolationLevel,
   ReviewerMode,
-  ReviewerResult,
+  ReviewerOutput,
   ReviewerSkipReason,
   ReviewerTerminalRecord,
   RunStatus,
 } from "../protocol/schemas.js";
+import type { AdjudicationOutcome } from "../findings/adjudication.js";
+import {
+  canonicalizeFindings,
+  type CanonicalRawFinding,
+} from "../findings/canonical.js";
 import { meetsGateThresholds } from "./lens-policy.js";
 
 export type ReviewerLifecycleStatus =
@@ -39,7 +44,8 @@ export interface ReviewerState {
   readonly lastActivity?: ReviewerActivity;
   readonly capabilities?: AdapterCapabilities;
   readonly isolation?: IsolationLevel;
-  readonly result?: ReviewerResult;
+  readonly result?: ReviewerOutput;
+  readonly adjudicationOutcome?: AdjudicationOutcome;
   readonly failure?: AdapterFailure;
   readonly skipReason?: ReviewerSkipReason;
   readonly blockedByReviewerId?: string;
@@ -58,7 +64,8 @@ interface InternalReviewerState extends ReviewerState {
   lastActivity?: ReviewerActivity;
   capabilities?: AdapterCapabilities;
   isolation?: IsolationLevel;
-  result?: ReviewerResult;
+  result?: ReviewerOutput;
+  adjudicationOutcome?: AdjudicationOutcome;
   failure?: AdapterFailure;
   skipReason?: ReviewerSkipReason;
   blockedByReviewerId?: string;
@@ -80,8 +87,9 @@ export interface SuiteState {
   setAdjudication(id: string, sourceReviewerId: string): ReviewerState;
   complete(
     id: string,
-    result: ReviewerResult,
+    result: ReviewerOutput,
     isolation: IsolationLevel,
+    adjudicationOutcome?: AdjudicationOutcome,
   ): ReviewerState;
   incomplete(
     id: string,
@@ -128,6 +136,8 @@ export interface RunAggregate {
   notEvaluatedLenses: string[];
   reviewers: ReviewerTerminalRecord[];
   uniqueFindings: number;
+  rawFindings: number;
+  gateFindings: number;
   advisoryFindings: number;
 }
 
@@ -316,7 +326,7 @@ export function createSuiteState(
       };
       return snapshot(state);
     },
-    complete(id, result, isolation) {
+    complete(id, result, isolation, adjudicationOutcome) {
       const state = lookup(id);
       ensureActive(state);
       if (state.status !== "reviewing" && state.status !== "validating") {
@@ -326,6 +336,9 @@ export function createSuiteState(
       }
       state.status = "completed";
       state.result = clone(result);
+      if (adjudicationOutcome !== undefined) {
+        state.adjudicationOutcome = clone(adjudicationOutcome);
+      }
       state.isolation = isolation;
       state.completedAt = now();
       state.elapsedMs = elapsedMs(state, state.completedAt);
@@ -394,7 +407,8 @@ export function reviewerTerminalRecord(
 }
 
 function gateFindingCount(state: ReviewerState): number {
-  if (state.result === undefined) return 0;
+  if (state.result === undefined || !("actionable_findings" in state.result))
+    return 0;
   const policy = state.reviewer.policy;
   return state.result.actionable_findings.filter((finding) => {
     if (finding.severity === "low") return false;
@@ -420,98 +434,135 @@ function gateFindingCount(state: ReviewerState): number {
   }).length;
 }
 
-export function summarizeLogicalLenses(state: SuiteState): LogicalLensSummary {
-  const reviewers = state.reviewers;
-  const groups = new Map<string, ReviewerState[]>();
+function rawFindingsForStates(
+  reviewers: readonly ReviewerState[],
+): CanonicalRawFinding[] {
+  const adjudications = new Map<
+    string,
+    NonNullable<ReviewerState["adjudicationOutcome"]>
+  >();
   for (const reviewer of reviewers) {
-    const id = lensId(reviewer.reviewer);
-    const group = groups.get(id) ?? [];
-    group.push(reviewer);
-    groups.set(id, group);
-  }
-  const summary: LogicalLensSummary = {
-    total: groups.size,
-    pending: 0,
-    findings: 0,
-    passed: 0,
-    incomplete: 0,
-    not_applicable: 0,
-    not_evaluated: 0,
-    not_selected: 0,
-  };
-  for (const group of groups.values()) {
-    const completed = group.filter((item) => item.status === "completed");
-    const adjudicatedSources = new Set(
-      completed.flatMap((item) =>
-        item.reviewer.policy?.mode === "adjudication" &&
-        item.reviewer.policy.adjudicatesReviewerId !== undefined
-          ? [item.reviewer.policy.adjudicatesReviewerId]
-          : [],
-      ),
-    );
-    const gateFindings = completed
-      .filter(
-        (item) =>
-          !adjudicatedSources.has(item.reviewer.id) ||
-          item.reviewer.policy?.mode === "adjudication",
-      )
-      .reduce((total, item) => total + gateFindingCount(item), 0);
-    const requiresAdjudication = completed.some(
-      (item) =>
-        item.reviewer.policy?.adjudication === "required" &&
-        item.reviewer.policy?.mode !== "adjudication" &&
-        gateFindingCount(item) > 0,
-    );
-    const hasAdjudicator = completed.some(
-      (item) => item.reviewer.policy?.mode === "adjudication",
-    );
-    if (gateFindings > 0) {
-      summary.findings += 1;
-      if (requiresAdjudication && !hasAdjudicator) summary.incomplete += 1;
-    } else if (group.every((item) => item.skipReason === "not_applicable")) {
-      summary.not_applicable += 1;
-    } else if (
-      group.every((item) => item.skipReason === "not_selected_for_retry")
+    const sourceReviewerId = reviewer.reviewer.policy?.adjudicatesReviewerId;
+    if (
+      reviewer.status === "completed" &&
+      sourceReviewerId !== undefined &&
+      reviewer.adjudicationOutcome !== undefined
     ) {
-      summary.not_selected = (summary.not_selected ?? 0) + 1;
-    } else if (
-      group.every((item) => item.skipReason === "not_evaluated_missing_input")
-    ) {
-      summary.not_evaluated += 1;
-    } else if (
-      group.some(
-        (item) =>
-          item.status !== "completed" &&
-          item.status !== "incomplete" &&
-          item.status !== "skipped",
-      )
-    ) {
-      summary.pending += 1;
-    } else {
-      const policy = group[0]?.reviewer.policy;
-      const passQuorum = policy?.passQuorum ?? group.length;
-      const minimumProviderGroups = policy?.minimumProviderGroups ?? 1;
-      const clean = completed.filter(
-        (item) =>
-          item.reviewer.policy?.mode !== "adjudication" &&
-          item.result?.actionable_findings.length === 0,
-      );
-      const rejectedByAdjudication = completed.some(
-        (item) =>
-          item.reviewer.policy?.mode === "adjudication" &&
-          item.result?.actionable_findings.length === 0,
-      );
-      const providers = new Set(
-        clean.map((item) => providerGroup(item.reviewer)),
-      );
-      if (clean.length >= passQuorum && providers.size >= minimumProviderGroups)
-        summary.passed += 1;
-      else if (rejectedByAdjudication && gateFindings === 0)
-        summary.passed += 1;
-      else summary.incomplete += 1;
+      adjudications.set(sourceReviewerId, reviewer.adjudicationOutcome);
     }
   }
-  return summary;
+  const findings: CanonicalRawFinding[] = [];
+  for (const reviewer of reviewers) {
+    if (
+      reviewer.status !== "completed" ||
+      reviewer.result === undefined ||
+      !("actionable_findings" in reviewer.result)
+    ) {
+      continue;
+    }
+    const outcome = adjudications.get(reviewer.reviewer.id);
+    const decisions = new Map(
+      outcome?.decisions.map((decision) => [
+        decision.source_finding_id,
+        decision,
+      ]) ?? [],
+    );
+    for (const finding of reviewer.result.actionable_findings) {
+      const confidence =
+        "confidence" in finding ? finding.confidence : "medium";
+      const classification =
+        "classification" in finding
+          ? finding.classification
+          : "needs_verification";
+      const decision = decisions.get(finding.id);
+      const adjudication =
+        decision === undefined
+          ? "unadjudicated"
+          : decision.effective_decision === "rejected"
+            ? "rejected"
+            : decision.effective_decision === "needs_verification"
+              ? "needs_verification"
+              : decision.effective_decision;
+      const effectiveClassification =
+        adjudication === "needs_verification"
+          ? "needs_verification"
+          : classification;
+      const policy = reviewer.reviewer.policy;
+      const thresholdEligible =
+        finding.severity !== "low" &&
+        effectiveClassification !== "advisory" &&
+        (policy === undefined ||
+          meetsGateThresholds(
+            { severity: finding.severity, confidence },
+            {
+              minimumSeverity: policy.gateMinimumSeverity,
+              minimumConfidence: policy.gateMinimumConfidence,
+            },
+          ));
+      findings.push({
+        source_ref: `${reviewer.reviewer.id}#${finding.id}`,
+        reviewer_id: reviewer.reviewer.id,
+        lens_id: lensId(reviewer.reviewer),
+        finding_id: finding.id,
+        severity: finding.severity,
+        title: finding.title,
+        description: finding.description,
+        evidence: finding.evidence.map((evidence) => ({
+          ...(evidence.path === undefined ? {} : { path: evidence.path }),
+          ...(evidence.start_line === undefined
+            ? {}
+            : { start_line: evidence.start_line }),
+          ...(evidence.end_line === undefined
+            ? {}
+            : { end_line: evidence.end_line }),
+          detail: evidence.detail,
+        })),
+        suggested_direction: finding.suggested_direction,
+        confidence,
+        classification: effectiveClassification,
+        external_assumptions:
+          "external_assumptions" in finding
+            ? [...finding.external_assumptions]
+            : [],
+        source_findings: [
+          { reviewer_id: reviewer.reviewer.id, finding_id: finding.id },
+        ],
+        duplicate_finding_ids:
+          "duplicate_finding_ids" in finding
+            ? [...(finding.duplicate_finding_ids ?? [])]
+            : [],
+        ...(!!("root_issue_id" in finding) &&
+        typeof finding.root_issue_id === "string"
+          ? { root_issue_id: finding.root_issue_id }
+          : {}),
+        ...(!!("duplicate_of" in finding) &&
+        typeof finding.duplicate_of === "string"
+          ? { duplicate_of: finding.duplicate_of }
+          : {}),
+        gate_eligible:
+          thresholdEligible &&
+          adjudication !== "rejected" &&
+          adjudication !== "needs_verification",
+        adjudication,
+        ...(!!("category" in finding) && typeof finding.category === "string"
+          ? { category: finding.category }
+          : {}),
+        ...(!!("verification" in finding) &&
+        typeof finding.verification === "string"
+          ? { verification: finding.verification }
+          : {}),
+        ...(!!("change_impact" in finding) &&
+        typeof finding.change_impact === "string"
+          ? { change_impact: finding.change_impact }
+          : {}),
+      });
+    }
+  }
+  return findings;
+}
+
+export function summarizeLogicalLenses(state: SuiteState): LogicalLensSummary {
+  return aggregateRun(state).logicalLenses;
 }
 
 export function analyzeLogicalLenses(state: SuiteState): LogicalLensAnalysis {
@@ -527,6 +578,8 @@ export function analyzeLogicalLenses(state: SuiteState): LogicalLensAnalysis {
 
 export function aggregateRun(state: SuiteState): RunAggregate {
   const reviewers = state.reviewers;
+  const rawFindings = rawFindingsForStates(reviewers);
+  const canonical = canonicalizeFindings(rawFindings);
   const groups = new Map<string, ReviewerState[]>();
   for (const reviewer of reviewers) {
     const id = lensId(reviewer.reviewer);
@@ -546,27 +599,12 @@ export function aggregateRun(state: SuiteState): RunAggregate {
   };
   const incompleteLenses: string[] = [];
   const notEvaluatedLenses: string[] = [];
-  const uniqueFindingKeys = new Set<string>();
-  let advisoryFindings = 0;
   for (const [id, group] of groups) {
     const completed = group.filter((item) => item.status === "completed");
-    const adjudicatedSources = new Set(
-      completed.flatMap((item) =>
-        item.reviewer.policy?.mode === "adjudication" &&
-        item.reviewer.policy.adjudicatesReviewerId !== undefined
-          ? [item.reviewer.policy.adjudicatesReviewerId]
-          : [],
-      ),
+    const lensCanonical = canonicalizeFindings(
+      rawFindings.filter((finding) => finding.lens_id === id),
     );
-    const effectiveCompleted = completed.filter(
-      (item) =>
-        !adjudicatedSources.has(item.reviewer.id) ||
-        item.reviewer.policy?.mode === "adjudication",
-    );
-    const gateFindings = effectiveCompleted.reduce(
-      (total, item) => total + gateFindingCount(item),
-      0,
-    );
+    const gateFindings = lensCanonical.counts.gate;
     const requiredSourceFindings = completed.filter(
       (item) =>
         item.reviewer.policy?.adjudication === "required" &&
@@ -576,53 +614,14 @@ export function aggregateRun(state: SuiteState): RunAggregate {
     const adjudicatedSourceIds = new Set(
       completed.flatMap((item) =>
         item.reviewer.policy?.mode === "adjudication" &&
-        item.reviewer.policy.adjudicatesReviewerId !== undefined
+        item.reviewer.policy.adjudicatesReviewerId !== undefined &&
+        item.adjudicationOutcome !== undefined
           ? [item.reviewer.policy.adjudicatesReviewerId]
           : [],
       ),
     );
     const unadjudicatedRequired = requiredSourceFindings.some(
       (item) => !adjudicatedSourceIds.has(item.reviewer.id),
-    );
-    for (const item of effectiveCompleted) {
-      const policy = item.reviewer.policy;
-      for (const finding of item.result?.actionable_findings ?? []) {
-        const confidence =
-          "confidence" in finding &&
-          (finding.confidence === "high" ||
-            finding.confidence === "medium" ||
-            finding.confidence === "low")
-            ? finding.confidence
-            : "medium";
-        if (
-          finding.severity === "low" ||
-          ("classification" in finding &&
-            finding.classification === "advisory") ||
-          (policy !== undefined &&
-            !meetsGateThresholds(
-              { severity: finding.severity, confidence },
-              {
-                minimumSeverity: policy.gateMinimumSeverity,
-                minimumConfidence: policy.gateMinimumConfidence,
-              },
-            ))
-        )
-          continue;
-        const rootIssueId =
-          "root_issue_id" in finding ? finding.root_issue_id : undefined;
-        uniqueFindingKeys.add(
-          typeof rootIssueId === "string" && rootIssueId.length > 0
-            ? rootIssueId
-            : `${finding.title.toLocaleLowerCase()}\u0000${finding.description.toLocaleLowerCase()}`,
-        );
-      }
-    }
-    advisoryFindings += effectiveCompleted.reduce(
-      (total, item) =>
-        total +
-        (item.result?.actionable_findings.length ?? 0) -
-        gateFindingCount(item),
-      0,
     );
     if (gateFindings > 0) {
       logical.findings += 1;
@@ -649,12 +648,12 @@ export function aggregateRun(state: SuiteState): RunAggregate {
     const clean = completed.filter(
       (item) =>
         item.reviewer.policy?.mode !== "adjudication" &&
-        item.result?.actionable_findings.length === 0,
+        gateFindingCount(item) === 0,
     );
-    const rejectedByAdjudication = completed.some(
+    const resolvedByAdjudication = completed.some(
       (item) =>
         item.reviewer.policy?.mode === "adjudication" &&
-        item.result?.actionable_findings.length === 0,
+        item.adjudicationOutcome?.complete === true,
     );
     const providerGroups = new Set(
       clean.map((item) => providerGroup(item.reviewer)),
@@ -666,7 +665,7 @@ export function aggregateRun(state: SuiteState): RunAggregate {
       logical.passed += 1;
       continue;
     }
-    if (rejectedByAdjudication && gateFindings === 0) {
+    if (resolvedByAdjudication && gateFindings === 0) {
       logical.passed += 1;
       continue;
     }
@@ -707,9 +706,15 @@ export function aggregateRun(state: SuiteState): RunAggregate {
     modelRuns: summarizeSuite(state),
     incompleteLenses,
     notEvaluatedLenses,
-    reviewers: reviewers.map(terminalRecord),
-    uniqueFindings: uniqueFindingKeys.size,
-    advisoryFindings,
+    reviewers: reviewers
+      .filter((reviewer) =>
+        ["completed", "incomplete", "skipped"].includes(reviewer.status),
+      )
+      .map(terminalRecord),
+    uniqueFindings: canonical.counts.unique,
+    rawFindings: canonical.counts.raw,
+    gateFindings: canonical.counts.gate,
+    advisoryFindings: canonical.counts.advisory,
   };
 }
 

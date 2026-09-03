@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { ReviewerResultV3 } from "../protocol/schemas.js";
+import type { ReviewerOutput } from "../protocol/schemas.js";
 
 function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== "object") {
@@ -15,6 +15,6 @@ function canonicalJson(value: unknown): string {
     .join(",")}}`;
 }
 
-export function reviewerResultDigest(result: ReviewerResultV3): string {
+export function reviewerResultDigest(result: ReviewerOutput): string {
   return createHash("sha256").update(canonicalJson(result), "utf8").digest("hex");
 }

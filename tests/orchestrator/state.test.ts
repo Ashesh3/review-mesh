@@ -154,6 +154,28 @@ describe("suite state", () => {
     ).toEqual(["first", "second", "third"]);
   });
 
+  it("uses the canonical unique population independently of gate thresholds", () => {
+    const first = completedFail("first");
+    if (first.result.schema_version !== "3") throw new Error("v3 fixture required");
+    first.result.actionable_findings[0]!.title = "Shared root";
+    first.result.actionable_findings[0]!.description = "First description.";
+    first.result.actionable_findings[0]!.root_issue_id = "shared-root";
+    const second = completedFail("second");
+    if (second.result.schema_version !== "3") throw new Error("v3 fixture required");
+    second.result.actionable_findings[0]!.title = "Different wording";
+    second.result.actionable_findings[0]!.description = "Second description.";
+    second.result.actionable_findings[0]!.root_issue_id = "shared-root";
+    second.result.actionable_findings[0]!.severity = "low";
+    second.result.actionable_findings[0]!.classification = "advisory";
+
+    const aggregate = aggregateRun(suiteState([first, second]));
+
+    expect(aggregate.rawFindings).toBe(2);
+    expect(aggregate.uniqueFindings).toBe(1);
+    expect(aggregate.gateFindings).toBe(1);
+    expect(aggregate.advisoryFindings).toBe(0);
+  });
+
   it("isolates caller-owned inputs and returned snapshots from stored state", () => {
     const reviewer = resolvedReviewer({ id: "a", purpose: "original" });
     const capabilities = {

@@ -491,6 +491,12 @@ describe("readRunReport", () => {
         ],
       }),
     ]);
+    expect(report.finding_counts).toEqual({
+      raw: 2,
+      unique: 1,
+      gate: 1,
+      advisory: 0,
+    });
   });
 
   it("accepts a partial final line only for an active record", async () => {
@@ -1021,5 +1027,80 @@ describe("finding consolidation and rendering", () => {
     expect(await readFile(report.report_path, "utf8")).toContain(
       persistedReviewerResultRecordType,
     );
+  });
+
+  it("reports the exact canonical count recorded by live completion", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-canonical-count";
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [
+        line({
+          record: "resolution",
+          run_id: runId,
+          resolution: {
+            reviewers: [
+              { id: "contract::one", agent_id: "contract" },
+              { id: "contract::two", agent_id: "contract" },
+            ],
+          },
+        }),
+        line({
+          record: persistedReviewerResultRecordType,
+          run_id: runId,
+          reviewer_id: "contract::one",
+          result: resultV2([
+            findingV2({ id: "one", root_issue_id: "shared-root" }),
+          ]),
+        }),
+        line({
+          record: persistedReviewerResultRecordType,
+          run_id: runId,
+          reviewer_id: "contract::two",
+          result: resultV2([
+            findingV2({
+              id: "two",
+              root_issue_id: "shared-root",
+              title: "Different wording",
+            }),
+          ]),
+        }),
+        line({
+          schema_version: "5",
+          event: "run.completed",
+          run_id: runId,
+          seq: 1,
+          timestamp: "2026-09-04T00:00:00.000Z",
+          data: {
+            gate_outcome: "findings",
+            coverage_outcome: "complete",
+            exit_code: 1,
+            consistency_mode: "live_worktree",
+            total_elapsed_ms: 1,
+            raw_findings: 2,
+            unique_findings: 1,
+            gate_findings: 1,
+            advisory_findings: 0,
+            status: "findings",
+            suite: {
+              total: 2,
+              deferred: 0,
+              queued: 0,
+              running: 0,
+              completed: 2,
+              incomplete: 0,
+              skipped: 0,
+            },
+          },
+        }),
+      ].join(""),
+    );
+
+    const report = await readRunReport({ runsDirectory, runId });
+    const findings = await readRunFindings({ runsDirectory, runId });
+
+    expect(report.finding_counts.unique).toBe(1);
+    expect(findings.deduplicated).toHaveLength(1);
+    expect(report.finding_counts.unique).toBe(findings.deduplicated.length);
   });
 });

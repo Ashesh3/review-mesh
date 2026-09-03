@@ -6,6 +6,7 @@ import {
 import { AdapterRegistry } from "../../src/adapters/registry.js";
 import { buildAllowlistedEnvironment } from "../../src/adapters/types.js";
 import { buildReviewerPrompt } from "../../src/protocol/prompt.js";
+import { adjudicationResultJsonSchemaFor } from "../../src/protocol/json-schema.js";
 import { resolvedContext, resolvedReviewer } from "../helpers/fixtures.js";
 import { AsyncQueue } from "../helpers/async-queue.js";
 import { FakeAdapter } from "../helpers/fake-adapter.js";
@@ -83,10 +84,26 @@ describe("buildReviewerPrompt", () => {
           mode: "adjudication",
           adjudicatesReviewerId: "reliability::primary",
           candidateFindings: {
-            schema_version: "2",
+            schema_version: "3",
             verdict: "fail",
+            review_markdown: "# Review\n\nCandidate reliability defect.",
             summary: "Candidate reliability defect.",
-            actionable_findings: [],
+            actionable_findings: [
+              {
+                id: "candidate-reliability",
+                severity: "high",
+                title: "Candidate reliability defect",
+                description: "The candidate says ordering is unsafe.",
+                evidence: [{ detail: "Candidate evidence." }],
+                suggested_direction: "Restore safe ordering.",
+                confidence: "high",
+                classification: "confirmed_defect",
+                external_assumptions: [],
+                category: "reliability",
+                verification: "Candidate verification.",
+                change_impact: "Candidate change impact.",
+              },
+            ],
             informational_notes: [],
           },
         },
@@ -101,6 +118,21 @@ describe("buildReviewerPrompt", () => {
     expect(prompt.system).toContain(
       "do not classify the candidate as a confirmed_defect",
     );
+    expect(prompt.system).toContain(
+      "Return one decision keyed by source_finding_id for every supplied candidate",
+    );
+    expect(prompt.user).toContain("review-mesh.adjudication-result");
+    expect(prompt.user).toContain('"candidate-reliability"');
+  });
+
+  it("binds the adjudication schema to the supplied candidate ids", () => {
+    const schema = adjudicationResultJsonSchemaFor(["first", "second"]);
+    const encoded = JSON.stringify(schema);
+
+    expect(encoded).toContain('"first"');
+    expect(encoded).toContain('"second"');
+    expect(encoded).toContain('"minItems":2');
+    expect(encoded).toContain('"maxItems":2');
   });
 
   it("delimits every untrusted prompt layer without admitting it to the system prompt", () => {

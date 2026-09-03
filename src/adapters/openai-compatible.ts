@@ -11,7 +11,10 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import type { AdapterRegistration } from "../config/schemas.js";
-import { reviewerResultV3Schema } from "../protocol/schemas.js";
+import {
+  currentReviewerOutputSchema,
+  type CurrentReviewerOutput,
+} from "../protocol/schemas.js";
 import {
   adapterFailure,
   type AdapterFailure,
@@ -1293,7 +1296,7 @@ function relaxedStructuredOutputSchema(
 }
 
 type ReviewerResultParse =
-  | { success: true; data: z.infer<typeof reviewerResultV3Schema> }
+  | { success: true; data: CurrentReviewerOutput }
   | {
       success: false;
       diagnostic: string;
@@ -1332,7 +1335,7 @@ function parseReviewerResult(
       ],
     };
   }
-  const parsed = reviewerResultV3Schema.safeParse(value);
+  const parsed = currentReviewerOutputSchema.safeParse(value);
   if (parsed.success) return parsed;
   const validationIssues = zodValidationIssues(parsed.error);
   const issues = validationIssues.map(

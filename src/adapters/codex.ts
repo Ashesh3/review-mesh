@@ -9,7 +9,7 @@ import {
 } from "@openai/codex-sdk";
 import type { AdapterRegistration } from "../config/schemas.js";
 import { getAppPaths } from "../config/paths.js";
-import { reviewerResultV2Schema } from "../protocol/schemas.js";
+import { currentReviewerOutputSchema } from "../protocol/schemas.js";
 import { adapterFailure } from "./errors.js";
 import {
   buildAllowlistedEnvironment,
@@ -407,7 +407,7 @@ class CodexAdapter implements ReviewAdapter {
             };
             return;
           }
-          const parsedResult = reviewerResultV2Schema.safeParse(parsedJson);
+          const parsedResult = currentReviewerOutputSchema.safeParse(parsedJson);
           if (!parsedResult.success) {
             yield {
               type: "failure",

@@ -6,7 +6,7 @@ import type { ResolvedContext } from "../context/resolve.js";
 import type {
   IsolationLevel,
   IsolationPolicy,
-  ReviewerResult,
+  ReviewerOutput,
 } from "../protocol/schemas.js";
 import type { ReviewerPromptBundle } from "../protocol/prompt.js";
 import type { AdapterFailure } from "./errors.js";
@@ -38,7 +38,7 @@ export interface AdapterReviewInput {
 export type AdapterEvent =
   | { type: "progress"; phase: string; message?: string }
   | { type: "activity"; message: string }
-  | { type: "result"; result: ReviewerResult; isolation: IsolationLevel }
+  | { type: "result"; result: ReviewerOutput; isolation: IsolationLevel }
   | { type: "failure"; failure: AdapterFailure; isolation?: IsolationLevel };
 
 export interface ReviewAdapter {

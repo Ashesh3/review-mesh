@@ -17,9 +17,13 @@ import type {
   EventWriter,
   RunBoundRecordDraft,
 } from "../protocol/event-writer.js";
-import { reviewerResultJsonSchema } from "../protocol/json-schema.js";
+import {
+  adjudicationResultJsonSchemaFor,
+  reviewerResultJsonSchema,
+} from "../protocol/json-schema.js";
 import { buildReviewerPrompt } from "../protocol/prompt.js";
 import {
+  adjudicationResultSchema,
   incompleteReasonSchema,
   reviewerPhaseSchema,
   reviewerResultSchema,
@@ -35,8 +39,9 @@ import {
 import { reviewerResultDigest } from "../results/digest.js";
 import {
   ResultSanitizationError,
-  sanitizeReviewerResult,
+  sanitizeCurrentReviewerOutput,
 } from "../results/sanitize.js";
+import { validateAdjudication } from "../findings/adjudication.js";
 import {
   aggregateRun,
   createSuiteState,
@@ -681,7 +686,11 @@ export async function runReviewRound({
     result: unknown,
     isolation: IsolationLevel,
   ): Promise<ModelExecution> => {
-    const parsed = reviewerResultSchema.safeParse(result);
+    const mode = reviewerMode(reviewer);
+    const parsed =
+      mode === "adjudication"
+        ? adjudicationResultSchema.safeParse(result)
+        : reviewerResultSchema.safeParse(result);
     if (!parsed.success) {
       const failure = adapterFailure.invalidResult(
         "The adapter returned an invalid reviewer result.",
@@ -696,7 +705,10 @@ export async function runReviewRound({
       await finalizeIncomplete(reviewer, failure, isolation);
       return { outcome: "incomplete", failure };
     }
-    if (parsed.data.schema_version !== "3") {
+    if (
+      mode !== "adjudication" &&
+      parsed.data.schema_version !== "3"
+    ) {
       const failure = adapterFailure.invalidResult(
         "The adapter returned a legacy reviewer result for a v3 review request.",
         false,
@@ -712,7 +724,7 @@ export async function runReviewRound({
     }
     let accepted;
     try {
-      accepted = sanitizeReviewerResult(parsed.data);
+      accepted = sanitizeCurrentReviewerOutput(parsed.data);
     } catch (error) {
       const failure =
         error instanceof ResultSanitizationError
@@ -782,7 +794,22 @@ export async function runReviewRound({
       await finalizeIncomplete(reviewer, failure, isolation);
       return { outcome: "incomplete", failure };
     }
-    state.complete(reviewer.id, accepted, isolation);
+    const sourceReviewerId = reviewer.policy?.adjudicatesReviewerId;
+    const sourceResult =
+      sourceReviewerId === undefined
+        ? undefined
+        : state.reviewer(sourceReviewerId).result;
+    const adjudicationOutcome =
+      mode === "adjudication" &&
+      sourceResult !== undefined &&
+      sourceResult.schema_version === "3" &&
+      "actionable_findings" in sourceResult &&
+      "decisions" in accepted
+        ? validateAdjudication(sourceResult, accepted, {
+            reviewScope: context.review_scope.mode,
+          })
+        : undefined;
+    state.complete(reviewer.id, accepted, isolation, adjudicationOutcome);
     const terminal = reviewerTerminalRecord(state, reviewer.id);
     resultManifest.push({
       reviewer_id: reviewer.id,
@@ -804,7 +831,7 @@ export async function runReviewRound({
         provider_group: providerGroup(reviewer),
         isolation,
         elapsed_ms: terminal.elapsed_ms,
-        verdict: accepted.verdict,
+        ...("verdict" in accepted ? { verdict: accepted.verdict } : {}),
         summary:
           sanitizePublicText(accepted.summary, 1_000) ??
           "Reviewer completed without a public summary.",
@@ -827,6 +854,16 @@ export async function runReviewRound({
           result: accepted,
         },
       });
+    }
+    if (mode === "adjudication") {
+      return {
+        outcome:
+          (adjudicationOutcome?.decisions.some(
+            (decision) => decision.gate_eligible,
+          ) ?? false)
+            ? "findings"
+            : "pass",
+      };
     }
     return { outcome: gateFindings > 0 ? "findings" : "pass" };
   };
@@ -965,13 +1002,31 @@ export async function runReviewRound({
         if (lastFailure !== undefined) continue;
         state.transition(reviewer.id, "reviewing");
         runtime.phase = "reviewing";
+        const candidateFindingIds = Array.isArray(
+          reviewer.policy?.candidateFindings,
+        )
+          ? reviewer.policy.candidateFindings.flatMap((value) => {
+              if (
+                typeof value !== "object" ||
+                value === null ||
+                Array.isArray(value)
+              )
+                return [];
+              const id = (value as Record<string, unknown>).id;
+              return typeof id === "string" && id.length > 0 ? [id] : [];
+            })
+          : [];
+        const outputSchema =
+          reviewerMode(reviewer) === "adjudication"
+            ? adjudicationResultJsonSchemaFor(candidateFindingIds)
+            : reviewerResultJsonSchema;
         const prompt = buildReviewerPrompt({
           reviewer,
           context,
           ...(config.project_context === undefined
             ? {}
             : { projectContext: config.project_context }),
-          resultJsonSchema: reviewerResultJsonSchema,
+          resultJsonSchema: outputSchema,
         });
         let iterator: AsyncIterator<AdapterEvent> | undefined;
         try {
@@ -980,7 +1035,7 @@ export async function runReviewRound({
             reviewer,
             context,
             prompt,
-            resultJsonSchema: reviewerResultJsonSchema,
+            resultJsonSchema: outputSchema,
             isolationPolicy: reviewer.isolationPolicy,
             signal: controller.signal,
           });
@@ -1610,8 +1665,13 @@ export async function runReviewRound({
                   pendingAdjudication = {
                     sourceReviewerId: reviewer.id,
                     sourceResult: structuredClone(
-                      state.reviewer(reviewer.id).result?.actionable_findings ??
-                        [],
+                      (() => {
+                        const result = state.reviewer(reviewer.id).result;
+                        return result !== undefined &&
+                          "actionable_findings" in result
+                          ? result.actionable_findings
+                          : [];
+                      })(),
                     ) as JsonValue,
                     sourceProviderGroup: providerGroup(reviewer),
                   };
@@ -1639,7 +1699,10 @@ export async function runReviewRound({
                       mode: "adjudication",
                       adjudicatesReviewerId: reviewer.id,
                       candidateFindings: structuredClone(
-                        sourceResult?.actionable_findings ?? [],
+                        sourceResult !== undefined &&
+                          "actionable_findings" in sourceResult
+                          ? sourceResult.actionable_findings
+                          : [],
                       ) as JsonValue,
                     };
                     state.setAdjudication(adjudicator.id, reviewer.id);
@@ -1730,6 +1793,8 @@ export async function runReviewRound({
         logical_lenses: aggregate.logicalLenses,
         model_runs: aggregate.modelRuns,
         unique_findings: aggregate.uniqueFindings,
+        raw_findings: aggregate.rawFindings,
+        gate_findings: aggregate.gateFindings,
         advisory_findings: aggregate.advisoryFindings,
         incomplete_lenses: aggregate.incompleteLenses,
         not_evaluated_lenses: aggregate.notEvaluatedLenses,

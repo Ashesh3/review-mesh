@@ -10,11 +10,17 @@ import {
   isolationLevelSchema,
   isolationPolicySchema,
   publicEventSchema,
+  adjudicationResultSchema,
   reviewerModeSchema,
   reviewerResultSchema,
   reviewerSkipReasonSchema,
   reviewRequestSchema,
 } from "../protocol/schemas.js";
+import {
+  canonicalizeFindings,
+  type CanonicalRawFinding,
+} from "../findings/canonical.js";
+import { validateAdjudication } from "../findings/adjudication.js";
 import { reviewerResultDigest } from "../results/digest.js";
 
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
@@ -86,6 +92,7 @@ const legacyReviewerResultSchema = z
   });
 
 const persistedReviewerResultSchema = z.union([
+  adjudicationResultSchema,
   reviewerResultSchema,
   legacyReviewerResultSchema,
 ]);
@@ -501,7 +508,11 @@ const privateRecordSchema = z.union([
       ...legacyResultRecordFields,
     })
     .superRefine((value, ctx) => {
-      if (value.result.schema_version !== "3") return;
+      if (
+        value.result.schema_version !== "3" &&
+        !("kind" in value.result)
+      )
+        return;
       if (value.digest === undefined) {
         ctx.addIssue({
           code: "custom",
@@ -531,7 +542,11 @@ const privateRecordSchema = z.union([
       }),
     })
     .superRefine((value, ctx) => {
-      if (value.data.result.schema_version !== "3") return;
+      if (
+        value.data.result.schema_version !== "3" &&
+        !("kind" in value.data.result)
+      )
+        return;
       if (value.data.digest === undefined) {
         ctx.addIssue({
           code: "custom",
@@ -646,6 +661,13 @@ export interface RawRunFinding {
   duplicate_finding_ids: string[];
   deduplication_key?: string;
   duplicate_of?: string;
+  gate_eligible?: boolean;
+  adjudication?:
+    | "unadjudicated"
+    | "confirmed"
+    | "adjusted"
+    | "rejected"
+    | "needs_verification";
 }
 
 export interface ConsolidatedRunFinding {
@@ -660,6 +682,9 @@ export interface ConsolidatedRunFinding {
   external_assumptions: string[];
   source_findings: FindingSource[];
   duplicate_finding_ids: string[];
+  descriptions?: string[];
+  suggested_directions?: string[];
+  gate_eligible?: boolean;
 }
 
 export interface RunReport {
@@ -699,6 +724,12 @@ export interface RunReport {
   incomplete_lenses: string[];
   raw_findings: RawRunFinding[];
   findings: ConsolidatedRunFinding[];
+  finding_counts: {
+    raw: number;
+    unique: number;
+    gate: number;
+    advisory: number;
+  };
   attempts: Array<{
     reviewer_id: string;
     lens_id?: string;
@@ -1343,7 +1374,7 @@ function parsePrivateRecord(
     const result = persistedReviewerResultSchema.parse(
       value.result ?? asRecord(value.data)?.result,
     );
-    if (result.schema_version === "3") {
+    if (result.schema_version === "3" || "kind" in result) {
       const container = asRecord(value.data) ?? value;
       const digest = nonEmptyString(container.digest);
       const byteCount = nonNegativeInteger(container.byte_count);
@@ -1574,24 +1605,47 @@ function uniqueSources(values: readonly FindingSource[]): FindingSource[] {
 
 function parseRawFindings(parsed: ParsedReportRecord): ParsedFinding[] {
   const findings: ParsedFinding[] = [];
-  const rejectedSources = new Set(
-    [...parsed.reviewers.values()].flatMap((metadata) => {
-      if (
-        metadata.mode !== "adjudication" ||
-        metadata.adjudicatesReviewerId === undefined
-      )
-        return [];
-      const terminal = parsed.terminals.get(metadata.reviewerId);
-      const result = terminal?.result;
-      const actionable = Array.isArray(result?.actionable_findings)
-        ? result.actionable_findings
-        : [];
-      return actionable.length === 0 ? [metadata.adjudicatesReviewerId] : [];
-    }),
-  );
+  const adjudicationDecisions = new Map<
+    string,
+    Map<string, "confirmed" | "adjusted" | "rejected" | "needs_verification">
+  >();
+  for (const metadata of parsed.reviewers.values()) {
+    if (
+      metadata.mode !== "adjudication" ||
+      metadata.adjudicatesReviewerId === undefined
+    ) {
+      continue;
+    }
+    const result = parsed.terminals.get(metadata.reviewerId)?.result;
+    const sourceResult = parsed.terminals.get(
+      metadata.adjudicatesReviewerId,
+    )?.result;
+    if (
+      result === undefined ||
+      !("decisions" in result) ||
+      sourceResult === undefined ||
+      sourceResult.schema_version !== "3" ||
+      !("actionable_findings" in sourceResult)
+    )
+      continue;
+    const reviewScope =
+      asRecord(parsed.request?.review_scope)?.mode === "changes"
+        ? "changes"
+        : "full";
+    const outcome = validateAdjudication(sourceResult, result, { reviewScope });
+    adjudicationDecisions.set(
+      metadata.adjudicatesReviewerId,
+      new Map(
+        outcome.decisions.map((decision) => [
+          decision.source_finding_id,
+          decision.effective_decision,
+        ]),
+      ),
+    );
+  }
   for (const terminal of parsed.terminals.values()) {
-    if (rejectedSources.has(terminal.reviewerId)) continue;
     if (terminal.result === undefined) continue;
+    if (!("actionable_findings" in terminal.result)) continue;
     const candidates = terminal.result.actionable_findings;
     const metadata = parsed.reviewers.get(terminal.reviewerId) ?? {
       reviewerId: terminal.reviewerId,
@@ -1607,6 +1661,9 @@ function parseRawFindings(parsed: ParsedReportRecord): ParsedFinding[] {
       const deduplicationKey = richer?.root_issue_id;
       const duplicateOf = richer?.duplicate_of;
       const duplicateFindingIds = richer?.duplicate_finding_ids ?? [];
+      const adjudication =
+        adjudicationDecisions.get(terminal.reviewerId)?.get(findingId) ??
+        "unadjudicated";
       findings.push({
         source_ref: sourceReference(terminal.reviewerId, findingId),
         reviewer_id: terminal.reviewerId,
@@ -1618,7 +1675,10 @@ function parseRawFindings(parsed: ParsedReportRecord): ParsedFinding[] {
         evidence: uniqueEvidence(runFindingEvidence(finding.evidence)),
         suggested_direction: finding.suggested_direction,
         confidence: richer?.confidence ?? "medium",
-        classification: richer?.classification ?? "needs_verification",
+        classification:
+          adjudication === "needs_verification"
+            ? "needs_verification"
+            : (richer?.classification ?? "needs_verification"),
         external_assumptions: uniqueSorted(richer?.external_assumptions ?? []),
         source_findings: [currentSource],
         duplicate_finding_ids: uniqueSorted(duplicateFindingIds),
@@ -1626,6 +1686,13 @@ function parseRawFindings(parsed: ParsedReportRecord): ParsedFinding[] {
           ? {}
           : { deduplication_key: deduplicationKey }),
         ...(duplicateOf === undefined ? {} : { duplicate_of: duplicateOf }),
+        gate_eligible:
+          finding.severity !== "low" &&
+          (richer?.classification ?? "needs_verification") ===
+            "confirmed_defect" &&
+          adjudication !== "rejected" &&
+          adjudication !== "needs_verification",
+        adjudication,
         legacyDeduplicationKey: `${normalizedText(finding.title)}\u0000${normalizedText(finding.description)}`,
       });
     }
@@ -1715,109 +1782,8 @@ function consolidatedClassification(
 export function consolidateFindings(
   values: readonly RawRunFinding[],
 ): ConsolidatedRunFinding[] {
-  const findings = values.map<ParsedFinding>((finding) => ({
-    ...structuredClone(finding),
-    legacyDeduplicationKey: `${normalizedText(finding.title)}\u0000${normalizedText(finding.description)}`,
-  }));
-  const sets = new DisjointSet(findings.length);
-  const explicitGroups = new Map<string, number>();
-  const legacyGroups = new Map<string, number>();
-  const sourceRefs = new Map<string, number>();
-  const findingIds = new Map<string, number[]>();
-
-  for (const [index, finding] of findings.entries()) {
-    sourceRefs.set(finding.source_ref, index);
-    findingIds.set(finding.finding_id, [
-      ...(findingIds.get(finding.finding_id) ?? []),
-      index,
-    ]);
-    if (finding.deduplication_key !== undefined) {
-      const key = normalizedText(finding.deduplication_key);
-      const previous = explicitGroups.get(key);
-      if (previous === undefined) explicitGroups.set(key, index);
-      else sets.union(previous, index);
-      continue;
-    }
-    const previous = legacyGroups.get(finding.legacyDeduplicationKey);
-    if (previous === undefined) {
-      legacyGroups.set(finding.legacyDeduplicationKey, index);
-    } else {
-      sets.union(previous, index);
-    }
-  }
-
-  for (const [index, finding] of findings.entries()) {
-    const references = [
-      ...(finding.duplicate_of === undefined ? [] : [finding.duplicate_of]),
-      ...finding.duplicate_finding_ids,
-    ];
-    for (const reference of references) {
-      const sourceIndex = sourceRefs.get(reference);
-      if (sourceIndex !== undefined) {
-        sets.union(index, sourceIndex);
-        continue;
-      }
-      const matchingIds = findingIds.get(reference);
-      if (matchingIds?.length === 1) sets.union(index, matchingIds[0]!);
-    }
-  }
-
-  const groups = new Map<number, RawRunFinding[]>();
-  for (const [index, finding] of findings.entries()) {
-    const root = sets.find(index);
-    groups.set(root, [...(groups.get(root) ?? []), finding]);
-  }
-
-  const consolidated = [...groups.values()].map((group) => {
-    const ordered = [...group].sort(compareCanonicalCandidates);
-    const canonical = ordered[0]!;
-    const sources = uniqueSources(
-      ordered.flatMap((finding) => finding.source_findings),
-    );
-    const sourceIds = uniqueSorted(
-      ordered.flatMap((finding) => [
-        finding.finding_id,
-        ...finding.duplicate_finding_ids,
-      ]),
-    );
-    return {
-      id: canonical.finding_id,
-      severity: ordered.reduce<FindingSeverity>(
-        (highest, finding) =>
-          severityRank[finding.severity] > severityRank[highest]
-            ? finding.severity
-            : highest,
-        "low",
-      ),
-      title: canonical.title,
-      description: canonical.description,
-      evidence: uniqueEvidence(ordered.flatMap((finding) => finding.evidence)),
-      suggested_direction: canonical.suggested_direction,
-      confidence: consolidatedConfidence(ordered),
-      classification: consolidatedClassification(ordered),
-      external_assumptions: uniqueSorted(
-        ordered.flatMap((finding) => finding.external_assumptions),
-      ),
-      source_findings: sources,
-      duplicate_finding_ids: sourceIds.filter(
-        (id) => id !== canonical.finding_id,
-      ),
-    } satisfies ConsolidatedRunFinding;
-  });
-
-  consolidated.sort(
-    (left, right) =>
-      severityRank[right.severity] - severityRank[left.severity] ||
-      left.id.localeCompare(right.id) ||
-      left.title.localeCompare(right.title),
-  );
-  const usedIds = new Map<string, number>();
-  for (const finding of consolidated) {
-    const occurrence = (usedIds.get(finding.id) ?? 0) + 1;
-    usedIds.set(finding.id, occurrence);
-    if (occurrence > 1) finding.id = `${finding.id}~${occurrence}`;
-  }
-  return consolidated;
+  return canonicalizeFindings(values as readonly CanonicalRawFinding[])
+    .consolidated;
 }
 
 type LensState =
@@ -1939,6 +1905,9 @@ export async function readRunReport({
     ({ legacyDeduplicationKey: _legacyKey, ...finding }) => finding,
   );
   const findings = consolidateFindings(rawFindings);
+  const canonical = canonicalizeFindings(
+    rawFindings as readonly CanonicalRawFinding[],
+  );
   const lensStates = logicalLensStates(parsed, rawFindings);
   const derivedIncompleteLenses = [...lensStates]
     .filter(([, state]) => state === "incomplete")
@@ -2024,6 +1993,7 @@ export async function readRunReport({
     incomplete_lenses: [...incompleteLenses],
     raw_findings: rawFindings,
     findings,
+    finding_counts: canonical.counts,
     attempts: [...parsed.attempts],
     ...(parsed.recordWarnings.length === 0
       ? {}

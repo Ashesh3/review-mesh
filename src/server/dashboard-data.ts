@@ -10,11 +10,14 @@ import {
 } from "../config/manage.js";
 import type { AppPaths } from "../config/paths.js";
 import { reviewMeshVersion } from "../discovery/help.js";
-import {
-  consolidateFindings,
-  type ConsolidatedRunFinding,
-  type RawRunFinding,
+import type {
+  ConsolidatedRunFinding,
+  RawRunFinding,
 } from "../diagnostics/run-report.js";
+import {
+  canonicalizeFindings,
+  type CanonicalRawFinding,
+} from "../findings/canonical.js";
 
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 const ACTIVE_RUN_FILE =
@@ -863,7 +866,9 @@ function runSummaryFromParsed(parsed: ParsedRunFile): DashboardRunSummary {
   const stale = activeFile && !active;
   const findings =
     integer(completion.unique_findings) ??
-    consolidateFindings(rawFindings(reviewers)).length;
+    canonicalizeFindings(
+      rawFindings(reviewers) as readonly CanonicalRawFinding[],
+    ).counts.unique;
   const hasIncomplete = reviewers.some(
     (reviewer) => reviewer.state === "incomplete",
   );
@@ -1217,21 +1222,39 @@ function normalizeFinding(value: RawRunFinding | ConsolidatedRunFinding) {
 
 function rawFindings(reviewers: readonly ReviewerRuntime[]): RawRunFinding[] {
   const values: RawRunFinding[] = [];
-  const rejectedSources = new Set(
-    reviewers.flatMap((reviewer) => {
-      if (
-        reviewer.mode !== "adjudication" ||
-        reviewer.adjudicates_reviewer_id === undefined
-      ) {
-        return [];
-      }
-      return findingCount(reviewer.result?.actionable_findings) === 0
-        ? [reviewer.adjudicates_reviewer_id]
-        : [];
-    }),
-  );
+  const adjudicationDecisions = new Map<
+    string,
+    Map<string, "confirmed" | "adjusted" | "rejected" | "needs_verification">
+  >();
   for (const reviewer of reviewers) {
-    if (rejectedSources.has(reviewer.reviewer_id)) continue;
+    if (
+      reviewer.mode !== "adjudication" ||
+      reviewer.adjudicates_reviewer_id === undefined ||
+      !Array.isArray(reviewer.result?.decisions)
+    ) {
+      continue;
+    }
+    const decisions = new Map<
+      string,
+      "confirmed" | "adjusted" | "rejected" | "needs_verification"
+    >();
+    for (const value of reviewer.result.decisions) {
+      const decision = asRecord(value);
+      const id = text(decision?.source_finding_id);
+      const requested = text(decision?.decision);
+      if (
+        id === undefined ||
+        (requested !== "confirmed" &&
+          requested !== "adjusted" &&
+          requested !== "rejected")
+      ) {
+        continue;
+      }
+      decisions.set(id, requested);
+    }
+    adjudicationDecisions.set(reviewer.adjudicates_reviewer_id, decisions);
+  }
+  for (const reviewer of reviewers) {
     const result = reviewer.result;
     const findings = Array.isArray(result?.actionable_findings)
       ? result.actionable_findings
@@ -1305,6 +1328,15 @@ function rawFindings(reviewers: readonly ReviewerRuntime[]): RawRunFinding[] {
         ...(text(finding.duplicate_of) === undefined
           ? {}
           : { duplicate_of: text(finding.duplicate_of)! }),
+        gate_eligible:
+          severity !== "low" &&
+          classification === "confirmed_defect" &&
+          adjudicationDecisions
+            .get(reviewer.reviewer_id)
+            ?.get(findingId) !== "rejected",
+        adjudication:
+          adjudicationDecisions.get(reviewer.reviewer_id)?.get(findingId) ??
+          "unadjudicated",
       });
     }
   }
@@ -1328,9 +1360,15 @@ export async function readDashboardRun(input: {
     data: bounded(event.data),
   }));
   const raw = rawFindings(reviewers);
+  const canonical = canonicalizeFindings(
+    raw as readonly CanonicalRawFinding[],
+  );
   const findings = {
-    raw: raw.map(normalizeFinding),
-    consolidated: consolidateFindings(raw).map(normalizeFinding),
+    raw: canonical.raw.map(normalizeFinding),
+    consolidated: canonical.consolidated.map(normalizeFinding),
+    gate_effective: canonical.gate_effective.map(normalizeFinding),
+    advisory: canonical.advisory.map(normalizeFinding),
+    counts: canonical.counts,
   };
   const startedAt = timestamp(parsed.started?.timestamp);
   const completedAt = timestamp(parsed.completed?.timestamp);

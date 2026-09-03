@@ -568,7 +568,26 @@ describe("v6 review feedback semantics", () => {
 
   it("lets a focused diverse adjudicator reject a source finding", async () => {
     const source = fakeAdapterReturning(failResult("candidate"));
-    const adjudicator = fakeAdapterReturning(passResult("Candidate rejected."));
+    const adjudicator = fakeAdapterReturning({
+      schema_version: "1",
+      kind: "review-mesh.adjudication-result",
+      verdict: "pass",
+      review_markdown: "# Adjudication\n\nCandidate rejected.",
+      summary: "Candidate rejected.",
+      actionable_findings: [],
+      decisions: [
+        {
+          source_finding_id: "candidate",
+          decision: "rejected",
+          rationale: "The cited code does not exhibit the reported defect.",
+          cited_evidence: [
+            { detail: "The candidate evidence contradicts the conclusion." },
+          ],
+          unverified_assumptions: [],
+        },
+      ],
+      informational_notes: [],
+    });
     const completion = await runReviewRound(
       roundInput({
         adapters: { source, adjudicator },

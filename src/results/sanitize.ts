@@ -1,5 +1,7 @@
 import {
+  currentReviewerOutputSchema,
   reviewerResultV3Schema,
+  type CurrentReviewerOutput,
   type ReviewerResultV3,
 } from "../protocol/schemas.js";
 
@@ -167,6 +169,17 @@ function sanitizeValue(value: unknown): unknown {
 
 export function sanitizeReviewerResult(value: unknown): ReviewerResultV3 {
   const sanitized = reviewerResultV3Schema.parse(sanitizeValue(value));
+  const byteLength = Buffer.byteLength(JSON.stringify(sanitized), "utf8");
+  if (byteLength > MAX_REVIEWER_RESULT_BYTES) {
+    throw new ResultSanitizationError(byteLength);
+  }
+  return sanitized;
+}
+
+export function sanitizeCurrentReviewerOutput(
+  value: unknown,
+): CurrentReviewerOutput {
+  const sanitized = currentReviewerOutputSchema.parse(sanitizeValue(value));
   const byteLength = Buffer.byteLength(JSON.stringify(sanitized), "utf8");
   if (byteLength > MAX_REVIEWER_RESULT_BYTES) {
     throw new ResultSanitizationError(byteLength);

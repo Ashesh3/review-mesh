@@ -1,6 +1,7 @@
 import type { ResolvedReviewer } from "../config/schemas.js";
 import type { ResolvedContext } from "../context/resolve.js";
 import type { JsonValue } from "./schemas.js";
+import { adjudicationResultJsonSchemaFor } from "./json-schema.js";
 
 export interface ReviewerPromptBundle {
   system: string;
@@ -40,6 +41,20 @@ export function buildReviewerPrompt({
   projectContext,
   resultJsonSchema = {},
 }: BuildReviewerPromptInput): ReviewerPromptBundle {
+  const candidateFindingIds =
+    reviewer.policy?.mode === "adjudication" &&
+    Array.isArray(reviewer.policy.candidateFindings)
+      ? reviewer.policy.candidateFindings.flatMap((value) => {
+          if (typeof value !== "object" || value === null || Array.isArray(value))
+            return [];
+          const id = (value as Record<string, unknown>).id;
+          return typeof id === "string" && id.length > 0 ? [id] : [];
+        })
+      : [];
+  const effectiveResultJsonSchema =
+    reviewer.policy?.mode === "adjudication"
+      ? adjudicationResultJsonSchemaFor(candidateFindingIds)
+      : resultJsonSchema;
   const trustedInstructions = reviewer.instruction_layers
     .filter((layer) => layer.source === "trusted")
     .map((layer) => layer.content)
@@ -65,6 +80,7 @@ export function buildReviewerPrompt({
     ...(reviewer.policy?.mode === "adjudication"
       ? [
           "This is a focused adjudication, not a fresh broad review. Evaluate only the supplied candidate findings and their cited evidence. Confirm, reject, or adjust each candidate; do not introduce unrelated findings.",
+          "Return one decision keyed by source_finding_id for every supplied candidate. Preserve the complete adjudication review in review_markdown and list every unverified assumption.",
           "For every medium-or-higher candidate about reliability, lifecycle, concurrency, cleanup, or control flow, reconstruct and cite the relevant execution ordering before confirming it. When the supplied change context contains a base-to-head diff, compare the prior and changed behavior and confirm that the reviewed change introduced or exposed the defect. If ordering or base-version evidence is unavailable, record that limitation as an external assumption and do not classify the candidate as a confirmed_defect.",
         ]
       : []),
@@ -90,7 +106,7 @@ export function buildReviewerPrompt({
             reviewer.policy.candidateFindings,
           ),
         ]),
-    delimited("REVIEWER RESULT JSON SCHEMA", resultJsonSchema),
+    delimited("REVIEWER RESULT JSON SCHEMA", effectiveResultJsonSchema),
   ];
   const user = userSections.join("\n\n");
   return { system, user, combined: `${system}\n\n${user}` };

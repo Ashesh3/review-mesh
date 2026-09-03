@@ -1,6 +1,7 @@
 import type {
   ReviewRequest,
   ReviewerResult,
+  ReviewerOutput,
   ReviewerResultV3,
 } from "../../src/protocol/schemas.js";
 import type {
@@ -181,7 +182,7 @@ export function failResult(id = "f-1"): ReviewerResultV3 {
 }
 
 export function fakeAdapterReturning(
-  result: ReviewerResult,
+  result: ReviewerOutput,
   delayMs = 0,
 ): FakeAdapter {
   return new FakeAdapter({
