@@ -3,13 +3,14 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   rename,
   rm,
   symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   MAX_RESULT_SPOOL_BYTES,
@@ -88,21 +89,61 @@ describe("result spool", () => {
 
   it("preserves a foreign replacement when identity changes during creation", async () => {
     const directory = await root();
-    const original = join(directory, "creation-original.spool");
-    const path = join(directory, "creation-race.spool");
+    let original = "";
+    let path = "";
 
     await expect(
       createResultSpool({
         directory,
         id: "creation-race",
         async afterCreateOpen(openedPath: string) {
+          path = openedPath;
+          original = `${openedPath}.original`;
           await rename(openedPath, original);
           await writeFile(openedPath, "foreign replacement");
         },
       }),
     ).rejects.toMatchObject({ code: "identity_changed" });
-    expect(await readFile(path, "utf8")).toBe("foreign replacement");
-    expect(await readFile(original, "utf8")).toBe("");
+    const quarantined = readdir(dirname(dirname(path)), { withFileTypes: true })
+      .then((entries) =>
+        entries.find(
+          (entry) =>
+            entry.isDirectory() &&
+            entry.name.startsWith(`${basename(dirname(path))}.failed-`),
+        ),
+      );
+    const quarantine = await quarantined;
+    expect(quarantine).toBeDefined();
+    const quarantineDirectory = join(dirname(dirname(path)), quarantine!.name);
+    expect(await readFile(join(quarantineDirectory, basename(path)), "utf8")).toBe(
+      "foreign replacement",
+    );
+    expect(
+      await readFile(join(quarantineDirectory, basename(original)), "utf8"),
+    ).toBe("");
+  });
+
+  it("does not unlink a replacement introduced at the cleanup remove boundary", async () => {
+    const directory = await root();
+    let replacementPath = "";
+    const spool = await createResultSpool({
+      directory,
+      id: "cleanup-race",
+      async beforeCleanupRemove(path: string) {
+        replacementPath = path;
+        await rename(path, `${path}.owned`);
+        await writeFile(path, "foreign replacement");
+      },
+    });
+    await spool.append("owned content");
+
+    await expect(spool.cleanup()).rejects.toMatchObject({
+      code: "identity_changed",
+    });
+    expect(replacementPath).not.toBe("");
+    expect(await readFile(replacementPath, "utf8")).toBe(
+      "foreign replacement",
+    );
   });
 
   it("refuses a symlinked spool directory", async () => {

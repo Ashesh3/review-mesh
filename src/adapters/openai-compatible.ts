@@ -2653,6 +2653,11 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
                 continue;
               }
             } else if (!parsedResult.success) {
+              if (continuationSpool !== undefined) {
+                await continuationSpool.cleanup();
+                continuationSpool = undefined;
+                continuationFragments = [];
+              }
               const repairMessage = {
                 role: "user",
                 content: `Your previous final result was invalid. ${parsedResult.diagnostic} Return exactly one JSON object that satisfies the supplied reviewer_result schema. Include every required top-level field, use no markdown or commentary, and do not call tools.`,

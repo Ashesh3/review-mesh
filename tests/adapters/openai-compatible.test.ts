@@ -988,6 +988,45 @@ describe("OpenAI-compatible adapter", () => {
     expect(JSON.stringify(bodies[3])).not.toContain("not valid json");
   });
 
+  it("resets invalid continuation bytes before a truncated schema repair", async () => {
+    const bodies: any[] = [];
+    const encoded = JSON.stringify(passResult("Fresh repair assembly."));
+    const repairPrefix = encoded.slice(0, 89);
+    const repairSuffix = encoded.slice(89);
+    const responses = [
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      assistantResponse({ role: "assistant", content: "not " }, "length"),
+      assistantResponse({ role: "assistant", content: "valid json" }, "stop"),
+      assistantResponse(
+        { role: "assistant", content: repairPrefix },
+        "length",
+      ),
+      assistantResponse(
+        { role: "assistant", content: repairSuffix },
+        "stop",
+      ),
+    ];
+    const prepared = setup("C:\\workspace", {
+      finalizationAttempts: 3,
+      fetch: fetchMock(async (_input, init) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return responses.shift()!;
+      }),
+    });
+
+    expect(terminal(await collect(prepared.adapter, prepared.input))).toEqual({
+      type: "result",
+      result: passResult("Fresh repair assembly."),
+      isolation: "runtime_read_only",
+    });
+    expect(bodies).toHaveLength(5);
+    expect(bodies[4].messages.at(-2)).toEqual({
+      role: "assistant",
+      content: repairPrefix,
+    });
+    expect(JSON.stringify(bodies[4])).not.toContain("not valid json");
+  });
+
   it("retries an empty streamed envelope through the identical SSE request", async () => {
     const bodies: any[] = [];
     const responses = [

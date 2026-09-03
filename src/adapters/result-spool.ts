@@ -1,9 +1,11 @@
+import { randomUUID } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
 import {
   lstat,
   mkdir,
   open,
   realpath,
+  rename,
   rm,
   type FileHandle,
 } from "node:fs/promises";
@@ -42,6 +44,8 @@ export interface CreateResultSpoolOptions {
   reviewedWorkspace?: string;
   /** Test seam for deterministic pathname-replacement races after open. */
   afterCreateOpen?(path: string): void | Promise<void>;
+  /** Test seam for deterministic replacement after cleanup quarantine. */
+  beforeCleanupRemove?(path: string): void | Promise<void>;
 }
 
 function sameIdentity(left: BigIntStats, right: BigIntStats): boolean {
@@ -62,10 +66,13 @@ class FileResultSpool implements ResultSpool {
 
   constructor(
     readonly path: string,
-    private readonly directory: string,
-    private readonly directoryIdentity: BigIntStats,
+    private readonly ownedDirectory: string,
+    private readonly ownedDirectoryIdentity: BigIntStats,
     private readonly handle: FileHandle,
     private readonly fileIdentity: BigIntStats,
+    private readonly beforeCleanupRemove:
+      | ((path: string) => void | Promise<void>)
+      | undefined,
   ) {}
 
   get byteLength(): number {
@@ -81,7 +88,7 @@ class FileResultSpool implements ResultSpool {
     let opened: BigIntStats;
     try {
       [directory, file, opened] = await Promise.all([
-        lstat(this.directory, { bigint: true }),
+        lstat(this.ownedDirectory, { bigint: true }),
         lstat(this.path, { bigint: true }),
         this.handle.stat({ bigint: true }),
       ]);
@@ -97,7 +104,7 @@ class FileResultSpool implements ResultSpool {
       file.isSymbolicLink() ||
       !file.isFile() ||
       !opened.isFile() ||
-      !sameIdentity(this.directoryIdentity, directory) ||
+      !sameIdentity(this.ownedDirectoryIdentity, directory) ||
       !sameIdentity(this.fileIdentity, file) ||
       !sameIdentity(this.fileIdentity, opened)
     ) {
@@ -193,7 +200,37 @@ class FileResultSpool implements ResultSpool {
     }
     this.closed = true;
     await this.handle.close();
-    await rm(this.path, { force: false });
+    const quarantineDirectory = `${this.ownedDirectory}.cleanup-${randomUUID()}`;
+    await rename(this.ownedDirectory, quarantineDirectory);
+    const quarantinePath = resolve(
+      quarantineDirectory,
+      this.path.slice(this.ownedDirectory.length + 1),
+    );
+    const verifyQuarantine = async () => {
+      const [directory, file] = await Promise.all([
+        lstat(quarantineDirectory, { bigint: true }).catch(() => undefined),
+        lstat(quarantinePath, { bigint: true }).catch(() => undefined),
+      ]);
+      if (
+        directory === undefined ||
+        file === undefined ||
+        directory.isSymbolicLink() ||
+        !directory.isDirectory() ||
+        file.isSymbolicLink() ||
+        !file.isFile() ||
+        !sameIdentity(this.ownedDirectoryIdentity, directory) ||
+        !sameIdentity(this.fileIdentity, file)
+      ) {
+        throw new ResultSpoolError(
+          "identity_changed",
+          "The result spool changed identity during cleanup.",
+        );
+      }
+    };
+    await verifyQuarantine();
+    await this.beforeCleanupRemove?.(quarantinePath);
+    await verifyQuarantine();
+    await rm(quarantineDirectory, { recursive: true, force: false });
   }
 }
 
@@ -231,7 +268,22 @@ export async function createResultSpool(
       );
     }
   }
-  const path = resolve(canonicalDirectory, `${options.id}.spool`);
+  const ownedDirectory = resolve(
+    canonicalDirectory,
+    `.spool-${options.id}-${randomUUID()}`,
+  );
+  await mkdir(ownedDirectory, { mode: 0o700 });
+  const ownedDirectoryIdentity = await lstat(ownedDirectory, { bigint: true });
+  if (
+    ownedDirectoryIdentity.isSymbolicLink() ||
+    !ownedDirectoryIdentity.isDirectory()
+  ) {
+    throw new ResultSpoolError(
+      "unsafe_directory",
+      "The owned result spool directory is unsafe.",
+    );
+  }
+  const path = resolve(ownedDirectory, `${options.id}.spool`);
   const flags =
     constants.O_CREAT |
     constants.O_EXCL |
@@ -257,22 +309,38 @@ export async function createResultSpool(
     }
     return new FileResultSpool(
       path,
-      canonicalDirectory,
-      canonicalMetadata,
+      ownedDirectory,
+      ownedDirectoryIdentity,
       handle,
       fileIdentity,
+      options.beforeCleanupRemove,
     );
   } catch (error) {
     await handle.close().catch(() => undefined);
     if (createdIdentity !== undefined) {
-      const current = await lstat(path, { bigint: true }).catch(() => undefined);
-      if (
-        current !== undefined &&
-        !current.isSymbolicLink() &&
-        current.isFile() &&
-        sameIdentity(createdIdentity, current)
-      ) {
-        await rm(path, { force: false }).catch(() => undefined);
+      const quarantineDirectory = `${ownedDirectory}.failed-${randomUUID()}`;
+      try {
+        await rename(ownedDirectory, quarantineDirectory);
+        const quarantinePath = resolve(
+          quarantineDirectory,
+          path.slice(ownedDirectory.length + 1),
+        );
+        const [directory, file] = await Promise.all([
+          lstat(quarantineDirectory, { bigint: true }),
+          lstat(quarantinePath, { bigint: true }),
+        ]);
+        if (
+          !directory.isSymbolicLink() &&
+          directory.isDirectory() &&
+          !file.isSymbolicLink() &&
+          file.isFile() &&
+          sameIdentity(ownedDirectoryIdentity, directory) &&
+          sameIdentity(createdIdentity, file)
+        ) {
+          await rm(quarantineDirectory, { recursive: true, force: false });
+        }
+      } catch {
+        // Ambiguous ownership is preserved for stale-run cleanup.
       }
     }
     throw error;
