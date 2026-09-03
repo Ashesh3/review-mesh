@@ -1,6 +1,7 @@
 import { constants } from "node:fs";
 import { open, readdir, realpath } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import type { ReviewerResultV3 } from "../protocol/schemas.js";
 
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 const ACTIVE_SUFFIX = /^\.jsonl\.active(?:\..+)?$/u;
@@ -62,6 +63,7 @@ interface ReviewerSnapshot {
     gate_findings?: number;
     informational_notes: number;
   };
+  complete_result?: ReviewerResultV3;
   failure?: Record<string, unknown>;
   skipped?: Record<string, unknown>;
   attempts?: ReviewerAttempt[];
@@ -432,6 +434,26 @@ export async function readRunStatus({
           : reviewer.state;
       reviewer.last_activity_message =
         text(data.message) ?? reviewer.last_activity_message;
+    } else if (eventName === "reviewer.result") {
+      const result = asRecord(data.result);
+      if (result !== undefined) {
+        reviewer.state = "completed";
+        reviewer.result = {
+          verdict: result.verdict === "fail" ? "fail" : "pass",
+          summary: text(result.summary) ?? "Completed reviewer result.",
+          actionable_findings: Array.isArray(result.actionable_findings)
+            ? result.actionable_findings.length
+            : 0,
+          informational_notes: Array.isArray(result.informational_notes)
+            ? result.informational_notes.length
+            : 0,
+        };
+        if (result.schema_version === "3") {
+          reviewer.complete_result = structuredClone(
+            result as unknown as ReviewerResultV3,
+          );
+        }
+      }
     } else if (eventName === "reviewer.completed") {
       reviewer.state = "completed";
       const legacyResult = asRecord(data.result);

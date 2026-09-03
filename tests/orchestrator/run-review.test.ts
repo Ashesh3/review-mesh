@@ -7,7 +7,11 @@ import type {
   ReviewAdapter,
 } from "../../src/adapters/types.js";
 import { runReviewRound } from "../../src/orchestrator/run-review.js";
-import type { PublicEvent } from "../../src/protocol/schemas.js";
+import type {
+  PublicEvent,
+  ReviewerResultV3,
+} from "../../src/protocol/schemas.js";
+import { reviewerResultDigest } from "../../src/results/digest.js";
 import { FakeAdapter } from "../helpers/fake-adapter.js";
 import {
   failResult,
@@ -1181,6 +1185,101 @@ describe("runReviewRound", () => {
       reason: "protocol_violation",
     });
     expect(events.at(-1)?.event).toBe("run.completed");
+  });
+
+  it("emits the exact sanitized v3 result and digest in full-jsonl mode", async () => {
+    const original: ReviewerResultV3 = {
+      schema_version: "3",
+      verdict: "pass",
+      review_markdown: `# Review\n\n${"Complete evidence. ".repeat(700)}Authorization: Bearer secret-value`,
+      summary: "No actionable findings.",
+      actionable_findings: [],
+      informational_notes: [],
+    };
+    const events: PublicEvent[] = [];
+    const completion = runReviewRound(
+      roundInput({
+        adapters: { full: fakeAdapterReturning(original) },
+        outputMode: "full-jsonl",
+        reportPath: "C:\\runs\\run-1.jsonl",
+        onEvent: (event) => events.push(event),
+      }),
+    );
+
+    await vi.runAllTimersAsync();
+    await completion;
+
+    const resultEvent = events.find(
+      (event) => event.event === "reviewer.result",
+    );
+    expect(resultEvent?.data).toMatchObject({
+      digest: reviewerResultDigest({
+        ...original,
+        review_markdown: original.review_markdown.replace(
+          "Authorization: Bearer secret-value",
+          "[redacted]",
+        ),
+      }),
+      result: {
+        review_markdown: original.review_markdown.replace(
+          "Authorization: Bearer secret-value",
+          "[redacted]",
+        ),
+      },
+    });
+    const completed = events.at(-1);
+    expect(completed).toMatchObject({
+      event: "run.completed",
+      data: {
+        results_complete: true,
+        result_manifest: [
+          expect.objectContaining({
+            reviewer_id: "full",
+            artifact_path: "C:\\runs\\run-1.jsonl",
+          }),
+        ],
+      },
+    });
+  });
+
+  it("omits reviewer.result payloads in compact-jsonl mode but retains the manifest", async () => {
+    const events: PublicEvent[] = [];
+    const completion = runReviewRound(
+      roundInput({
+        adapters: {
+          compact: fakeAdapterReturning({
+            schema_version: "3",
+            verdict: "pass",
+            review_markdown: "# Complete review",
+            summary: "No actionable findings.",
+            actionable_findings: [],
+            informational_notes: [],
+          }),
+        },
+        outputMode: "compact-jsonl",
+        reportPath: "C:\\runs\\run-1.jsonl",
+        onEvent: (event) => events.push(event),
+      }),
+    );
+
+    await vi.runAllTimersAsync();
+    await completion;
+
+    expect(events.some((event) => event.event === "reviewer.result")).toBe(
+      false,
+    );
+    expect(events.at(-1)).toMatchObject({
+      event: "run.completed",
+      data: {
+        results_complete: true,
+        result_manifest: [
+          expect.objectContaining({
+            reviewer_id: "compact",
+            artifact_path: "C:\\runs\\run-1.jsonl",
+          }),
+        ],
+      },
+    });
   });
 
   it("redacts credential-shaped text from the public completion summary", async () => {

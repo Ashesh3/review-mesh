@@ -27,7 +27,7 @@ agent suite selected for a workspace, streams factual JSONL progress, waits for
 each agent's executed model chain, and exits only after run.completed.
 
 USAGE
-  review-mesh review [WORKSPACE] [--output-mode compact-jsonl] [--no-ansi]
+  review-mesh review [WORKSPACE] [--output-mode full-jsonl|compact-jsonl] [--no-ansi]
       [--heartbeat aggregate] [--details-file PATH]
   review-mesh status RUN_ID [REVIEWER_ID] [--json]
   review-mesh report RUN_ID [--format markdown|json] [--best-effort]
@@ -84,7 +84,7 @@ const pages: Record<Exclude<HelpTopic, "overview">, string> = {
   review: `REVIEW-MESH REVIEW
 
 USAGE
-  review-mesh review [WORKSPACE] [--output-mode compact-jsonl] [--no-ansi]
+  review-mesh review [WORKSPACE] [--output-mode full-jsonl|compact-jsonl] [--no-ansi]
       [--heartbeat aggregate] [--details-file PATH]
   <request.json review-mesh review
 

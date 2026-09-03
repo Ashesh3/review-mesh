@@ -781,7 +781,7 @@ export async function runCli(
       for (const argument of argv.slice(1)) {
         if (argument.startsWith("--") && !knownStandaloneFlags.has(argument)) {
           await writeUsageDiagnostic(
-            "Expected: review-mesh review [WORKSPACE] [--output-mode compact-jsonl] [--no-ansi] [--heartbeat aggregate] [--details-file PATH]",
+            "Expected: review-mesh review [WORKSPACE] [--output-mode full-jsonl|compact-jsonl] [--no-ansi] [--heartbeat aggregate] [--details-file PATH]",
             "review-mesh help review",
             errorOutput,
           );
@@ -837,11 +837,13 @@ export async function runCli(
     if (
       invalidReviewArguments ||
       positional.length > 1 ||
-      (outputMode !== undefined && outputMode !== "compact-jsonl") ||
+      (outputMode !== undefined &&
+        outputMode !== "full-jsonl" &&
+        outputMode !== "compact-jsonl") ||
       (heartbeatMode !== undefined && heartbeatMode !== "aggregate")
     ) {
       await writeUsageDiagnostic(
-        "Expected: review-mesh review [WORKSPACE] [--output-mode compact-jsonl] [--no-ansi] [--heartbeat aggregate] [--details-file PATH]",
+        "Expected: review-mesh review [WORKSPACE] [--output-mode full-jsonl|compact-jsonl] [--no-ansi] [--heartbeat aggregate] [--details-file PATH]",
         "review-mesh help review",
         errorOutput,
       );
@@ -931,6 +933,8 @@ export async function runCli(
           ...(detailsFile === undefined
             ? {}
             : { detailsFile: resolve(cwd, detailsFile) }),
+          outputMode:
+            outputMode === "compact-jsonl" ? "compact-jsonl" : "full-jsonl",
         });
       } catch (error) {
         await writeDiagnostic(

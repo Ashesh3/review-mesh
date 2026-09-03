@@ -15,7 +15,11 @@ import {
   type OrchestratorClock,
 } from "./orchestrator/run-review.js";
 import { createEventWriter } from "./protocol/event-writer.js";
-import { reviewRequestSchema } from "./protocol/schemas.js";
+import {
+  reviewOutputModeSchema,
+  reviewRequestSchema,
+  type ReviewOutputMode,
+} from "./protocol/schemas.js";
 
 export interface ReviewApplicationOptions {
   requestText: string;
@@ -29,6 +33,7 @@ export interface ReviewApplicationOptions {
   parentRunId?: string;
   onlyLensIds?: readonly string[];
   detailsFile?: string;
+  outputMode?: ReviewOutputMode;
 }
 
 export class ReviewRunError extends Error {
@@ -305,6 +310,9 @@ export async function runReviewApplication(
       ...(config.diagnostics.persist_runs || options.detailsFile !== undefined
         ? { reportPath: options.detailsFile ?? internalReportPath }
         : {}),
+      outputMode: reviewOutputModeSchema.parse(
+        options.outputMode ?? "full-jsonl",
+      ),
     });
     if (detailsHandle !== undefined) {
       const current = await detailsHandle.stat();

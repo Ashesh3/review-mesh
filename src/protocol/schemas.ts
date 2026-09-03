@@ -5,6 +5,7 @@ export type JsonValue =
 
 export const protocolVersionSchema = z.enum(["1", "2"]);
 export const publicEventVersionSchema = z.enum(["4", "5"]);
+export const reviewOutputModeSchema = z.enum(["full-jsonl", "compact-jsonl"]);
 export const runStatusSchema = z.enum(["passed", "findings", "incomplete"]);
 export const gateOutcomeSchema = z.enum(["no_findings", "findings"]);
 export const coverageOutcomeSchema = z.enum(["complete", "partial"]);
@@ -26,6 +27,7 @@ export const incompleteReasonSchema = z.enum([
   "process_crashed",
   "protocol_violation",
   "invalid_result",
+  "result_too_large",
   "cancelled",
   "unknown",
 ]);
@@ -40,6 +42,18 @@ export const findingClassificationSchema = z.enum([
   "confirmed_defect",
   "needs_verification",
   "advisory",
+]);
+export const findingCategorySchema = z.enum([
+  "correctness",
+  "security",
+  "reliability",
+  "concurrency",
+  "lifecycle",
+  "cleanup",
+  "compatibility",
+  "deployment",
+  "performance",
+  "other",
 ]);
 export const reviewerModeSchema = z.enum(["full_review", "adjudication"]);
 export const reviewerSkipReasonSchema = z.enum([
@@ -62,6 +76,7 @@ const findingText = z
   .string()
   .min(1)
   .max(8 * 1_024);
+const completeResultText = z.string().min(1);
 const nonNegativeInteger = z.number().int().nonnegative();
 const positiveInteger = z.number().int().positive();
 const boundedMessage = z.string().min(1).max(1_000);
@@ -179,9 +194,60 @@ export const actionableFindingV2Schema = z.strictObject({
   duplicate_of: nonEmptyString.optional(),
   duplicate_finding_ids: z.array(nonEmptyString).optional(),
 });
+const findingEvidenceV3Schema = z
+  .strictObject({
+    path: nonEmptyString.optional(),
+    start_line: positiveInteger.optional(),
+    end_line: positiveInteger.optional(),
+    detail: completeResultText,
+  })
+  .superRefine((value, ctx) => {
+    const hasStart = value.start_line !== undefined;
+    const hasEnd = value.end_line !== undefined;
+    if ((hasStart || hasEnd) && value.path === undefined) {
+      ctx.addIssue({ code: "custom", message: "line ranges require a path" });
+    }
+    if (hasStart !== hasEnd) {
+      ctx.addIssue({
+        code: "custom",
+        message: "line ranges require both start_line and end_line",
+      });
+    }
+    if (
+      value.start_line !== undefined &&
+      value.end_line !== undefined &&
+      value.end_line < value.start_line
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message: "end_line must be greater than or equal to start_line",
+      });
+    }
+  });
+export const actionableFindingV3Schema = z.strictObject({
+  id: nonEmptyString,
+  severity: findingSeveritySchema,
+  title: completeResultText,
+  description: completeResultText,
+  evidence: z.array(findingEvidenceV3Schema).min(1).max(256),
+  suggested_direction: completeResultText,
+  confidence: findingConfidenceSchema,
+  classification: findingClassificationSchema,
+  external_assumptions: z.array(completeResultText).max(128),
+  root_issue_id: nonEmptyString.optional(),
+  duplicate_of: nonEmptyString.optional(),
+  duplicate_finding_ids: z.array(nonEmptyString).optional(),
+  category: findingCategorySchema,
+  verification: completeResultText,
+  change_impact: completeResultText.optional(),
+});
 const informationalNoteSchema = z.strictObject({
   title: nonEmptyString,
   description: nonEmptyString,
+});
+const informationalNoteV3Schema = z.strictObject({
+  title: completeResultText,
+  description: completeResultText,
 });
 function validateVerdict(
   value: { verdict: "pass" | "fail"; actionable_findings: unknown[] },
@@ -218,7 +284,18 @@ export const reviewerResultV2Schema = z
     informational_notes: z.array(informationalNoteSchema).max(256),
   })
   .superRefine(validateVerdict);
+export const reviewerResultV3Schema = z
+  .strictObject({
+    schema_version: z.literal("3"),
+    verdict: z.enum(["pass", "fail"]),
+    review_markdown: completeResultText,
+    summary: completeResultText,
+    actionable_findings: z.array(actionableFindingV3Schema).max(256),
+    informational_notes: z.array(informationalNoteV3Schema).max(256),
+  })
+  .superRefine(validateVerdict);
 export const reviewerResultSchema = z.union([
+  reviewerResultV3Schema,
   reviewerResultV2Schema,
   reviewerResultV1Schema,
 ]);
@@ -532,6 +609,17 @@ const publicEventSchemas = [
     }),
   }),
   eventEnvelopeSchema.extend({
+    event: z.literal("reviewer.result"),
+    data: z.strictObject({
+      lens_id: nonEmptyString.optional(),
+      mode: reviewerModeSchema.optional(),
+      digest: z.string().regex(/^[a-f0-9]{64}$/u),
+      byte_count: nonNegativeInteger,
+      artifact_path: nonEmptyString.optional(),
+      result: reviewerResultV3Schema,
+    }),
+  }),
+  eventEnvelopeSchema.extend({
     event: z.literal("reviewer.incomplete"),
     data: z.strictObject({
       lens_id: nonEmptyString,
@@ -580,6 +668,18 @@ const publicEventSchemas = [
         incomplete_lenses: z.array(nonEmptyString).optional(),
         not_evaluated_lenses: z.array(nonEmptyString).optional(),
         report_path: nonEmptyString.optional(),
+        result_manifest: z
+          .array(
+            z.strictObject({
+              reviewer_id: nonEmptyString,
+              lens_id: nonEmptyString.optional(),
+              digest: z.string().regex(/^[a-f0-9]{64}$/u),
+              byte_count: nonNegativeInteger,
+              artifact_path: nonEmptyString.optional(),
+            }),
+          )
+          .optional(),
+        results_complete: z.boolean().optional(),
         status: runStatusSchema.optional(),
         suite: modelRunCountsSchema,
         reviewers: z.array(reviewerTerminalRecordSchema).optional(),
@@ -625,6 +725,7 @@ export type ReviewRequest = z.infer<typeof reviewRequestSchema>;
 export type ReviewerResult = z.infer<typeof reviewerResultSchema>;
 export type ReviewerResultV1 = z.infer<typeof reviewerResultV1Schema>;
 export type ReviewerResultV2 = z.infer<typeof reviewerResultV2Schema>;
+export type ReviewerResultV3 = z.infer<typeof reviewerResultV3Schema>;
 export type PublicEvent = z.infer<typeof publicEventSchema>;
 export type ReviewerPhase = z.infer<typeof reviewerPhaseSchema>;
 export type ReviewerTerminalRecord = z.infer<
@@ -640,4 +741,6 @@ export type IncompleteReason = z.infer<typeof incompleteReasonSchema>;
 export type FindingSeverity = z.infer<typeof findingSeveritySchema>;
 export type FindingConfidence = z.infer<typeof findingConfidenceSchema>;
 export type FindingClassification = z.infer<typeof findingClassificationSchema>;
+export type FindingCategory = z.infer<typeof findingCategorySchema>;
 export type ReviewerMode = z.infer<typeof reviewerModeSchema>;
+export type ReviewOutputMode = z.infer<typeof reviewOutputModeSchema>;

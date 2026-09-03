@@ -22,6 +22,7 @@ import {
   publicEventSchema,
   type PublicEvent,
 } from "../../src/protocol/schemas.js";
+import { reviewerResultDigest } from "../../src/results/digest.js";
 import { installAbortHandlers, runCli as runCliEntry } from "../../src/cli.js";
 
 const projectRoot = resolve(import.meta.dirname, "../..");
@@ -753,7 +754,7 @@ describe("review-mesh review", () => {
     });
     const adapterScript = `
       const chunks=[]; for await (const chunk of process.stdin) chunks.push(chunk);
-      process.stdout.write(JSON.stringify({type:"result",result:{schema_version:"2",verdict:"pass",summary:"Authorization: Bearer summary-secret",actionable_findings:[],informational_notes:[]}})+"\\n");
+      process.stdout.write(JSON.stringify({type:"result",result:{schema_version:"3",verdict:"pass",review_markdown:"# Review\\n\\nAuthorization: Bearer summary-secret",summary:"Authorization: Bearer summary-secret",actionable_findings:[],informational_notes:[]}})+"\\n");
     `;
     await writeFile(
       fixture.configFile,
@@ -787,6 +788,55 @@ describe("review-mesh review", () => {
     const details = await readFile(detailsFile, "utf8");
     expect(details).toContain("[redacted]");
     expect(details).not.toContain("summary-secret");
+  });
+
+  it("defaults review output to full-jsonl", async () => {
+    const fixture = await createFixture(["pass"]);
+    const stdout = new PassThrough();
+    let publicOutput = "";
+    stdout.setEncoding("utf8");
+    stdout.on("data", (chunk: string) => {
+      publicOutput += chunk;
+    });
+    const adapterScript = `
+      const chunks=[]; for await (const chunk of process.stdin) chunks.push(chunk);
+      process.stdout.write(JSON.stringify({type:"result",result:{schema_version:"3",verdict:"pass",review_markdown:"# Complete review",summary:"No actionable findings.",actionable_findings:[],informational_notes:[]}})+"\\n");
+    `;
+    await writeFile(
+      fixture.configFile,
+      trustedConfig(["pass"]).replace(
+        `args = ["--input-type=module", "-e", ${tomlString(fixtureScript("pass"))}]`,
+        `args = ["--input-type=module", "-e", ${tomlString(adapterScript)}]`,
+      ),
+    );
+
+    const exitCode = await runReviewApplication({
+      requestText: fixture.request,
+      configFile: fixture.configFile,
+      stdout,
+      stderr: new PassThrough(),
+      signal: new AbortController().signal,
+      runIdFactory: () => "default-full-output",
+      appPaths: {
+        configFile: join(fixture.root, "unused-config.toml"),
+        reviewersDirectory: join(fixture.root, "unused-reviewers"),
+        runsDirectory: join(fixture.root, "runs"),
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(parseEvents(publicOutput)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event: "reviewer.result",
+          data: expect.objectContaining({
+            result: expect.objectContaining({
+              review_markdown: "# Complete review",
+            }),
+          }),
+        }),
+      ]),
+    );
   });
 
   it("rejects an existing details target without changing it", async () => {

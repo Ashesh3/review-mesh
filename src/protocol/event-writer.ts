@@ -22,9 +22,11 @@ export type EventDraft = PublicEvent extends infer Event
 
 export interface EventWriter {
   emit(draft: EventDraft): Promise<PublicEvent>;
-  record?(record: unknown): Promise<void>;
+  record?(record: RunBoundRecordDraft): Promise<void>;
   close(): Promise<void>;
 }
+
+export type RunBoundRecordDraft = Record<string, unknown> & { run_id?: string };
 
 export interface CreateEventWriterOptions {
   output: EventSink;
@@ -275,7 +277,12 @@ export function createEventWriter({
 
     record(record) {
       if (onRecord === undefined) return Promise.resolve();
-      return onRecord(record);
+      if (record.run_id !== undefined && record.run_id !== runId) {
+        return Promise.reject(
+          new Error("Private record run_id does not match the current run."),
+        );
+      }
+      return onRecord({ ...record, run_id: runId });
     },
 
     close() {

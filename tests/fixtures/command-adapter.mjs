@@ -27,16 +27,18 @@ if (capturePath !== undefined) {
 }
 
 const passResult = {
-  schema_version: "2",
+  schema_version: "3",
   verdict: "pass",
+  review_markdown: "# Review\n\nClean.",
   summary: "clean",
   actionable_findings: [],
   informational_notes: [],
 };
 
 const failResult = {
-  schema_version: "2",
+  schema_version: "3",
   verdict: "fail",
+  review_markdown: "# Review\n\nOne actionable finding.",
   summary: "one actionable finding",
   actionable_findings: [
     {
@@ -49,6 +51,8 @@ const failResult = {
       confidence: "high",
       classification: "confirmed_defect",
       external_assumptions: [],
+      category: "correctness",
+      verification: "Controlled evidence demonstrates the defect.",
     },
   ],
   informational_notes: [],

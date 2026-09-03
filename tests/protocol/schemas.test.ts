@@ -4,6 +4,7 @@ import {
   reviewRequestSchema,
   type ReviewerResult,
   reviewerResultSchema,
+  reviewerResultV3Schema,
 } from "../../src/protocol/schemas.js";
 
 describe("reviewRequestSchema", () => {
@@ -100,6 +101,45 @@ describe("reviewRequestSchema", () => {
 });
 
 describe("reviewerResultSchema", () => {
+  it("accepts a v3 review_markdown value larger than the legacy 8 KiB text limit", () => {
+    const reviewMarkdown = `# Complete review\n\n${"Evidence-backed analysis. ".repeat(500)}`;
+
+    const result = reviewerResultV3Schema.parse({
+      schema_version: "3",
+      verdict: "pass",
+      review_markdown: reviewMarkdown,
+      summary: "No actionable findings.",
+      actionable_findings: [],
+      informational_notes: [],
+    });
+
+    expect(Buffer.byteLength(result.review_markdown, "utf8")).toBeGreaterThan(
+      8 * 1_024,
+    );
+    expect(result.review_markdown).toBe(reviewMarkdown);
+  });
+
+  it("keeps v1 and v2 reviewer results readable", () => {
+    expect(
+      reviewerResultSchema.parse({
+        schema_version: "1",
+        verdict: "pass",
+        summary: "Legacy v1 pass.",
+        actionable_findings: [],
+        informational_notes: [],
+      }).schema_version,
+    ).toBe("1");
+    expect(
+      reviewerResultSchema.parse({
+        schema_version: "2",
+        verdict: "pass",
+        summary: "Legacy v2 pass.",
+        actionable_findings: [],
+        informational_notes: [],
+      }).schema_version,
+    ).toBe("2");
+  });
+
   it("accepts a clean pass", () => {
     expect(
       reviewerResultSchema.parse({

@@ -88,7 +88,9 @@ const persistedReviewerResultSchema = z.union([
   reviewerResultSchema,
   legacyReviewerResultSchema,
 ]);
-type PersistedReviewerResult = z.infer<typeof persistedReviewerResultSchema>;
+export type PersistedReviewerResult = z.infer<
+  typeof persistedReviewerResultSchema
+>;
 
 const legacySuiteCountsSchema = z.strictObject({
   total: nonNegativeIntegerSchema,
@@ -459,6 +461,8 @@ const persistedRunSummaryDataSchema = z.looseObject({
   incomplete_lenses: z.array(persistedString).max(1_024).optional(),
   not_evaluated_lenses: z.array(persistedString).max(1_024).optional(),
   report_path: persistedString.optional(),
+  result_manifest: z.array(z.record(z.string(), z.unknown())).optional(),
+  results_complete: z.boolean().optional(),
   reviewers: z.array(persistedReviewerTerminalSchema).max(1_024).optional(),
 });
 
@@ -486,6 +490,11 @@ const privateRecordSchema = z.union([
     agent_id: persistedString.optional(),
     mode: reviewerModeSchema.optional(),
     adjudicates_reviewer_id: persistedString.optional(),
+    digest: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/u)
+      .optional(),
+    byte_count: nonNegativeIntegerSchema.optional(),
     result: persistedReviewerResultSchema,
   }),
   z.looseObject({
@@ -496,7 +505,19 @@ const privateRecordSchema = z.union([
     agent_id: persistedString.optional(),
     mode: reviewerModeSchema.optional(),
     adjudicates_reviewer_id: persistedString.optional(),
-    data: z.strictObject({ result: persistedReviewerResultSchema }),
+    digest: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/u)
+      .optional(),
+    byte_count: nonNegativeIntegerSchema.optional(),
+    data: z.strictObject({
+      result: persistedReviewerResultSchema,
+      digest: z
+        .string()
+        .regex(/^[a-f0-9]{64}$/u)
+        .optional(),
+      byte_count: nonNegativeIntegerSchema.optional(),
+    }),
   }),
   z.looseObject({
     record: z.literal(persistedReviewerTerminalRecordType),
@@ -640,6 +661,13 @@ export interface RunReport {
     incomplete: number;
     skipped: number;
   };
+  reviewers: Array<{
+    reviewer_id: string;
+    lens_id: string;
+    status: "completed" | "incomplete" | "skipped";
+    reason?: string;
+    result?: PersistedReviewerResult;
+  }>;
   incomplete_lenses: string[];
   raw_findings: RawRunFinding[];
   findings: ConsolidatedRunFinding[];
@@ -1913,6 +1941,18 @@ export async function readRunReport({
       incomplete: incompleteRuns,
       skipped: skippedRuns,
     },
+    reviewers: [...parsed.terminals.values()].map((terminal) => {
+      const metadata = parsed.reviewers.get(terminal.reviewerId);
+      return {
+        reviewer_id: terminal.reviewerId,
+        lens_id: metadata?.lensId ?? terminal.reviewerId,
+        status: terminal.status,
+        ...(terminal.reason === undefined ? {} : { reason: terminal.reason }),
+        ...(terminal.result === undefined
+          ? {}
+          : { result: structuredClone(terminal.result) }),
+      };
+    }),
     incomplete_lenses: [...incompleteLenses],
     raw_findings: rawFindings,
     findings,

@@ -1,6 +1,7 @@
 import type {
   ReviewRequest,
   ReviewerResult,
+  ReviewerResultV3,
 } from "../../src/protocol/schemas.js";
 import type {
   ResolvedConfig,
@@ -143,20 +144,22 @@ export function resolvedReviewer(
 
 export function passResult(
   summary = "No actionable findings.",
-): ReviewerResult {
+): ReviewerResultV3 {
   return {
-    schema_version: "2",
+    schema_version: "3",
     verdict: "pass",
+    review_markdown: `# Review\n\n${summary}`,
     summary,
     actionable_findings: [],
     informational_notes: [],
   };
 }
 
-export function failResult(id = "f-1"): ReviewerResult {
+export function failResult(id = "f-1"): ReviewerResultV3 {
   return {
-    schema_version: "2",
+    schema_version: "3",
     verdict: "fail",
+    review_markdown: "# Review\n\nOne actionable finding was found.",
     summary: "An actionable finding was found.",
     actionable_findings: [
       {
@@ -169,6 +172,8 @@ export function failResult(id = "f-1"): ReviewerResult {
         confidence: "high",
         classification: "confirmed_defect",
         external_assumptions: [],
+        category: "correctness",
+        verification: "Evidence directly demonstrates the broken invariant.",
       },
     ],
     informational_notes: [],

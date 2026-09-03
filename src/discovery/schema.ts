@@ -41,6 +41,7 @@ const runStatusReviewerSchema = z.strictObject({
       informational_notes: z.number().int().nonnegative(),
     })
     .optional(),
+  complete_result: reviewerResultSchema.optional(),
   failure: z
     .strictObject({
       reason: z.string().min(1),

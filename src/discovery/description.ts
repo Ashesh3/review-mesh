@@ -121,6 +121,8 @@ export async function describeTool(options: DescribeToolOptions = {}) {
       review: {
         stdin: "empty-or-review-request-json-v2" as const,
         stdout: "public-events-jsonl-v5" as const,
+        default_output_mode: "full-jsonl" as const,
+        output_modes: ["full-jsonl", "compact-jsonl"] as const,
         stderr: "diagnostic-jsonl-v1" as const,
         final_event: "run.completed" as const,
         status_query: "review-mesh status RUN_ID [REVIEWER_ID] --json" as const,

@@ -346,6 +346,18 @@ function line(value: unknown): string {
   return `${JSON.stringify(sanitize(value))}\n`;
 }
 
+function recordLine(value: unknown): string {
+  if (
+    typeof value === "object" &&
+    value !== null &&
+    "record" in value &&
+    value.record === "reviewer.result"
+  ) {
+    return `${JSON.stringify(value)}\n`;
+  }
+  return line(value);
+}
+
 async function lstatIfPresent(path: string) {
   try {
     return await lstat(path);
@@ -607,7 +619,7 @@ export function createRunRecorder({
       }
       return enqueue(async () => {
         const handle = await initialize();
-        await handle.appendFile(line(record));
+        await handle.appendFile(recordLine(record));
       });
     },
     close(): Promise<void> {

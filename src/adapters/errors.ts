@@ -117,6 +117,7 @@ const defaultFallbackEligibility: Record<IncompleteReason, boolean> = {
   process_crashed: true,
   protocol_violation: true,
   invalid_result: true,
+  result_too_large: true,
   cancelled: false,
   unknown: true,
 };

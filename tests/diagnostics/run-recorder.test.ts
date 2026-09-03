@@ -130,6 +130,48 @@ describe("RunRecorder", () => {
     await recorder.close();
   });
 
+  it("preserves the accepted full reviewer result without per-string truncation", async () => {
+    const root = await temporaryRoot();
+    const runsDirectory = join(root, "runs");
+    const recorder = createRunRecorder({
+      applicationDataRoot: root,
+      runsDirectory,
+      runId: "run-lossless-result",
+      maxRuns: 10,
+      resolution: {},
+    });
+    const reviewMarkdown = `# Complete review\n\n${"Evidence. ".repeat(2_000)}`;
+
+    await recorder.onRecord({
+      record: "reviewer.result",
+      run_id: "run-lossless-result",
+      reviewer_id: "reviewer-1",
+      digest: "a".repeat(64),
+      byte_count: Buffer.byteLength(reviewMarkdown, "utf8"),
+      result: {
+        schema_version: "3",
+        verdict: "pass",
+        review_markdown: reviewMarkdown,
+        summary: "No actionable findings.",
+        actionable_findings: [],
+        informational_notes: [],
+      },
+    });
+    await recorder.close();
+
+    const records = (
+      await readFile(join(runsDirectory, "run-lossless-result.jsonl"), "utf8")
+    )
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(records[1]).toMatchObject({
+      record: "reviewer.result",
+      result: { review_markdown: reviewMarkdown },
+    });
+    expect(JSON.stringify(records[1])).not.toContain("[truncated]");
+  });
+
   it("publishes a sanitized run record at the exact run path only after close", async () => {
     const root = await temporaryRoot();
     const runsDirectory = join(root, "application-data", "runs");

@@ -12,22 +12,31 @@ import type {
 import type { AdapterRegistry } from "../adapters/registry.js";
 import type { ResolvedConfig, ResolvedReviewer } from "../config/schemas.js";
 import type { ResolvedContext } from "../context/resolve.js";
-import type { EventDraft, EventWriter } from "../protocol/event-writer.js";
+import type {
+  EventDraft,
+  EventWriter,
+  RunBoundRecordDraft,
+} from "../protocol/event-writer.js";
 import { reviewerResultJsonSchema } from "../protocol/json-schema.js";
 import { buildReviewerPrompt } from "../protocol/prompt.js";
 import {
   incompleteReasonSchema,
   reviewerPhaseSchema,
   reviewerResultSchema,
-  reviewerResultV2Schema,
   type IsolationLevel,
   type JsonValue,
   type ReviewerMode,
+  type ReviewOutputMode,
   type ReviewerPhase,
   type ReviewerSkipReason,
   type ReviewerTerminalRecord,
   type RunStatus,
 } from "../protocol/schemas.js";
+import { reviewerResultDigest } from "../results/digest.js";
+import {
+  ResultSanitizationError,
+  sanitizeReviewerResult,
+} from "../results/sanitize.js";
 import {
   aggregateRun,
   createSuiteState,
@@ -65,6 +74,7 @@ export interface RunReviewRoundInput {
   parentRunId?: string;
   onlyLensIds?: readonly string[];
   reportPath?: string;
+  outputMode?: ReviewOutputMode;
   config: ResolvedConfig;
   context: ResolvedContext;
   registry: AdapterRegistry;
@@ -427,6 +437,7 @@ export async function runReviewRound({
   parentRunId,
   onlyLensIds,
   reportPath,
+  outputMode = "full-jsonl",
   config,
   context,
   registry,
@@ -441,6 +452,13 @@ export async function runReviewRound({
   const attemptHistory = new Map<string, AttemptRecord[]>();
   const circuits = new Map<string, ProviderCircuit>();
   const providerSemaphores = new Map<string, Semaphore>();
+  const resultManifest: Array<{
+    reviewer_id: string;
+    lens_id?: string;
+    digest: string;
+    byte_count: number;
+    artifact_path?: string;
+  }> = [];
   let interrupted = signal.aborted;
   let writerUsable = true;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
@@ -526,7 +544,7 @@ export async function runReviewRound({
     }
   };
 
-  const record = async (value: unknown): Promise<void> => {
+  const record = async (value: RunBoundRecordDraft): Promise<void> => {
     try {
       await writer.record?.(value);
     } catch {
@@ -573,7 +591,7 @@ export async function runReviewRound({
     if (["completed", "incomplete", "skipped"].includes(current.status)) return;
     state.incomplete(reviewer.id, failure, isolation);
     const terminal = reviewerTerminalRecord(state, reviewer.id);
-    await record({ record: "reviewer.terminal", run_id: runId, terminal });
+    await record({ record: "reviewer.terminal", terminal });
     await emit({
       event: "reviewer.incomplete",
       reviewer_id: reviewer.id,
@@ -605,7 +623,7 @@ export async function runReviewRound({
     result: unknown,
     isolation: IsolationLevel,
   ): Promise<ModelExecution> => {
-    const parsed = reviewerResultV2Schema.safeParse(result);
+    const parsed = reviewerResultSchema.safeParse(result);
     if (!parsed.success) {
       const failure = adapterFailure.invalidResult(
         "The adapter returned an invalid reviewer result.",
@@ -617,6 +635,53 @@ export async function runReviewRound({
           },
         },
       );
+      await finalizeIncomplete(reviewer, failure, isolation);
+      return { outcome: "incomplete", failure };
+    }
+    if (parsed.data.schema_version !== "3") {
+      const failure = adapterFailure.invalidResult(
+        "The adapter returned a legacy reviewer result for a v3 review request.",
+        false,
+        {
+          diagnostics: {
+            failure_stage: "structured_result_parsing",
+            scope: "provider",
+          },
+        },
+      );
+      await finalizeIncomplete(reviewer, failure, isolation);
+      return { outcome: "incomplete", failure };
+    }
+    let accepted;
+    try {
+      accepted = sanitizeReviewerResult(parsed.data);
+    } catch (error) {
+      const failure =
+        error instanceof ResultSanitizationError
+          ? sanitizeAdapterFailure(
+              "result_too_large",
+              "The sanitized reviewer result exceeds the 16 MiB result limit.",
+              false,
+              {
+                fallback_eligible: true,
+                circuit_qualifying: false,
+                diagnostics: {
+                  failure_stage: "structured_result_sanitization",
+                  scope: "provider",
+                  response_bytes: error.byteLength,
+                },
+              },
+            )
+          : adapterFailure.invalidResult(
+              "The adapter returned an invalid reviewer result.",
+              false,
+              {
+                diagnostics: {
+                  failure_stage: "structured_result_sanitization",
+                  scope: "provider",
+                },
+              },
+            );
       await finalizeIncomplete(reviewer, failure, isolation);
       return { outcome: "incomplete", failure };
     }
@@ -632,11 +697,19 @@ export async function runReviewRound({
       await finalizeIncomplete(reviewer, failure, isolation);
       return { outcome: "incomplete", failure };
     }
-    state.complete(reviewer.id, parsed.data, isolation);
+    state.complete(reviewer.id, accepted, isolation);
     const terminal = reviewerTerminalRecord(state, reviewer.id);
+    const digest = reviewerResultDigest(accepted);
+    const byteCount = Buffer.byteLength(JSON.stringify(accepted), "utf8");
+    resultManifest.push({
+      reviewer_id: reviewer.id,
+      lens_id: lensId(reviewer),
+      digest,
+      byte_count: byteCount,
+      ...(reportPath === undefined ? {} : { artifact_path: reportPath }),
+    });
     await record({
       record: "reviewer.result",
-      run_id: runId,
       reviewer_id: reviewer.id,
       lens_id: lensId(reviewer),
       mode: reviewerMode(reviewer),
@@ -645,10 +718,12 @@ export async function runReviewRound({
         : {
             adjudicates_reviewer_id: reviewer.policy.adjudicatesReviewerId,
           }),
-      result: parsed.data,
+      digest,
+      byte_count: byteCount,
+      result: accepted,
     });
-    await record({ record: "reviewer.terminal", run_id: runId, terminal });
-    const gateFindings = gateFindingCount(reviewer, parsed.data);
+    await record({ record: "reviewer.terminal", terminal });
+    const gateFindings = gateFindingCount(reviewer, accepted);
     await emit({
       event: "reviewer.completed",
       reviewer_id: reviewer.id,
@@ -660,16 +735,30 @@ export async function runReviewRound({
         provider_group: providerGroup(reviewer),
         isolation,
         elapsed_ms: terminal.elapsed_ms,
-        verdict: parsed.data.verdict,
+        verdict: accepted.verdict,
         summary:
-          sanitizePublicText(parsed.data.summary, 1_000) ??
+          sanitizePublicText(accepted.summary, 1_000) ??
           "Reviewer completed without a public summary.",
-        actionable_findings: parsed.data.actionable_findings.length,
+        actionable_findings: accepted.actionable_findings.length,
         gate_findings: gateFindings,
-        informational_notes: parsed.data.informational_notes.length,
+        informational_notes: accepted.informational_notes.length,
         ...(reportPath === undefined ? {} : { detail_ref: reportPath }),
       },
     });
+    if (outputMode === "full-jsonl") {
+      await emit({
+        event: "reviewer.result",
+        reviewer_id: reviewer.id,
+        data: {
+          lens_id: lensId(reviewer),
+          mode: reviewerMode(reviewer),
+          digest,
+          byte_count: byteCount,
+          ...(reportPath === undefined ? {} : { artifact_path: reportPath }),
+          result: accepted,
+        },
+      });
+    }
     return { outcome: gateFindings > 0 ? "findings" : "pass" };
   };
 
@@ -869,7 +958,6 @@ export async function runReviewRound({
                 runtime.lastActivityMessage = message;
                 await record({
                   record: "reviewer.activity",
-                  run_id: runId,
                   reviewer_id: reviewer.id,
                   lens_id: lensId(reviewer),
                   phase: runtime.phase,
@@ -967,7 +1055,6 @@ export async function runReviewRound({
         attemptHistory.set(reviewer.id, history);
         await record({
           record: "reviewer.attempt",
-          run_id: runId,
           reviewer_id: reviewer.id,
           lens_id: lensId(reviewer),
           ...history.at(-1),
@@ -1062,7 +1149,6 @@ export async function runReviewRound({
     });
     await record({
       record: "request",
-      run_id: runId,
       request: {
         schema_version: "2",
         project_name: context.project_name,
@@ -1575,6 +1661,8 @@ export async function runReviewRound({
         incomplete_lenses: aggregate.incompleteLenses,
         not_evaluated_lenses: aggregate.notEvaluatedLenses,
         ...(reportPath === undefined ? {} : { report_path: reportPath }),
+        result_manifest: resultManifest,
+        results_complete: true,
         status: aggregate.status,
         suite: aggregate.modelRuns,
       },

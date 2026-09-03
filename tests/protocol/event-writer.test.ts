@@ -20,6 +20,43 @@ class ControlledSink extends EventEmitter {
 }
 
 describe("EventWriter", () => {
+  it("injects the current run_id into every private record", async () => {
+    const recorded: unknown[] = [];
+    const writer = createEventWriter({
+      output: new PassThrough(),
+      runId: "run-bound",
+      onRecord: async (record) => {
+        recorded.push(record);
+      },
+    });
+
+    await writer.record?.({ record: "context", context: { project: "demo" } });
+
+    expect(recorded).toEqual([
+      {
+        record: "context",
+        run_id: "run-bound",
+        context: { project: "demo" },
+      },
+    ]);
+  });
+
+  it("rejects a private record that attempts to override the current run_id", async () => {
+    const writer = createEventWriter({
+      output: new PassThrough(),
+      runId: "run-bound",
+      onRecord: async () => undefined,
+    });
+
+    await expect(
+      writer.record?.({
+        record: "context",
+        run_id: "different-run",
+        context: {},
+      }),
+    ).rejects.toThrow(/run_id/i);
+  });
+
   it("does not resolve an emission until its write callback succeeds", async () => {
     const output = new ControlledSink();
     const writer = createEventWriter({ output, runId: "run-callback" });
