@@ -31,6 +31,12 @@ import {
 } from "./discovery/help.js";
 import { describeWorkspace, renderDescription } from "./discovery/describe.js";
 import { isSchemaName, renderSchema, schemaNames } from "./discovery/schema.js";
+import {
+  openDashboardBrowser,
+  startDashboardServer,
+  type DashboardServerHandle,
+  type DashboardServerOptions,
+} from "./server/dashboard-server.js";
 
 declare const REVIEW_MESH_STANDALONE: boolean | undefined;
 
@@ -187,6 +193,10 @@ export interface CliRuntime {
   adapterRegistry?: AdapterRegistry;
   appPaths?: AppPaths;
   runReview?: (options: ReviewApplicationOptions) => Promise<number>;
+  startDashboard?: (
+    options: DashboardServerOptions,
+  ) => Promise<DashboardServerHandle>;
+  openBrowser?: (url: string) => void;
 }
 
 export function installAbortHandlers(
@@ -240,7 +250,7 @@ export async function runCli(
       if (topic === undefined) {
         await writeDiagnostic(
           "unknown_help_topic",
-          `Unknown help topic: ${argv[1] ?? ""}. Available topics: review, status, config, config-file, adapters, command-adapter, describe, schema, events, exit-codes.`,
+          `Unknown help topic: ${argv[1] ?? ""}. Available topics: review, status, report, findings, retry, doctor, serve, config, config-file, adapters, command-adapter, describe, schema, events, exit-codes.`,
           errorOutput,
         );
         process.exitCode = 2;
@@ -467,6 +477,82 @@ export async function runCli(
       });
       return;
     }
+    if (argv[0] === "serve") {
+      let host = "127.0.0.1";
+      let port = 0;
+      let noOpen = false;
+      let invalid = false;
+      for (let index = 1; index < argv.length; index += 1) {
+        const argument = argv[index]!;
+        if (argument === "--no-open") {
+          if (noOpen) invalid = true;
+          noOpen = true;
+          continue;
+        }
+        if (argument === "--host" || argument === "--port") {
+          const value = argv[index + 1];
+          if (value === undefined || value.startsWith("--")) {
+            invalid = true;
+            break;
+          }
+          if (argument === "--host") {
+            if (host !== "127.0.0.1") invalid = true;
+            host = value;
+          } else {
+            if (port !== 0 || !/^\d+$/u.test(value)) invalid = true;
+            port = Number(value);
+          }
+          index += 1;
+          continue;
+        }
+        invalid = true;
+      }
+      if (
+        invalid ||
+        host.length === 0 ||
+        !Number.isSafeInteger(port) ||
+        port < 0 ||
+        port > 65535
+      ) {
+        await writeUsageDiagnostic(
+          "Expected: review-mesh serve [--host HOST] [--port PORT] [--no-open]",
+          "review-mesh help serve",
+          errorOutput,
+        );
+        process.exitCode = 2;
+        return;
+      }
+      try {
+        const dashboard = await (
+          runtime.startDashboard ?? startDashboardServer
+        )({
+          host,
+          port,
+          appPaths: runtime.appPaths ?? getAppPaths(),
+          signal: controller.signal,
+        });
+        await writeText(output, `Review Mesh dashboard: ${dashboard.url}\n`);
+        if (!noOpen && output.isTTY === true) {
+          try {
+            (runtime.openBrowser ?? openDashboardBrowser)(dashboard.url);
+          } catch {
+            // Browser launch is a convenience and does not affect the server.
+          }
+        }
+        await dashboard.closed;
+        process.exitCode = 0;
+      } catch (serveError) {
+        await writeDiagnostic(
+          "serve_failed",
+          serveError instanceof Error
+            ? serveError.message
+            : "Review Mesh could not start the dashboard.",
+          errorOutput,
+        );
+        process.exitCode = 2;
+      }
+      return;
+    }
     if (argv[0] === "status") {
       const argumentsWithoutJson = argv
         .slice(1)
@@ -673,7 +759,7 @@ export async function runCli(
     }
     if (argv[0] !== "review") {
       await writeUsageDiagnostic(
-        "Unknown command. Expected one of: review, status, report, findings, retry, doctor, describe, schema, config, help, or version.",
+        "Unknown command. Expected one of: review, status, report, findings, retry, doctor, serve, describe, schema, config, help, or version.",
         "review-mesh --help",
         errorOutput,
         ["Run review-mesh --help for the complete command manual."],

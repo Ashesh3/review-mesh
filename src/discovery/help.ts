@@ -10,6 +10,7 @@ export type HelpTopic =
   | "findings"
   | "retry"
   | "doctor"
+  | "serve"
   | "config"
   | "describe"
   | "schema"
@@ -34,6 +35,7 @@ USAGE
   review-mesh retry RUN_ID --only-incomplete
   review-mesh doctor [WORKSPACE] [--adapter ID] [--model MODEL]
       [--structured-output]
+  review-mesh serve [--host 127.0.0.1] [--port 0] [--no-open]
   review-mesh describe [WORKSPACE] [--json]
   review-mesh schema list
   review-mesh schema NAME [--json]
@@ -61,6 +63,7 @@ AGENT QUICK START
 DISCOVERY COMMANDS
   describe   Resolve the suite selected for a workspace without starting it.
   status     Query a compact persisted run or individual reviewer snapshot.
+  serve      Open the local read-only review operations dashboard.
   schema     List or print generated Zod-derived structural schemas.
   help       Print this manual or a focused topic page.
   config     Inspect or manage trusted global configuration.
@@ -71,7 +74,7 @@ REVIEW I/O CONTRACT
   stderr     Diagnostics before a run begins or if infrastructure fails.
 
 HELP TOPICS
-  review, status, report, findings, retry, doctor, config, config-file,
+  review, status, report, findings, retry, doctor, serve, config, config-file,
   adapters, command-adapter, describe, schema, events, exit-codes
 
 Run 'review-mesh help TOPIC' or 'review-mesh TOPIC --help' for details.
@@ -123,6 +126,25 @@ overwriting an existing file.
 
 Exit codes: 0 passed, 1 findings, 2 invalid request/config/usage,
 3 incomplete reviewer/runtime, 4 interrupted.
+`,
+  serve: `REVIEW-MESH SERVE
+
+USAGE
+  review-mesh serve [--host HOST] [--port PORT] [--no-open]
+
+Starts the embedded read-only Review Mesh dashboard. It shows active and recent
+review timelines, concrete reviewer/model activity and results, configured
+agents, project assignments, and sanitized system settings. No write API is
+exposed. Reviewer activity contains persisted summaries and structured results,
+not a provider's full chat transcript.
+
+HOST defaults to 127.0.0.1 and must resolve to a loopback address. PORT defaults
+to 0 so the operating system selects an available port. The browser opens by
+default only in an interactive terminal; --no-open always suppresses it.
+
+Run records are discovered from the Review Mesh application data directory.
+Active reviews remain observable even when completed-run retention is disabled;
+in that case their transient record is removed when the review exits.
 `,
   status: `REVIEW-MESH STATUS
 

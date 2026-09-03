@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
-import { access } from "node:fs/promises";
+import { access, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
@@ -48,6 +49,61 @@ describe.skipIf(process.platform !== "win32")("standalone CLI", () => {
       expect(Buffer.concat(stdout).toString("utf8")).toContain(
         "AGENT QUICK START",
       );
+    },
+    30_000,
+  );
+
+  it.skipIf(!verifyStandalone || !windowsExecutableExists)(
+    "serves the embedded dashboard from the exact Windows release executable",
+    async () => {
+      const appData = await mkdtemp(
+        join(tmpdir(), "review-mesh-standalone-dashboard-"),
+      );
+      const child = spawn(
+        windowsExecutable,
+        ["serve", "--host", "127.0.0.1", "--port", "0", "--no-open"],
+        {
+          cwd: tmpdir(),
+          env: { ...process.env, APPDATA: appData, LOCALAPPDATA: appData },
+          stdio: "pipe",
+          windowsHide: true,
+        },
+      );
+      try {
+        const url = await new Promise<string>((resolveUrl, reject) => {
+          let stdout = "";
+          const timer = setTimeout(
+            () => reject(new Error("dashboard URL was not printed")),
+            15_000,
+          );
+          child.stdout.setEncoding("utf8");
+          child.stdout.on("data", (chunk: string) => {
+            stdout += chunk;
+            const match = /Review Mesh dashboard: (http:\/\/[^\s]+)/u.exec(
+              stdout,
+            );
+            if (match === null) return;
+            clearTimeout(timer);
+            resolveUrl(match[1]!);
+          });
+          child.once("error", (error) => {
+            clearTimeout(timer);
+            reject(error);
+          });
+        });
+        const page = await fetch(url);
+        expect(page.status).toBe(200);
+        expect(await page.text()).toContain("Review Mesh");
+        const snapshot = await fetch(new URL("api/snapshot", url));
+        expect(snapshot.status).toBe(200);
+        expect(await snapshot.json()).toMatchObject({
+          server: { read_only: true },
+        });
+      } finally {
+        child.kill("SIGTERM");
+        await new Promise((resolveClose) => child.once("close", resolveClose));
+        await rm(appData, { recursive: true, force: true });
+      }
     },
     30_000,
   );

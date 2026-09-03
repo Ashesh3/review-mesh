@@ -472,6 +472,28 @@ const privateRecordSchema = z.union([
     failure: persistedFailureSchema,
   }),
   z.strictObject({
+    record: z.literal("reviewer.activity"),
+    run_id: persistedString,
+    reviewer_id: persistedString,
+    lens_id: persistedString.optional(),
+    phase: z
+      .enum([
+        "queued",
+        "probing",
+        "starting",
+        "reviewing",
+        "validating",
+        "terminal",
+      ])
+      .optional(),
+    type: z.enum(["activity", "progress"]),
+    timestamp: timestampSchema,
+    message: z
+      .string()
+      .min(1)
+      .max(64 * 1_024),
+  }),
+  z.strictObject({
     record: z.literal("reviewer.attempt"),
     run_id: persistedString,
     reviewer_id: persistedString,
@@ -1092,6 +1114,7 @@ function parsePrivateRecord(
     return;
   }
   if (value.record === "context") return;
+  if (value.record === "reviewer.activity") return;
   if (value.record === "reviewer.attempt") {
     parsed.attempts.push({
       reviewer_id: value.reviewer_id,

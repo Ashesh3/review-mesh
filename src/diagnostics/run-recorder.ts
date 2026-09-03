@@ -45,6 +45,7 @@ export interface RunRecorderFileSystem {
 }
 
 export interface RunRecorder {
+  ready(): Promise<void>;
   onEvent(event: PublicEvent): Promise<void>;
   onRecord(record: unknown): Promise<void>;
   close(): Promise<void>;
@@ -61,6 +62,7 @@ export interface CreateRunRecorderOptions {
   now?: () => number;
   isProcessAlive?: (identity: RunRecorderProcessIdentity) => boolean;
   beforeOperation?: (operation: RunRecorderOperation) => Promise<void>;
+  publish?: boolean;
 }
 
 export interface PathSemantics {
@@ -501,6 +503,7 @@ export function createRunRecorder({
   now = Date.now,
   isProcessAlive = processIsAlive,
   beforeOperation = async () => undefined,
+  publish = true,
 }: CreateRunRecorderOptions): RunRecorder {
   requireSafeRunId(runId);
   requireSafeProcessIdentity(processIdentity);
@@ -586,6 +589,9 @@ export function createRunRecorder({
   };
 
   return {
+    async ready() {
+      await initialize();
+    },
     onEvent(event) {
       if (state !== "open") {
         return Promise.reject(new Error("Run recorder is closing or closed"));
@@ -619,25 +625,27 @@ export function createRunRecorder({
           }
           let published = false;
           try {
-            await beforeOperation("link");
-            await assertPinnedRunsDirectory(resolvedRunsDirectory, pinned);
-            await fileSystem.link(activeRunFile, runFile);
-            published = true;
-            await assertPinnedRunsDirectory(resolvedRunsDirectory, pinned);
-            const [handleIdentity, activeIdentity, finalIdentity] =
-              await Promise.all([
-                handle.stat(),
-                regularFileIdentity(activeRunFile),
-                regularFileIdentity(runFile),
-              ]);
-            if (
-              !handleIdentity.isFile() ||
-              !sameFileIdentity(handleIdentity, activeIdentity) ||
-              !sameFileIdentity(handleIdentity, finalIdentity)
-            ) {
-              throw new Error(
-                "published run record identity does not match active handle",
-              );
+            if (publish) {
+              await beforeOperation("link");
+              await assertPinnedRunsDirectory(resolvedRunsDirectory, pinned);
+              await fileSystem.link(activeRunFile, runFile);
+              published = true;
+              await assertPinnedRunsDirectory(resolvedRunsDirectory, pinned);
+              const [handleIdentity, activeIdentity, finalIdentity] =
+                await Promise.all([
+                  handle.stat(),
+                  regularFileIdentity(activeRunFile),
+                  regularFileIdentity(runFile),
+                ]);
+              if (
+                !handleIdentity.isFile() ||
+                !sameFileIdentity(handleIdentity, activeIdentity) ||
+                !sameFileIdentity(handleIdentity, finalIdentity)
+              ) {
+                throw new Error(
+                  "published run record identity does not match active handle",
+                );
+              }
             }
           } catch (error) {
             if (published) {

@@ -26,6 +26,7 @@ It is designed for automation, coding agents, CI, and local review loops:
 - Changed-surface applicability and required-input checks before provider work.
 - Deterministic finding consolidation with confidence, classification, assumptions, and provenance.
 - No source edits by Review Mesh.
+- Embedded local read-only dashboard for active timelines, results, agents, and projects.
 - Portable single-file builds: a Node.js script and standalone Windows/Linux executables.
 
 ## Quick start
@@ -45,6 +46,7 @@ review-mesh describe . --json
 review-mesh schema request --json
 review-mesh doctor . --adapter gateway --model claude-opus-5 --structured-output
 review-mesh review . --output-mode compact-jsonl --no-ansi --heartbeat aggregate --details-file review-details.jsonl
+review-mesh serve
 review-mesh config --help
 ```
 
@@ -60,6 +62,31 @@ The selection object includes `project_name` and `project_name_source`, plus
 `matched_project_name` when a configured project entry matched. This makes the
 automatic identity decision inspectable before a review starts.
 
+## Web dashboard
+
+```text
+review-mesh serve [--host 127.0.0.1] [--port 0] [--no-open]
+```
+
+`serve` starts the embedded Review Mesh Observer. The Reviews view shows active
+and recent runs as factual lens/reviewer timelines; selecting a run exposes its
+context, events, findings, attempts, and concrete reviewer results. Agents,
+Projects, and System show the complete configured catalog through a dedicated
+sanitized view. Instruction bodies and paths, project context values, runtime
+objects, adapter commands/arguments, endpoint values, and credential values are
+not served.
+
+The server is deliberately local-only, read-only, same-origin, and dependency
+free. It defaults to `127.0.0.1` and an available operating-system-assigned port.
+The UI and server are compiled into both single-file distributions; no asset
+directory or CDN is required.
+
+Review Mesh records sanitized phase and activity summaries for the reviewer
+inspector, plus full structured findings/results. These are not raw provider
+chat transcripts. When completed-run persistence is disabled, an active run is
+still visible through a transient record that is removed as soon as the review
+finishes.
+
 For an AI caller, identity and scope are separate:
 
 - `project_name` selects no path. Copy it from `describe`; Review Mesh verifies
@@ -74,10 +101,10 @@ For an AI caller, identity and scope are separate:
 
 ### Download a standalone executable
 
-Release `v6.1.0` provides operational multi-provider fallback, project-name
-configuration, per-reviewer gateway session affinity, the agent-first CLI,
-public event protocol v5, compact reporting, and
-self-contained Bun executables that do not require Node.js or Bun:
+Release `v7.0.0` adds the embedded read-only web dashboard and transient active
+run observation to operational multi-provider fallback, project-name
+configuration, the agent-first CLI, public event protocol v5, compact reporting,
+and self-contained Bun executables that do not require Node.js or Bun:
 
 - Windows x64: `review-mesh-windows-x64.exe`
 - Linux x64 (glibc): `review-mesh-linux-x64`
@@ -85,14 +112,14 @@ self-contained Bun executables that do not require Node.js or Bun:
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v6.1.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
+Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v7.0.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
 .\review-mesh.exe review
 ```
 
 Linux:
 
 ```bash
-curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v6.1.0/review-mesh-linux-x64
+curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v7.0.0/review-mesh-linux-x64
 chmod +x ./review-mesh-linux-x64
 ./review-mesh-linux-x64 review
 ```
@@ -667,11 +694,12 @@ completed, incomplete, and skipped model runs without inventing percentages.
 | `reviewer.skipped`    | A later model was bypassed after prior findings/failure.      |
 | `run.completed`       | Compact gate/coverage summary and report artifact path.       |
 
-`reviewer.progress` is phase-level. High-frequency adapter activity updates the
-reviewer's persisted latest activity and appears in heartbeats/status snapshots,
-but is not emitted once per tool action. Use `review-mesh status RUN_ID --json`
-for the compact roster or add a reviewer id for one reviewer. The generated
-machine contract is available from `review-mesh schema run-status --json`.
+`reviewer.progress` is phase-level. High-frequency adapter activity is retained
+as sanitized private `reviewer.activity` records for the dashboard and latest
+status, but is not emitted once per tool action on public stdout. Use
+`review-mesh status RUN_ID --json` for the compact roster or add a reviewer id
+for one reviewer. The generated machine contract is available from
+`review-mesh schema run-status --json`.
 
 Detailed and retry workflows:
 
