@@ -45,13 +45,37 @@ describe("sanitizeReviewerResult", () => {
   it("redacts credential-shaped query values even under a benign parameter name", () => {
     const credential = `ghp_${"a".repeat(24)}`;
     const sanitized = sanitizeReviewerResult(
-      passResult(`Reviewed https://example.test/callback?state=${credential}&page=2.`),
+      passResult(
+        `Reviewed https://example.test/callback?state=${credential}&page=2.`,
+      ),
     );
 
     expect(sanitized.review_markdown).toContain(
       "https://example.test/callback?state=[redacted]&page=2.",
     );
     expect(sanitized.review_markdown).not.toContain(credential);
+  });
+
+  it("redacts credential patterns in URL paths and fragments without duplicating fragments", () => {
+    const github = `ghp_${"g".repeat(24)}`;
+    const jwt = "eyJheader12.eyJpayload12.signature12";
+    const sanitized = sanitizeReviewerResult(
+      passResult(
+        [
+          "https://example.test/token=path-secret/report?q=regression",
+          `https://example.test/report#Bearer%20fragment-secret-${github}-${jwt}`,
+          `https://example.test/#${github}`,
+        ].join("\n"),
+      ),
+    );
+
+    expect(sanitized.review_markdown).toContain("?q=regression");
+    expect(sanitized.review_markdown).not.toMatch(
+      /path-secret|fragment-secret|ghp_|eyJheader12/iu,
+    );
+    expect(
+      sanitized.review_markdown.match(/https:\/\/example\.test\/#/gu),
+    ).toHaveLength(1);
   });
 
   it("rejects a sanitized result above 16 MiB with result_too_large", () => {

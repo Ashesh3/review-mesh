@@ -20,6 +20,26 @@ class ControlledSink extends EventEmitter {
 }
 
 describe("EventWriter", () => {
+  it("propagates an authoritative publication failure instead of swallowing it", async () => {
+    const publicationFailure = new Error("immutable publication failed");
+    const writer = createEventWriter({
+      output: new PassThrough(),
+      runId: "run-publication-failed",
+      onEvent: async () => undefined,
+      onMirrorClose: async () => {
+        throw publicationFailure;
+      },
+      mirrorCloseRequired: true,
+    });
+
+    await writer.emit({
+      event: "run.started",
+      data: { consistency_mode: "live_worktree" },
+    });
+
+    await expect(writer.close()).rejects.toBe(publicationFailure);
+  });
+
   it("injects the current run_id into every private record", async () => {
     const recorded: unknown[] = [];
     const writer = createEventWriter({

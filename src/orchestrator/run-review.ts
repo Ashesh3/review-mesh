@@ -118,10 +118,31 @@ interface ModelExecution {
 }
 
 class RequiredPersistenceError extends Error {
+  readonly kind: "persistence" | "output";
+
   constructor(cause: unknown) {
     super("The complete reviewer result could not be persisted.", { cause });
     this.name = "RequiredPersistenceError";
+    this.kind = "persistence";
   }
+}
+
+class FinalOutputError extends Error {
+  constructor(cause: unknown) {
+    super("The final public event could not be written.", { cause });
+    this.name = "FinalOutputError";
+  }
+}
+
+function errorChainContains(error: unknown, pattern: RegExp): boolean {
+  let current = error;
+  const seen = new Set<unknown>();
+  while (current instanceof Error && !seen.has(current)) {
+    seen.add(current);
+    if (pattern.test(current.message)) return true;
+    current = current.cause;
+  }
+  return false;
 }
 
 interface ProviderCircuit {
@@ -548,6 +569,28 @@ export async function runReviewRound({
       if (outcome !== "complete") throw new Error("event write failed");
     } catch {
       writerUsable = false;
+    }
+  };
+
+  const emitFinal = async (draft: EventDraft): Promise<void> => {
+    if (!writerUsable) return;
+    try {
+      await (writer.emitFinal ?? writer.emit)(draft);
+    } catch (error) {
+      writerUsable = false;
+      if (
+        writer.outputFailed?.() === true ||
+        errorChainContains(error, /public output|stdout|broken pipe|EPIPE/iu)
+      ) {
+        throw new FinalOutputError(error);
+      }
+      if (
+        error instanceof Error &&
+        /publish|persistence|link|record|artifact/iu.test(error.message)
+      ) {
+        throw new RequiredPersistenceError(error);
+      }
+      throw new FinalOutputError(error);
     }
   };
 
@@ -1672,7 +1715,11 @@ export async function runReviewRound({
     const exitCode = interrupted
       ? 4
       : exitCodeFor(aggregate.gateOutcome, aggregate.coverageOutcome);
-    await emit({
+    if (heartbeat !== undefined) {
+      clock.clearInterval(heartbeat);
+      heartbeat = undefined;
+    }
+    await emitFinal({
       event: "run.completed",
       data: {
         gate_outcome: aggregate.gateOutcome,
@@ -1713,10 +1760,8 @@ export async function runReviewRound({
         config.execution.shutdown_grace_period_ms,
       );
     }
-    await writer.close().catch(() => {
-      writerUsable = false;
-    });
-    if (!writerUsable)
-      throw new Error("The public event stream became unavailable.");
+    if (!writerUsable) {
+      await writer.close().catch(() => undefined);
+    }
   }
 }

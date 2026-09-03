@@ -909,6 +909,34 @@ describe("RunRecorder", () => {
     );
   });
 
+  it("rejects an immutable link failure and leaves no published artifact", async () => {
+    const root = await temporaryRoot();
+    const runsDirectory = join(root, "runs");
+    const failure = new Error("link failed");
+    const recorder = createRunRecorder({
+      applicationDataRoot: root,
+      runsDirectory,
+      runId: "run-link-failure",
+      maxRuns: 1,
+      resolution: {},
+      fileSystem: {
+        mkdir,
+        readdir,
+        stat,
+        rm: async (path) => rm(path),
+        link: async () => {
+          throw failure;
+        },
+      },
+    });
+
+    await recorder.onEvent(startedEvent());
+    await expect(recorder.close()).rejects.toBe(failure);
+    await expect(
+      stat(join(runsDirectory, "run-link-failure.jsonl")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("detects a runs-directory swap before open without writing outside", async () => {
     const root = await temporaryRoot();
     const applicationDataRoot = join(root, "application-data");

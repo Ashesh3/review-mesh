@@ -361,6 +361,73 @@ function applyPrivateResult(
   };
 }
 
+function applyPublicResult(
+  reviewers: Map<string, ReviewerSnapshot>,
+  reviewerId: string,
+  data: Record<string, unknown>,
+  line: number,
+): void {
+  const result = reviewerResultV3Schema.safeParse(data.result);
+  if (!result.success) {
+    throw new RunStatusError(
+      "invalid_run_record",
+      `The public reviewer result is invalid at JSONL line ${line}.`,
+      line,
+      "reviewer.result",
+      ["result"],
+    );
+  }
+  const digest = text(data.digest);
+  const byteCount = integer(data.byte_count);
+  if (digest !== reviewerResultDigest(result.data)) {
+    throw new RunStatusError(
+      "invalid_run_record",
+      `The public reviewer result digest is invalid at JSONL line ${line}.`,
+      line,
+      "reviewer.result",
+      ["digest"],
+    );
+  }
+  const expectedByteCount = Buffer.byteLength(
+    JSON.stringify(result.data),
+    "utf8",
+  );
+  if (byteCount !== expectedByteCount) {
+    throw new RunStatusError(
+      "invalid_run_record",
+      `The public reviewer result byte count is invalid at JSONL line ${line}.`,
+      line,
+      "reviewer.result",
+      ["byte_count"],
+    );
+  }
+  const reviewer = reviewerFor(reviewers, reviewerId);
+  if (
+    reviewer.complete_result !== undefined &&
+    (reviewer.result_digest !== digest ||
+      reviewer.result_byte_count !== byteCount ||
+      JSON.stringify(reviewer.complete_result) !== JSON.stringify(result.data))
+  ) {
+    throw new RunStatusError(
+      "invalid_run_record",
+      `The public reviewer result conflicts with the private result at JSONL line ${line}.`,
+      line,
+      "reviewer.result",
+      ["digest"],
+    );
+  }
+  reviewer.state = "completed";
+  reviewer.complete_result = structuredClone(result.data);
+  reviewer.result_digest = digest;
+  reviewer.result_byte_count = byteCount;
+  reviewer.result = {
+    verdict: result.data.verdict,
+    summary: result.data.summary,
+    actionable_findings: result.data.actionable_findings.length,
+    informational_notes: result.data.informational_notes.length,
+  };
+}
+
 export async function readRunStatus({
   runsDirectory,
   runId,
@@ -500,25 +567,7 @@ export async function readRunStatus({
       reviewer.last_activity_message =
         text(data.message) ?? reviewer.last_activity_message;
     } else if (eventName === "reviewer.result") {
-      const result = asRecord(data.result);
-      if (result !== undefined) {
-        reviewer.state = "completed";
-        reviewer.result = {
-          verdict: result.verdict === "fail" ? "fail" : "pass",
-          summary: text(result.summary) ?? "Completed reviewer result.",
-          actionable_findings: Array.isArray(result.actionable_findings)
-            ? result.actionable_findings.length
-            : 0,
-          informational_notes: Array.isArray(result.informational_notes)
-            ? result.informational_notes.length
-            : 0,
-        };
-        if (result.schema_version === "3") {
-          reviewer.complete_result = structuredClone(
-            result as unknown as ReviewerResultV3,
-          );
-        }
-      }
+      applyPublicResult(reviewers, id, data, index + 1);
     } else if (eventName === "reviewer.completed") {
       reviewer.state = "completed";
       const legacyResult = asRecord(data.result);

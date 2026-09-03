@@ -10,6 +10,7 @@ import { resolveConfig } from "./config/resolve.js";
 import { createGitRunner } from "./context/git.js";
 import { resolveContext, ReviewScopeError } from "./context/resolve.js";
 import { createRunRecorder } from "./diagnostics/run-recorder.js";
+import type { RunRecorderFileSystem } from "./diagnostics/run-recorder.js";
 import {
   runReviewRound,
   type OrchestratorClock,
@@ -34,6 +35,7 @@ export interface ReviewApplicationOptions {
   onlyLensIds?: readonly string[];
   detailsFile?: string;
   outputMode?: ReviewOutputMode;
+  runRecorderFileSystem?: RunRecorderFileSystem;
 }
 
 export class ReviewRunError extends Error {
@@ -266,6 +268,9 @@ export async function runReviewApplication(
         config.diagnostics.persist_runs ||
         options.detailsFile !== undefined ||
         compactRequiresArtifact,
+      ...(options.runRecorderFileSystem === undefined
+        ? {}
+        : { fileSystem: options.runRecorderFileSystem }),
     });
     await recorder.ready();
   } catch {
@@ -285,7 +290,18 @@ export async function runReviewApplication(
     onEvent: recorder.onEvent,
     onRecord: recorder.onRecord,
     onMirrorClose: recorder.close,
+    mirrorCloseRequired:
+      config.diagnostics.persist_runs ||
+      options.detailsFile !== undefined ||
+      compactRequiresArtifact,
     onWarning: () => {
+      if (
+        config.diagnostics.persist_runs ||
+        options.detailsFile !== undefined ||
+        compactRequiresArtifact
+      ) {
+        return;
+      }
       void writeDiagnostic(
         options.stderr,
         "persistence_failed",
@@ -348,8 +364,43 @@ export async function runReviewApplication(
         await rm(internalReportPath, { force: true });
       }
     }
+    try {
+      await writer.close();
+    } catch {
+      if (writer.outputFailed?.() === true) {
+        await writeDiagnostic(
+          options.stderr,
+          "review_failed",
+          "The valid review run failed unexpectedly.",
+        );
+        return 3;
+      }
+      await writeDiagnostic(
+        options.stderr,
+        "persistence_failed",
+        "The immutable run artifact could not be published.",
+      );
+      return 3;
+    }
     return completion.exitCode;
   } catch (error) {
+    if ((options.stdout as { destroyed?: boolean }).destroyed === true) {
+      const failure = new ReviewRunError(error);
+      await writeDiagnostic(options.stderr, "review_failed", failure.message);
+      return 3;
+    }
+    if (
+      error instanceof Error &&
+      (error.name === "RequiredPersistenceError" ||
+        error.message.includes("immutable run artifact"))
+    ) {
+      await writeDiagnostic(
+        options.stderr,
+        "persistence_failed",
+        "The immutable run artifact could not be published.",
+      );
+      return 3;
+    }
     const failure = new ReviewRunError(error);
     await writeDiagnostic(options.stderr, "review_failed", failure.message);
     return 3;

@@ -240,3 +240,102 @@ seconds in the worker run. The controller independently reran the same command:
 
 None for the six reviewed findings. Provider-specific v3/continuation work
 remains explicitly assigned to Task 2, as noted above.
+
+## Fix round 2: publication proof, URL components, and status integrity
+
+### Implementation
+
+1. Added an authoritative final-event path to `EventWriter`. For a persisted
+   run, it drains pending mirrored events, appends `run.completed` to the active
+   artifact, closes/publishes the immutable artifact, and only then writes the
+   terminal event to stdout. Publication/link errors propagate instead of being
+   converted to warnings. `runReviewApplication` returns exit 3 with a typed
+   `persistence_failed` diagnostic and never writes `results_complete: true` to
+   stdout when publication fails. Non-persisted legacy mirror behavior remains
+   bounded/best-effort.
+2. Reworked URL handling by components. The sanitizer now redacts credential
+   patterns in URL paths and fragments, selectively redacts query keys/values,
+   preserves benign queries such as `q=regression`, and reconstructs each
+   fragment exactly once.
+3. Added one integrity path for public v3 status results. Public
+   `reviewer.result` records now require a valid v3 object and matching digest
+   and byte count. If a private result already exists, the public object and its
+   integrity metadata must match exactly; conflicting public/private results
+   are rejected instead of mixing one object with the other's metadata.
+
+### RED evidence
+
+Command:
+
+`npx vitest run tests/results/sanitize.test.ts tests/protocol/event-writer.test.ts tests/diagnostics/run-recorder.test.ts tests/diagnostics/run-status.test.ts tests/cli/review.test.ts -t "URL paths and fragments|authoritative publication failure|immutable link failure|conflicting public v3 result|immutable artifact publication fails" --reporter=verbose`
+
+Result: 4 intended failures and one existing recorder guard pass. The failures
+proved that EventWriter swallowed `onMirrorClose`, URL paths/fragments leaked
+and fragment text duplicated, public status results overwrote private content,
+and CLI link failure returned success after emitting completeness.
+
+### GREEN evidence
+
+Command:
+
+`npm run typecheck`
+
+Result: PASS for production and test TypeScript projects.
+
+Command:
+
+`npx vitest run tests/results/sanitize.test.ts tests/protocol/event-writer.test.ts tests/diagnostics/run-recorder.test.ts tests/diagnostics/run-status.test.ts --reporter=dot`
+
+Result: PASS. 4 files passed, 72 tests passed.
+
+Command:
+
+`npx vitest run tests/cli/review.test.ts -t "automatically publishes an immutable artifact for compact-jsonl|does not emit results_complete when immutable artifact publication fails|returns runtime failure when the final public event cannot be written|removes the transient active record when persistence is disabled" --reporter=dot`
+
+Result: PASS. 1 file passed, 4 tests passed, 39 skipped.
+
+### Fix-round-2 self-review
+
+- Verified successful persisted terminal output is ordered after recorder link
+  and identity verification, so `results_complete: true` is backed by the final
+  immutable artifact rather than only active-file appends.
+- Verified a recorder link failure leaves no final artifact, produces one
+  persistence diagnostic, exits 3, and exposes no successful terminal stdout.
+- Verified ordinary final stdout failure remains `review_failed`, distinct from
+  durable publication failure.
+- Verified URL queries remain byte-preserving apart from redacted values and no
+  URL parser normalization reorders benign parameters.
+- Verified path, query, and fragment components all receive credential-pattern
+  redaction, including percent-encoded Bearer separators.
+- Verified public/private status integrity cannot be mixed: object, digest, and
+  byte count are accepted or rejected as one unit.
+
+### Fix-round-2 concerns
+
+None for the three reviewed findings.
+
+### Final diagnostic-classification compatibility fix
+
+The controller found one focused compatibility failure after fix round 2:
+closed stdout was being reported as `persistence_failed`. Root cause: the
+final-event error wrapper was classified from its outer message after the
+artifact had already published; the underlying stdout error was no longer
+distinguishable from publication failure by the original heuristic.
+
+The writer/orchestrator now retain and inspect output failure state plus the
+complete error cause chain. Final stdout/EPIPE failures produce
+`FinalOutputError` and the existing `review_failed` diagnostic. Recorder
+close/link/publication failures retain `RequiredPersistenceError` and the new
+`persistence_failed` diagnostic.
+
+Command:
+
+`npx vitest run tests/cli/review.test.ts -t "exits 3 with one sanitized diagnostic when the stdout consumer closes|does not emit results_complete when immutable artifact publication fails" --reporter=dot`
+
+Result: PASS. 1 file passed, 2 tests passed, 41 skipped.
+
+Command:
+
+`npm run typecheck`
+
+Result: PASS for production and test TypeScript projects.

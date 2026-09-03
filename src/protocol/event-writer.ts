@@ -22,8 +22,10 @@ export type EventDraft = PublicEvent extends infer Event
 
 export interface EventWriter {
   emit(draft: EventDraft): Promise<PublicEvent>;
+  emitFinal?(draft: EventDraft): Promise<PublicEvent>;
   record?(record: RunBoundRecordDraft): Promise<void>;
   close(): Promise<void>;
+  outputFailed?(): boolean;
 }
 
 export type RunBoundRecordDraft = Record<string, unknown> & { run_id?: string };
@@ -36,6 +38,7 @@ export interface CreateEventWriterOptions {
   onEvent?: (event: PublicEvent) => Promise<void>;
   onRecord?: (record: unknown) => Promise<void>;
   onMirrorClose?: () => Promise<void>;
+  mirrorCloseRequired?: boolean;
   onWarning?: (error: Error) => void;
   mirrorFlushTimeoutMs?: number;
   mirrorMaxPendingEvents?: number;
@@ -55,6 +58,7 @@ export function createEventWriter({
   onEvent,
   onRecord,
   onMirrorClose,
+  mirrorCloseRequired = false,
   onWarning,
   mirrorFlushTimeoutMs = 1_000,
   mirrorMaxPendingEvents = 256,
@@ -83,6 +87,8 @@ export function createEventWriter({
   let mirrorPump: Promise<void> | undefined;
   let mirrorWarningIssued = false;
   let mirrorClose: Promise<void> | undefined;
+  let mirrorFailure: Error | undefined;
+  let mirrorFinalized = false;
 
   const rememberError = (error: Error) => {
     streamError ??= error;
@@ -103,6 +109,7 @@ export function createEventWriter({
   };
 
   const disableMirror = (error: unknown) => {
+    mirrorFailure ??= error instanceof Error ? error : new Error(String(error));
     mirrorEnabled = false;
     mirrorQueue = [];
     mirrorQueuedBytes = 0;
@@ -139,6 +146,15 @@ export function createEventWriter({
     });
   };
 
+  const drainMirror = async (): Promise<void> => {
+    while (mirrorPump !== undefined || mirrorQueue.length > 0) {
+      if (mirrorPump === undefined) startMirrorPump();
+      const pump = mirrorPump;
+      if (pump !== undefined) await pump;
+    }
+    if (mirrorFailure !== undefined) throw mirrorFailure;
+  };
+
   const enqueueMirror = (event: PublicEvent, bytes: number) => {
     if (!mirrorEnabled || onEvent === undefined) return;
     const pendingEvents =
@@ -159,17 +175,31 @@ export function createEventWriter({
   };
 
   const scheduleMirrorClose = (): Promise<void> => {
-    mirrorClose ??= (async () => {
+    if (mirrorFinalized) return Promise.resolve();
+    const closing = (async () => {
       const pump = mirrorPump;
       if (pump !== undefined) {
         await pump;
       }
       if (onMirrorClose !== undefined) await onMirrorClose();
-    })().catch((error: unknown) => {
-      disableMirror(error);
-    });
+    })();
+    mirrorClose ??= mirrorCloseRequired
+      ? closing
+      : closing.catch((error: unknown) => {
+          disableMirror(error);
+        });
     return mirrorClose;
   };
+
+  const materialize = (draft: EventDraft): PublicEvent =>
+    publicEventSchema.parse({
+      ...draft,
+      schema_version: "5",
+      run_id: runId,
+      ...(requestId === undefined ? {} : { request_id: requestId }),
+      seq: ++sequence,
+      timestamp: now().toISOString(),
+    });
 
   const flushMirror = async (): Promise<void> => {
     const flush = scheduleMirrorClose();
@@ -243,6 +273,11 @@ export function createEventWriter({
       }
     });
 
+  const writeFinalLine = (line: string): Promise<void> =>
+    writeLine(line).catch((error) => {
+      throw new Error("Final public output write failed.", { cause: error });
+    });
+
   return {
     emit(draft) {
       if (closed) {
@@ -257,20 +292,40 @@ export function createEventWriter({
           throw streamError;
         }
 
-        const event = publicEventSchema.parse({
-          ...draft,
-          schema_version: "5",
-          run_id: runId,
-          ...(requestId === undefined ? {} : { request_id: requestId }),
-          seq: ++sequence,
-          timestamp: now().toISOString(),
-        });
+        const event = materialize(draft);
         const line = JSON.stringify(event) + "\n";
 
         await writeLine(line);
 
         enqueueMirror(event, Buffer.byteLength(line, "utf8"));
 
+        return event;
+      });
+    },
+
+    emitFinal(draft) {
+      if (closed) {
+        return Promise.reject(new Error("Event writer is closed"));
+      }
+      if (streamError !== undefined) return Promise.reject(streamError);
+      return enqueue(async () => {
+        const event = materialize(draft);
+        const line = JSON.stringify(event) + "\n";
+        await drainMirror();
+        if (onEvent !== undefined) await onEvent(event);
+        if (onMirrorClose !== undefined) {
+          try {
+            await onMirrorClose();
+          } catch (error) {
+            throw new Error("Immutable artifact publication failed.", {
+              cause: error,
+            });
+          }
+        }
+        mirrorFinalized = true;
+        mirrorEnabled = false;
+        mirrorClose = Promise.resolve();
+        await writeFinalLine(line);
         return event;
       });
     },
@@ -294,6 +349,9 @@ export function createEventWriter({
           if (streamError !== undefined) throw streamError;
         }
       });
+    },
+    outputFailed() {
+      return streamError !== undefined;
     },
   };
 }

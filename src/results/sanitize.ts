@@ -27,18 +27,21 @@ export class ResultSanitizationError extends Error {
 
 function redactString(value: string): string {
   const urls: string[] = [];
-  const withoutUrls = value.replace(/https?:\/\/[^\s]+/giu, (candidate) => {
+  const shielded = value.replace(/https?:\/\/[^\s]+/giu, (candidate) => {
     const queryStart = candidate.indexOf("?");
     const fragmentStart = candidate.indexOf("#");
+    const pathEnd =
+      queryStart < 0
+        ? fragmentStart < 0
+          ? candidate.length
+          : fragmentStart
+        : queryStart;
     const queryEnd = fragmentStart < 0 ? candidate.length : fragmentStart;
-    const prefix = queryStart < 0 ? candidate : candidate.slice(0, queryStart);
+    const path = candidate.slice(0, pathEnd);
     const query =
       queryStart < 0 ? undefined : candidate.slice(queryStart + 1, queryEnd);
-    const fragment = fragmentStart < 0 ? "" : candidate.slice(fragmentStart);
-    const redactedPrefix = prefix.replace(
-      /^(https?:\/\/)[^\s/@:]+:[^\s/@]+@/iu,
-      "$1[redacted]@",
-    );
+    const fragment =
+      fragmentStart < 0 ? undefined : candidate.slice(fragmentStart + 1);
     const redactedQuery =
       query === undefined
         ? ""
@@ -47,14 +50,14 @@ function redactString(value: string): string {
             .map((part) => {
               const separator = part.indexOf("=");
               const rawKey = separator < 0 ? part : part.slice(0, separator);
+              const rawValue = separator < 0 ? "" : part.slice(separator + 1);
               let key = rawKey;
+              let queryValue = rawValue;
               try {
                 key = decodeURIComponent(rawKey.replaceAll("+", " "));
               } catch {
                 // Malformed untrusted query keys remain unchanged.
               }
-              const rawValue = separator < 0 ? "" : part.slice(separator + 1);
-              let queryValue = rawValue;
               try {
                 queryValue = decodeURIComponent(rawValue.replaceAll("+", " "));
               } catch {
@@ -69,11 +72,21 @@ function redactString(value: string): string {
               return `${rawKey}=${REDACTED}`;
             })
             .join("&")}`;
-    const redactedUrl = `${redactedPrefix}${redactedQuery}${fragment}`;
+    const redactedFragment =
+      fragment === undefined ? "" : `#${redactCredentialPatterns(fragment)}`;
+    const redactedUrl = `${redactCredentialPatterns(path)}${redactedQuery}${redactedFragment}`;
     const index = urls.push(redactedUrl) - 1;
     return `\uE000${index}\uE001`;
   });
-  const redacted = withoutUrls
+  return redactCredentialPatterns(shielded).replace(
+    /\uE000(\d+)\uE001/gu,
+    (marker, index: string) => urls[Number(index)] ?? marker,
+  );
+}
+
+function redactCredentialPatterns(value: string): string {
+  return value
+    .replace(/(https?:\/\/)[^\s/@:]+:[^\s/@]+@/giu, "$1[redacted]@")
     .replace(
       /\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/gu,
       REDACTED,
@@ -84,17 +97,14 @@ function redactString(value: string): string {
     )
     .replace(/\bauthorization\s*[:=]\s*bearer\s+[^\s,;]+/giu, REDACTED)
     .replace(
-      /\b(?:authorization|api[_-]?key|access[_-]?token|client[_-]?secret|password|secret|accountkey)\s*[:=]\s*[^\s,;]+/giu,
+      /\b(?:authorization|api[_-]?key|access[_-]?token|client[_-]?secret|password|secret|accountkey|token)\s*[:=]\s*[^\s,;/#]+/giu,
       REDACTED,
     )
     .replace(
       /\b(?:DefaultEndpointsProtocol|AccountName|AccountKey|EndpointSuffix)=[^;\s]+(?:;[^\s]*)?/giu,
       REDACTED,
     )
-    .replace(/\bBearer\s+[^\s,;]+/giu, REDACTED);
-  return redacted.replace(/\uE000(\d+)\uE001/gu, (_marker, index: string) => {
-    return urls[Number(index)] ?? _marker;
-  });
+    .replace(/\bBearer(?:%20|\s)+[^\s,;#]+/giu, REDACTED);
 }
 
 function sanitizeValue(value: unknown): unknown {

@@ -8,6 +8,7 @@ import {
   readdir,
   realpath,
   rm,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -892,6 +893,56 @@ describe("review-mesh review", () => {
         }),
       ],
     });
+  });
+
+  it("does not emit results_complete when immutable artifact publication fails", async () => {
+    const fixture = await createFixture(["pass"]);
+    const runsDirectory = join(fixture.root, "publication-failure", "runs");
+    const stdout = new PassThrough();
+    let publicOutput = "";
+    stdout.setEncoding("utf8");
+    stdout.on("data", (chunk: string) => {
+      publicOutput += chunk;
+    });
+    const stderr = new PassThrough();
+    let diagnostic = "";
+    stderr.setEncoding("utf8");
+    stderr.on("data", (chunk: string) => {
+      diagnostic += chunk;
+    });
+
+    const exitCode = await runReviewApplication({
+      requestText: fixture.request,
+      configFile: fixture.configFile,
+      stdout,
+      stderr,
+      signal: new AbortController().signal,
+      runIdFactory: () => "publication-failed",
+      outputMode: "compact-jsonl",
+      appPaths: {
+        configFile: join(fixture.root, "unused-config.toml"),
+        reviewersDirectory: join(fixture.root, "unused-reviewers"),
+        runsDirectory,
+      },
+      runRecorderFileSystem: {
+        mkdir,
+        readdir,
+        stat,
+        rm: async (path) => rm(path),
+        link: async () => {
+          throw new Error("link failed");
+        },
+      },
+    });
+
+    expect(exitCode).toBe(3);
+    expect(publicOutput).not.toContain('"results_complete":true');
+    expect(parseSingleDiagnostic(diagnostic)).toMatchObject({
+      error: "persistence_failed",
+    });
+    await expect(
+      access(join(runsDirectory, "publication-failed.jsonl")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("rejects an existing details target without changing it", async () => {
