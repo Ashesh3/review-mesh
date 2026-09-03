@@ -273,7 +273,7 @@ describe("publicEventSchema", () => {
     expect(event.data.suite.skipped).toBe(1);
   });
 
-  it("accepts resolved suite and reviewer startup metadata", () => {
+  it("accepts compact resolved-suite and reviewer startup metadata", () => {
     const envelope = {
       schema_version: "4" as const,
       run_id: "run-1",
@@ -287,7 +287,8 @@ describe("publicEventSchema", () => {
         ...envelope,
         event: "suite.resolved",
         data: {
-          total: 1,
+          logical_lenses: 1,
+          model_runs: 1,
           execution: {
             max_concurrency: 2,
             heartbeat_interval_ms: 15_000,
@@ -299,21 +300,14 @@ describe("publicEventSchema", () => {
             project_name_source: "git_remote",
             matched_project_name: "project",
           },
-          reviewers: [
+          lenses: [
             {
               id: "reviewer-1",
-              agent_id: "reviewer-1",
-              model_index: 0,
-              model_count: 1,
-              activation: "immediate",
               purpose: "Review correctness",
-              adapter: "gateway",
-              adapter_type: "openai_compatible",
-              model: "test-model",
-              effort: "high",
-              isolation_policy: "prefer_enforced",
-              timeout_ms: 900_000,
-              instruction_sources: ["trusted", "project"],
+              model_runs: 1,
+              pass_quorum: 1,
+              minimum_provider_groups: 1,
+              adjudication: "off",
             },
           ],
         },

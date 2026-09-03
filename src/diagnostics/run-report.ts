@@ -290,6 +290,7 @@ const legacyV4PublicEventSchema = z.discriminatedUnion("event", [
 ]);
 
 const persistedExecutionSchema = legacyV4ExecutionSchema.extend({
+  distribute_primaries: z.boolean().optional(),
   default_provider_concurrency: positiveIntegerSchema.optional(),
   provider_limits: z.record(persistedString, positiveIntegerSchema).optional(),
   circuit_breaker_threshold: positiveIntegerSchema.optional(),
@@ -319,6 +320,7 @@ const persistedResolutionReviewerSchema = z.strictObject({
   id: persistedString,
   agent_id: persistedString.optional(),
   model_index: nonNegativeIntegerSchema.optional(),
+  configured_model_index: nonNegativeIntegerSchema.optional(),
   model_count: positiveIntegerSchema.optional(),
   previous_reviewer_id: persistedString.optional(),
   purpose: persistedString.optional(),
@@ -1051,7 +1053,8 @@ function parsePublicEvent(
     if (Array.isArray(data.reviewers)) {
       for (const reviewer of data.reviewers) addReviewer(parsed, reviewer);
     }
-    const total = nonNegativeInteger(data.total);
+    const total =
+      nonNegativeInteger(data.model_runs) ?? nonNegativeInteger(data.total);
     if (total !== undefined) parsed.reportedModelTotal = total;
     return;
   }

@@ -247,6 +247,7 @@ const executionSchema = z.strictObject({
 });
 
 const executionV5Schema = executionSchema.extend({
+  distribute_primaries: z.boolean().optional(),
   default_provider_concurrency: positiveInteger.optional(),
   provider_limits: z.record(nonEmptyString, positiveInteger).optional(),
   circuit_breaker_threshold: positiveInteger.optional(),
@@ -393,6 +394,7 @@ export interface ResolvedReviewer {
   id: string;
   agentId?: string;
   modelIndex?: number;
+  configuredModelIndex?: number;
   modelCount?: number;
   previousReviewerId?: string;
   providerGroup?: string;
@@ -428,6 +430,7 @@ export interface ResolvedReviewer {
 
 export interface ResolvedConfig {
   execution: TrustedConfigV1["execution"] & {
+    distribute_primaries: boolean;
     default_provider_concurrency: number;
     provider_limits: Record<string, number>;
     circuit_breaker_threshold: number;

@@ -58,10 +58,26 @@ describe("readRunStatus", () => {
           data: { consistency_mode: "live_worktree" },
         }),
         line({
+          schema_version: "5",
+          event: "suite.resolved",
+          run_id: runId,
+          seq: 2,
+          timestamp: "2026-09-03T00:00:00.500Z",
+          data: {
+            logical_lenses: 2,
+            model_runs: 2,
+            execution: {
+              max_concurrency: 2,
+              heartbeat_interval_ms: 15_000,
+              shutdown_grace_period_ms: 5_000,
+            },
+          },
+        }),
+        line({
           schema_version: "3",
           event: "reviewer.progress",
           run_id: runId,
-          seq: 2,
+          seq: 3,
           timestamp: "2026-09-03T00:00:01.000Z",
           reviewer_id: "second",
           data: { phase: "reviewing", message: "Inspecting files." },
@@ -70,7 +86,7 @@ describe("readRunStatus", () => {
           schema_version: "3",
           event: "reviewer.heartbeat",
           run_id: runId,
-          seq: 3,
+          seq: 4,
           timestamp: "2026-09-03T00:00:02.000Z",
           reviewer_id: "second",
           data: {
@@ -98,10 +114,13 @@ describe("readRunStatus", () => {
       run_id: runId,
       active: true,
       status: "running",
-      last_seq: 3,
+      last_seq: 4,
       reviewers: [
         {
           reviewer_id: "second",
+          purpose: "Second",
+          adapter: "gateway",
+          model: "b",
           state: "reviewing",
           elapsed_ms: 2_000,
           last_activity_message: "Completed inspection tool.",

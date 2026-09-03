@@ -186,7 +186,7 @@ describe("runReviewRound", () => {
     ).toEqual(["first", "second", "third"]);
   });
 
-  it("reports resolved runtime details without synthetic probing progress", async () => {
+  it("reports compact logical-lens details without a public model roster", async () => {
     const events: PublicEvent[] = [];
     const completionPromise = runReviewRound(
       roundInput({
@@ -213,21 +213,27 @@ describe("runReviewRound", () => {
       events.find((event) => event.event === "suite.resolved"),
     ).toMatchObject({
       data: {
+        logical_lenses: 1,
+        model_runs: 1,
         execution: {
           max_concurrency: 1,
           heartbeat_interval_ms: 25,
           shutdown_grace_period_ms: 10,
         },
-        reviewers: [
+        lenses: [
           {
             id: "detailed",
-            adapter_type: "command",
-            effort: "high",
-            timeout_ms: 321_000,
+            purpose: "Find regressions",
+            model_runs: 1,
           },
         ],
       },
     });
+    const suite = events.find((event) => event.event === "suite.resolved");
+    expect(suite === undefined ? undefined : "reviewers" in suite.data).toBe(
+      false,
+    );
+    expect(JSON.stringify(suite)).not.toContain("fixture-model");
     expect(
       events.filter((event) => event.event === "reviewer.progress"),
     ).toHaveLength(0);
@@ -1094,6 +1100,34 @@ describe("runReviewRound", () => {
       reason: "protocol_violation",
     });
     expect(events.at(-1)?.event).toBe("run.completed");
+  });
+
+  it("redacts credential-shaped text from the public completion summary", async () => {
+    const events: PublicEvent[] = [];
+    const completion = runReviewRound(
+      roundInput({
+        adapters: {
+          summary: fakeAdapterReturning(
+            passResult(
+              "Reviewed https://user:password@example.test/path with client_secret=summary-secret",
+            ),
+          ),
+        },
+        onEvent: (event) => events.push(event),
+      }),
+    );
+    await vi.runAllTimersAsync();
+    await completion;
+
+    const completed = events.find(
+      (event) => event.event === "reviewer.completed",
+    );
+    expect(completed).toMatchObject({
+      data: { summary: expect.stringContaining("[redacted]") },
+    });
+    expect(JSON.stringify(completed)).not.toMatch(
+      /password|summary-secret|client_secret/u,
+    );
   });
 
   it("terminalizes a synchronous adapter.run exception and still completes the run", async () => {

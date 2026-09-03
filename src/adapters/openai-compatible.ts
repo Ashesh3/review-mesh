@@ -25,6 +25,7 @@ import type {
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 180_000;
 const DEFAULT_MAX_TURNS = 80;
+const DEFAULT_FINALIZATION_ATTEMPTS = 2;
 const MAX_FILE_BYTES = 512 * 1_024;
 const MAX_SNAPSHOT_BYTES = 32 * 1_024 * 1_024;
 const MAX_LIST_ENTRIES = 2_000;
@@ -64,6 +65,8 @@ export interface OpenAICompatibleAdapterDependencies {
   sessionIdFactory?: () => string;
   requestTimeoutMs?: number;
   maxTurns?: number;
+  finalizationAttempts?: number;
+  now?: () => number;
   workspaceHooks?: ReadOnlyWorkspaceHooks;
   fileSystemIdentity?: FileSystemIdentityFacade;
   maxSnapshotBytes?: number;
@@ -815,6 +818,22 @@ function providerFailureForStatus(
   );
 }
 
+function retryableResultProductionFailure(failure: AdapterFailure): boolean {
+  return (
+    failure.retryable ||
+    (failure.reason === "protocol_violation" &&
+      failure.diagnostics?.scope !== "run_input" &&
+      failure.diagnostics?.scope !== "adapter") ||
+    failure.reason === "invalid_result"
+  );
+}
+
+function exhaustedResultProductionFailure(
+  failure: AdapterFailure,
+): AdapterFailure {
+  return failure.retryable ? { ...failure, retryable: false } : failure;
+}
+
 interface ProviderJsonResponse {
   value: unknown;
   diagnostics: AdapterFailureDiagnostics;
@@ -1242,6 +1261,8 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
   private readonly sessionIdFactory: () => string;
   private readonly requestTimeoutMs: number;
   private readonly maxTurns: number;
+  private readonly finalizationAttempts: number;
+  private readonly now: () => number;
   private readonly workspaceHooks: ReadOnlyWorkspaceHooks;
   private readonly fileSystemIdentity: FileSystemIdentityFacade;
   private readonly maxSnapshotBytes: number;
@@ -1260,6 +1281,16 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     this.requestTimeoutMs =
       dependencies.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.maxTurns = dependencies.maxTurns ?? DEFAULT_MAX_TURNS;
+    this.finalizationAttempts =
+      dependencies.finalizationAttempts ?? DEFAULT_FINALIZATION_ATTEMPTS;
+    if (
+      !Number.isSafeInteger(this.finalizationAttempts) ||
+      this.finalizationAttempts < 1 ||
+      this.finalizationAttempts > 10
+    ) {
+      throw new Error("finalizationAttempts must be an integer from 1 to 10");
+    }
+    this.now = dependencies.now ?? Date.now;
     this.workspaceHooks = dependencies.workspaceHooks ?? {};
     this.fileSystemIdentity = dependencies.fileSystemIdentity ?? {
       lstat: (path) => lstat(path, { bigint: true }),
@@ -2052,87 +2083,121 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
             schema: relaxedStructuredOutputSchema(input.resultJsonSchema),
           },
         } as const;
-        const finalResponse = await this.chat(
-          configuration,
-          input.signal,
-          sessionId,
-          {
-            model: input.reviewer.model,
-            ...(input.reviewer.effort === undefined
-              ? {}
-              : { reasoning_effort: input.reviewer.effort }),
-            messages,
-            response_format: responseFormat,
-            max_tokens: 8_192,
-          },
-          {
+        // Retain one immutable post-inspection checkpoint. Result-production
+        // transport/envelope/schema failures can retry from it without
+        // repeating any repository tool calls or inspection turns.
+        const finalizationCheckpoint = structuredClone(messages);
+        const finalizationDeadline =
+          this.now() + this.requestTimeoutMs * this.finalizationAttempts * 2;
+        let lastFinalizationFailure: AdapterFailure | undefined;
+        for (
+          let finalizationAttempt = 1;
+          finalizationAttempt <= this.finalizationAttempts;
+          finalizationAttempt += 1
+        ) {
+          throwIfAborted(input.signal);
+          if (this.now() >= finalizationDeadline) {
+            lastFinalizationFailure = adapterFailure.timeout(
+              "Structured result production exceeded its bounded deadline.",
+              true,
+              {
+                diagnostics: {
+                  failure_stage: "structured_result_deadline",
+                  scope: "provider",
+                },
+              },
+            );
+            break;
+          }
+          const finalizationMessages = structuredClone(finalizationCheckpoint);
+          let resultDiagnostics: AdapterFailureDiagnostics = {
             failure_stage: "structured_result_envelope",
+            scope: "provider",
             repair_attempted: false,
             repair_outcome: "not_attempted",
-          },
-        );
-        const finalMessage = finalResponse.message;
-        let resultDiagnostics = finalResponse.diagnostics;
-        let parsedResult = parseReviewerResult(
-          normalizedAssistantContent(finalMessage.content),
-        );
-        if (!parsedResult.success) {
-          const repairMessage = {
-            role: "user",
-            content: `Your previous final result was invalid. ${parsedResult.diagnostic} Return exactly one JSON object that satisfies the supplied reviewer_result schema. Include every required top-level field, use no markdown or commentary, and do not call tools.`,
           };
-          if (
-            conversationBytes([...messages, repairMessage]) >
-            this.maxConversationBytes
-          ) {
-            if (
-              !forceFinalization(
-                messages,
-                "The invalid final result could not be repaired within the bounded context.",
-                this.maxConversationBytes,
-              )
-            ) {
-              throw new ProviderRequestError(
-                adapterFailure.read(
-                  "The bounded conversation cannot fit a schema repair request.",
-                ),
+          try {
+            const finalResponse = await this.chat(
+              configuration,
+              input.signal,
+              sessionId,
+              {
+                model: input.reviewer.model,
+                ...(input.reviewer.effort === undefined
+                  ? {}
+                  : { reasoning_effort: input.reviewer.effort }),
+                messages: finalizationMessages,
+                response_format: responseFormat,
+                max_tokens: 8_192,
+              },
+              {
+                failure_stage: "structured_result_envelope",
+                repair_attempted: false,
+                repair_outcome: "not_attempted",
+              },
+            );
+            resultDiagnostics = finalResponse.diagnostics;
+            let parsedResult = parseReviewerResult(
+              normalizedAssistantContent(finalResponse.message.content),
+            );
+            if (!parsedResult.success) {
+              const repairMessage = {
+                role: "user",
+                content: `Your previous final result was invalid. ${parsedResult.diagnostic} Return exactly one JSON object that satisfies the supplied reviewer_result schema. Include every required top-level field, use no markdown or commentary, and do not call tools.`,
+              };
+              if (
+                conversationBytes([...finalizationMessages, repairMessage]) >
+                this.maxConversationBytes
+              ) {
+                if (
+                  !forceFinalization(
+                    finalizationMessages,
+                    "The invalid final result could not be repaired within the bounded context.",
+                    this.maxConversationBytes,
+                  )
+                ) {
+                  throw new ProviderRequestError(
+                    adapterFailure.read(
+                      "The bounded conversation cannot fit a schema repair request.",
+                    ),
+                  );
+                }
+                finalizationMessages.push({
+                  role: "user",
+                  content: truncateUtf8(parsedResult.diagnostic, 512),
+                });
+              } else {
+                finalizationMessages.push(repairMessage);
+              }
+              const repairedResponse = await this.chat(
+                configuration,
+                input.signal,
+                sessionId,
+                {
+                  model: input.reviewer.model,
+                  ...(input.reviewer.effort === undefined
+                    ? {}
+                    : { reasoning_effort: input.reviewer.effort }),
+                  messages: finalizationMessages,
+                  response_format: responseFormat,
+                  max_tokens: 8_192,
+                },
+                {
+                  failure_stage: "structured_result_repair_envelope",
+                  repair_attempted: true,
+                  repair_outcome: "failed",
+                },
+              );
+              resultDiagnostics = repairedResponse.diagnostics;
+              parsedResult = parseReviewerResult(
+                normalizedAssistantContent(repairedResponse.message.content),
               );
             }
-            messages.push({
-              role: "user",
-              content: truncateUtf8(parsedResult.diagnostic, 512),
-            });
-          } else {
-            messages.push(repairMessage);
-          }
-          const repairedResponse = await this.chat(
-            configuration,
-            input.signal,
-            sessionId,
-            {
-              model: input.reviewer.model,
-              ...(input.reviewer.effort === undefined
-                ? {}
-                : { reasoning_effort: input.reviewer.effort }),
-              messages,
-              response_format: responseFormat,
-              max_tokens: 8_192,
-            },
-            {
-              failure_stage: "structured_result_repair_envelope",
-              repair_attempted: true,
-              repair_outcome: "failed",
-            },
-          );
-          const repairedMessage = repairedResponse.message;
-          resultDiagnostics = repairedResponse.diagnostics;
-          parsedResult = parseReviewerResult(
-            normalizedAssistantContent(repairedMessage.content),
-          );
-        }
-        if (!parsedResult.success) {
-          throw new ProviderRequestError(
-            adapterFailure.invalidResult(
+            if (parsedResult.success) {
+              yield { type: "result", result: parsedResult.data, isolation };
+              return;
+            }
+            lastFinalizationFailure = adapterFailure.invalidResult(
               "The OpenAI-compatible endpoint returned a reviewer result that violates the required schema after one repair attempt.",
               false,
               {
@@ -2145,11 +2210,33 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
                   repair_outcome: "failed",
                 },
               },
-            ),
-          );
+            );
+          } catch (error) {
+            if (!(error instanceof ProviderRequestError)) throw error;
+            lastFinalizationFailure = error.failure;
+          }
+          if (
+            finalizationAttempt < this.finalizationAttempts &&
+            lastFinalizationFailure !== undefined &&
+            retryableResultProductionFailure(lastFinalizationFailure)
+          ) {
+            yield {
+              type: "progress",
+              phase: "validating",
+              message: `Retrying structured result production from the retained inspection checkpoint (attempt ${finalizationAttempt + 1} of ${this.finalizationAttempts}).`,
+            };
+            continue;
+          }
+          break;
         }
-        yield { type: "result", result: parsedResult.data, isolation };
-        return;
+        throw new ProviderRequestError(
+          exhaustedResultProductionFailure(
+            lastFinalizationFailure ??
+              adapterFailure.invalidResult(
+                "The OpenAI-compatible endpoint did not return a valid reviewer result.",
+              ),
+          ),
+        );
       }
 
       yield {

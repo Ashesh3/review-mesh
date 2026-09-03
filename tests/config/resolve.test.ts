@@ -7,6 +7,7 @@ import {
   type TrustedConfigV2,
   type TrustedConfigV3,
   type TrustedConfigV4,
+  type TrustedConfigV5,
 } from "../../src/config/schemas.js";
 import { loadConfigFiles } from "../../src/config/load.js";
 import { resolveConfig } from "../../src/config/resolve.js";
@@ -70,6 +71,15 @@ function v4(projectName: string): TrustedConfigV4 {
     projects: {
       [projectName]: legacy.projects!["/legacy/path"]!,
     },
+  };
+}
+
+function v5(projectName: string): TrustedConfigV5 {
+  const legacy = v4(projectName);
+  return {
+    ...legacy,
+    schema_version: "5",
+    execution: { ...legacy.execution },
   };
 }
 
@@ -175,6 +185,201 @@ describe("global configuration", () => {
     );
   });
 
+  it("rotates multi-model primaries deterministically across logical lenses", () => {
+    const config = v5("demo");
+    config.adapters.a = {
+      type: "command",
+      command: "a",
+      protocol: "review-mesh-command-v1",
+    };
+    config.adapters.b = {
+      type: "command",
+      command: "b",
+      protocol: "review-mesh-command-v1",
+    };
+    config.adapters.c = {
+      type: "command",
+      command: "c",
+      protocol: "review-mesh-command-v1",
+    };
+    const profile = {
+      adapter: "a",
+      model_runs: [
+        { id: "a", adapter: "a", model: "model-a" },
+        { id: "b", adapter: "b", model: "model-b" },
+        { id: "c", adapter: "c", model: "model-c" },
+      ],
+      purpose: "Distributed review",
+      instructions: "Review carefully.",
+      isolation: "prefer_enforced" as const,
+      timeout_ms: 60_000,
+    };
+    config.agents = {
+      first: structuredClone(profile),
+      second: structuredClone(profile),
+      third: structuredClone(profile),
+      fourth: structuredClone(profile),
+    };
+    config.defaults = { agents: ["first", "second", "third", "fourth"] };
+    config.projects = {};
+
+    const resolved = resolveConfig({
+      trusted: config,
+      projectName: "demo",
+    });
+    const orders = new Map<string, string[]>();
+    for (const reviewer of resolved.reviewers) {
+      const id = reviewer.agentId ?? reviewer.id;
+      orders.set(id, [...(orders.get(id) ?? []), reviewer.id]);
+    }
+    expect(resolved.execution.distribute_primaries).toBe(true);
+    expect([...orders.values()]).toEqual([
+      ["first::a", "first::b", "first::c"],
+      ["second::b", "second::c", "second::a"],
+      ["third::c", "third::a", "third::b"],
+      ["fourth::a", "fourth::b", "fourth::c"],
+    ]);
+    expect(
+      resolved.reviewers.map((reviewer) => ({
+        id: reviewer.id,
+        modelIndex: reviewer.modelIndex,
+        configuredModelIndex: reviewer.configuredModelIndex,
+        previousReviewerId: reviewer.previousReviewerId,
+      })),
+    ).toEqual([
+      { id: "first::a", modelIndex: 0, configuredModelIndex: 0 },
+      {
+        id: "first::b",
+        modelIndex: 1,
+        configuredModelIndex: 1,
+        previousReviewerId: "first::a",
+      },
+      {
+        id: "first::c",
+        modelIndex: 2,
+        configuredModelIndex: 2,
+        previousReviewerId: "first::b",
+      },
+      { id: "second::b", modelIndex: 0, configuredModelIndex: 1 },
+      {
+        id: "second::c",
+        modelIndex: 1,
+        configuredModelIndex: 2,
+        previousReviewerId: "second::b",
+      },
+      {
+        id: "second::a",
+        modelIndex: 2,
+        configuredModelIndex: 0,
+        previousReviewerId: "second::c",
+      },
+      { id: "third::c", modelIndex: 0, configuredModelIndex: 2 },
+      {
+        id: "third::a",
+        modelIndex: 1,
+        configuredModelIndex: 0,
+        previousReviewerId: "third::c",
+      },
+      {
+        id: "third::b",
+        modelIndex: 2,
+        configuredModelIndex: 1,
+        previousReviewerId: "third::a",
+      },
+      { id: "fourth::a", modelIndex: 0, configuredModelIndex: 0 },
+      {
+        id: "fourth::b",
+        modelIndex: 1,
+        configuredModelIndex: 1,
+        previousReviewerId: "fourth::a",
+      },
+      {
+        id: "fourth::c",
+        modelIndex: 2,
+        configuredModelIndex: 2,
+        previousReviewerId: "fourth::b",
+      },
+    ]);
+  });
+
+  it("preserves configured model-run order when primary distribution is disabled", () => {
+    const config = v5("demo");
+    config.execution.distribute_primaries = false;
+    config.agents = {
+      first: {
+        adapter: "gateway",
+        model_runs: [
+          { id: "one", model: "one" },
+          { id: "two", model: "two" },
+        ],
+        purpose: "First",
+        instructions: "Review.",
+        isolation: "prefer_enforced",
+        timeout_ms: 60_000,
+      },
+      second: {
+        adapter: "gateway",
+        model_runs: [
+          { id: "one", model: "one" },
+          { id: "two", model: "two" },
+        ],
+        purpose: "Second",
+        instructions: "Review.",
+        isolation: "prefer_enforced",
+        timeout_ms: 60_000,
+      },
+    };
+    config.defaults = { agents: ["first", "second"] };
+    config.projects = {};
+
+    const resolved = resolveConfig({ trusted: config, projectName: "demo" });
+    expect(resolved.execution.distribute_primaries).toBe(false);
+    expect(resolved.reviewers.map((reviewer) => reviewer.id)).toEqual([
+      "first::one",
+      "first::two",
+      "second::one",
+      "second::two",
+    ]);
+  });
+
+  it("does not let scalar lenses consume a primary-rotation slot", () => {
+    const config = v5("demo");
+    const rotating = {
+      adapter: "gateway",
+      model_runs: [
+        { id: "one", model: "one" },
+        { id: "two", model: "two" },
+      ],
+      purpose: "Rotating",
+      instructions: "Review.",
+      isolation: "prefer_enforced" as const,
+      timeout_ms: 60_000,
+    };
+    config.agents = {
+      first: structuredClone(rotating),
+      scalar: {
+        adapter: "gateway",
+        model: "scalar",
+        purpose: "Scalar",
+        instructions: "Review.",
+        isolation: "prefer_enforced",
+        timeout_ms: 60_000,
+      },
+      second: structuredClone(rotating),
+    };
+    config.defaults = { agents: ["first", "scalar", "second"] };
+    config.projects = {};
+
+    const resolved = resolveConfig({ trusted: config, projectName: "demo" });
+    expect(resolved.reviewers.map((reviewer) => reviewer.id)).toEqual([
+      "first::one",
+      "first::two",
+      "scalar",
+      "second::two",
+      "second::one",
+    ]);
+  });
+
   it("selects v4 project settings by name regardless of workspace path", () => {
     const config = v4("Review-Mesh");
     const resolved = resolveConfig({
@@ -184,6 +389,7 @@ describe("global configuration", () => {
       projectNameSource: "git_remote",
     });
     expect(resolved.reviewers.map(({ id }) => id)).toEqual(["gemini"]);
+    expect(resolved.execution.distribute_primaries).toBe(false);
     expect(resolved.selection).toEqual({
       source: "project",
       projectName: "review-mesh",

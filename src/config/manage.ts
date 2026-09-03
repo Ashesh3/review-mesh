@@ -100,6 +100,7 @@ export interface ManagedConfig {
     max_concurrency: number;
     heartbeat_interval_ms: number;
     shutdown_grace_period_ms: number;
+    distribute_primaries?: boolean | undefined;
     default_provider_concurrency?: number | undefined;
     provider_limits?: Record<string, number> | undefined;
     circuit_breaker_threshold?: number | undefined;
@@ -215,12 +216,26 @@ function clone<T>(value: T): T {
   return structuredClone(value);
 }
 
+function preserveLegacyPrimaryOrder<T extends { execution: object }>(
+  value: T,
+): T & { execution: T["execution"] & { distribute_primaries: false } } {
+  return {
+    ...value,
+    execution: { ...value.execution, distribute_primaries: false },
+  };
+}
+
 function requireManagedConfig(value: unknown): ManagedConfig {
   let record = asRecord(value);
   if (record?.schema_version === "4") {
+    const legacy = trustedConfigV4Schema.parse(value);
     record = {
-      ...(clone(trustedConfigV4Schema.parse(value)) as TrustedConfigV4),
+      ...(clone(legacy) as TrustedConfigV4),
       schema_version: "5",
+      execution: {
+        ...legacy.execution,
+        distribute_primaries: false,
+      },
     };
     value = record;
   }
@@ -361,7 +376,10 @@ export function migrateV1Config(value: unknown): ManagedConfig {
 
   return requireManagedConfig({
     schema_version: "5",
-    execution: clone(record.execution as ManagedConfig["execution"]),
+    execution: {
+      ...clone(record.execution as ManagedConfig["execution"]),
+      distribute_primaries: false,
+    },
     diagnostics: clone(record.diagnostics as ManagedConfig["diagnostics"]),
     adapters: clone(record.adapters as ManagedConfig["adapters"]),
     agents,
@@ -377,7 +395,7 @@ export function migrateV2Config(value: unknown): ManagedConfig {
     throw new Error("configuration is not a Review Mesh v2 configuration");
   }
   return requireManagedConfig({
-    ...(clone(parsed) as TrustedConfigV2),
+    ...preserveLegacyPrimaryOrder(clone(parsed) as TrustedConfigV2),
     schema_version: "5",
     projects: migrateLegacyProjects(parsed.projects),
   });
@@ -436,7 +454,7 @@ export function migrateV3Config(value: unknown): ManagedConfig {
   }
   validateProjectKeys(parsed.projects);
   return requireManagedConfig({
-    ...(clone(parsed) as TrustedConfigV3),
+    ...preserveLegacyPrimaryOrder(clone(parsed) as TrustedConfigV3),
     schema_version: "5",
     projects: migrateLegacyProjects(parsed.projects),
   });
@@ -451,7 +469,7 @@ export async function migrateLegacyConfig(
   if (parsed.schema_version === "2") {
     validateProjectKeys(parsed.projects);
     return requireManagedConfig({
-      ...(clone(parsed) as TrustedConfigV2),
+      ...preserveLegacyPrimaryOrder(clone(parsed) as TrustedConfigV2),
       schema_version: "5",
       projects: await migrateLegacyProjectsByIdentity(parsed.projects),
     });
@@ -459,14 +477,14 @@ export async function migrateLegacyConfig(
   if (parsed.schema_version === "3") {
     validateProjectKeys(parsed.projects);
     return requireManagedConfig({
-      ...(clone(parsed) as TrustedConfigV3),
+      ...preserveLegacyPrimaryOrder(clone(parsed) as TrustedConfigV3),
       schema_version: "5",
       projects: await migrateLegacyProjectsByIdentity(parsed.projects),
     });
   }
   if (parsed.schema_version === "4") {
     return requireManagedConfig({
-      ...(clone(parsed) as TrustedConfigV4),
+      ...preserveLegacyPrimaryOrder(clone(parsed) as TrustedConfigV4),
       schema_version: "5",
     });
   }
@@ -489,7 +507,7 @@ export function parseManagedConfig(text: string): {
     const legacy = trustedConfigV4Schema.parse(parsed);
     return {
       config: requireManagedConfig({
-        ...(clone(legacy) as TrustedConfigV4),
+        ...preserveLegacyPrimaryOrder(clone(legacy) as TrustedConfigV4),
         schema_version: "5",
       }),
       migrated: true,
@@ -516,6 +534,7 @@ export function emptyManagedConfig(): ManagedConfig {
       max_concurrency: 2,
       heartbeat_interval_ms: 15_000,
       shutdown_grace_period_ms: 5_000,
+      distribute_primaries: true,
       default_provider_concurrency: 2,
       provider_limits: {},
       circuit_breaker_threshold: 2,

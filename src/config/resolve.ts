@@ -61,6 +61,7 @@ function resolveReviewer(
   id: string,
   agentId: string,
   modelIndex: number,
+  configuredModelIndex: number,
   modelCount: number,
   previousReviewerId: string | undefined,
   profile: ReviewerProfileBase,
@@ -84,6 +85,7 @@ function resolveReviewer(
     id,
     agentId,
     modelIndex,
+    configuredModelIndex,
     modelCount,
     ...(previousReviewerId === undefined ? {} : { previousReviewerId }),
     ...(options?.providerGroup === undefined
@@ -197,11 +199,18 @@ function resolveAgent(
   profile: AgentProfile,
   adapters: TrustedConfigV2["adapters"],
   projectInstructions?: string,
+  primaryOffset = 0,
 ): ResolvedReviewer[] {
   configuredAdapter(id, profile.adapter, adapters);
   if ("model_runs" in profile) {
     const policy = resolvedPolicy(profile);
-    return profile.model_runs.map((run, index) => {
+    const runCount = profile.model_runs.length;
+    const offset = ((primaryOffset % runCount) + runCount) % runCount;
+    const orderedRuns = Array.from({ length: runCount }, (_, index) => {
+      const configuredIndex = (offset + index) % runCount;
+      return { run: profile.model_runs[configuredIndex]!, configuredIndex };
+    });
+    return orderedRuns.map(({ run, configuredIndex }, index) => {
       const adapterId = run.adapter ?? profile.adapter;
       const label = `agent ${id} model run ${run.id}`;
       const adapter = configuredAdapter(id, adapterId, adapters, label);
@@ -211,8 +220,9 @@ function resolveAgent(
         reviewerId,
         id,
         index,
+        configuredIndex,
         profile.model_runs.length,
-        index === 0 ? undefined : `${id}::${profile.model_runs[index - 1]!.id}`,
+        index === 0 ? undefined : `${id}::${orderedRuns[index - 1]!.run.id}`,
         profile,
         adapterId,
         run.model,
@@ -234,6 +244,7 @@ function resolveAgent(
     resolveReviewer(
       id,
       id,
+      0,
       0,
       1,
       undefined,
@@ -302,6 +313,7 @@ function resolveV1(
       definition.id,
       definition.id,
       0,
+      0,
       1,
       undefined,
       profile,
@@ -321,6 +333,7 @@ function resolveV1(
   return {
     execution: {
       ...config.execution,
+      distribute_primaries: false,
       default_provider_concurrency: 2,
       provider_limits: {},
       circuit_breaker_threshold: 2,
@@ -363,17 +376,31 @@ function resolveV2(
   if (agentIds === undefined || agentIds.length === 0) {
     throw new Error("no agents are configured for the requested project");
   }
+  const distributePrimaries =
+    config.schema_version === "5"
+      ? (config.execution.distribute_primaries ?? true)
+      : false;
+  let rotatableLensIndex = 0;
   const reviewers = agentIds.flatMap((id) => {
     const agent = Object.hasOwn(config.agents, id)
       ? config.agents[id]
       : undefined;
     if (agent === undefined) throw new Error(`unknown configured agent: ${id}`);
-    return resolveAgent(id, agent, config.adapters, project?.instructions);
+    const primaryOffset =
+      distributePrimaries && "model_runs" in agent ? rotatableLensIndex++ : 0;
+    return resolveAgent(
+      id,
+      agent,
+      config.adapters,
+      project?.instructions,
+      primaryOffset,
+    );
   });
   requireUniqueResolvedIds(reviewers);
   return {
     execution: {
       ...config.execution,
+      distribute_primaries: distributePrimaries,
       default_provider_concurrency:
         "default_provider_concurrency" in config.execution
           ? (config.execution.default_provider_concurrency ?? 2)

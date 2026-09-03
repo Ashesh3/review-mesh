@@ -358,32 +358,22 @@ describe("review-mesh review", () => {
     const suite = events.find((event) => event.event === "suite.resolved");
     expect(suite).toMatchObject({
       data: {
-        total: 2,
-        reviewers: [
+        logical_lenses: 1,
+        model_runs: 2,
+        lenses: [
           {
-            id: "architecture::opus",
-            agent_id: "architecture",
-            model_index: 0,
-            model_count: 2,
-            activation: "immediate",
-            adapter: "opus",
-            model: "claude-opus-test",
-            effort: "high",
-          },
-          {
-            id: "architecture::grok",
-            agent_id: "architecture",
-            model_index: 1,
-            model_count: 2,
-            previous_reviewer_id: "architecture::opus",
-            activation: "after_lens_progress",
-            adapter: "grok",
-            model: "grok-test",
-            effort: "medium",
+            id: "architecture",
+            model_runs: 2,
           },
         ],
       },
     });
+    expect(suite === undefined ? undefined : "reviewers" in suite.data).toBe(
+      false,
+    );
+    expect(JSON.stringify(suite)).not.toMatch(
+      /claude-opus-test|grok-test|architecture::opus|architecture::grok/u,
+    );
     expect(
       events
         .filter((event) => event.event === "reviewer.completed")
@@ -707,6 +697,171 @@ describe("review-mesh review", () => {
     await expect(access(join(fixture.root, "runs"))).rejects.toMatchObject({
       code: "ENOENT",
     });
+  });
+
+  it("publishes a sanitized details file and removes the temporary internal record", async () => {
+    const fixture = await createFixture(["secret-messages"]);
+    const runsDirectory = join(fixture.root, "injected-app-data", "runs");
+    const detailsFile = join(fixture.root, "review-details.jsonl");
+    const stdout = new PassThrough();
+    let publicOutput = "";
+    stdout.setEncoding("utf8");
+    stdout.on("data", (chunk: string) => {
+      publicOutput += chunk;
+    });
+
+    const exitCode = await runReviewApplication({
+      requestText: fixture.request,
+      configFile: fixture.configFile,
+      stdout,
+      stderr: new PassThrough(),
+      signal: new AbortController().signal,
+      runIdFactory: () => "details-success",
+      detailsFile,
+      appPaths: {
+        configFile: join(fixture.root, "unused-config.toml"),
+        reviewersDirectory: join(fixture.root, "unused-reviewers"),
+        runsDirectory,
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    const completed = parseEvents(publicOutput).at(-1);
+    expect(completed).toMatchObject({
+      event: "run.completed",
+      data: { report_path: detailsFile },
+    });
+    const details = await readFile(detailsFile, "utf8");
+    expect(details).toContain('"event":"run.completed"');
+    expect(details).toContain("[redacted]");
+    expect(details).not.toMatch(/progress-secret|activity-secret/u);
+    await expect(
+      access(join(runsDirectory, "details-success.jsonl")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("redacts a reviewer summary in both stdout and the exported artifact", async () => {
+    const fixture = await createFixture(["pass"]);
+    const runsDirectory = join(fixture.root, "injected-app-data", "runs");
+    const detailsFile = join(fixture.root, "summary-details.jsonl");
+    const stdout = new PassThrough();
+    let publicOutput = "";
+    stdout.setEncoding("utf8");
+    stdout.on("data", (chunk: string) => {
+      publicOutput += chunk;
+    });
+    const adapterScript = `
+      const chunks=[]; for await (const chunk of process.stdin) chunks.push(chunk);
+      process.stdout.write(JSON.stringify({type:"result",result:{schema_version:"2",verdict:"pass",summary:"Authorization: Bearer summary-secret",actionable_findings:[],informational_notes:[]}})+"\\n");
+    `;
+    await writeFile(
+      fixture.configFile,
+      trustedConfig(["pass"]).replace(
+        `args = ["--input-type=module", "-e", ${tomlString(fixtureScript("pass"))}]`,
+        `args = ["--input-type=module", "-e", ${tomlString(adapterScript)}]`,
+      ),
+    );
+
+    const exitCode = await runReviewApplication({
+      requestText: fixture.request,
+      configFile: fixture.configFile,
+      stdout,
+      stderr: new PassThrough(),
+      signal: new AbortController().signal,
+      runIdFactory: () => "details-summary",
+      detailsFile,
+      appPaths: {
+        configFile: join(fixture.root, "unused-config.toml"),
+        reviewersDirectory: join(fixture.root, "unused-reviewers"),
+        runsDirectory,
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    const completed = parseEvents(publicOutput).find(
+      (event) => event.event === "reviewer.completed",
+    );
+    expect(completed).toMatchObject({ data: { summary: "[redacted]" } });
+    expect(publicOutput).not.toContain("summary-secret");
+    const details = await readFile(detailsFile, "utf8");
+    expect(details).toContain("[redacted]");
+    expect(details).not.toContain("summary-secret");
+  });
+
+  it("rejects an existing details target without changing it", async () => {
+    const fixture = await createFixture(["pass"]);
+    const runsDirectory = join(fixture.root, "injected-app-data", "runs");
+    const detailsFile = join(fixture.root, "existing-details.jsonl");
+    await writeFile(detailsFile, "keep-me");
+    const stderr = new PassThrough();
+    let diagnostic = "";
+    stderr.setEncoding("utf8");
+    stderr.on("data", (chunk: string) => {
+      diagnostic += chunk;
+    });
+
+    const exitCode = await runReviewApplication({
+      requestText: fixture.request,
+      configFile: fixture.configFile,
+      stdout: new PassThrough(),
+      stderr,
+      signal: new AbortController().signal,
+      runIdFactory: () => "details-existing",
+      detailsFile,
+      appPaths: {
+        configFile: join(fixture.root, "unused-config.toml"),
+        reviewersDirectory: join(fixture.root, "unused-reviewers"),
+        runsDirectory,
+      },
+    });
+
+    expect(exitCode).toBe(2);
+    expect(parseSingleDiagnostic(diagnostic)).toMatchObject({
+      error: "details_file_unavailable",
+    });
+    expect(await readFile(detailsFile, "utf8")).toBe("keep-me");
+    await expect(access(runsDirectory)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
+  it("publishes a nonempty cancellation artifact after an interrupted run", async () => {
+    const fixture = await createFixture(["pass"]);
+    const runsDirectory = join(fixture.root, "injected-app-data", "runs");
+    const detailsFile = join(fixture.root, "interrupted-details.jsonl");
+    const controller = new AbortController();
+    const stdout = new PassThrough();
+    let publicOutput = "";
+    stdout.setEncoding("utf8");
+    stdout.on("data", (chunk: string) => {
+      publicOutput += chunk;
+      if (chunk.includes('"event":"run.started"')) controller.abort("SIGINT");
+    });
+
+    const exitCode = await runReviewApplication({
+      requestText: fixture.request,
+      configFile: fixture.configFile,
+      stdout,
+      stderr: new PassThrough(),
+      signal: controller.signal,
+      runIdFactory: () => "details-interrupted",
+      detailsFile,
+      appPaths: {
+        configFile: join(fixture.root, "unused-config.toml"),
+        reviewersDirectory: join(fixture.root, "unused-reviewers"),
+        runsDirectory,
+      },
+    });
+
+    expect(exitCode).toBe(4);
+    expect(publicOutput).toContain('"event":"run.completed"');
+    const details = await readFile(detailsFile, "utf8");
+    expect(details).toContain('"event":"run.completed"');
+    expect(details).toContain('"reason":"cancelled"');
+    expect(Buffer.byteLength(details)).toBeGreaterThan(0);
+    await expect(
+      access(join(runsDirectory, "details-interrupted.jsonl")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("does not persist arbitrary reviewer runtime values in the run header", async () => {

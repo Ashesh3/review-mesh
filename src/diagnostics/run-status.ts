@@ -266,17 +266,6 @@ export async function readRunStatus({
     if (eventName === "suite.resolved") {
       resolvedModelTotal =
         integer(data.model_runs) ?? integer(data.total) ?? resolvedModelTotal;
-      const roster = Array.isArray(data.reviewers) ? data.reviewers : [];
-      for (const item of roster) {
-        const entry = asRecord(item);
-        const reviewer = text(entry?.id);
-        if (reviewer === undefined) continue;
-        const snapshot = reviewerFor(reviewers, reviewer);
-        snapshot.lens_id = text(entry?.agent_id) ?? snapshot.lens_id;
-        snapshot.purpose = text(entry?.purpose) ?? snapshot.purpose;
-        snapshot.adapter = text(entry?.adapter) ?? snapshot.adapter;
-        snapshot.model = text(entry?.model) ?? snapshot.model;
-      }
       continue;
     }
     if (eventName === "run.completed") {
