@@ -1242,6 +1242,44 @@ describe("runReviewRound", () => {
     });
   });
 
+  it("marks the run incomplete instead of claiming complete results when result persistence fails", async () => {
+    const emitted: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const writer = {
+      emit: vi.fn(
+        async (draft: { event: string; data: Record<string, unknown> }) => {
+          emitted.push(draft);
+          return {};
+        },
+      ),
+      record: vi.fn(async (record: { record: string }) => {
+        if (record.record === "reviewer.result") {
+          throw new Error("disk write failed");
+        }
+      }),
+      close: vi.fn(async () => undefined),
+    };
+    const completionPromise = runReviewRound(
+      roundInput({
+        adapters: { persistence: fakeAdapterReturning(passResult()) },
+        writer,
+        reportPath: "C:\\runs\\run-1.jsonl",
+      }),
+    );
+
+    await vi.runAllTimersAsync();
+    const completion = await completionPromise;
+
+    expect(completion).toMatchObject({ status: "incomplete", exitCode: 3 });
+    expect(completion.reviewers[0]).toMatchObject({
+      status: "incomplete",
+      reason: "persistence_failed",
+    });
+    expect(emitted.at(-1)).toMatchObject({
+      event: "run.completed",
+      data: { results_complete: false, result_manifest: [] },
+    });
+  });
+
   it("omits reviewer.result payloads in compact-jsonl mode but retains the manifest", async () => {
     const events: PublicEvent[] = [];
     const completion = runReviewRound(

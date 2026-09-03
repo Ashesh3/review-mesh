@@ -2,6 +2,8 @@ import { constants } from "node:fs";
 import { open, readdir, realpath } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import type { ReviewerResultV3 } from "../protocol/schemas.js";
+import { reviewerResultV3Schema } from "../protocol/schemas.js";
+import { reviewerResultDigest } from "../results/digest.js";
 
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 const ACTIVE_SUFFIX = /^\.jsonl\.active(?:\..+)?$/u;
@@ -13,6 +15,7 @@ export class RunStatusError extends Error {
     message: string,
     readonly line?: number,
     readonly recordType?: string,
+    readonly schemaPaths?: string[],
   ) {
     super(message);
     this.name = "RunStatusError";
@@ -24,6 +27,9 @@ export class RunStatusError extends Error {
       ...(this.recordType === undefined
         ? {}
         : { record_type: this.recordType }),
+      ...(this.schemaPaths === undefined
+        ? {}
+        : { schema_paths: this.schemaPaths }),
     };
   }
 }
@@ -64,6 +70,8 @@ interface ReviewerSnapshot {
     informational_notes: number;
   };
   complete_result?: ReviewerResultV3;
+  result_digest?: string;
+  result_byte_count?: number;
   failure?: Record<string, unknown>;
   skipped?: Record<string, unknown>;
   attempts?: ReviewerAttempt[];
@@ -300,6 +308,59 @@ function privateTerminal(
   return asRecord(record.terminal) ?? asRecord(record.data);
 }
 
+function applyPrivateResult(
+  reviewers: Map<string, ReviewerSnapshot>,
+  record: Record<string, unknown>,
+  line: number,
+): void {
+  const id = text(record.reviewer_id);
+  const result = reviewerResultV3Schema.safeParse(record.result);
+  if (id === undefined || !result.success) {
+    throw new RunStatusError(
+      "invalid_run_record",
+      `The persisted reviewer result is invalid at JSONL line ${line}.`,
+      line,
+      "reviewer.result",
+      [id === undefined ? "reviewer_id" : "result"],
+    );
+  }
+  const digest = text(record.digest);
+  const byteCount = integer(record.byte_count);
+  if (digest !== reviewerResultDigest(result.data)) {
+    throw new RunStatusError(
+      "invalid_run_record",
+      `The persisted reviewer result digest is invalid at JSONL line ${line}.`,
+      line,
+      "reviewer.result",
+      ["digest"],
+    );
+  }
+  const expectedByteCount = Buffer.byteLength(
+    JSON.stringify(result.data),
+    "utf8",
+  );
+  if (byteCount !== expectedByteCount) {
+    throw new RunStatusError(
+      "invalid_run_record",
+      `The persisted reviewer result byte count is invalid at JSONL line ${line}.`,
+      line,
+      "reviewer.result",
+      ["byte_count"],
+    );
+  }
+  const reviewer = reviewerFor(reviewers, id);
+  reviewer.state = "completed";
+  reviewer.complete_result = structuredClone(result.data);
+  reviewer.result_digest = digest;
+  reviewer.result_byte_count = byteCount;
+  reviewer.result = {
+    verdict: result.data.verdict,
+    summary: result.data.summary,
+    actionable_findings: result.data.actionable_findings.length,
+    informational_notes: result.data.informational_notes.length,
+  };
+}
+
 export async function readRunStatus({
   runsDirectory,
   runId,
@@ -364,6 +425,10 @@ export async function readRunStatus({
     }
     if (event.record === "reviewer.attempt") {
       addAttempt(reviewers, event);
+      continue;
+    }
+    if (event.record === "reviewer.result") {
+      applyPrivateResult(reviewers, event, index + 1);
       continue;
     }
     if (event.record === "reviewer.terminal") {

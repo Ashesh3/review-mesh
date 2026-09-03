@@ -29,6 +29,31 @@ describe("sanitizeReviewerResult", () => {
     expect(sanitized.review_markdown).not.toContain("[truncated]");
   });
 
+  it("preserves benign URL query parameters while redacting credential parameters", () => {
+    const sanitized = sanitizeReviewerResult(
+      passResult(
+        "Reviewed https://example.test/search?q=review&page=2&access_token=query-secret&sort=asc successfully.",
+      ),
+    );
+
+    expect(sanitized.review_markdown).toContain(
+      "https://example.test/search?q=review&page=2&access_token=[redacted]&sort=asc",
+    );
+    expect(sanitized.review_markdown).not.toContain("query-secret");
+  });
+
+  it("redacts credential-shaped query values even under a benign parameter name", () => {
+    const credential = `ghp_${"a".repeat(24)}`;
+    const sanitized = sanitizeReviewerResult(
+      passResult(`Reviewed https://example.test/callback?state=${credential}&page=2.`),
+    );
+
+    expect(sanitized.review_markdown).toContain(
+      "https://example.test/callback?state=[redacted]&page=2.",
+    );
+    expect(sanitized.review_markdown).not.toContain(credential);
+  });
+
   it("rejects a sanitized result above 16 MiB with result_too_large", () => {
     expect(() =>
       sanitizeReviewerResult(passResult("x".repeat(16 * 1_024 * 1_024))),

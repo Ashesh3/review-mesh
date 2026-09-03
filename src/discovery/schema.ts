@@ -42,6 +42,11 @@ const runStatusReviewerSchema = z.strictObject({
     })
     .optional(),
   complete_result: reviewerResultSchema.optional(),
+  result_digest: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/u)
+    .optional(),
+  result_byte_count: z.number().int().nonnegative().optional(),
   failure: z
     .strictObject({
       reason: z.string().min(1),

@@ -117,6 +117,13 @@ interface ModelExecution {
   failure?: AdapterFailure;
 }
 
+class RequiredPersistenceError extends Error {
+  constructor(cause: unknown) {
+    super("The complete reviewer result could not be persisted.", { cause });
+    this.name = "RequiredPersistenceError";
+  }
+}
+
 interface ProviderCircuit {
   failures: number;
   state: "closed" | "open" | "half_open";
@@ -552,6 +559,14 @@ export async function runReviewRound({
     }
   };
 
+  const recordRequired = async (value: RunBoundRecordDraft): Promise<void> => {
+    try {
+      await writer.record?.(value);
+    } catch (error) {
+      throw new RequiredPersistenceError(error);
+    }
+  };
+
   const skipReviewer = async (
     reviewer: ResolvedReviewer,
     reason: ReviewerSkipReason,
@@ -697,30 +712,41 @@ export async function runReviewRound({
       await finalizeIncomplete(reviewer, failure, isolation);
       return { outcome: "incomplete", failure };
     }
-    state.complete(reviewer.id, accepted, isolation);
-    const terminal = reviewerTerminalRecord(state, reviewer.id);
     const digest = reviewerResultDigest(accepted);
     const byteCount = Buffer.byteLength(JSON.stringify(accepted), "utf8");
+    try {
+      await recordRequired({
+        record: "reviewer.result",
+        reviewer_id: reviewer.id,
+        lens_id: lensId(reviewer),
+        mode: reviewerMode(reviewer),
+        ...(reviewer.policy?.adjudicatesReviewerId === undefined
+          ? {}
+          : {
+              adjudicates_reviewer_id: reviewer.policy.adjudicatesReviewerId,
+            }),
+        digest,
+        byte_count: byteCount,
+        result: accepted,
+      });
+    } catch (error) {
+      const failure = sanitizeAdapterFailure(
+        "persistence_failed",
+        error instanceof Error ? error.message : error,
+        false,
+        { fallback_eligible: false, circuit_qualifying: false },
+      );
+      await finalizeIncomplete(reviewer, failure, isolation);
+      return { outcome: "incomplete", failure };
+    }
+    state.complete(reviewer.id, accepted, isolation);
+    const terminal = reviewerTerminalRecord(state, reviewer.id);
     resultManifest.push({
       reviewer_id: reviewer.id,
       lens_id: lensId(reviewer),
       digest,
       byte_count: byteCount,
       ...(reportPath === undefined ? {} : { artifact_path: reportPath }),
-    });
-    await record({
-      record: "reviewer.result",
-      reviewer_id: reviewer.id,
-      lens_id: lensId(reviewer),
-      mode: reviewerMode(reviewer),
-      ...(reviewer.policy?.adjudicatesReviewerId === undefined
-        ? {}
-        : {
-            adjudicates_reviewer_id: reviewer.policy.adjudicatesReviewerId,
-          }),
-      digest,
-      byte_count: byteCount,
-      result: accepted,
     });
     await record({ record: "reviewer.terminal", terminal });
     const gateFindings = gateFindingCount(reviewer, accepted);
@@ -1662,7 +1688,9 @@ export async function runReviewRound({
         not_evaluated_lenses: aggregate.notEvaluatedLenses,
         ...(reportPath === undefined ? {} : { report_path: reportPath }),
         result_manifest: resultManifest,
-        results_complete: true,
+        results_complete:
+          resultManifest.length === aggregate.modelRuns.completed &&
+          aggregate.coverageOutcome === "complete",
         status: aggregate.status,
         suite: aggregate.modelRuns,
       },

@@ -203,6 +203,10 @@ export async function runReviewApplication(
 
   const runId = (options.runIdFactory ?? (() => `run_${randomUUID()}`))();
   const appPaths = options.appPaths ?? getAppPaths();
+  const outputMode = reviewOutputModeSchema.parse(
+    options.outputMode ?? "full-jsonl",
+  );
+  const compactRequiresArtifact = outputMode === "compact-jsonl";
   let detailsHandle: FileHandle | undefined;
   let detailsTargetCreated = false;
   let detailsIdentity:
@@ -259,7 +263,9 @@ export async function runReviewApplication(
       maxRuns: config.diagnostics.max_runs,
       resolution: resolvedRunHeader(config),
       publish:
-        config.diagnostics.persist_runs || options.detailsFile !== undefined,
+        config.diagnostics.persist_runs ||
+        options.detailsFile !== undefined ||
+        compactRequiresArtifact,
     });
     await recorder.ready();
   } catch {
@@ -307,12 +313,12 @@ export async function runReviewApplication(
       ...(options.onlyLensIds === undefined
         ? {}
         : { onlyLensIds: options.onlyLensIds }),
-      ...(config.diagnostics.persist_runs || options.detailsFile !== undefined
+      ...(config.diagnostics.persist_runs ||
+      options.detailsFile !== undefined ||
+      compactRequiresArtifact
         ? { reportPath: options.detailsFile ?? internalReportPath }
         : {}),
-      outputMode: reviewOutputModeSchema.parse(
-        options.outputMode ?? "full-jsonl",
-      ),
+      outputMode,
     });
     if (detailsHandle !== undefined) {
       const current = await detailsHandle.stat();

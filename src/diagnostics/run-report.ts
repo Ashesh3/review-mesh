@@ -15,6 +15,7 @@ import {
   reviewerSkipReasonSchema,
   reviewRequestSchema,
 } from "../protocol/schemas.js";
+import { reviewerResultDigest } from "../results/digest.js";
 
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 const ACTIVE_SUFFIX = /^\.jsonl\.active(?:\..+)?$/u;
@@ -91,6 +92,12 @@ const persistedReviewerResultSchema = z.union([
 export type PersistedReviewerResult = z.infer<
   typeof persistedReviewerResultSchema
 >;
+const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
+const legacyResultRecordFields = {
+  digest: digestSchema.optional(),
+  byte_count: nonNegativeIntegerSchema.optional(),
+  result: persistedReviewerResultSchema,
+};
 
 const legacySuiteCountsSchema = z.strictObject({
   total: nonNegativeIntegerSchema,
@@ -482,43 +489,64 @@ const privateRecordSchema = z.union([
     run_id: persistedString,
     context: z.json(),
   }),
-  z.looseObject({
-    record: z.literal(persistedReviewerResultRecordType),
-    run_id: persistedString,
-    reviewer_id: persistedString,
-    lens_id: persistedString.optional(),
-    agent_id: persistedString.optional(),
-    mode: reviewerModeSchema.optional(),
-    adjudicates_reviewer_id: persistedString.optional(),
-    digest: z
-      .string()
-      .regex(/^[a-f0-9]{64}$/u)
-      .optional(),
-    byte_count: nonNegativeIntegerSchema.optional(),
-    result: persistedReviewerResultSchema,
-  }),
-  z.looseObject({
-    record: z.literal(persistedReviewerResultRecordType),
-    run_id: persistedString,
-    reviewer_id: persistedString,
-    lens_id: persistedString.optional(),
-    agent_id: persistedString.optional(),
-    mode: reviewerModeSchema.optional(),
-    adjudicates_reviewer_id: persistedString.optional(),
-    digest: z
-      .string()
-      .regex(/^[a-f0-9]{64}$/u)
-      .optional(),
-    byte_count: nonNegativeIntegerSchema.optional(),
-    data: z.strictObject({
-      result: persistedReviewerResultSchema,
-      digest: z
-        .string()
-        .regex(/^[a-f0-9]{64}$/u)
-        .optional(),
-      byte_count: nonNegativeIntegerSchema.optional(),
+  z
+    .looseObject({
+      record: z.literal(persistedReviewerResultRecordType),
+      run_id: persistedString,
+      reviewer_id: persistedString,
+      lens_id: persistedString.optional(),
+      agent_id: persistedString.optional(),
+      mode: reviewerModeSchema.optional(),
+      adjudicates_reviewer_id: persistedString.optional(),
+      ...legacyResultRecordFields,
+    })
+    .superRefine((value, ctx) => {
+      if (value.result.schema_version !== "3") return;
+      if (value.digest === undefined) {
+        ctx.addIssue({
+          code: "custom",
+          message: "v3 reviewer result records require a digest",
+          path: ["digest"],
+        });
+      }
+      if (value.byte_count === undefined) {
+        ctx.addIssue({
+          code: "custom",
+          message: "v3 reviewer result records require a byte count",
+          path: ["byte_count"],
+        });
+      }
     }),
-  }),
+  z
+    .looseObject({
+      record: z.literal(persistedReviewerResultRecordType),
+      run_id: persistedString,
+      reviewer_id: persistedString,
+      lens_id: persistedString.optional(),
+      agent_id: persistedString.optional(),
+      mode: reviewerModeSchema.optional(),
+      adjudicates_reviewer_id: persistedString.optional(),
+      data: z.strictObject({
+        ...legacyResultRecordFields,
+      }),
+    })
+    .superRefine((value, ctx) => {
+      if (value.data.result.schema_version !== "3") return;
+      if (value.data.digest === undefined) {
+        ctx.addIssue({
+          code: "custom",
+          message: "v3 reviewer result records require a digest",
+          path: ["data", "digest"],
+        });
+      }
+      if (value.data.byte_count === undefined) {
+        ctx.addIssue({
+          code: "custom",
+          message: "v3 reviewer result records require a byte count",
+          path: ["data", "byte_count"],
+        });
+      }
+    }),
   z.looseObject({
     record: z.literal(persistedReviewerTerminalRecordType),
     run_id: persistedString,
@@ -1111,7 +1139,7 @@ function upsertTerminal(
   const current = parsed.terminals.get(reviewerId);
   const reason = nonEmptyString(record.reason) ?? current?.reason;
   const resultFields =
-    result !== undefined && resultPriority >= (current?.resultPriority ?? -1)
+    result !== undefined && resultPriority > (current?.resultPriority ?? -1)
       ? { result, resultPriority }
       : current?.result === undefined
         ? {
@@ -1315,6 +1343,31 @@ function parsePrivateRecord(
     const result = persistedReviewerResultSchema.parse(
       value.result ?? asRecord(value.data)?.result,
     );
+    if (result.schema_version === "3") {
+      const container = asRecord(value.data) ?? value;
+      const digest = nonEmptyString(container.digest);
+      const byteCount = nonNegativeInteger(container.byte_count);
+      const expectedByteCount = Buffer.byteLength(
+        JSON.stringify(result),
+        "utf8",
+      );
+      if (digest !== reviewerResultDigest(result)) {
+        throw invalidRecordError(
+          0,
+          persistedReviewerResultRecordType,
+          "a reviewer result with a mismatched digest",
+          ["digest"],
+        );
+      }
+      if (byteCount !== expectedByteCount) {
+        throw invalidRecordError(
+          0,
+          persistedReviewerResultRecordType,
+          "a reviewer result with a mismatched byte count",
+          ["byte_count"],
+        );
+      }
+    }
     addReviewer(parsed, value, value.reviewer_id);
     const current = parsed.terminals.get(value.reviewer_id);
     parsed.terminals.set(value.reviewer_id, {
@@ -1322,7 +1375,7 @@ function parsePrivateRecord(
       status: current?.status ?? "completed",
       ...(current?.reason === undefined ? {} : { reason: current.reason }),
       result: structuredClone(result),
-      resultPriority: 2,
+      resultPriority: 3,
     });
     return;
   }
@@ -1431,7 +1484,22 @@ function parseRunRecord(
           ["run_id"],
         );
       }
-      parsePrivateRecord(parsed, privateRecord.data);
+      try {
+        parsePrivateRecord(parsed, privateRecord.data);
+      } catch (error) {
+        if (error instanceof RunReportError) {
+          const normalized = invalidRecordError(
+            line,
+            error.recordType ?? recordType(record),
+            "an invalid private record",
+            error.schemaPaths,
+          );
+          if (!bestEffort) throw normalized;
+          addRecordWarning(parsed, normalized);
+          continue;
+        }
+        throw error;
+      }
       continue;
     }
     const error = invalidRecordError(

@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { mkdtemp } from "node:fs/promises";
 import { afterEach, describe, expect, it } from "vitest";
 import { readRunStatus } from "../../src/diagnostics/run-status.js";
+import type { ReviewerResultV3 } from "../../src/protocol/schemas.js";
+import { reviewerResultDigest } from "../../src/results/digest.js";
 
 const temporaryRoots: string[] = [];
 
@@ -28,6 +30,93 @@ afterEach(async () => {
 });
 
 describe("readRunStatus", () => {
+  it("loads and verifies the complete private v3 result for compact artifacts", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-private-result";
+    const result: ReviewerResultV3 = {
+      schema_version: "3",
+      verdict: "pass",
+      review_markdown: "# Complete private review",
+      summary: "No findings.",
+      actionable_findings: [],
+      informational_notes: [],
+    };
+    const digest = reviewerResultDigest(result);
+    const byteCount = Buffer.byteLength(JSON.stringify(result), "utf8");
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [
+        line({
+          record: "reviewer.result",
+          run_id: runId,
+          reviewer_id: "security",
+          digest,
+          byte_count: byteCount,
+          result,
+        }),
+        line({
+          record: "reviewer.terminal",
+          run_id: runId,
+          terminal: {
+            reviewer_id: "security",
+            status: "completed",
+            adapter: "gateway",
+            model: "model",
+            isolation: "runtime_read_only",
+            elapsed_ms: 1,
+            result: { ...result, review_markdown: "[truncated]" },
+          },
+        }),
+      ].join(""),
+    );
+
+    await expect(
+      readRunStatus({ runsDirectory, runId }),
+    ).resolves.toMatchObject({
+      reviewers: [
+        {
+          reviewer_id: "security",
+          complete_result: result,
+          result_digest: digest,
+          result_byte_count: byteCount,
+        },
+      ],
+    });
+  });
+
+  it("rejects a private v3 result whose digest does not match", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-private-result-mismatch";
+    const result: ReviewerResultV3 = {
+      schema_version: "3",
+      verdict: "pass",
+      review_markdown: "# Complete private review",
+      summary: "No findings.",
+      actionable_findings: [],
+      informational_notes: [],
+    };
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      line({
+        record: "reviewer.result",
+        run_id: runId,
+        reviewer_id: "security",
+        digest: "0".repeat(64),
+        byte_count: Buffer.byteLength(JSON.stringify(result), "utf8"),
+        result,
+      }),
+    );
+
+    await expect(readRunStatus({ runsDirectory, runId })).rejects.toMatchObject(
+      {
+        code: "invalid_run_record",
+        line: 1,
+        recordType: "reviewer.result",
+        schemaPaths: ["digest"],
+      },
+    );
+  });
+
   it("summarizes one active reviewer without returning unrelated reviewers", async () => {
     const { runsDirectory } = await fixture();
     const runId = "run-active";

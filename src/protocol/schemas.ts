@@ -28,6 +28,7 @@ export const incompleteReasonSchema = z.enum([
   "protocol_violation",
   "invalid_result",
   "result_too_large",
+  "persistence_failed",
   "cancelled",
   "unknown",
 ]);

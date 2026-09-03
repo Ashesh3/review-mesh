@@ -23,6 +23,7 @@ import {
   type PublicEvent,
 } from "../../src/protocol/schemas.js";
 import { reviewerResultDigest } from "../../src/results/digest.js";
+import { readRunReport } from "../../src/diagnostics/run-report.js";
 import { installAbortHandlers, runCli as runCliEntry } from "../../src/cli.js";
 
 const projectRoot = resolve(import.meta.dirname, "../..");
@@ -837,6 +838,60 @@ describe("review-mesh review", () => {
         }),
       ]),
     );
+  });
+
+  it("automatically publishes an immutable artifact for compact-jsonl", async () => {
+    const fixture = await createFixture(["pass"]);
+    const runsDirectory = join(fixture.root, "compact-app-data", "runs");
+    const stdout = new PassThrough();
+    let publicOutput = "";
+    stdout.setEncoding("utf8");
+    stdout.on("data", (chunk: string) => {
+      publicOutput += chunk;
+    });
+
+    const exitCode = await runReviewApplication({
+      requestText: fixture.request,
+      configFile: fixture.configFile,
+      stdout,
+      stderr: new PassThrough(),
+      signal: new AbortController().signal,
+      runIdFactory: () => "compact-persisted",
+      outputMode: "compact-jsonl",
+      appPaths: {
+        configFile: join(fixture.root, "unused-config.toml"),
+        reviewersDirectory: join(fixture.root, "unused-reviewers"),
+        runsDirectory,
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    const events = parseEvents(publicOutput);
+    expect(events.some((event) => event.event === "reviewer.result")).toBe(
+      false,
+    );
+    expect(events.at(-1)).toMatchObject({
+      event: "run.completed",
+      data: {
+        report_path: join(runsDirectory, "compact-persisted.jsonl"),
+        results_complete: true,
+        result_manifest: [
+          expect.objectContaining({
+            artifact_path: join(runsDirectory, "compact-persisted.jsonl"),
+          }),
+        ],
+      },
+    });
+    await expect(
+      readRunReport({ runsDirectory, runId: "compact-persisted" }),
+    ).resolves.toMatchObject({
+      active: false,
+      reviewers: [
+        expect.objectContaining({
+          result: expect.objectContaining({ schema_version: "3" }),
+        }),
+      ],
+    });
   });
 
   it("rejects an existing details target without changing it", async () => {

@@ -12,6 +12,8 @@ import {
   RunReportError,
   type RawRunFinding,
 } from "../../src/diagnostics/run-report.js";
+import type { ReviewerResultV3 } from "../../src/protocol/schemas.js";
+import { reviewerResultDigest } from "../../src/results/digest.js";
 
 const temporaryRoots: string[] = [];
 
@@ -53,6 +55,33 @@ function resultV2(
   };
 }
 
+function resultV3(reviewMarkdown: string): ReviewerResultV3 {
+  return {
+    schema_version: "3",
+    verdict: "pass",
+    review_markdown: reviewMarkdown,
+    summary: "No findings.",
+    actionable_findings: [],
+    informational_notes: [],
+  };
+}
+
+function persistedResultV3(
+  runId: string,
+  result: ReviewerResultV3,
+  overrides: Record<string, unknown> = {},
+) {
+  return {
+    record: persistedReviewerResultRecordType,
+    run_id: runId,
+    reviewer_id: "security",
+    digest: reviewerResultDigest(result),
+    byte_count: Buffer.byteLength(JSON.stringify(result), "utf8"),
+    result,
+    ...overrides,
+  };
+}
+
 function legacyFinding(overrides: Record<string, unknown> = {}) {
   return {
     id: "mapping-failure",
@@ -91,6 +120,73 @@ afterEach(async () => {
 });
 
 describe("readRunReport", () => {
+  it("keeps the authoritative full result when a later terminal contains a truncated copy", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-authoritative-result";
+    const full = resultV3(`# Full review\n\n${"Evidence. ".repeat(2_000)}`);
+    const truncated = resultV3("# Full review\n\nEvidence. [truncated]");
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [
+        line(persistedResultV3(runId, full)),
+        line({
+          record: "reviewer.terminal",
+          run_id: runId,
+          terminal: {
+            reviewer_id: "security",
+            status: "completed",
+            adapter: "gateway",
+            model: "model",
+            isolation: "runtime_read_only",
+            elapsed_ms: 1,
+            result: truncated,
+          },
+        }),
+      ].join(""),
+    );
+
+    const report = await readRunReport({ runsDirectory, runId });
+    expect(report.reviewers[0]?.result).toEqual(full);
+  });
+
+  it.each([
+    {
+      name: "missing digest",
+      override: { digest: undefined },
+      schemaPath: "digest",
+    },
+    {
+      name: "wrong digest",
+      override: { digest: "0".repeat(64) },
+      schemaPath: "digest",
+    },
+    {
+      name: "wrong byte count",
+      override: { byte_count: 1 },
+      schemaPath: "byte_count",
+    },
+  ])(
+    "rejects a v3 result record with $name",
+    async ({ override, schemaPath }) => {
+      const { runsDirectory } = await fixture();
+      const runId = "run-invalid-integrity";
+      const result = resultV3("# Complete review");
+      await writeFile(
+        join(runsDirectory, `${runId}.jsonl`),
+        line(persistedResultV3(runId, result, override)),
+      );
+
+      await expect(
+        readRunReport({ runsDirectory, runId }),
+      ).rejects.toMatchObject({
+        code: "invalid_run_record",
+        line: 1,
+        recordType: persistedReviewerResultRecordType,
+        schemaPaths: [schemaPath],
+      });
+    },
+  );
+
   it("separates logical-lens coverage from model executions for a current v4 record", async () => {
     const { runsDirectory } = await fixture();
     const runId = "run-current-v4";
