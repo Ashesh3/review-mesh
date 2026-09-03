@@ -152,7 +152,7 @@ export function createEventWriter({
       const pump = mirrorPump;
       if (pump !== undefined) await pump;
     }
-    if (mirrorFailure !== undefined) throw mirrorFailure;
+    if (mirrorFailure !== undefined && mirrorCloseRequired) throw mirrorFailure;
   };
 
   const enqueueMirror = (event: PublicEvent, bytes: number) => {
@@ -312,7 +312,7 @@ export function createEventWriter({
         const event = materialize(draft);
         const line = JSON.stringify(event) + "\n";
         await drainMirror();
-        if (onEvent !== undefined) await onEvent(event);
+        if (onEvent !== undefined && mirrorEnabled) await onEvent(event);
         if (onMirrorClose !== undefined) {
           try {
             await onMirrorClose();

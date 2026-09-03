@@ -172,6 +172,58 @@ describe("readRunStatus", () => {
     );
   });
 
+  it("rejects a conflicting private v3 result that follows a verified public result", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-conflicting-private-result";
+    const publicResult: ReviewerResultV3 = {
+      schema_version: "3",
+      verdict: "pass",
+      review_markdown: "# Verified public review",
+      summary: "No findings.",
+      actionable_findings: [],
+      informational_notes: [],
+    };
+    const privateResult = {
+      ...publicResult,
+      review_markdown: "# Conflicting private review",
+    };
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [
+        line({
+          schema_version: "5",
+          event: "reviewer.result",
+          run_id: runId,
+          seq: 1,
+          timestamp: "2026-09-03T00:00:01.000Z",
+          reviewer_id: "security",
+          data: {
+            digest: reviewerResultDigest(publicResult),
+            byte_count: Buffer.byteLength(JSON.stringify(publicResult), "utf8"),
+            result: publicResult,
+          },
+        }),
+        line({
+          record: "reviewer.result",
+          run_id: runId,
+          reviewer_id: "security",
+          digest: reviewerResultDigest(privateResult),
+          byte_count: Buffer.byteLength(JSON.stringify(privateResult), "utf8"),
+          result: privateResult,
+        }),
+      ].join(""),
+    );
+
+    await expect(readRunStatus({ runsDirectory, runId })).rejects.toMatchObject(
+      {
+        code: "invalid_run_record",
+        line: 2,
+        recordType: "reviewer.result",
+        schemaPaths: ["digest"],
+      },
+    );
+  });
+
   it("summarizes one active reviewer without returning unrelated reviewers", async () => {
     const { runsDirectory } = await fixture();
     const runId = "run-active";

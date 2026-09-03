@@ -282,6 +282,95 @@ Command:
 
 Result: PASS for production and test TypeScript projects.
 
+## Fix round 3: details ordering, encoded URLs, symmetric status, mirror policy
+
+### Implementation
+
+1. Made the internal immutable run artifact authoritative whenever persistence
+   is required by configuration, compact mode, or `--details-file`.
+   `run.completed.report_path` and every manifest entry now identify that
+   internal artifact, which is fully appended, linked, and identity-verified
+   before terminal stdout. The requested details file is copied and synced
+   afterward as an additional export. The internal artifact is retained so the
+   already-emitted terminal reference remains true even if the export fails.
+2. Added percent-decoded credential detection for URL path segments, query
+   keys/values, and fragments. Benign encoded spelling remains byte-preserved;
+   encoded client secrets, GitHub tokens, JWTs, and Bearer values are replaced.
+3. Factored `applyVerifiedResult` in run status. Both private and public v3
+   result records validate schema, digest, byte count, and any existing verified
+   result before committing one atomic result/integrity tuple. Conflicts now
+   reject in either record order.
+4. Made mirror overflow policy conditional. Optional mirrors warn/drop and full
+   stdout still delivers the large result plus complete terminal event.
+   Required mirrors fail terminal publication on overflow.
+
+### RED evidence
+
+Command:
+
+`npx vitest run tests/results/sanitize.test.ts tests/diagnostics/run-status.test.ts tests/protocol/event-writer.test.ts tests/cli/review.test.ts -t "percent-encoded credentials|conflicting private v3 result|optional mirror overflows|required mirror overflows|complete immutable artifact before writing terminal" --reporter=verbose`
+
+Result: intended failures showed encoded path credentials remained, optional
+mirror overflow aborted final delivery, required overflow did not settle, and
+terminal output still referenced the empty details export instead of the
+published internal artifact. The status-order fixture was corrected so its own
+integrity fields were valid before exercising the symmetric conflict check.
+
+### GREEN evidence
+
+Command:
+
+`npx vitest run tests/results/sanitize.test.ts tests/diagnostics/run-status.test.ts tests/protocol/event-writer.test.ts tests/cli/review.test.ts -t "percent-encoded credentials|conflicting private v3 result|optional mirror overflows|required mirror overflows|complete immutable artifact before writing terminal" --reporter=verbose`
+
+Result: PASS. 4 files passed, 5 focused tests passed, 81 skipped.
+
+Command:
+
+`npx vitest run tests/results/sanitize.test.ts --reporter=dot`
+
+Result: PASS, 7 tests.
+
+Command:
+
+`npx vitest run tests/diagnostics/run-status.test.ts --reporter=dot`
+
+Result: PASS, 13 tests.
+
+Command:
+
+`npx vitest run tests/protocol/event-writer.test.ts --reporter=dot`
+
+Result: PASS, 22 tests.
+
+Command:
+
+`npx vitest run tests/cli/review.test.ts -t "publishes a sanitized details file|references a complete immutable artifact before writing terminal|publishes a nonempty cancellation artifact|automatically publishes an immutable artifact for compact-jsonl|does not emit results_complete when immutable artifact publication fails|exits 3 with one sanitized diagnostic when the stdout consumer closes" --reporter=dot`
+
+Result: PASS, 6 tests passed, 38 skipped.
+
+Command:
+
+`npm run typecheck`
+
+Result: PASS for production and test TypeScript projects.
+
+### Fix-round-3 self-review
+
+- Verified every terminal artifact path names a file already durably published
+  when the stdout callback receives `run.completed`.
+- Verified the details export cannot invalidate the authoritative internal
+  artifact; export failures still return `persistence_failed`.
+- Verified decoded credential detection is used only for deciding redaction;
+  benign encoded components are returned with their original spelling.
+- Verified public-first and private-first status result conflicts share the same
+  comparison/assignment function.
+- Verified optional mirror capacity failure is not promoted to an authoritative
+  result failure, while required mirror capacity failure is.
+
+### Fix-round-3 concerns
+
+None for the four reviewed findings.
+
 Command:
 
 `npx vitest run tests/results/sanitize.test.ts tests/protocol/event-writer.test.ts tests/diagnostics/run-recorder.test.ts tests/diagnostics/run-status.test.ts --reporter=dot`

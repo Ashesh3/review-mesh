@@ -733,7 +733,7 @@ describe("review-mesh review", () => {
     const completed = parseEvents(publicOutput).at(-1);
     expect(completed).toMatchObject({
       event: "run.completed",
-      data: { report_path: detailsFile },
+      data: { report_path: join(runsDirectory, "details-success.jsonl") },
     });
     const details = await readFile(detailsFile, "utf8");
     expect(details).toContain('"event":"run.completed"');
@@ -741,7 +741,69 @@ describe("review-mesh review", () => {
     expect(details).not.toMatch(/progress-secret|activity-secret/u);
     await expect(
       access(join(runsDirectory, "details-success.jsonl")),
-    ).rejects.toMatchObject({ code: "ENOENT" });
+    ).resolves.toBeUndefined();
+  });
+
+  it("references a complete immutable artifact before writing terminal stdout with --details-file", async () => {
+    const fixture = await createFixture(["pass"]);
+    const runsDirectory = join(fixture.root, "details-order", "runs");
+    const detailsFile = join(fixture.root, "details-order.jsonl");
+    let terminalInspection:
+      | Promise<{
+          path: string;
+          contents: string;
+        }>
+      | undefined;
+    const stdout = Object.assign(new EventEmitter(), {
+      write(
+        chunk: string | Uint8Array,
+        callback?: (error?: Error | null) => void,
+      ) {
+        const line = chunk.toString();
+        if (line.includes('"event":"run.completed"')) {
+          const event = JSON.parse(line) as {
+            data: { report_path: string };
+          };
+          terminalInspection = readFile(event.data.report_path, "utf8").then(
+            (contents) => ({ path: event.data.report_path, contents }),
+          );
+          void terminalInspection.then(
+            () => callback?.(null),
+            (error: unknown) =>
+              callback?.(
+                error instanceof Error ? error : new Error(String(error)),
+              ),
+          );
+          return true;
+        }
+        queueMicrotask(() => callback?.(null));
+        return true;
+      },
+    }) as unknown as NodeJS.WritableStream;
+
+    const exitCode = await runReviewApplication({
+      requestText: fixture.request,
+      configFile: fixture.configFile,
+      stdout,
+      stderr: new PassThrough(),
+      signal: new AbortController().signal,
+      runIdFactory: () => "details-order",
+      detailsFile,
+      appPaths: {
+        configFile: join(fixture.root, "unused-config.toml"),
+        reviewersDirectory: join(fixture.root, "unused-reviewers"),
+        runsDirectory,
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    await expect(terminalInspection).resolves.toMatchObject({
+      path: join(runsDirectory, "details-order.jsonl"),
+      contents: expect.stringContaining('"record":"reviewer.result"'),
+    });
+    await expect(readFile(detailsFile, "utf8")).resolves.toContain(
+      '"record":"reviewer.result"',
+    );
   });
 
   it("redacts a reviewer summary in both stdout and the exported artifact", async () => {
@@ -1018,7 +1080,7 @@ describe("review-mesh review", () => {
     expect(Buffer.byteLength(details)).toBeGreaterThan(0);
     await expect(
       access(join(runsDirectory, "details-interrupted.jsonl")),
-    ).rejects.toMatchObject({ code: "ENOENT" });
+    ).resolves.toBeUndefined();
   });
 
   it("does not persist arbitrary reviewer runtime values in the run header", async () => {

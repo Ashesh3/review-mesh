@@ -209,6 +209,7 @@ export async function runReviewApplication(
     options.outputMode ?? "full-jsonl",
   );
   const compactRequiresArtifact = outputMode === "compact-jsonl";
+  const internalReportPath = join(appPaths.runsDirectory, `${runId}.jsonl`);
   let detailsHandle: FileHandle | undefined;
   let detailsTargetCreated = false;
   let detailsIdentity:
@@ -311,7 +312,6 @@ export async function runReviewApplication(
   });
 
   try {
-    const internalReportPath = join(appPaths.runsDirectory, `${runId}.jsonl`);
     const completion = await runReviewRound({
       runId,
       ...(request.request_id === undefined
@@ -332,7 +332,7 @@ export async function runReviewApplication(
       ...(config.diagnostics.persist_runs ||
       options.detailsFile !== undefined ||
       compactRequiresArtifact
-        ? { reportPath: options.detailsFile ?? internalReportPath }
+        ? { reportPath: internalReportPath }
         : {}),
       outputMode,
     });
@@ -360,9 +360,6 @@ export async function runReviewApplication(
       await detailsHandle.close();
       detailsHandle = undefined;
       detailsTargetCreated = false;
-      if (!config.diagnostics.persist_runs) {
-        await rm(internalReportPath, { force: true });
-      }
     }
     try {
       await writer.close();

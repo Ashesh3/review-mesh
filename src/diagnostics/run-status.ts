@@ -308,81 +308,29 @@ function privateTerminal(
   return asRecord(record.terminal) ?? asRecord(record.data);
 }
 
-function applyPrivateResult(
-  reviewers: Map<string, ReviewerSnapshot>,
-  record: Record<string, unknown>,
-  line: number,
-): void {
-  const id = text(record.reviewer_id);
-  const result = reviewerResultV3Schema.safeParse(record.result);
-  if (id === undefined || !result.success) {
-    throw new RunStatusError(
-      "invalid_run_record",
-      `The persisted reviewer result is invalid at JSONL line ${line}.`,
-      line,
-      "reviewer.result",
-      [id === undefined ? "reviewer_id" : "result"],
-    );
-  }
-  const digest = text(record.digest);
-  const byteCount = integer(record.byte_count);
-  if (digest !== reviewerResultDigest(result.data)) {
-    throw new RunStatusError(
-      "invalid_run_record",
-      `The persisted reviewer result digest is invalid at JSONL line ${line}.`,
-      line,
-      "reviewer.result",
-      ["digest"],
-    );
-  }
-  const expectedByteCount = Buffer.byteLength(
-    JSON.stringify(result.data),
-    "utf8",
-  );
-  if (byteCount !== expectedByteCount) {
-    throw new RunStatusError(
-      "invalid_run_record",
-      `The persisted reviewer result byte count is invalid at JSONL line ${line}.`,
-      line,
-      "reviewer.result",
-      ["byte_count"],
-    );
-  }
-  const reviewer = reviewerFor(reviewers, id);
-  reviewer.state = "completed";
-  reviewer.complete_result = structuredClone(result.data);
-  reviewer.result_digest = digest;
-  reviewer.result_byte_count = byteCount;
-  reviewer.result = {
-    verdict: result.data.verdict,
-    summary: result.data.summary,
-    actionable_findings: result.data.actionable_findings.length,
-    informational_notes: result.data.informational_notes.length,
-  };
-}
-
-function applyPublicResult(
+function applyVerifiedResult(
   reviewers: Map<string, ReviewerSnapshot>,
   reviewerId: string,
-  data: Record<string, unknown>,
+  container: Record<string, unknown>,
   line: number,
+  source: "private" | "public",
 ): void {
-  const result = reviewerResultV3Schema.safeParse(data.result);
+  const result = reviewerResultV3Schema.safeParse(container.result);
   if (!result.success) {
     throw new RunStatusError(
       "invalid_run_record",
-      `The public reviewer result is invalid at JSONL line ${line}.`,
+      `The ${source} reviewer result is invalid at JSONL line ${line}.`,
       line,
       "reviewer.result",
       ["result"],
     );
   }
-  const digest = text(data.digest);
-  const byteCount = integer(data.byte_count);
+  const digest = text(container.digest);
+  const byteCount = integer(container.byte_count);
   if (digest !== reviewerResultDigest(result.data)) {
     throw new RunStatusError(
       "invalid_run_record",
-      `The public reviewer result digest is invalid at JSONL line ${line}.`,
+      `The ${source} reviewer result digest is invalid at JSONL line ${line}.`,
       line,
       "reviewer.result",
       ["digest"],
@@ -395,7 +343,7 @@ function applyPublicResult(
   if (byteCount !== expectedByteCount) {
     throw new RunStatusError(
       "invalid_run_record",
-      `The public reviewer result byte count is invalid at JSONL line ${line}.`,
+      `The ${source} reviewer result byte count is invalid at JSONL line ${line}.`,
       line,
       "reviewer.result",
       ["byte_count"],
@@ -410,7 +358,7 @@ function applyPublicResult(
   ) {
     throw new RunStatusError(
       "invalid_run_record",
-      `The public reviewer result conflicts with the private result at JSONL line ${line}.`,
+      `The ${source} reviewer result conflicts with an existing verified result at JSONL line ${line}.`,
       line,
       "reviewer.result",
       ["digest"],
@@ -426,6 +374,33 @@ function applyPublicResult(
     actionable_findings: result.data.actionable_findings.length,
     informational_notes: result.data.informational_notes.length,
   };
+}
+
+function applyPrivateResult(
+  reviewers: Map<string, ReviewerSnapshot>,
+  record: Record<string, unknown>,
+  line: number,
+): void {
+  const id = text(record.reviewer_id);
+  if (id === undefined) {
+    throw new RunStatusError(
+      "invalid_run_record",
+      `The private reviewer result is missing reviewer_id at JSONL line ${line}.`,
+      line,
+      "reviewer.result",
+      ["reviewer_id"],
+    );
+  }
+  applyVerifiedResult(reviewers, id, record, line, "private");
+}
+
+function applyPublicResult(
+  reviewers: Map<string, ReviewerSnapshot>,
+  reviewerId: string,
+  data: Record<string, unknown>,
+  line: number,
+): void {
+  applyVerifiedResult(reviewers, reviewerId, data, line, "public");
 }
 
 export async function readRunStatus({

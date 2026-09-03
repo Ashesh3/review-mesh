@@ -73,8 +73,8 @@ function redactString(value: string): string {
             })
             .join("&")}`;
     const redactedFragment =
-      fragment === undefined ? "" : `#${redactCredentialPatterns(fragment)}`;
-    const redactedUrl = `${redactCredentialPatterns(path)}${redactedQuery}${redactedFragment}`;
+      fragment === undefined ? "" : `#${redactUrlFragment(fragment)}`;
+    const redactedUrl = `${redactUrlPath(path)}${redactedQuery}${redactedFragment}`;
     const index = urls.push(redactedUrl) - 1;
     return `\uE000${index}\uE001`;
   });
@@ -82,6 +82,42 @@ function redactString(value: string): string {
     /\uE000(\d+)\uE001/gu,
     (marker, index: string) => urls[Number(index)] ?? marker,
   );
+}
+
+function decoded(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function redactUrlPath(value: string): string {
+  const schemeEnd = value.indexOf("://");
+  const pathStart = schemeEnd < 0 ? -1 : value.indexOf("/", schemeEnd + 3);
+  if (pathStart < 0) return redactCredentialPatterns(value);
+  const authority = redactCredentialPatterns(value.slice(0, pathStart));
+  const path = value
+    .slice(pathStart)
+    .split("/")
+    .map((segment) => {
+      if (segment.length === 0) return segment;
+      const decodedSegment = decoded(segment);
+      return redactCredentialPatterns(decodedSegment) === decodedSegment
+        ? segment
+        : REDACTED;
+    })
+    .join("/");
+  return authority + path;
+}
+
+function redactUrlFragment(value: string): string {
+  const redacted = redactCredentialPatterns(value);
+  if (redacted !== value) return redacted;
+  const decodedValue = decoded(value);
+  return redactCredentialPatterns(decodedValue) === decodedValue
+    ? value
+    : REDACTED;
 }
 
 function redactCredentialPatterns(value: string): string {

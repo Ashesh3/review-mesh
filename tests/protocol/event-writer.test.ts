@@ -20,6 +20,98 @@ class ControlledSink extends EventEmitter {
 }
 
 describe("EventWriter", () => {
+  const largeResultEvent = () => ({
+    event: "reviewer.result" as const,
+    reviewer_id: "reviewer-1",
+    data: {
+      digest: "a".repeat(64),
+      byte_count: 1_100_000,
+      result: {
+        schema_version: "3" as const,
+        verdict: "pass" as const,
+        review_markdown: "x".repeat(1_100_000),
+        summary: "No findings.",
+        actionable_findings: [],
+        informational_notes: [],
+      },
+    },
+  });
+
+  it("keeps full stdout complete when an optional mirror overflows", async () => {
+    const output = new PassThrough();
+    let stdout = "";
+    output.setEncoding("utf8");
+    output.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    const writer = createEventWriter({
+      output,
+      runId: "run-optional-overflow",
+      onEvent: async () => undefined,
+      onMirrorClose: async () => undefined,
+      mirrorMaxPendingBytes: 1_024,
+    });
+
+    await writer.emit(largeResultEvent());
+    await writer.emitFinal?.({
+      event: "run.completed",
+      data: {
+        exit_code: 0,
+        consistency_mode: "live_worktree",
+        total_elapsed_ms: 1,
+        results_complete: true,
+        suite: {
+          total: 1,
+          deferred: 0,
+          queued: 0,
+          running: 0,
+          completed: 1,
+          incomplete: 0,
+          skipped: 0,
+        },
+      },
+    });
+
+    expect(stdout).toContain('"event":"reviewer.result"');
+    expect(stdout).toContain('"event":"run.completed"');
+    expect(stdout).toContain('"results_complete":true');
+  });
+
+  it("fails terminal output when a required mirror overflows", async () => {
+    const output = new PassThrough();
+    output.resume();
+    const writer = createEventWriter({
+      output,
+      runId: "run-required-overflow",
+      onEvent: async () => undefined,
+      onMirrorClose: async () => undefined,
+      mirrorCloseRequired: true,
+      mirrorMaxPendingBytes: 1_024,
+    });
+
+    await writer.emit(largeResultEvent());
+    await expect(
+      writer.emitFinal?.({
+        event: "run.completed",
+        data: {
+          exit_code: 0,
+          consistency_mode: "live_worktree",
+          total_elapsed_ms: 1,
+          results_complete: true,
+          suite: {
+            total: 1,
+            deferred: 0,
+            queued: 0,
+            running: 0,
+            completed: 1,
+            incomplete: 0,
+            skipped: 0,
+          },
+        },
+      }),
+    ).rejects.toThrow(/capacity/i);
+  });
+
   it("propagates an authoritative publication failure instead of swallowing it", async () => {
     const publicationFailure = new Error("immutable publication failed");
     const writer = createEventWriter({

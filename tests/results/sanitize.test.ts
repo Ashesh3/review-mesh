@@ -78,6 +78,25 @@ describe("sanitizeReviewerResult", () => {
     ).toHaveLength(1);
   });
 
+  it("detects percent-encoded credentials while preserving benign encoded URL spelling", () => {
+    const github = `ghp_${"h".repeat(24)}`;
+    const jwt = "eyJheader12.eyJpayload12.signature12";
+    const sanitized = sanitizeReviewerResult(
+      passResult(
+        [
+          "https://example.test/%63lient_secret%3Dpath-secret/report?q=%72egression",
+          `https://example.test/callback?state=${encodeURIComponent(github)}&q=%72egression`,
+          `https://example.test/report#${encodeURIComponent(`Bearer fragment-secret ${jwt}`)}`,
+        ].join("\n"),
+      ),
+    );
+
+    expect(sanitized.review_markdown).toContain("q=%72egression");
+    expect(sanitized.review_markdown).not.toMatch(
+      /path-secret|ghp_|eyJheader12|fragment-secret|%63lient_secret/iu,
+    );
+  });
+
   it("rejects a sanitized result above 16 MiB with result_too_large", () => {
     expect(() =>
       sanitizeReviewerResult(passResult("x".repeat(16 * 1_024 * 1_024))),
