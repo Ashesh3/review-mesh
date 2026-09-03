@@ -1,16 +1,14 @@
 import {
-  lstat,
   mkdir,
   mkdtemp,
   readFile,
-  readdir,
   rename,
   rm,
   symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   MAX_RESULT_SPOOL_BYTES,
@@ -33,7 +31,7 @@ afterEach(async () => {
 });
 
 describe("result spool", () => {
-  it("appends and reads exact bytes, then removes its owned file", async () => {
+  it("appends and reads exact bytes, then durably wipes its owned file idempotently", async () => {
     const directory = await root();
     const spool = await createResultSpool({ directory, id: "exact" });
 
@@ -52,7 +50,10 @@ describe("result spool", () => {
     );
 
     await spool.cleanup();
-    await expect(lstat(spool.path)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(spool.byteLength).toBe(0);
+    expect(await readFile(spool.path)).toHaveLength(0);
+    await expect(spool.cleanup()).resolves.toBeUndefined();
+    expect(await readFile(spool.path)).toHaveLength(0);
   });
 
   it("enforces the fixed 16 MiB total limit without discarding accepted fragments", async () => {
@@ -81,10 +82,10 @@ describe("result spool", () => {
     await expect(spool.append("more")).rejects.toMatchObject({
       code: "identity_changed",
     });
-    await expect(spool.cleanup()).rejects.toMatchObject({
-      code: "identity_changed",
-    });
+    await expect(spool.cleanup()).resolves.toBeUndefined();
+    await expect(spool.cleanup()).resolves.toBeUndefined();
     expect(await readFile(spool.path, "utf8")).toBe("foreign");
+    expect(await readFile(moved)).toHaveLength(0);
   });
 
   it("preserves a foreign replacement when identity changes during creation", async () => {
@@ -104,23 +105,8 @@ describe("result spool", () => {
         },
       }),
     ).rejects.toMatchObject({ code: "identity_changed" });
-    const quarantined = readdir(dirname(dirname(path)), { withFileTypes: true })
-      .then((entries) =>
-        entries.find(
-          (entry) =>
-            entry.isDirectory() &&
-            entry.name.startsWith(`${basename(dirname(path))}.failed-`),
-        ),
-      );
-    const quarantine = await quarantined;
-    expect(quarantine).toBeDefined();
-    const quarantineDirectory = join(dirname(dirname(path)), quarantine!.name);
-    expect(await readFile(join(quarantineDirectory, basename(path)), "utf8")).toBe(
-      "foreign replacement",
-    );
-    expect(
-      await readFile(join(quarantineDirectory, basename(original)), "utf8"),
-    ).toBe("");
+    expect(await readFile(path, "utf8")).toBe("foreign replacement");
+    expect(await readFile(original)).toHaveLength(0);
   });
 
   it("does not unlink a replacement introduced at the cleanup remove boundary", async () => {
@@ -129,21 +115,21 @@ describe("result spool", () => {
     const spool = await createResultSpool({
       directory,
       id: "cleanup-race",
-      async beforeCleanupRemove(path: string) {
+      async beforeCleanupWipe(path: string) {
         replacementPath = path;
         await rename(path, `${path}.owned`);
         await writeFile(path, "foreign replacement");
       },
-    });
+    } as Parameters<typeof createResultSpool>[0]);
     await spool.append("owned content");
 
-    await expect(spool.cleanup()).rejects.toMatchObject({
-      code: "identity_changed",
-    });
+    await expect(spool.cleanup()).resolves.toBeUndefined();
+    await expect(spool.cleanup()).resolves.toBeUndefined();
     expect(replacementPath).not.toBe("");
     expect(await readFile(replacementPath, "utf8")).toBe(
       "foreign replacement",
     );
+    expect(await readFile(`${replacementPath}.owned`)).toHaveLength(0);
   });
 
   it("refuses a symlinked spool directory", async () => {

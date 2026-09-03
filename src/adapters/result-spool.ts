@@ -5,8 +5,6 @@ import {
   mkdir,
   open,
   realpath,
-  rename,
-  rm,
   type FileHandle,
 } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
@@ -44,8 +42,8 @@ export interface CreateResultSpoolOptions {
   reviewedWorkspace?: string;
   /** Test seam for deterministic pathname-replacement races after open. */
   afterCreateOpen?(path: string): void | Promise<void>;
-  /** Test seam for deterministic replacement after cleanup quarantine. */
-  beforeCleanupRemove?(path: string): void | Promise<void>;
+  /** Test seam for deterministic pathname replacement before handle wipe. */
+  beforeCleanupWipe?(path: string): void | Promise<void>;
 }
 
 function sameIdentity(left: BigIntStats, right: BigIntStats): boolean {
@@ -60,6 +58,36 @@ function pathIsInside(root: string, target: string): boolean {
   );
 }
 
+async function wipeOwnedHandle(
+  handle: FileHandle,
+  identity: BigIntStats,
+): Promise<void> {
+  try {
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile() || !sameIdentity(identity, before)) {
+      throw new ResultSpoolError(
+        "identity_changed",
+        "The owned result spool handle changed identity.",
+      );
+    }
+    await handle.truncate(0);
+    await handle.sync();
+    const after = await handle.stat({ bigint: true });
+    if (
+      !after.isFile() ||
+      !sameIdentity(identity, after) ||
+      after.size !== 0n
+    ) {
+      throw new ResultSpoolError(
+        "identity_changed",
+        "The owned result spool could not be verified empty.",
+      );
+    }
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
 class FileResultSpool implements ResultSpool {
   private length = 0;
   private closed = false;
@@ -70,7 +98,7 @@ class FileResultSpool implements ResultSpool {
     private readonly ownedDirectoryIdentity: BigIntStats,
     private readonly handle: FileHandle,
     private readonly fileIdentity: BigIntStats,
-    private readonly beforeCleanupRemove:
+    private readonly beforeCleanupWipe:
       | ((path: string) => void | Promise<void>)
       | undefined,
   ) {}
@@ -191,46 +219,10 @@ class FileResultSpool implements ResultSpool {
 
   async cleanup(): Promise<void> {
     if (this.closed) return;
-    try {
-      await this.verifyIdentity();
-    } catch (error) {
-      this.closed = true;
-      await this.handle.close().catch(() => undefined);
-      throw error;
-    }
     this.closed = true;
-    await this.handle.close();
-    const quarantineDirectory = `${this.ownedDirectory}.cleanup-${randomUUID()}`;
-    await rename(this.ownedDirectory, quarantineDirectory);
-    const quarantinePath = resolve(
-      quarantineDirectory,
-      this.path.slice(this.ownedDirectory.length + 1),
-    );
-    const verifyQuarantine = async () => {
-      const [directory, file] = await Promise.all([
-        lstat(quarantineDirectory, { bigint: true }).catch(() => undefined),
-        lstat(quarantinePath, { bigint: true }).catch(() => undefined),
-      ]);
-      if (
-        directory === undefined ||
-        file === undefined ||
-        directory.isSymbolicLink() ||
-        !directory.isDirectory() ||
-        file.isSymbolicLink() ||
-        !file.isFile() ||
-        !sameIdentity(this.ownedDirectoryIdentity, directory) ||
-        !sameIdentity(this.fileIdentity, file)
-      ) {
-        throw new ResultSpoolError(
-          "identity_changed",
-          "The result spool changed identity during cleanup.",
-        );
-      }
-    };
-    await verifyQuarantine();
-    await this.beforeCleanupRemove?.(quarantinePath);
-    await verifyQuarantine();
-    await rm(quarantineDirectory, { recursive: true, force: false });
+    await this.beforeCleanupWipe?.(this.path);
+    await wipeOwnedHandle(this.handle, this.fileIdentity);
+    this.length = 0;
   }
 }
 
@@ -313,36 +305,12 @@ export async function createResultSpool(
       ownedDirectoryIdentity,
       handle,
       fileIdentity,
-      options.beforeCleanupRemove,
+      options.beforeCleanupWipe,
     );
   } catch (error) {
-    await handle.close().catch(() => undefined);
     if (createdIdentity !== undefined) {
-      const quarantineDirectory = `${ownedDirectory}.failed-${randomUUID()}`;
-      try {
-        await rename(ownedDirectory, quarantineDirectory);
-        const quarantinePath = resolve(
-          quarantineDirectory,
-          path.slice(ownedDirectory.length + 1),
-        );
-        const [directory, file] = await Promise.all([
-          lstat(quarantineDirectory, { bigint: true }),
-          lstat(quarantinePath, { bigint: true }),
-        ]);
-        if (
-          !directory.isSymbolicLink() &&
-          directory.isDirectory() &&
-          !file.isSymbolicLink() &&
-          file.isFile() &&
-          sameIdentity(ownedDirectoryIdentity, directory) &&
-          sameIdentity(createdIdentity, file)
-        ) {
-          await rm(quarantineDirectory, { recursive: true, force: false });
-        }
-      } catch {
-        // Ambiguous ownership is preserved for stale-run cleanup.
-      }
-    }
+      await wipeOwnedHandle(handle, createdIdentity).catch(() => undefined);
+    } else await handle.close().catch(() => undefined);
     throw error;
   }
 }
