@@ -774,6 +774,37 @@ describe("OpenAI-compatible adapter", () => {
     expect(bodies[1]).toEqual(bodies[2]);
   });
 
+  it("continues a length-limited response returned by the empty-envelope retry", async () => {
+    const bodies: any[] = [];
+    const encoded = JSON.stringify(passResult("Retried length continuation."));
+    const first = encoded.slice(0, 73);
+    const second = encoded.slice(73);
+    const responses = [
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      jsonResponse({ choices: [] }),
+      assistantResponse({ role: "assistant", content: first }, "length"),
+      assistantResponse({ role: "assistant", content: second }, "stop"),
+    ];
+    const prepared = setup("C:\\workspace", {
+      finalizationAttempts: 2,
+      fetch: fetchMock(async (_input, init) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return responses.shift()!;
+      }),
+    });
+
+    expect(terminal(await collect(prepared.adapter, prepared.input))).toEqual({
+      type: "result",
+      result: passResult("Retried length continuation."),
+      isolation: "runtime_read_only",
+    });
+    expect(bodies[1]).toEqual(bodies[2]);
+    expect(bodies[3].messages.at(-2)).toEqual({
+      role: "assistant",
+      content: first,
+    });
+  });
+
   it("assembles exact continuation fragments without compacting or repeating inspection", async () => {
     const bodies: any[] = [];
     const encoded = JSON.stringify(passResult("Exact continuation."));
@@ -923,6 +954,97 @@ describe("OpenAI-compatible adapter", () => {
     expect(bodies).toHaveLength(4);
     expect(bodies[1].messages).toEqual(bodies[3].messages);
     expect(bodies[2].messages).not.toEqual(bodies[3].messages);
+  });
+
+  it("continues exact bytes from a length-limited schema repair response", async () => {
+    const bodies: any[] = [];
+    const encoded = JSON.stringify(passResult("Repair continuation."));
+    const first = encoded.slice(0, 81);
+    const second = encoded.slice(81);
+    const responses = [
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      assistantResponse({ role: "assistant", content: "not valid json" }),
+      assistantResponse({ role: "assistant", content: first }, "length"),
+      assistantResponse({ role: "assistant", content: second }, "stop"),
+    ];
+    const prepared = setup("C:\\workspace", {
+      finalizationAttempts: 2,
+      fetch: fetchMock(async (_input, init) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return responses.shift()!;
+      }),
+    });
+
+    expect(terminal(await collect(prepared.adapter, prepared.input))).toEqual({
+      type: "result",
+      result: passResult("Repair continuation."),
+      isolation: "runtime_read_only",
+    });
+    expect(bodies).toHaveLength(4);
+    expect(bodies[3].messages.at(-2)).toEqual({
+      role: "assistant",
+      content: first,
+    });
+    expect(JSON.stringify(bodies[3])).not.toContain("not valid json");
+  });
+
+  it("retries an empty streamed envelope through the identical SSE request", async () => {
+    const bodies: any[] = [];
+    const responses = [
+      sseResponse([
+        {
+          id: "chatcmpl-empty",
+          object: "chat.completion.chunk",
+          choices: [],
+        },
+      ]),
+      sseResponse([
+        {
+          id: "chatcmpl-tool",
+          object: "chat.completion.chunk",
+          choices: [
+            {
+              index: 0,
+              delta: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "list-1",
+                    type: "function",
+                    function: { name: "list_files", arguments: "{}" },
+                  },
+                ],
+              },
+              finish_reason: "tool_calls",
+            },
+          ],
+        },
+      ]),
+      sseAssistant("Inspection complete."),
+      sseAssistant(JSON.stringify(passResult("Stream retry."))),
+    ];
+    const prepared = setup(
+      "C:\\workspace",
+      {
+        fetch: fetchMock(async (_input, init) => {
+          bodies.push(JSON.parse(String(init?.body)));
+          return responses.shift()!;
+        }),
+      },
+      undefined,
+      { ...registration, streaming: "auto" },
+    );
+
+    expect(terminal(await collect(prepared.adapter, prepared.input))).toEqual({
+      type: "result",
+      result: passResult("Stream retry."),
+      isolation: "runtime_read_only",
+    });
+    expect(bodies).toHaveLength(4);
+    expect(bodies[0]).toEqual(bodies[1]);
+    expect(bodies[0].stream).toBe(true);
   });
 
   it("retries from the checkpoint after one complete invalid-result cycle", async () => {

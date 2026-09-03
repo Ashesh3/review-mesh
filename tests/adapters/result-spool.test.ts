@@ -86,6 +86,25 @@ describe("result spool", () => {
     expect(await readFile(spool.path, "utf8")).toBe("foreign");
   });
 
+  it("preserves a foreign replacement when identity changes during creation", async () => {
+    const directory = await root();
+    const original = join(directory, "creation-original.spool");
+    const path = join(directory, "creation-race.spool");
+
+    await expect(
+      createResultSpool({
+        directory,
+        id: "creation-race",
+        async afterCreateOpen(openedPath: string) {
+          await rename(openedPath, original);
+          await writeFile(openedPath, "foreign replacement");
+        },
+      }),
+    ).rejects.toMatchObject({ code: "identity_changed" });
+    expect(await readFile(path, "utf8")).toBe("foreign replacement");
+    expect(await readFile(original, "utf8")).toBe("");
+  });
+
   it("refuses a symlinked spool directory", async () => {
     const directory = await root();
     const target = join(directory, "target");

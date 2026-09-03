@@ -17,23 +17,23 @@ export class OpenAIStreamError extends Error {
   }
 }
 
-const toolCallDeltaSchema = z.strictObject({
+const toolCallDeltaSchema = z.object({
   index: z.number().int().nonnegative(),
   id: z.string().optional(),
   type: z.string().optional(),
   function: z
-    .strictObject({
+    .object({
       name: z.string().optional(),
       arguments: z.string().optional(),
     })
     .optional(),
 });
 
-const streamEventSchema = z.strictObject({
+const streamEventSchema = z.object({
   choices: z.array(
-    z.strictObject({
+    z.object({
       index: z.number().int().nonnegative(),
-      delta: z.strictObject({
+      delta: z.object({
         role: z.string().optional(),
         content: z.string().nullable().optional(),
         tool_calls: z.array(toolCallDeltaSchema).optional(),
@@ -104,6 +104,7 @@ export async function parseOpenAIChatStream(
   let role = "assistant";
   let content = "";
   let receivedContent = false;
+  let receivedChoice = false;
   let finishReason: string | undefined;
   let usage: Record<string, unknown> | undefined;
   const toolCalls = new Map<number, ToolCallAccumulator>();
@@ -143,6 +144,7 @@ export async function parseOpenAIChatStream(
     }
     for (const choice of parsed.data.choices) {
       if (choice.index !== 0) continue;
+      receivedChoice = true;
       if (choice.delta.role !== undefined) role = choice.delta.role;
       if (typeof choice.delta.content === "string") {
         receivedContent = true;
@@ -229,6 +231,9 @@ export async function parseOpenAIChatStream(
       if (dataLines.length > 0) consumeEvent();
     }
     if (!done) throw invalidStream("The stream ended without [DONE].");
+    if (!receivedChoice) {
+      throw invalidStream("The stream did not contain a primary choice.");
+    }
 
     const reconstructedCalls = [...toolCalls.entries()]
       .sort(([left], [right]) => left - right)

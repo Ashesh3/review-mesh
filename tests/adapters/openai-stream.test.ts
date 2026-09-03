@@ -29,6 +29,23 @@ function encodedChunks(value: string, boundaries: readonly number[]) {
 }
 
 describe("OpenAI-compatible SSE reconstruction", () => {
+  it("accepts ordinary OpenAI chunk metadata while validating consumed deltas", async () => {
+    const stream = [
+      'data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1720000000,"model":"gpt-test","system_fingerprint":"fp_123","service_tier":"default","choices":[{"index":0,"delta":{"role":"assistant","content":"metadata-safe","refusal":null},"logprobs":null,"finish_reason":"stop"}]}\n\n',
+      "data: [DONE]\n\n",
+    ].join("");
+
+    await expect(
+      parseOpenAIChatStream(
+        chunkedBody([new TextEncoder().encode(stream)]),
+        { signal: new AbortController().signal },
+      ),
+    ).resolves.toMatchObject({
+      message: { role: "assistant", content: "metadata-safe" },
+      finish_reason: "stop",
+    });
+  });
+
   it("reconstructs fragmented UTF-8 content, tool calls, finish reason, and usage losslessly", async () => {
     const stream = [
       'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"A €"},"finish_reason":null}]}\r\n\r\n',

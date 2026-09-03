@@ -56,6 +56,8 @@ const MAX_RETURNED_LINE_LENGTH = 1_000;
 const MAX_CONTENT_PARTS = 1_024;
 const DEFAULT_FINALIZATION_MAX_TOKENS = 8_192;
 const MAX_VALIDATION_ISSUES = 12;
+const EXACT_CONTINUATION_PROMPT =
+  "Continue the same JSON object from the exact stopping point. Return only the next bytes: do not repeat, rewrite, condense, or drop any prior content, and do not call tools.";
 const SKIPPED_DIRECTORIES = new Set([
   ".git",
   ".git-recovered",
@@ -1903,25 +1905,12 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     }
   }
 
-  private async chat(
+  private async chatResponse(
     configuration: ProviderConfiguration,
     signal: AbortSignal,
     sessionId: string,
     body: Record<string, unknown>,
-    failureDiagnostics: Partial<AdapterFailureDiagnostics> = {},
-  ): Promise<ChatResponse> {
-    if (
-      "messages" in body &&
-      Array.isArray(body.messages) &&
-      conversationBytes(body.messages as ChatMessage[]) >
-        this.maxConversationBytes
-    ) {
-      throw new ProviderRequestError(
-        adapterFailure.read(
-          "The bounded provider conversation exceeded its configured limit.",
-        ),
-      );
-    }
+  ): Promise<ProviderJsonResponse> {
     const configuredStreamingMode = this.registration.streaming ?? "disabled";
     const streamingMode = this.nonStreamingSessions.has(sessionId)
       ? "disabled"
@@ -1938,9 +1927,8 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
       },
       body: JSON.stringify(requestBody),
     } as const;
-    let response: ProviderJsonResponse;
     if (streamingMode === "disabled") {
-      response = await this.requestJson(
+      return this.requestJson(
         configuration,
         "/chat/completions",
         "chat",
@@ -1960,7 +1948,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           const contentType =
             streamed.response.headers.get("content-type")?.toLowerCase() ?? "";
           if (!contentType.includes("text/event-stream")) {
-            response = await this.readJsonResponse(
+            return await this.readJsonResponse(
               streamed.response,
               streamed.diagnostics,
               signal,
@@ -1991,7 +1979,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               ...(parsed.usage === undefined ? {} : { usage: parsed.usage }),
             };
             const structure = responseStructure(value);
-            response = {
+            return {
               value,
               diagnostics: {
                 ...streamed.diagnostics,
@@ -2005,6 +1993,31 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               },
             };
           }
+        } catch (error) {
+          if (error instanceof OpenAIStreamError) {
+            throw new ProviderRequestError(
+              error.code === "cancelled"
+                ? adapterFailure.cancelled()
+                : adapterFailure.protocolViolation(
+                    "The OpenAI-compatible endpoint returned an invalid stream.",
+                    false,
+                    {
+                      fallback_eligible: true,
+                      circuit_qualifying: false,
+                      diagnostics: {
+                        ...streamed.diagnostics,
+                        failure_code:
+                          error.code === "response_too_large"
+                            ? "response_too_large"
+                            : "provider_response_invalid",
+                        failure_stage: "stream_decode",
+                        scope: "provider",
+                      },
+                    },
+                  ),
+            );
+          }
+          throw error;
         } finally {
           streamed.dispose();
         }
@@ -2017,7 +2030,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
             error.failure.diagnostics?.http_status === 422);
         if (unsupported && streamingMode === "auto") {
           this.nonStreamingSessions.add(sessionId);
-          response = await this.requestJson(
+          return await this.requestJson(
             configuration,
             "/chat/completions",
             "chat",
@@ -2046,34 +2059,103 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               },
             ),
           );
-        } else if (error instanceof OpenAIStreamError) {
-          throw new ProviderRequestError(
-            error.code === "cancelled"
-              ? adapterFailure.cancelled()
-              : adapterFailure.protocolViolation(
-                  "The OpenAI-compatible endpoint returned an invalid stream.",
-                  false,
-                  {
-                    fallback_eligible: true,
-                    circuit_qualifying: false,
-                    diagnostics: {
-                      failure_code:
-                        error.code === "response_too_large"
-                          ? "response_too_large"
-                          : "provider_response_invalid",
-                      failure_stage: "stream_decode",
-                      scope: "provider",
-                    },
-                  },
-                ),
-          );
         } else {
           throw error;
         }
       }
     }
-    const firstDiagnostics = response.diagnostics;
+  }
+
+  private async chat(
+    configuration: ProviderConfiguration,
+    signal: AbortSignal,
+    sessionId: string,
+    body: Record<string, unknown>,
+    failureDiagnostics: Partial<AdapterFailureDiagnostics> = {},
+  ): Promise<ChatResponse> {
+    if (
+      "messages" in body &&
+      Array.isArray(body.messages) &&
+      conversationBytes(body.messages as ChatMessage[]) >
+        this.maxConversationBytes
+    ) {
+      throw new ProviderRequestError(
+        adapterFailure.read(
+          "The bounded provider conversation exceeded its configured limit.",
+        ),
+      );
+    }
     let retriedEnvelope = false;
+    let response: ProviderJsonResponse;
+    try {
+      response = await this.chatResponse(
+        configuration,
+        signal,
+        sessionId,
+        body,
+      );
+    } catch (error) {
+      if (
+        !(error instanceof ProviderRequestError) ||
+        error.failure.diagnostics?.failure_code !==
+          "provider_response_invalid" ||
+        error.failure.diagnostics.http_status !== 200
+      ) {
+        throw error;
+      }
+      retriedEnvelope = true;
+      try {
+        response = await this.chatResponse(
+          configuration,
+          signal,
+          sessionId,
+          body,
+        );
+        response.diagnostics = {
+          ...response.diagnostics,
+          attempt_count: 2,
+          retry_outcome: "succeeded",
+        };
+      } catch (retryError) {
+        if (retryError instanceof ProviderRequestError) {
+          throw new ProviderRequestError({
+            ...retryError.failure,
+            diagnostics: {
+              ...retryError.failure.diagnostics,
+              attempt_count: 2,
+              retry_outcome: "exhausted",
+            },
+          });
+        }
+        throw retryError;
+      }
+    }
+    let parsed = chatResponseSchema.safeParse(response.value);
+    if (!parsed.success) {
+      const choices =
+        typeof response.value === "object" &&
+        response.value !== null &&
+        !Array.isArray(response.value)
+          ? (response.value as { choices?: unknown }).choices
+          : undefined;
+      if (Array.isArray(choices) && choices.length === 0) {
+        retriedEnvelope = true;
+        response = await this.chatResponse(
+          configuration,
+          signal,
+          sessionId,
+          body,
+        );
+        parsed = chatResponseSchema.safeParse(response.value);
+        if (parsed.success) {
+          response.diagnostics = {
+            ...response.diagnostics,
+            attempt_count: 2,
+            retry_outcome: "succeeded",
+          };
+        }
+      }
+    }
     const receivedContentTypes = [
       ...(response.diagnostics.content_types ?? []),
       ...assistantContentTypes(response.value),
@@ -2089,37 +2171,6 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         ? {}
         : { finish_reason: receivedFinishReason }),
     };
-    let parsed = chatResponseSchema.safeParse(response.value);
-    if (!parsed.success) {
-      const choices =
-        typeof response.value === "object" &&
-        response.value !== null &&
-        !Array.isArray(response.value)
-          ? (response.value as { choices?: unknown }).choices
-          : undefined;
-      if (Array.isArray(choices) && choices.length === 0) {
-        retriedEnvelope = true;
-        const retried = await this.requestJson(
-          configuration,
-          "/chat/completions",
-          "chat",
-          signal,
-          {
-            ...requestInit,
-            body: JSON.stringify(requestBody),
-          },
-        );
-        response = retried;
-        parsed = chatResponseSchema.safeParse(response.value);
-        if (parsed.success) {
-          response.diagnostics = {
-            ...response.diagnostics,
-            attempt_count: 2,
-            retry_outcome: "succeeded",
-          };
-        }
-      }
-    }
     if (!parsed.success) {
       throw new ProviderRequestError(
         adapterFailure.protocolViolation(
@@ -2145,7 +2196,6 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     return {
       message: parsed.data.choices[0]!.message,
       diagnostics: {
-        ...firstDiagnostics,
         ...response.diagnostics,
         ...failureDiagnostics,
         ...(receivedContentTypes.length === 0
@@ -2532,8 +2582,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
             });
             finalizationMessages.push({
               role: "user",
-              content:
-                "Continue the same JSON object from the exact stopping point. Return only the next bytes: do not repeat, rewrite, condense, or drop any prior content, and do not call tools.",
+              content: EXACT_CONTINUATION_PROMPT,
             });
           }
           let resultDiagnostics: AdapterFailureDiagnostics = {
@@ -2652,17 +2701,44 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
                 },
               );
               resultDiagnostics = repairedResponse.diagnostics;
-              parsedResult = parseReviewerResult(
-                normalizedAssistantContent(repairedResponse.message.content),
+              const repairedFragment = normalizedAssistantContent(
+                repairedResponse.message.content,
               );
               resultTruncated =
                 repairedResponse.diagnostics.finish_reason === "length";
               if (resultTruncated) {
+                if (typeof repairedFragment === "string") {
+                  if (continuationSpool === undefined) {
+                    continuationSpool = await createResultSpool({
+                      directory: join(tmpdir(), "review-mesh-result-spools"),
+                      id: `${input.runId}-${input.reviewer.id}-${randomUUID()}`.replace(
+                        /[^A-Za-z0-9_-]/gu,
+                        "-",
+                      ),
+                      reviewedWorkspace: input.context.workspace,
+                    });
+                  }
+                  await continuationSpool.append(repairedFragment);
+                  continuationFragments.push(repairedFragment);
+                }
                 lastFinalizationFailure = outputTruncationFailure(
                   repairedResponse.diagnostics,
                   true,
                 );
+                if (finalizationAttempt < this.finalizationAttempts) {
+                  yield {
+                    type: "progress",
+                    phase: "validating",
+                    message: `Continuing the exact structured result from its stopping point (fragment ${finalizationAttempt + 1} of ${this.finalizationAttempts}).`,
+                  };
+                  continue;
+                }
               }
+              parsedResult = parseReviewerResult(
+                continuationSpool === undefined
+                  ? repairedFragment
+                  : await continuationSpool.readText(),
+              );
             }
             if (parsedResult.success && !resultTruncated) {
               await continuationSpool?.cleanup();

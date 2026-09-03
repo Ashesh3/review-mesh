@@ -40,6 +40,8 @@ export interface CreateResultSpoolOptions {
   directory: string;
   id: string;
   reviewedWorkspace?: string;
+  /** Test seam for deterministic pathname-replacement races after open. */
+  afterCreateOpen?(path: string): void | Promise<void>;
 }
 
 function sameIdentity(left: BigIntStats, right: BigIntStats): boolean {
@@ -236,8 +238,11 @@ export async function createResultSpool(
     constants.O_RDWR |
     ((constants as unknown as Record<string, number>).O_NOFOLLOW ?? 0);
   const handle = await open(path, flags, 0o600);
+  let createdIdentity: BigIntStats | undefined;
   try {
     const fileIdentity = await handle.stat({ bigint: true });
+    createdIdentity = fileIdentity;
+    await options.afterCreateOpen?.(path);
     const pathIdentity = await lstat(path, { bigint: true });
     if (
       !fileIdentity.isFile() ||
@@ -259,7 +264,17 @@ export async function createResultSpool(
     );
   } catch (error) {
     await handle.close().catch(() => undefined);
-    await rm(path, { force: true }).catch(() => undefined);
+    if (createdIdentity !== undefined) {
+      const current = await lstat(path, { bigint: true }).catch(() => undefined);
+      if (
+        current !== undefined &&
+        !current.isSymbolicLink() &&
+        current.isFile() &&
+        sameIdentity(createdIdentity, current)
+      ) {
+        await rm(path, { force: false }).catch(() => undefined);
+      }
+    }
     throw error;
   }
 }

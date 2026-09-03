@@ -140,11 +140,20 @@ async function runDoctorReview(
       if (event.type === "activity") readToolObserved = true;
       if (event.type === "result" || event.type === "failure") terminal = event;
     }
+    const streamingFailure =
+      terminal?.type === "failure" &&
+      doctorFailureStage(terminal) === "streaming_negotiation"
+        ? terminal.failure
+        : undefined;
     checks.push({
       name: "streaming_negotiation",
-      passed:
-        terminal?.type !== "failure" ||
-        doctorFailureStage(terminal) !== "streaming_negotiation",
+      passed: streamingFailure === undefined,
+      ...(streamingFailure === undefined
+        ? {}
+        : {
+            message: streamingFailure.message,
+            failure: streamingFailure,
+          }),
     });
     if (terminal?.type === "failure") {
       const name = doctorFailureStage(terminal);

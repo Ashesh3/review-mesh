@@ -577,6 +577,119 @@ describe("report and findings commands", () => {
     process.exitCode = undefined;
   });
 
+  it("retains typed diagnostics on the doctor streaming-negotiation stage", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-mesh-doctor-stream-"));
+    roots.push(root);
+    const workspace = join(root, "demo");
+    const configFile = join(root, "config.toml");
+    await mkdir(workspace);
+    const config: ManagedConfig = {
+      schema_version: "5",
+      execution: {
+        max_concurrency: 1,
+        heartbeat_interval_ms: 1_000,
+        shutdown_grace_period_ms: 100,
+      },
+      diagnostics: { persist_runs: false, max_runs: 1 },
+      adapters: {
+        gateway: {
+          type: "openai_compatible",
+          base_url_env: "BASE",
+          api_key_env: "KEY",
+          streaming: "required",
+        },
+      },
+      agents: {
+        security: {
+          adapter: "gateway",
+          model: "review-model",
+          purpose: "Security",
+          instructions: "Review security.",
+          isolation: "prefer_enforced",
+          timeout_ms: 1_000,
+        },
+      },
+      defaults: { agents: ["security"] },
+      projects: {},
+    };
+    await writeFile(configFile, serializeManagedConfig(config));
+    const registry = new AdapterRegistry();
+    registry.register("openai_compatible", () => ({
+      id: "gateway",
+      async probe() {
+        return {
+          available: true,
+          authenticated: true,
+          model_available: true,
+          streaming: true,
+          cancellation: true,
+          maximumIsolation: "runtime_read_only",
+        };
+      },
+      async *run() {
+        yield {
+          type: "failure",
+          isolation: "runtime_read_only",
+          failure: {
+            reason: "protocol_violation",
+            message: "Required streaming is unsupported.",
+            retryable: false,
+            fallback_eligible: true,
+            circuit_qualifying: false,
+            diagnostics: {
+              failure_code: "streaming_unsupported",
+              failure_stage: "streaming_negotiation",
+              scope: "provider",
+              http_status: 422,
+              provider_request_id: "request-stream-1",
+              correlation_headers: { "cf-ray": "ray-stream-1" },
+              validation_issues: [
+                {
+                  path: "$.stream",
+                  code: "unsupported",
+                  message: "Streaming is unsupported.",
+                },
+              ],
+              attempt_count: 1,
+              retry_outcome: "not_attempted",
+            },
+          },
+        };
+      },
+    }));
+    const stdout = stream();
+    await runCli(process, {
+      argv: ["doctor", workspace, "--structured-output"],
+      output: stdout,
+      error: stream(),
+      configFile,
+      adapterRegistry: registry,
+    });
+
+    const result = JSON.parse(await output(stdout));
+    expect(result.reviewers[0].checks).toContainEqual({
+      name: "streaming_negotiation",
+      passed: false,
+      message: "Required streaming is unsupported.",
+      failure: expect.objectContaining({
+        reason: "protocol_violation",
+        diagnostics: expect.objectContaining({
+          failure_code: "streaming_unsupported",
+          http_status: 422,
+          provider_request_id: "request-stream-1",
+          correlation_headers: { "cf-ray": "ray-stream-1" },
+          validation_issues: [
+            expect.objectContaining({ path: "$.stream" }),
+          ],
+          attempt_count: 1,
+          retry_outcome: "not_attempted",
+        }),
+      }),
+    });
+    expect(process.exitCode).toBe(3);
+    process.exitCode = undefined;
+  });
+
   it("filters doctor by exact adapter and model before creating adapters", async () => {
     const root = await mkdtemp(join(tmpdir(), "review-mesh-doctor-filter-"));
     roots.push(root);
