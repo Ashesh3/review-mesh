@@ -699,6 +699,57 @@ describe("runReviewRound", () => {
     ]);
   });
 
+  it("short-circuits on a confirmed low finding when the configured threshold is low", async () => {
+    const lowResult = failResult("low-confirmed");
+    lowResult.actionable_findings[0]!.severity = "low";
+    const first = fakeAdapterReturning(lowResult);
+    const second = fakeAdapterReturning(passResult("must not run"));
+    const completionPromise = runReviewRound(
+      roundInput({
+        adapters: { first, second },
+        config: {
+          reviewers: [
+            {
+              agentId: "configurable",
+              modelIndex: 0,
+              modelCount: 2,
+              policy: {
+                passQuorum: 1,
+                minimumProviderGroups: 1,
+                adjudication: "off",
+                gateMinimumSeverity: "low",
+                gateMinimumConfidence: "medium",
+              },
+            },
+            {
+              agentId: "configurable",
+              modelIndex: 1,
+              modelCount: 2,
+              previousReviewerId: "first",
+              policy: {
+                passQuorum: 1,
+                minimumProviderGroups: 1,
+                adjudication: "off",
+                gateMinimumSeverity: "low",
+                gateMinimumConfidence: "medium",
+              },
+            },
+          ],
+        },
+      }),
+    );
+
+    await vi.runAllTimersAsync();
+    const completion = await completionPromise;
+
+    expect(completion.gateOutcome).toBe("findings");
+    expect(second.runCalls).toBe(0);
+    expect(completion.reviewers[1]).toMatchObject({
+      status: "skipped",
+      reason: "short_circuited_after_finding",
+    });
+  });
+
   it("continues a model fallback chain after an operationally incomplete run", async () => {
     const first = new FakeAdapter({
       capabilities: {
@@ -1296,6 +1347,222 @@ describe("runReviewRound", () => {
         ],
       },
     });
+  });
+
+  it("releases adapter result storage only after immutable final persistence", async () => {
+    const persisted = vi.fn(async () => undefined);
+    const abandoned = vi.fn(async () => undefined);
+    const adapter = boundaryAdapter(async function* () {
+      yield {
+        type: "result",
+        result: passResult("Deferred cleanup."),
+        isolation: "enforced_read_only",
+        resultStorage: { persisted, abandoned },
+      };
+    });
+    const records: unknown[] = [];
+    let finalPersisted = false;
+    const completion = runReviewRound(
+      roundInput({
+        adapters: { deferred: adapter },
+        writer: {
+          emit: vi.fn(async () => ({})),
+          emitFinal: vi.fn(async () => {
+            expect(persisted).not.toHaveBeenCalled();
+            finalPersisted = true;
+            return {};
+          }),
+          record: vi.fn(async (record: unknown) => {
+            expect(persisted).not.toHaveBeenCalled();
+            records.push(record);
+          }),
+          close: vi.fn(async () => undefined),
+        },
+      }),
+    );
+
+    await vi.runAllTimersAsync();
+    await completion;
+
+    expect(records).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ record: "reviewer.result" }),
+      ]),
+    );
+    expect(finalPersisted).toBe(true);
+    expect(persisted).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains adapter result storage when required private persistence fails", async () => {
+    const persisted = vi.fn(async () => undefined);
+    const abandoned = vi.fn(async () => undefined);
+    const adapter = boundaryAdapter(async function* () {
+      yield {
+        type: "result",
+        result: passResult("Retained diagnostics."),
+        isolation: "enforced_read_only",
+        resultStorage: { persisted, abandoned },
+      };
+    });
+    const completion = runReviewRound(
+      roundInput({
+        adapters: { retained: adapter },
+        writer: {
+          emit: vi.fn(async () => ({})),
+          record: vi.fn(async (record: any) => {
+            if (record.record === "reviewer.result") {
+              throw new Error("disk full");
+            }
+          }),
+          close: vi.fn(async () => undefined),
+        },
+      }),
+    );
+
+    await vi.runAllTimersAsync();
+    const result = await completion;
+
+    expect(result.coverageOutcome).toBe("partial");
+    expect(persisted).not.toHaveBeenCalled();
+    expect(abandoned).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases adapter result storage immediately when the result is invalid", async () => {
+    const persisted = vi.fn(async () => undefined);
+    const abandoned = vi.fn(async () => undefined);
+    const adapter = boundaryAdapter(async function* () {
+      yield {
+        type: "result",
+        result: { schema_version: "3", verdict: "pass" } as never,
+        isolation: "enforced_read_only",
+        resultStorage: { persisted, abandoned },
+      };
+    });
+    const completion = runReviewRound(
+      roundInput({ adapters: { invalid: adapter } }),
+    );
+
+    await vi.runAllTimersAsync();
+    const result = await completion;
+
+    expect(result.coverageOutcome).toBe("partial");
+    expect(persisted).toHaveBeenCalledTimes(1);
+    expect(abandoned).not.toHaveBeenCalled();
+  });
+
+  it("does not block on a hanging invalid-result storage wipe", async () => {
+    const persisted = vi.fn(() => new Promise<void>(() => undefined));
+    const abandoned = vi.fn(async () => undefined);
+    const adapter = boundaryAdapter(async function* () {
+      yield {
+        type: "result",
+        result: { schema_version: "3", verdict: "pass" } as never,
+        isolation: "enforced_read_only",
+        resultStorage: { persisted, abandoned },
+      };
+    });
+    const completion = runReviewRound(
+      roundInput({
+        adapters: { invalid: adapter },
+        config: { execution: { shutdown_grace_period_ms: 25 } },
+      }),
+    );
+
+    await vi.runAllTimersAsync();
+    await expect(completion).resolves.toMatchObject({
+      coverageOutcome: "partial",
+    });
+    expect(persisted).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not block on a hanging abandoned callback after record failure", async () => {
+    const persisted = vi.fn(async () => undefined);
+    const abandoned = vi.fn(() => new Promise<void>(() => undefined));
+    const adapter = boundaryAdapter(async function* () {
+      yield {
+        type: "result",
+        result: passResult("Retained diagnostics."),
+        isolation: "enforced_read_only",
+        resultStorage: { persisted, abandoned },
+      };
+    });
+    const completion = runReviewRound(
+      roundInput({
+        adapters: { retained: adapter },
+        config: { execution: { shutdown_grace_period_ms: 25 } },
+        writer: {
+          emit: vi.fn(async () => ({})),
+          record: vi.fn(async (record: any) => {
+            if (record.record === "reviewer.result")
+              throw new Error("disk full");
+          }),
+          close: vi.fn(async () => undefined),
+        },
+      }),
+    );
+
+    await vi.runAllTimersAsync();
+    await expect(completion).resolves.toMatchObject({
+      coverageOutcome: "partial",
+    });
+    expect(abandoned).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains adapter result storage when immutable final persistence fails", async () => {
+    const persisted = vi.fn(async () => undefined);
+    const abandoned = vi.fn(async () => undefined);
+    const adapter = boundaryAdapter(async function* () {
+      yield {
+        type: "result",
+        result: passResult("Retained after final failure."),
+        isolation: "enforced_read_only",
+        resultStorage: { persisted, abandoned },
+      };
+    });
+    const completion = runReviewRound(
+      roundInput({
+        adapters: { retained: adapter },
+        writer: {
+          emit: vi.fn(async () => ({})),
+          emitFinal: vi.fn(async () => {
+            throw new Error("final persistence failed");
+          }),
+          record: vi.fn(async () => undefined),
+          close: vi.fn(async () => undefined),
+        },
+      }),
+    );
+
+    const rejection = expect(completion).rejects.toThrow(
+      /complete reviewer result could not be persisted/i,
+    );
+    await vi.runAllTimersAsync();
+    await rejection;
+    expect(persisted).not.toHaveBeenCalled();
+    expect(abandoned).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds and detaches a hanging post-persistence cleanup", async () => {
+    const persisted = vi.fn(() => new Promise<void>(() => undefined));
+    const abandoned = vi.fn(async () => undefined);
+    const adapter = boundaryAdapter(async function* () {
+      yield {
+        type: "result",
+        result: passResult("Cleanup hangs."),
+        isolation: "enforced_read_only",
+        resultStorage: { persisted, abandoned },
+      };
+    });
+    const completion = runReviewRound(
+      roundInput({
+        adapters: { bounded: adapter },
+        config: { execution: { shutdown_grace_period_ms: 25 } },
+      }),
+    );
+
+    await vi.runAllTimersAsync();
+    await expect(completion).resolves.toMatchObject({ status: "passed" });
+    expect(persisted).toHaveBeenCalledTimes(1);
   });
 
   it("marks the run incomplete instead of claiming complete results when result persistence fails", async () => {

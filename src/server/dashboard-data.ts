@@ -1556,8 +1556,7 @@ function rawFindings(
           ? {}
           : { duplicate_of: text(finding.duplicate_of)! }),
         gate_eligible:
-          effectiveSeverity !== "low" &&
-          effectiveClassification !== "advisory" &&
+          effectiveClassification === "confirmed_defect" &&
           adjudicationDecision?.effective_decision !== "rejected" &&
           adjudicationDecision?.effective_decision !== "needs_verification",
         adjudication:

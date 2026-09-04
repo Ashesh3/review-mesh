@@ -16,7 +16,7 @@ import {
   canonicalizeFindings,
   type CanonicalRawFinding,
 } from "../findings/canonical.js";
-import { meetsGateThresholds } from "./lens-policy.js";
+import { DEFAULT_GATE_THRESHOLDS, meetsGateThresholds } from "./lens-policy.js";
 
 export type ReviewerLifecycleStatus =
   | "deferred"
@@ -414,10 +414,11 @@ function gateFindingCount(state: ReviewerState): number {
     return 0;
   const policy = state.reviewer.policy;
   return state.result.actionable_findings.filter((finding) => {
-    if (finding.severity === "low") return false;
-    if ("classification" in finding && finding.classification === "advisory")
+    if (
+      "classification" in finding &&
+      finding.classification !== "confirmed_defect"
+    )
       return false;
-    if (policy === undefined) return true;
     return meetsGateThresholds(
       {
         severity: finding.severity,
@@ -430,8 +431,12 @@ function gateFindingCount(state: ReviewerState): number {
             : "medium",
       },
       {
-        minimumSeverity: policy.gateMinimumSeverity,
-        minimumConfidence: policy.gateMinimumConfidence,
+        minimumSeverity:
+          policy?.gateMinimumSeverity ??
+          DEFAULT_GATE_THRESHOLDS.minimumSeverity,
+        minimumConfidence:
+          policy?.gateMinimumConfidence ??
+          DEFAULT_GATE_THRESHOLDS.minimumConfidence,
       },
     );
   }).length;
@@ -509,16 +514,18 @@ function rawFindingsForStates(
           : classification;
       const policy = reviewer.reviewer.policy;
       const thresholdEligible =
-        effectiveFinding.severity !== "low" &&
-        effectiveClassification !== "advisory" &&
-        (policy === undefined ||
-          meetsGateThresholds(
-            { severity: effectiveFinding.severity, confidence },
-            {
-              minimumSeverity: policy.gateMinimumSeverity,
-              minimumConfidence: policy.gateMinimumConfidence,
-            },
-          ));
+        effectiveClassification === "confirmed_defect" &&
+        meetsGateThresholds(
+          { severity: effectiveFinding.severity, confidence },
+          {
+            minimumSeverity:
+              policy?.gateMinimumSeverity ??
+              DEFAULT_GATE_THRESHOLDS.minimumSeverity,
+            minimumConfidence:
+              policy?.gateMinimumConfidence ??
+              DEFAULT_GATE_THRESHOLDS.minimumConfidence,
+          },
+        );
       findings.push({
         source_ref: `${reviewer.reviewer.id}#${finding.id}`,
         reviewer_id: reviewer.reviewer.id,

@@ -38,7 +38,16 @@ export interface AdapterReviewInput {
 export type AdapterEvent =
   | { type: "progress"; phase: string; message?: string }
   | { type: "activity"; message: string }
-  | { type: "result"; result: ReviewerOutput; isolation: IsolationLevel }
+  | {
+      type: "result";
+      result: ReviewerOutput;
+      isolation: IsolationLevel;
+      /** Adapter-owned exact-result storage lifecycle. */
+      resultStorage?: {
+        persisted(): void | Promise<void>;
+        abandoned(): void | Promise<void>;
+      };
+    }
   | { type: "failure"; failure: AdapterFailure; isolation?: IsolationLevel };
 
 export interface ReviewAdapter {

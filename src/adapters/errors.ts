@@ -54,10 +54,7 @@ export type AdapterFailureCode =
   | "response_too_large"
   | "streaming_unsupported";
 
-export type AdapterRetryOutcome =
-  | "not_attempted"
-  | "succeeded"
-  | "exhausted";
+export type AdapterRetryOutcome = "not_attempted" | "succeeded" | "exhausted";
 
 export interface AdapterValidationIssue {
   path: string;

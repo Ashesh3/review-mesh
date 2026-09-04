@@ -221,4 +221,50 @@ describe("canonicalizeFindings", () => {
     expect(result.gate_effective.map((item) => item.id)).toEqual(["gate"]);
     expect(result.counts).toEqual({ raw: 3, unique: 3, gate: 1, advisory: 2 });
   });
+
+  it("allows a confirmed low-severity finding only when the lens threshold is low", () => {
+    const low = finding("configurable::primary", "low-defect", {
+      lens_id: "configurable",
+      severity: "low",
+      confidence: "high",
+    });
+
+    expect(canonicalizeFindings([low]).counts).toEqual({
+      raw: 1,
+      unique: 1,
+      gate: 0,
+      advisory: 1,
+    });
+    expect(
+      canonicalizeFindings([low], {
+        gatePolicies: {
+          configurable: {
+            minimumSeverity: "low",
+            minimumConfidence: "medium",
+          },
+        },
+      }).counts,
+    ).toEqual({ raw: 1, unique: 1, gate: 1, advisory: 0 });
+  });
+
+  it("never gates a needs-verification finding even with the lowest thresholds", () => {
+    const uncertain = finding("configurable::primary", "uncertain", {
+      lens_id: "configurable",
+      severity: "low",
+      confidence: "low",
+      classification: "needs_verification",
+    });
+    delete uncertain.gate_eligible;
+
+    expect(
+      canonicalizeFindings([uncertain], {
+        gatePolicies: {
+          configurable: {
+            minimumSeverity: "low",
+            minimumConfidence: "low",
+          },
+        },
+      }).counts,
+    ).toEqual({ raw: 1, unique: 1, gate: 0, advisory: 1 });
+  });
 });

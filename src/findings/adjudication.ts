@@ -38,9 +38,7 @@ export type AdjudicationValidationIssue =
 export interface EffectiveAdjudicationDecision {
   source_finding_id: string;
   requested_decision: AdjudicationDecision["decision"] | "missing";
-  effective_decision:
-    | AdjudicationDecision["decision"]
-    | "needs_verification";
+  effective_decision: AdjudicationDecision["decision"] | "needs_verification";
   gate_eligible: boolean;
   issues: AdjudicationValidationIssue[];
   decision?: AdjudicationDecision;
@@ -77,13 +75,18 @@ export function failClosedAdjudicationOutcome(
         effective_decision: "needs_verification",
         gate_eligible: false,
         issues: ["validation_attestation_required"],
-        ...(decision === undefined ? {} : { decision: structuredClone(decision) }),
+        ...(decision === undefined
+          ? {}
+          : { decision: structuredClone(decision) }),
       };
     }),
     unknown_source_finding_ids: adjudicationResult.decisions
       .map((decision) => decision.source_finding_id)
       .filter(
-        (id) => !candidateResult.actionable_findings.some((finding) => finding.id === id),
+        (id) =>
+          !candidateResult.actionable_findings.some(
+            (finding) => finding.id === id,
+          ),
       )
       .sort(),
   };
@@ -124,11 +127,15 @@ function validOrderedProof(decision: AdjudicationDecision): {
   };
 }
 
-function concreteCitation(value: {
-  path?: string | undefined;
-  start_line?: number | undefined;
-  end_line?: number | undefined;
-} | undefined): boolean {
+function concreteCitation(
+  value:
+    | {
+        path?: string | undefined;
+        start_line?: number | undefined;
+        end_line?: number | undefined;
+      }
+    | undefined,
+): boolean {
   if (value === undefined) return false;
   const path = value.path;
   return (
@@ -143,7 +150,9 @@ function concreteCitation(value: {
     !path.includes("\\") &&
     !/[\u0000-\u001f]/u.test(path) &&
     !/[*?[\]]/u.test(path) &&
-    !path.split("/").some((part) => part === "" || part === "." || part === "..") &&
+    !path
+      .split("/")
+      .some((part) => part === "" || part === "." || part === "..") &&
     typeof value.start_line === "number" &&
     Number.isSafeInteger(value.start_line) &&
     value.start_line > 0 &&
@@ -215,7 +224,8 @@ function withinCandidateEvidence(
   if (!concreteCitation(citation)) return false;
   const end = citation.end_line ?? citation.start_line!;
   return candidate.evidence.some((evidence) => {
-    if (!concreteCitation(evidence) || evidence.path !== citation.path) return false;
+    if (!concreteCitation(evidence) || evidence.path !== citation.path)
+      return false;
     const evidenceEnd = evidence.end_line ?? evidence.start_line!;
     return citation.start_line! >= evidence.start_line! && end <= evidenceEnd;
   });
@@ -233,9 +243,12 @@ function contextBoundCitation(
   if (!concreteCitation(citation)) return false;
   if (withinCandidateEvidence(citation, candidate)) return true;
   const git = context.git;
-  if (git === undefined || !git.changedFiles.includes(citation.path!)) return false;
+  if (git === undefined || !git.changedFiles.includes(citation.path!))
+    return false;
   const ranges = parseDiffRanges(git.diff);
-  return withinRanges(citation, ranges.old) || withinRanges(citation, ranges.head);
+  return (
+    withinRanges(citation, ranges.old) || withinRanges(citation, ranges.head)
+  );
 }
 
 function adjustedFinding(
@@ -362,8 +375,14 @@ export function validateAdjudication(
       ) {
         const ranges = parseDiffRanges(context.git?.diff ?? "");
         if (
-          !withinRanges(decision.base_head_comparison.base.citation, ranges.old) ||
-          !withinRanges(decision.base_head_comparison.head.citation, ranges.head)
+          !withinRanges(
+            decision.base_head_comparison.base.citation,
+            ranges.old,
+          ) ||
+          !withinRanges(
+            decision.base_head_comparison.head.citation,
+            ranges.head,
+          )
         ) {
           issues.push("base_head_context_required");
         }
@@ -388,7 +407,6 @@ export function validateAdjudication(
         gate_eligible:
           decision.decision !== "rejected" &&
           issues.length === 0 &&
-          (effectiveFinding ?? candidate).severity !== "low" &&
           (effectiveFinding ?? candidate).classification === "confirmed_defect",
         issues,
         decision,

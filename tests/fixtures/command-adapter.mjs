@@ -51,11 +51,22 @@ const failResult = {
       confidence: "high",
       classification: "confirmed_defect",
       external_assumptions: [],
+      root_issue_id: "fixture-shared-root",
       category: "correctness",
       verification: "Controlled evidence demonstrates the defect.",
     },
   ],
   informational_notes: [],
+};
+
+const largePassResult = {
+  ...passResult,
+  review_markdown: `# Review\n\nClean.\n\n${"Complete acceptance evidence. ".repeat(4_096)}`,
+};
+
+const largeFailResult = {
+  ...failResult,
+  review_markdown: `# Review\n\nOne actionable finding.\n\n${"Complete acceptance evidence. ".repeat(4_096)}`,
 };
 
 const emit = (event) => process.stdout.write(`${JSON.stringify(event)}\n`);
@@ -79,6 +90,12 @@ switch (mode) {
     break;
   case "fail":
     emit({ type: "result", result: failResult });
+    break;
+  case "large-pass":
+    emit({ type: "result", result: largePassResult });
+    break;
+  case "large-fail":
+    emit({ type: "result", result: largeFailResult });
     break;
   case "capabilities-enforced":
     emit({ type: "capabilities", isolation: "enforced_read_only" });

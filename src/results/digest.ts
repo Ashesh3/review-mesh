@@ -17,7 +17,9 @@ export function canonicalJson(value: unknown): string {
 }
 
 export function reviewerResultDigest(result: ReviewerOutput): string {
-  return createHash("sha256").update(canonicalJson(result), "utf8").digest("hex");
+  return createHash("sha256")
+    .update(canonicalJson(result), "utf8")
+    .digest("hex");
 }
 
 export function adjudicationAttestationDigest(value: {
@@ -26,5 +28,7 @@ export function adjudicationAttestationDigest(value: {
   context_head: string | null;
   outcome: AdjudicationOutcome;
 }): string {
-  return createHash("sha256").update(canonicalJson(value), "utf8").digest("hex");
+  return createHash("sha256")
+    .update(canonicalJson(value), "utf8")
+    .digest("hex");
 }

@@ -2760,9 +2760,14 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               );
             }
             if (parsedResult.success && !resultTruncated) {
-              await continuationSpool?.cleanup();
+              const resultStorage = continuationSpool?.lifecycle();
               continuationSpool = undefined;
-              yield { type: "result", result: parsedResult.data, isolation };
+              yield {
+                type: "result",
+                result: parsedResult.data,
+                isolation,
+                ...(resultStorage === undefined ? {} : { resultStorage }),
+              };
               return;
             }
             if (

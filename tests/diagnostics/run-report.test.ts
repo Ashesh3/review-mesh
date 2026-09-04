@@ -129,6 +129,288 @@ afterEach(async () => {
 });
 
 describe("readRunReport", () => {
+  function currentIntegrityFixture(runId: string) {
+    const result = resultV3("# Complete review\n\nOne confirmed defect.");
+    result.verdict = "fail";
+    result.summary = "One confirmed defect.";
+    result.actionable_findings = [
+      {
+        ...findingV2({ id: "confirmed" }),
+        severity: "high" as const,
+        confidence: "high" as const,
+        classification: "confirmed_defect" as const,
+        category: "correctness",
+        verification: "The evidence directly confirms the defect.",
+      },
+    ];
+    const digest = reviewerResultDigest(result);
+    const byteCount = Buffer.byteLength(JSON.stringify(result), "utf8");
+    const completion = {
+      schema_version: "5",
+      event: "run.completed",
+      run_id: runId,
+      seq: 1,
+      timestamp: "2026-09-04T00:00:00.000Z",
+      data: {
+        gate_outcome: "findings",
+        coverage_outcome: "complete",
+        exit_code: 1,
+        consistency_mode: "live_worktree",
+        total_elapsed_ms: 1,
+        raw_findings: 1,
+        unique_findings: 1,
+        gate_findings: 1,
+        advisory_findings: 0,
+        result_manifest: [
+          {
+            reviewer_id: "security",
+            lens_id: "security",
+            digest,
+            byte_count: byteCount,
+          },
+        ],
+        results_complete: true,
+        status: "findings",
+        model_runs: {
+          total: 1,
+          deferred: 0,
+          queued: 0,
+          running: 0,
+          completed: 1,
+          incomplete: 0,
+          skipped: 0,
+        },
+        suite: {
+          total: 1,
+          deferred: 0,
+          queued: 0,
+          running: 0,
+          completed: 1,
+          incomplete: 0,
+          skipped: 0,
+        },
+      },
+    };
+    return { result, digest, byteCount, completion };
+  }
+
+  it("accepts a current completion whose manifest and canonical counts match verified results", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-valid-integrity";
+    const { result, completion } = currentIntegrityFixture(runId);
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [line(persistedResultV3(runId, result)), line(completion)].join(""),
+    );
+
+    await expect(
+      readRunReport({ runsDirectory, runId }),
+    ).resolves.toMatchObject({
+      finding_counts: { raw: 1, unique: 1, gate: 1, advisory: 0 },
+    });
+  });
+
+  it.each([
+    ["missing reviewer", (data: any) => (data.result_manifest = [])],
+    [
+      "duplicate reviewer",
+      (data: any) => data.result_manifest.push({ ...data.result_manifest[0] }),
+    ],
+    [
+      "unknown reviewer",
+      (data: any) => (data.result_manifest[0].reviewer_id = "unknown"),
+    ],
+    [
+      "wrong digest",
+      (data: any) => (data.result_manifest[0].digest = "0".repeat(64)),
+    ],
+    [
+      "wrong byte count",
+      (data: any) => (data.result_manifest[0].byte_count += 1),
+    ],
+    ["wrong lens", (data: any) => (data.result_manifest[0].lens_id = "wrong")],
+    ["missing lens", (data: any) => delete data.result_manifest[0].lens_id],
+    [
+      "wrong artifact path",
+      (data: any) =>
+        (data.result_manifest[0].artifact_path = "C:\\wrong.jsonl"),
+    ],
+    [
+      "missing required artifact path",
+      (data: any) => {
+        data.report_path = "C:\\run.jsonl";
+        delete data.result_manifest[0].artifact_path;
+      },
+    ],
+    ["false completeness", (data: any) => (data.results_complete = false)],
+    [
+      "true completeness for partial coverage",
+      (data: any) => (data.coverage_outcome = "partial"),
+    ],
+    ["missing manifest", (data: any) => delete data.result_manifest],
+    ["missing completeness", (data: any) => delete data.results_complete],
+    ["wrong raw count", (data: any) => (data.raw_findings = 2)],
+    ["wrong unique count", (data: any) => (data.unique_findings = 2)],
+    ["wrong gate count", (data: any) => (data.gate_findings = 0)],
+    ["wrong advisory count", (data: any) => (data.advisory_findings = 1)],
+    ["incomplete count tuple", (data: any) => delete data.raw_findings],
+  ])(
+    "rejects current completion integrity corruption: %s",
+    async (_name, mutate) => {
+      const { runsDirectory } = await fixture();
+      const runId = `run-corrupt-${String(_name).replaceAll(" ", "-")}`;
+      const { result, completion } = currentIntegrityFixture(runId);
+      mutate(completion.data);
+      await writeFile(
+        join(runsDirectory, `${runId}.jsonl`),
+        [line(persistedResultV3(runId, result)), line(completion)].join(""),
+      );
+
+      await expect(
+        readRunReport({ runsDirectory, runId }),
+      ).rejects.toMatchObject({
+        code: "invalid_run_record",
+        recordType: "run.completed",
+      });
+    },
+  );
+
+  it("salvages current completion integrity corruption only in best-effort mode", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-best-effort-integrity";
+    const { result, completion } = currentIntegrityFixture(runId);
+    completion.data.gate_findings = 0;
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [line(persistedResultV3(runId, result)), line(completion)].join(""),
+    );
+
+    const report = await readRunReport({
+      runsDirectory,
+      runId,
+      bestEffort: true,
+    });
+    expect(report.finding_counts.gate).toBe(1);
+    expect(report.coverage_outcome).toBe("partial");
+    expect(report.record_warnings).toEqual([
+      expect.objectContaining({ record_type: "run.completed" }),
+    ]);
+  });
+
+  it("rejects a duplicate current completion contract at its actual JSONL line", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-duplicate-completion";
+    const { result, completion } = currentIntegrityFixture(runId);
+    const duplicate = structuredClone(completion);
+    duplicate.seq = 2;
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [
+        line(persistedResultV3(runId, result)),
+        line(completion),
+        line(duplicate),
+      ].join(""),
+    );
+
+    await expect(readRunReport({ runsDirectory, runId })).rejects.toMatchObject(
+      {
+        code: "invalid_run_record",
+        line: 3,
+        recordType: "run.completed",
+      },
+    );
+  });
+
+  it("reports an invalid private summary contract at its actual JSONL line", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-private-summary-integrity";
+    const { result, completion } = currentIntegrityFixture(runId);
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [
+        line(persistedResultV3(runId, result)),
+        line({
+          record: "run.summary",
+          run_id: runId,
+          summary: { ...completion.data, gate_findings: 0 },
+        }),
+      ].join(""),
+    );
+
+    await expect(readRunReport({ runsDirectory, runId })).rejects.toMatchObject(
+      {
+        code: "invalid_run_record",
+        line: 2,
+        recordType: "run.summary",
+      },
+    );
+  });
+
+  it("allows a legacy summary before the single current completion contract", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-legacy-then-current-summary";
+    const { result, completion } = currentIntegrityFixture(runId);
+    completion.seq = 2;
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [
+        line(persistedResultV3(runId, result)),
+        line({
+          record: "run.summary",
+          run_id: runId,
+          summary: { gate_outcome: "findings", coverage_outcome: "complete" },
+        }),
+        line(completion),
+      ].join(""),
+    );
+
+    await expect(
+      readRunReport({ runsDirectory, runId }),
+    ).resolves.toMatchObject({
+      finding_counts: { raw: 1, unique: 1, gate: 1, advisory: 0 },
+    });
+  });
+
+  it("reads a v7.2 completion with only legacy unique and advisory counts", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-v72-legacy-counts";
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      line({
+        schema_version: "5",
+        event: "run.completed",
+        run_id: runId,
+        seq: 1,
+        timestamp: "2026-09-03T00:00:00.000Z",
+        data: {
+          gate_outcome: "no_findings",
+          coverage_outcome: "complete",
+          exit_code: 0,
+          consistency_mode: "live_worktree",
+          total_elapsed_ms: 1,
+          unique_findings: 0,
+          advisory_findings: 0,
+          status: "passed",
+          suite: {
+            total: 0,
+            deferred: 0,
+            queued: 0,
+            running: 0,
+            completed: 0,
+            incomplete: 0,
+            skipped: 0,
+          },
+        },
+      }),
+    );
+    await expect(
+      readRunReport({ runsDirectory, runId }),
+    ).resolves.toMatchObject({
+      status: "passed",
+      finding_counts: { raw: 0, unique: 0, gate: 0, advisory: 0 },
+    });
+  });
+
   it("joins a compact mirrored public result reference to the authoritative private result", async () => {
     const { runsDirectory } = await fixture();
     const runId = "run-public-reference";
@@ -431,7 +713,7 @@ describe("readRunReport", () => {
     expect(report).toMatchObject({
       active: false,
       status: "incomplete",
-      gate_outcome: "findings",
+      gate_outcome: "passed",
       coverage_outcome: "partial",
       exit_code: 3,
       logical_lenses: {
@@ -453,6 +735,12 @@ describe("readRunReport", () => {
       }),
     ]);
     expect(report.findings).toHaveLength(1);
+    expect(report.finding_counts).toEqual({
+      raw: 1,
+      unique: 1,
+      gate: 0,
+      advisory: 1,
+    });
     expect(JSON.stringify(report.raw_findings)).not.toContain(
       "Deployment parity is clear",
     );
@@ -1229,6 +1517,8 @@ describe("finding consolidation and rendering", () => {
             unique_findings: 1,
             gate_findings: 1,
             advisory_findings: 0,
+            result_manifest: [],
+            results_complete: false,
             status: "findings",
             suite: {
               total: 2,
@@ -1250,6 +1540,65 @@ describe("finding consolidation and rendering", () => {
     expect(report.finding_counts.unique).toBe(1);
     expect(findings.deduplicated).toHaveLength(1);
     expect(report.finding_counts.unique).toBe(findings.deduplicated.length);
+  });
+
+  it("uses the persisted low gate threshold in strict report and findings views", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-low-threshold";
+    const result = resultV3("# Review\n\nConfirmed low defect.");
+    result.verdict = "fail";
+    result.summary = "Confirmed low defect.";
+    result.actionable_findings = [
+      {
+        ...findingV2({ id: "low-confirmed", severity: "low" }),
+        severity: "low" as const,
+        confidence: "high" as const,
+        classification: "confirmed_defect" as const,
+        category: "correctness",
+        verification: "The cited evidence confirms the defect.",
+      },
+    ];
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [
+        line({
+          record: "resolution",
+          run_id: runId,
+          resolution: {
+            reviewers: [
+              {
+                id: "configurable::primary",
+                agent_id: "configurable",
+                policy: {
+                  passQuorum: 1,
+                  minimumProviderGroups: 1,
+                  adjudication: "off",
+                  gateMinimumSeverity: "low",
+                  gateMinimumConfidence: "medium",
+                },
+              },
+            ],
+          },
+        }),
+        line({
+          ...persistedResultV3(runId, result),
+          reviewer_id: "configurable::primary",
+          lens_id: "configurable",
+        }),
+      ].join(""),
+    );
+
+    const report = await readRunReport({ runsDirectory, runId });
+    const findings = await readRunFindings({ runsDirectory, runId });
+
+    expect(report).toMatchObject({
+      gate_outcome: "findings",
+      finding_counts: { raw: 1, unique: 1, gate: 1, advisory: 0 },
+    });
+    expect(findings.deduplicated).toEqual([
+      expect.objectContaining({ id: "low-confirmed", gate_eligible: true }),
+    ]);
+    expect(renderRunReportMarkdown(report)).toContain("LOW — Mapping failure");
   });
 
   it("derives a passed gate outcome when an unrecognized persisted outcome has only advisories", async () => {

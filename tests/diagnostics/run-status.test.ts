@@ -9,6 +9,7 @@ import type {
   ReviewerResultV3,
 } from "../../src/protocol/schemas.js";
 import { reviewerResultDigest } from "../../src/results/digest.js";
+import { createAdjudicationValidationAttestation } from "../../src/findings/attestation.js";
 
 const temporaryRoots: string[] = [];
 
@@ -33,6 +34,404 @@ afterEach(async () => {
 });
 
 describe("readRunStatus", () => {
+  function currentIntegrityRecords(runId: string) {
+    const result: ReviewerResultV3 = {
+      schema_version: "3",
+      verdict: "fail",
+      review_markdown: "# Review\n\nConfirmed defect.",
+      summary: "Confirmed defect.",
+      actionable_findings: [
+        {
+          id: "confirmed",
+          severity: "high",
+          title: "Confirmed defect",
+          description: "The invariant is broken.",
+          evidence: [{ detail: "Direct evidence." }],
+          suggested_direction: "Restore the invariant.",
+          confidence: "high",
+          classification: "confirmed_defect",
+          external_assumptions: [],
+          category: "correctness",
+          verification: "Direct evidence confirms the defect.",
+        },
+      ],
+      informational_notes: [],
+    };
+    const digest = reviewerResultDigest(result);
+    const byteCount = Buffer.byteLength(JSON.stringify(result), "utf8");
+    const completion = {
+      schema_version: "5",
+      event: "run.completed",
+      run_id: runId,
+      seq: 1,
+      timestamp: "2026-09-04T00:00:00.000Z",
+      data: {
+        gate_outcome: "findings",
+        coverage_outcome: "complete",
+        exit_code: 1,
+        consistency_mode: "live_worktree",
+        total_elapsed_ms: 1,
+        raw_findings: 1,
+        unique_findings: 1,
+        gate_findings: 1,
+        advisory_findings: 0,
+        result_manifest: [
+          {
+            reviewer_id: "security",
+            lens_id: "security",
+            digest,
+            byte_count: byteCount,
+          },
+        ],
+        results_complete: true,
+        status: "findings",
+        model_runs: {
+          total: 1,
+          deferred: 0,
+          queued: 0,
+          running: 0,
+          completed: 1,
+          incomplete: 0,
+          skipped: 0,
+        },
+        suite: {
+          total: 1,
+          deferred: 0,
+          queued: 0,
+          running: 0,
+          completed: 1,
+          incomplete: 0,
+          skipped: 0,
+        },
+      },
+    };
+    return {
+      result,
+      completion,
+      records: [
+        line({
+          record: "resolution",
+          run_id: runId,
+          resolution: { reviewers: [{ id: "security", agent_id: "security" }] },
+        }),
+        line({
+          record: "reviewer.result",
+          run_id: runId,
+          reviewer_id: "security",
+          lens_id: "security",
+          digest,
+          byte_count: byteCount,
+          result,
+        }),
+      ],
+    };
+  }
+
+  it("accepts a current status completion with a verified manifest and count tuple", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-status-valid-integrity";
+    const current = currentIntegrityRecords(runId);
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [...current.records, line(current.completion)].join(""),
+    );
+
+    await expect(
+      readRunStatus({ runsDirectory, runId }),
+    ).resolves.toMatchObject({
+      status: "findings",
+      reviewers: [{ reviewer_id: "security", complete_result: current.result }],
+    });
+  });
+
+  it("accepts current status counts derived with a persisted low gate threshold", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-status-low-threshold";
+    const current = currentIntegrityRecords(runId);
+    current.result.actionable_findings[0]!.severity = "low";
+    const digest = reviewerResultDigest(current.result);
+    const byteCount = Buffer.byteLength(JSON.stringify(current.result), "utf8");
+    current.completion.data.result_manifest[0]!.digest = digest;
+    current.completion.data.result_manifest[0]!.byte_count = byteCount;
+    current.records[0] = line({
+      record: "resolution",
+      run_id: runId,
+      resolution: {
+        reviewers: [
+          {
+            id: "security",
+            agent_id: "security",
+            policy: {
+              passQuorum: 1,
+              minimumProviderGroups: 1,
+              adjudication: "off",
+              gateMinimumSeverity: "low",
+              gateMinimumConfidence: "medium",
+            },
+          },
+        ],
+      },
+    });
+    current.records[1] = line({
+      record: "reviewer.result",
+      run_id: runId,
+      reviewer_id: "security",
+      lens_id: "security",
+      digest,
+      byte_count: byteCount,
+      result: current.result,
+    });
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [...current.records, line(current.completion)].join(""),
+    );
+
+    await expect(
+      readRunStatus({ runsDirectory, runId }),
+    ).resolves.toMatchObject({
+      status: "findings",
+      gate_outcome: "findings",
+    });
+  });
+
+  it("accepts current status counts after a valid adjudication rejects the candidate", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-status-adjudicated-rejection";
+    const current = currentIntegrityRecords(runId);
+    const candidate = current.result;
+    const adjudication: AdjudicationResult = {
+      schema_version: "1",
+      kind: "review-mesh.adjudication-result",
+      verdict: "pass",
+      review_markdown: "# Adjudication\n\nRejected.",
+      summary: "Rejected candidate.",
+      actionable_findings: [],
+      decisions: [
+        {
+          source_finding_id: "confirmed",
+          decision: "rejected",
+          rationale: "The cited path cannot execute.",
+          cited_evidence: [],
+          unverified_assumptions: [],
+        },
+      ],
+      informational_notes: [],
+    };
+    const attestation = createAdjudicationValidationAttestation({
+      candidateResult: candidate,
+      adjudicationResult: adjudication,
+      contextHead: null,
+      validationContext: {
+        reviewScope: "full",
+        git: { changedFiles: [], diff: "" },
+      },
+    });
+    const adjudicationDigest = reviewerResultDigest(adjudication);
+    const adjudicationBytes = Buffer.byteLength(
+      JSON.stringify(adjudication),
+      "utf8",
+    );
+    const candidateDigest = reviewerResultDigest(candidate);
+    const candidateBytes = Buffer.byteLength(JSON.stringify(candidate), "utf8");
+    current.completion.data.gate_outcome = "no_findings";
+    current.completion.data.exit_code = 0;
+    current.completion.data.raw_findings = 1;
+    current.completion.data.unique_findings = 1;
+    current.completion.data.gate_findings = 0;
+    current.completion.data.advisory_findings = 1;
+    current.completion.data.status = "passed";
+    current.completion.data.result_manifest = [
+      {
+        reviewer_id: "security::source",
+        lens_id: "security",
+        digest: candidateDigest,
+        byte_count: candidateBytes,
+      },
+      {
+        reviewer_id: "security::judge",
+        lens_id: "security",
+        digest: adjudicationDigest,
+        byte_count: adjudicationBytes,
+      },
+    ];
+    current.completion.data.model_runs.total = 2;
+    current.completion.data.model_runs.completed = 2;
+    current.completion.data.suite.total = 2;
+    current.completion.data.suite.completed = 2;
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [
+        line({
+          record: "resolution",
+          run_id: runId,
+          resolution: {
+            reviewers: [
+              { id: "security::source", agent_id: "security" },
+              {
+                id: "security::judge",
+                agent_id: "security",
+                policy: {
+                  passQuorum: 1,
+                  minimumProviderGroups: 1,
+                  adjudication: "required",
+                  gateMinimumSeverity: "medium",
+                  gateMinimumConfidence: "medium",
+                  mode: "adjudication",
+                  adjudicatesReviewerId: "security::source",
+                },
+              },
+            ],
+          },
+        }),
+        line({
+          record: "request",
+          run_id: runId,
+          request: {
+            schema_version: "2",
+            project_name: "demo",
+            workspace: "C:\\demo",
+            instructions: "Review.",
+            review_scope: { mode: "full" },
+          },
+        }),
+        line({
+          record: "context",
+          run_id: runId,
+          context: { git: { is_repository: false } },
+        }),
+        line({
+          record: "reviewer.result",
+          run_id: runId,
+          reviewer_id: "security::source",
+          lens_id: "security",
+          digest: candidateDigest,
+          byte_count: candidateBytes,
+          result: candidate,
+        }),
+        line({
+          record: "reviewer.result",
+          run_id: runId,
+          reviewer_id: "security::judge",
+          lens_id: "security",
+          mode: "adjudication",
+          adjudicates_reviewer_id: "security::source",
+          adjudication_validation: attestation,
+          digest: adjudicationDigest,
+          byte_count: adjudicationBytes,
+          result: adjudication,
+        }),
+        line(current.completion),
+      ].join(""),
+    );
+
+    await expect(
+      readRunStatus({ runsDirectory, runId }),
+    ).resolves.toMatchObject({
+      status: "passed",
+      gate_outcome: "no_findings",
+    });
+  });
+
+  it.each([
+    ["missing reviewer", (data: any) => (data.result_manifest = [])],
+    [
+      "duplicate reviewer",
+      (data: any) => data.result_manifest.push({ ...data.result_manifest[0] }),
+    ],
+    [
+      "unknown reviewer",
+      (data: any) => (data.result_manifest[0].reviewer_id = "unknown"),
+    ],
+    [
+      "wrong digest",
+      (data: any) => (data.result_manifest[0].digest = "0".repeat(64)),
+    ],
+    ["wrong bytes", (data: any) => (data.result_manifest[0].byte_count += 1)],
+    ["wrong lens", (data: any) => (data.result_manifest[0].lens_id = "wrong")],
+    ["missing lens", (data: any) => delete data.result_manifest[0].lens_id],
+    [
+      "wrong artifact",
+      (data: any) =>
+        (data.result_manifest[0].artifact_path = "C:\\wrong.jsonl"),
+    ],
+    [
+      "missing required artifact",
+      (data: any) => {
+        data.report_path = "C:\\run.jsonl";
+        delete data.result_manifest[0].artifact_path;
+      },
+    ],
+    ["false complete", (data: any) => (data.results_complete = false)],
+    [
+      "partial marked complete",
+      (data: any) => (data.coverage_outcome = "partial"),
+    ],
+    ["wrong raw", (data: any) => (data.raw_findings = 2)],
+    ["wrong unique", (data: any) => (data.unique_findings = 2)],
+    ["wrong gate", (data: any) => (data.gate_findings = 0)],
+    ["wrong advisory", (data: any) => (data.advisory_findings = 1)],
+  ])(
+    "rejects current status completion integrity corruption: %s",
+    async (_name, mutate) => {
+      const { runsDirectory } = await fixture();
+      const runId = `run-status-corrupt-${String(_name).replaceAll(" ", "-")}`;
+      const current = currentIntegrityRecords(runId);
+      mutate(current.completion.data);
+      await writeFile(
+        join(runsDirectory, `${runId}.jsonl`),
+        [...current.records, line(current.completion)].join(""),
+      );
+
+      await expect(
+        readRunStatus({ runsDirectory, runId }),
+      ).rejects.toMatchObject({
+        code: "invalid_run_record",
+        line: 3,
+        recordType: "run.completed",
+      });
+    },
+  );
+
+  it("reads a v7.2 completion with only legacy unique and advisory counts", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-status-v72-counts";
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      line({
+        schema_version: "5",
+        event: "run.completed",
+        run_id: runId,
+        seq: 1,
+        timestamp: "2026-09-03T00:00:00.000Z",
+        data: {
+          gate_outcome: "no_findings",
+          coverage_outcome: "complete",
+          exit_code: 0,
+          consistency_mode: "live_worktree",
+          total_elapsed_ms: 1,
+          unique_findings: 0,
+          advisory_findings: 0,
+          status: "passed",
+          suite: {
+            total: 0,
+            deferred: 0,
+            queued: 0,
+            running: 0,
+            completed: 0,
+            incomplete: 0,
+            skipped: 0,
+          },
+        },
+      }),
+    );
+    await expect(
+      readRunStatus({ runsDirectory, runId }),
+    ).resolves.toMatchObject({
+      status: "passed",
+      gate_outcome: "no_findings",
+    });
+  });
+
   it.each([
     {
       name: "schema-v5 public event",

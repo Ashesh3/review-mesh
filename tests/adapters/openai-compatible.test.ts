@@ -839,7 +839,9 @@ describe("OpenAI-compatible adapter", () => {
       }),
     });
 
-    expect(terminal(await collect(prepared.adapter, prepared.input))).toEqual({
+    expect(
+      terminal(await collect(prepared.adapter, prepared.input)),
+    ).toMatchObject({
       type: "result",
       result: passResult("Retried length continuation."),
       isolation: "runtime_read_only",
@@ -912,11 +914,17 @@ describe("OpenAI-compatible adapter", () => {
       }),
     });
 
-    expect(terminal(await collect(prepared.adapter, prepared.input))).toEqual({
+    const resultEvent = terminal(
+      await collect(prepared.adapter, prepared.input),
+    );
+    expect(resultEvent).toMatchObject({
       type: "result",
       result: passResult("Exact continuation."),
       isolation: "runtime_read_only",
     });
+    expect(
+      resultEvent.type === "result" && resultEvent.resultStorage?.persisted,
+    ).toEqual(expect.any(Function));
     expect(bodies).toHaveLength(5);
     expect(bodies.filter((body) => body.tools !== undefined)).toHaveLength(2);
     for (const body of bodies.slice(3)) {
@@ -957,7 +965,9 @@ describe("OpenAI-compatible adapter", () => {
       }),
     });
 
-    expect(terminal(await collect(prepared.adapter, prepared.input))).toEqual({
+    expect(
+      terminal(await collect(prepared.adapter, prepared.input)),
+    ).toMatchObject({
       type: "result",
       result: passResult("Four exact fragments."),
       isolation: "runtime_read_only",
@@ -1084,7 +1094,9 @@ describe("OpenAI-compatible adapter", () => {
       }),
     });
 
-    expect(terminal(await collect(prepared.adapter, prepared.input))).toEqual({
+    expect(
+      terminal(await collect(prepared.adapter, prepared.input)),
+    ).toMatchObject({
       type: "result",
       result: passResult("Repair continuation."),
       isolation: "runtime_read_only",
@@ -1117,7 +1129,9 @@ describe("OpenAI-compatible adapter", () => {
       }),
     });
 
-    expect(terminal(await collect(prepared.adapter, prepared.input))).toEqual({
+    expect(
+      terminal(await collect(prepared.adapter, prepared.input)),
+    ).toMatchObject({
       type: "result",
       result: passResult("Fresh repair assembly."),
       isolation: "runtime_read_only",

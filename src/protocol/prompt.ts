@@ -45,7 +45,11 @@ export function buildReviewerPrompt({
     reviewer.policy?.mode === "adjudication" &&
     Array.isArray(reviewer.policy.candidateFindings)
       ? reviewer.policy.candidateFindings.flatMap((value) => {
-          if (typeof value !== "object" || value === null || Array.isArray(value))
+          if (
+            typeof value !== "object" ||
+            value === null ||
+            Array.isArray(value)
+          )
             return [];
           const id = (value as Record<string, unknown>).id;
           return typeof id === "string" && id.length > 0 ? [id] : [];

@@ -407,7 +407,8 @@ class CodexAdapter implements ReviewAdapter {
             };
             return;
           }
-          const parsedResult = currentReviewerOutputSchema.safeParse(parsedJson);
+          const parsedResult =
+            currentReviewerOutputSchema.safeParse(parsedJson);
           if (!parsedResult.success) {
             yield {
               type: "failure",

@@ -99,10 +99,13 @@ function sameIdentity(
   );
 }
 
-function citations(result: AdjudicationResult["decisions"][number]): Citation[] {
+function citations(
+  result: AdjudicationResult["decisions"][number],
+): Citation[] {
   return [
     ...result.cited_evidence,
-    ...(result.ordered_execution_proof?.steps.map((step) => step.citation) ?? []),
+    ...(result.ordered_execution_proof?.steps.map((step) => step.citation) ??
+      []),
     ...(result.ordered_execution_proof?.failure_point.citation === undefined
       ? []
       : [result.ordered_execution_proof.failure_point.citation]),
@@ -169,7 +172,8 @@ async function verifyPath(
       return "identity_changed";
     }
     const canonical = await fileSystem.realpath(target).catch(() => undefined);
-    if (canonical === undefined || !within(root, canonical)) return "unsafe_file";
+    if (canonical === undefined || !within(root, canonical))
+      return "unsafe_file";
     const evidenceFailure = await proveLine(handle, endLine);
     await beforeIdentityCheck?.();
     const [afterHandle, afterPath, afterCanonical] = await Promise.all([
@@ -211,22 +215,33 @@ export async function verifyAdjudicationEvidence({
     const values = citations(decision);
     decisionCitations.set(decision.source_finding_id, values);
     for (const citation of values) {
-      if (citation.path === undefined || citation.start_line === undefined) continue;
+      if (citation.path === undefined || citation.start_line === undefined)
+        continue;
       requests.set(
         citation.path,
-        Math.max(requests.get(citation.path) ?? 0, citation.end_line ?? citation.start_line),
+        Math.max(
+          requests.get(citation.path) ?? 0,
+          citation.end_line ?? citation.start_line,
+        ),
       );
     }
   }
-  const verifiedPaths = new Map<string, EvidenceVerificationFailure | undefined>();
+  const verifiedPaths = new Map<
+    string,
+    EvidenceVerificationFailure | undefined
+  >();
   let hook = beforeIdentityCheck;
   for (const [path, endLine] of requests) {
-    verifiedPaths.set(path, await verifyPath(root, path, endLine, fileSystem, platform, hook));
+    verifiedPaths.set(
+      path,
+      await verifyPath(root, path, endLine, fileSystem, platform, hook),
+    );
     hook = undefined;
   }
   for (const decision of adjudicationResult.decisions) {
     const failures = new Set<EvidenceVerificationFailure>();
-    for (const citation of decisionCitations.get(decision.source_finding_id) ?? []) {
+    for (const citation of decisionCitations.get(decision.source_finding_id) ??
+      []) {
       if (
         citation.path === undefined ||
         citation.start_line === undefined ||

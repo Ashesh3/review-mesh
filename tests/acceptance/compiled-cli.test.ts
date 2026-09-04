@@ -18,7 +18,9 @@ import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   publicEventSchema,
   type PublicEvent,
+  type ReviewerResultV3,
 } from "../../src/protocol/schemas.js";
+import { reviewerResultDigest } from "../../src/results/digest.js";
 
 const projectRoot = resolve(import.meta.dirname, "../..");
 const require = createRequire(import.meta.url);
@@ -70,7 +72,10 @@ function script(mode: string): string {
   return `process.env.REVIEW_MESH_FIXTURE_MODE=${JSON.stringify(mode)}; await import(${JSON.stringify(fixtureUrl)});`;
 }
 
-function trustedConfig(modes: readonly string[]): string {
+function trustedConfig(
+  modes: readonly string[],
+  options: { persistRuns?: boolean } = {},
+): string {
   const reviewers = modes
     .map(
       (mode, index) => `
@@ -103,12 +108,15 @@ heartbeat_interval_ms = 100
 shutdown_grace_period_ms = 100
 
 [diagnostics]
-persist_runs = false
+persist_runs = ${options.persistRuns === true ? "true" : "false"}
 max_runs = 1
 ${reviewers}`;
 }
 
-async function createFixture(modes: readonly string[]): Promise<Fixture> {
+async function createFixture(
+  modes: readonly string[],
+  options: { persistRuns?: boolean } = {},
+): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), "review-mesh-acceptance-"));
   temporaryRoots.push(root);
   const workspace = join(root, "workspace");
@@ -117,7 +125,7 @@ async function createFixture(modes: readonly string[]): Promise<Fixture> {
   await writeFile(join(workspace, "source.ts"), "export const value = 1;\n");
   await writeFile(join(workspace, "sentinel.txt"), "immutable-sentinel\n");
   await mkdir(dirname(configFile), { recursive: true });
-  await writeFile(configFile, trustedConfig(modes));
+  await writeFile(configFile, trustedConfig(modes, options));
   return {
     root,
     workspace,
@@ -142,6 +150,20 @@ function start(fixture: Fixture): ChildProcessWithoutNullStreams {
   });
   child.stdin.on("error", () => undefined);
   child.stdin.end(fixture.request);
+  return child;
+}
+
+function startArguments(
+  fixture: Fixture,
+  args: readonly string[],
+): ChildProcessWithoutNullStreams {
+  const child = spawn(process.execPath, [compiledCli, ...args], {
+    cwd: projectRoot,
+    env: fixture.env,
+    stdio: "pipe",
+    windowsHide: true,
+  });
+  child.stdin.end();
   return child;
 }
 
@@ -239,6 +261,143 @@ afterEach(async () => {
 });
 
 describe("compiled CLI acceptance", () => {
+  it("reports the exact release version", async () => {
+    const home = await mkdtemp(join(tmpdir(), "review-mesh-version-"));
+    temporaryRoots.push(home);
+    const result = await collect(
+      spawn(process.execPath, [compiledCli, "--version"], {
+        cwd: projectRoot,
+        env: isolatedEnvironment(home),
+        stdio: "pipe",
+        windowsHide: true,
+      }),
+    );
+
+    expect(result).toMatchObject({
+      exitCode: 0,
+      signal: null,
+      stdout: "review-mesh 8.0.0\n",
+      stderr: "",
+    });
+  });
+
+  it("defaults to a complete full result and strictly round-trips its artifact", async () => {
+    const fixture = await createFixture(["large-fail", "large-fail"], {
+      persistRuns: true,
+    });
+    const result = await collect(start(fixture));
+    const parsed = events(result.stdout);
+    const full = parsed.find((event) => event.event === "reviewer.result");
+    const completed = parsed.at(-1);
+    if (
+      full?.event !== "reviewer.result" ||
+      completed?.event !== "run.completed"
+    ) {
+      throw new Error("missing full result contract");
+    }
+    const fullResults = parsed.filter(
+      (event): event is Extract<PublicEvent, { event: "reviewer.result" }> =>
+        event.event === "reviewer.result",
+    );
+    const accepted = full.data.result as ReviewerResultV3;
+    const expectedReview = `# Review\n\nOne actionable finding.\n\n${"Complete acceptance evidence. ".repeat(4_096)}`;
+    expect(Buffer.byteLength(expectedReview, "utf8")).toBeGreaterThan(
+      100 * 1_024,
+    );
+
+    expect(result).toMatchObject({ exitCode: 1, signal: null, stderr: "" });
+    expect(fullResults).toHaveLength(2);
+    const secondAccepted = fullResults[1]!.data.result as ReviewerResultV3;
+    for (const event of fullResults) {
+      const resultDigest = reviewerResultDigest(event.data.result);
+      const resultBytes = Buffer.byteLength(
+        JSON.stringify(event.data.result),
+        "utf8",
+      );
+      expect(event.data).toMatchObject({
+        digest: resultDigest,
+        byte_count: resultBytes,
+        result: {
+          schema_version: "3",
+          review_markdown: expectedReview,
+        },
+      });
+    }
+    expect(completed.data).toMatchObject({
+      raw_findings: 2,
+      unique_findings: 1,
+      gate_findings: 1,
+      advisory_findings: 0,
+      results_complete: true,
+    });
+    expect(completed.data.result_manifest).toHaveLength(2);
+    for (const [index, event] of fullResults.entries()) {
+      expect(event.data.artifact_path).toBe(completed.data.report_path);
+      expect(completed.data.result_manifest?.[index]).toMatchObject({
+        reviewer_id: event.reviewer_id,
+        digest: event.data.digest,
+        byte_count: event.data.byte_count,
+        artifact_path: completed.data.report_path,
+      });
+    }
+
+    const [statusOutput, reportOutput, findingsOutput] = await Promise.all([
+      collect(startArguments(fixture, ["status", completed.run_id, "--json"])),
+      collect(
+        startArguments(fixture, [
+          "report",
+          completed.run_id,
+          "--format",
+          "json",
+        ]),
+      ),
+      collect(
+        startArguments(fixture, [
+          "findings",
+          completed.run_id,
+          "--deduplicate",
+          "--json",
+        ]),
+      ),
+    ]);
+    for (const output of [statusOutput, reportOutput, findingsOutput]) {
+      expect(output).toMatchObject({ exitCode: 0, signal: null, stderr: "" });
+    }
+    const status = JSON.parse(statusOutput.stdout) as Record<string, unknown>;
+    const report = JSON.parse(reportOutput.stdout) as Record<string, unknown>;
+    const findings = JSON.parse(findingsOutput.stdout) as Record<
+      string,
+      unknown
+    >;
+    expect(status).toMatchObject({
+      run_id: completed.run_id,
+      reviewers: [
+        {
+          reviewer_id: "fixture-0",
+          complete_result: accepted,
+          result_digest: fullResults[0]?.data.digest,
+          result_byte_count: fullResults[0]?.data.byte_count,
+        },
+        { reviewer_id: "fixture-1", complete_result: secondAccepted },
+      ],
+    });
+    expect(report).toMatchObject({
+      run_id: completed.run_id,
+      reviewers: [
+        { reviewer_id: "fixture-0", result: accepted },
+        { reviewer_id: "fixture-1", result: secondAccepted },
+      ],
+      finding_counts: { raw: 2, unique: 1, gate: 1, advisory: 0 },
+    });
+    expect(findings).toMatchObject({
+      run_id: completed.run_id,
+      findings: [expect.objectContaining({ id: "fixture-medium" })],
+    });
+    expect((findings.findings as unknown[]).length).toBe(
+      completed.data.unique_findings,
+    );
+  }, 20_000);
+
   it.each([
     [["pass", "pass"], 0, "passed"],
     [["pass", "fail"], 1, "findings"],

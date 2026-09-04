@@ -2,18 +2,20 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   rename,
   rm,
   symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   MAX_RESULT_SPOOL_BYTES,
   ResultSpoolError,
   createResultSpool,
+  wipeStaleResultSpools,
 } from "../../src/adapters/result-spool.js";
 
 const roots: string[] = [];
@@ -53,6 +55,39 @@ describe("result spool", () => {
     expect(spool.byteLength).toBe(0);
     expect(await readFile(spool.path)).toHaveLength(0);
     await expect(spool.cleanup()).resolves.toBeUndefined();
+    expect(await readFile(spool.path)).toHaveLength(0);
+  });
+
+  it("retains exact bytes until the caller acknowledges durable persistence", async () => {
+    const directory = await root();
+    const spool = await createResultSpool({ directory, id: "deferred" });
+    await spool.append('{"review_markdown":"complete"}');
+
+    const cleanup = spool.lifecycle().persisted;
+    expect(await readFile(spool.path, "utf8")).toBe(
+      '{"review_markdown":"complete"}',
+    );
+
+    await cleanup();
+    expect(await readFile(spool.path)).toHaveLength(0);
+  });
+
+  it("closes an abandoned spool without wiping retained diagnostic bytes", async () => {
+    const directory = await root();
+    const spool = await createResultSpool({ directory, id: "abandoned" });
+    await spool.append("retained diagnostics");
+
+    await spool.lifecycle().abandoned();
+
+    expect(await readFile(spool.path, "utf8")).toBe("retained diagnostics");
+    await expect(spool.append("more")).rejects.toMatchObject({
+      code: "identity_changed",
+    });
+    await wipeStaleResultSpools({
+      directory,
+      now: () => Date.now() + 2 * 24 * 60 * 60 * 1_000,
+      minimumAgeMs: 24 * 60 * 60 * 1_000,
+    });
     expect(await readFile(spool.path)).toHaveLength(0);
   });
 
@@ -126,9 +161,7 @@ describe("result spool", () => {
     await expect(spool.cleanup()).resolves.toBeUndefined();
     await expect(spool.cleanup()).resolves.toBeUndefined();
     expect(replacementPath).not.toBe("");
-    expect(await readFile(replacementPath, "utf8")).toBe(
-      "foreign replacement",
-    );
+    expect(await readFile(replacementPath, "utf8")).toBe("foreign replacement");
     expect(await readFile(`${replacementPath}.owned`)).toHaveLength(0);
   });
 
@@ -148,5 +181,174 @@ describe("result spool", () => {
     ).rejects.toMatchObject({
       code: "unsafe_directory",
     });
+  });
+
+  it("does not scavenge when the spool root is inside the reviewed workspace", async () => {
+    const workspace = await root();
+    const directory = join(workspace, "spools");
+    await mkdir(directory);
+    const id = "unsafe";
+    const owned = join(
+      directory,
+      `.spool-${id}-00000000-0000-4000-8000-000000000001`,
+    );
+    const path = join(owned, `${id}.spool`);
+    await mkdir(owned);
+    await writeFile(path, "must remain");
+    await writeFile(join(directory, ".scan-index"), `${basename(owned)}\n`);
+    const staleAt = new Date(Date.now() - 2 * 24 * 60 * 60 * 1_000);
+    const { utimes } = await import("node:fs/promises");
+    await utimes(owned, staleAt, staleAt);
+
+    await expect(
+      createResultSpool({ directory, id: "new", reviewedWorkspace: workspace }),
+    ).rejects.toMatchObject({ code: "unsafe_directory" });
+    expect(await readFile(path, "utf8")).toBe("must remain");
+  });
+
+  it("wipes only stale owned spool placeholders and leaves fresh or foreign entries untouched", async () => {
+    const directory = await root();
+    const stale = await createResultSpool({ directory, id: "stale" });
+    const fresh = await createResultSpool({ directory, id: "fresh" });
+    await stale.append("stale diagnostic bytes");
+    await fresh.append("fresh diagnostic bytes");
+    const foreignDirectory = join(directory, "foreign");
+    await mkdir(foreignDirectory);
+    await writeFile(join(foreignDirectory, "foreign.spool"), "foreign");
+    const staleAt = new Date(Date.now() - 2 * 60 * 60 * 1_000);
+    const { utimes } = await import("node:fs/promises");
+    await utimes(stale.path, staleAt, staleAt);
+    await utimes(dirname(stale.path), staleAt, staleAt);
+
+    const result = await wipeStaleResultSpools({
+      directory,
+      now: () => Date.now(),
+      minimumAgeMs: 60 * 60 * 1_000,
+    });
+
+    expect(result.wiped).toBe(1);
+    expect(await readFile(stale.path)).toHaveLength(0);
+    expect(await readFile(fresh.path, "utf8")).toBe("fresh diagnostic bytes");
+    expect(
+      await readFile(join(foreignDirectory, "foreign.spool"), "utf8"),
+    ).toBe("foreign");
+    expect(
+      (await readdir(directory)).some((name) =>
+        name.startsWith(".spool-stale-"),
+      ),
+    ).toBe(true);
+    await stale.lifecycle().abandoned();
+    await fresh.cleanup();
+  });
+
+  it("advances a bounded persistent scan cursor past hundreds of empty placeholders", async () => {
+    const directory = await root();
+    const staleAt = new Date(Date.now() - 2 * 60 * 60 * 1_000);
+    const { utimes } = await import("node:fs/promises");
+    for (let index = 0; index < 300; index += 1) {
+      const id = `empty-${String(index).padStart(3, "0")}`;
+      const uuid = `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`;
+      const owned = join(directory, `.spool-${id}-${uuid}`);
+      await mkdir(owned);
+      await writeFile(join(owned, `${id}.spool`), "");
+      await utimes(owned, staleAt, staleAt);
+      await writeFile(join(directory, ".scan-index"), `${basename(owned)}\n`, {
+        flag: "a",
+      });
+    }
+    const laterDirectory = join(
+      directory,
+      ".spool-later-00000000-0000-4000-8000-999999999999",
+    );
+    const laterPath = join(laterDirectory, "later.spool");
+    await mkdir(laterDirectory);
+    await writeFile(laterPath, "must eventually be wiped");
+    await utimes(laterDirectory, staleAt, staleAt);
+    await writeFile(
+      join(directory, ".scan-index"),
+      `${basename(laterDirectory)}\n`,
+      { flag: "a" },
+    );
+
+    const results = [];
+    for (let sweep = 0; sweep < 6; sweep += 1) {
+      results.push(
+        await wipeStaleResultSpools({
+          directory,
+          now: () => Date.now(),
+          minimumAgeMs: 60 * 60 * 1_000,
+          maximumEntries: 64,
+        }),
+      );
+      if ((await readFile(laterPath)).length === 0) break;
+    }
+
+    expect(results.every((result) => result.inspected <= 64)).toBe(true);
+    expect(results.some((result) => result.wiped === 1)).toBe(true);
+    expect(await readFile(laterPath)).toHaveLength(0);
+  });
+
+  it("resets a scan cursor that points into the middle of an index record", async () => {
+    const directory = await root();
+    const id = "boundary";
+    const owned = join(
+      directory,
+      `.spool-${id}-00000000-0000-4000-8000-000000000001`,
+    );
+    const path = join(owned, `${id}.spool`);
+    await mkdir(owned);
+    await writeFile(path, "stale bytes");
+    const name = basename(owned);
+    await writeFile(join(directory, ".scan-index"), `${name}\n`);
+    await writeFile(join(directory, ".scan-cursor"), "3\n");
+    const staleAt = new Date(Date.now() - 2 * 24 * 60 * 60 * 1_000);
+    const { utimes } = await import("node:fs/promises");
+    await utimes(owned, staleAt, staleAt);
+
+    await wipeStaleResultSpools({ directory, maximumEntries: 1 });
+
+    expect(await readFile(path)).toHaveLength(0);
+  });
+
+  it("fails safely before creating a spool when the scan index exceeds its cap", async () => {
+    const directory = await root();
+    await writeFile(
+      join(directory, ".scan-index"),
+      Buffer.alloc(16 * 1024 * 1024),
+    );
+
+    await expect(
+      createResultSpool({ directory, id: "capped" }),
+    ).rejects.toMatchObject({ code: "unsafe_directory" });
+    expect(
+      (await readdir(directory)).filter((name) => name.startsWith(".spool-")),
+    ).toEqual([]);
+  });
+
+  it("skips an owned directory with many attacker-created children using bounded enumeration", async () => {
+    const directory = await root();
+    const id = "crowded";
+    const owned = join(
+      directory,
+      `.spool-${id}-00000000-0000-4000-8000-000000000001`,
+    );
+    const path = join(owned, `${id}.spool`);
+    await mkdir(owned);
+    await writeFile(path, "must remain");
+    for (let index = 0; index < 100; index += 1) {
+      await writeFile(join(owned, `foreign-${index}`), "x");
+    }
+    await writeFile(join(directory, ".scan-index"), `${basename(owned)}\n`);
+    const staleAt = new Date(Date.now() - 2 * 24 * 60 * 60 * 1_000);
+    const { utimes } = await import("node:fs/promises");
+    await utimes(owned, staleAt, staleAt);
+
+    const result = await wipeStaleResultSpools({
+      directory,
+      maximumEntries: 1,
+    });
+
+    expect(result).toEqual({ inspected: 1, wiped: 0 });
+    expect(await readFile(path, "utf8")).toBe("must remain");
   });
 });

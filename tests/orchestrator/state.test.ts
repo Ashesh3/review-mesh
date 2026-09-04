@@ -157,12 +157,14 @@ describe("suite state", () => {
 
   it("uses the canonical unique population independently of gate thresholds", () => {
     const first = completedFail("first");
-    if (first.result.schema_version !== "3") throw new Error("v3 fixture required");
+    if (first.result.schema_version !== "3")
+      throw new Error("v3 fixture required");
     first.result.actionable_findings[0]!.title = "Shared root";
     first.result.actionable_findings[0]!.description = "First description.";
     first.result.actionable_findings[0]!.root_issue_id = "shared-root";
     const second = completedFail("second");
-    if (second.result.schema_version !== "3") throw new Error("v3 fixture required");
+    if (second.result.schema_version !== "3")
+      throw new Error("v3 fixture required");
     second.result.actionable_findings[0]!.title = "Different wording";
     second.result.actionable_findings[0]!.description = "Second description.";
     second.result.actionable_findings[0]!.root_issue_id = "shared-root";
@@ -204,7 +206,8 @@ describe("suite state", () => {
     state.transition(sourceReviewer.id, "starting");
     state.transition(sourceReviewer.id, "reviewing");
     const candidate = completedFail(sourceReviewer.id).result;
-    if (candidate.schema_version !== "3") throw new Error("v3 fixture required");
+    if (candidate.schema_version !== "3")
+      throw new Error("v3 fixture required");
     candidate.actionable_findings[0]!.category = "correctness";
     state.complete(sourceReviewer.id, candidate, "enforced_read_only");
     state.setAdjudication(judgeReviewer.id, sourceReviewer.id);
@@ -276,7 +279,8 @@ describe("suite state", () => {
 
   it("uses non-default lens gate thresholds for live counts", () => {
     const strict = completedFail("strict::primary");
-    if (strict.result.schema_version !== "3") throw new Error("v3 fixture required");
+    if (strict.result.schema_version !== "3")
+      throw new Error("v3 fixture required");
     strict.lens_id = "strict";
     strict.result.actionable_findings[0]!.severity = "medium";
     strict.result.actionable_findings[0]!.confidence = "high";
@@ -293,11 +297,7 @@ describe("suite state", () => {
     const configured = createSuiteState([internal.reviewer]);
     configured.transition("strict::primary", "starting");
     configured.transition("strict::primary", "reviewing");
-    configured.complete(
-      "strict::primary",
-      strict.result,
-      "enforced_read_only",
-    );
+    configured.complete("strict::primary", strict.result, "enforced_read_only");
     const aggregate = aggregateRun(configured);
 
     expect(aggregate).toMatchObject({
@@ -306,6 +306,37 @@ describe("suite state", () => {
       gateFindings: 0,
       advisoryFindings: 1,
       gateOutcome: "no_findings",
+    });
+  });
+
+  it("gates a confirmed low-severity finding when the configured threshold is low", () => {
+    const low = completedFail("configurable::primary");
+    if (low.result.schema_version !== "3")
+      throw new Error("v3 fixture required");
+    low.result.actionable_findings[0]!.severity = "low";
+    low.result.actionable_findings[0]!.confidence = "high";
+    low.lens_id = "configurable";
+    const reviewer = resolvedReviewer({
+      id: low.reviewer_id,
+      agentId: "configurable",
+      policy: {
+        passQuorum: 1,
+        minimumProviderGroups: 1,
+        adjudication: "off",
+        gateMinimumSeverity: "low",
+        gateMinimumConfidence: "medium",
+      },
+    });
+    const state = createSuiteState([reviewer]);
+    state.transition(reviewer.id, "starting");
+    state.transition(reviewer.id, "reviewing");
+    state.complete(reviewer.id, low.result, "enforced_read_only");
+
+    expect(aggregateRun(state)).toMatchObject({
+      gateFindings: 1,
+      advisoryFindings: 0,
+      gateOutcome: "findings",
+      status: "findings",
     });
   });
 

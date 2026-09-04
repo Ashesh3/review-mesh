@@ -60,7 +60,9 @@ function context(
       ].join("\n"),
     },
     evidenceVerification: {
-      by_source_finding_id: { "enum-post-ingest": { verified: true, failures: [] } },
+      by_source_finding_id: {
+        "enum-post-ingest": { verified: true, failures: [] },
+      },
     },
     ...overrides,
   };
@@ -193,7 +195,9 @@ describe("validateAdjudication", () => {
       unverified_assumptions: [],
     });
 
-    expect(validateAdjudication(candidate(), judge, context()).decisions).toEqual([
+    expect(
+      validateAdjudication(candidate(), judge, context()).decisions,
+    ).toEqual([
       expect.objectContaining({
         effective_decision: "confirmed",
         gate_eligible: true,
@@ -240,7 +244,9 @@ describe("validateAdjudication", () => {
       unverified_assumptions: [],
     });
 
-    expect(validateAdjudication(candidate(), judge, context()).decisions).toEqual([
+    expect(
+      validateAdjudication(candidate(), judge, context()).decisions,
+    ).toEqual([
       expect.objectContaining({
         effective_decision: "needs_verification",
         gate_eligible: false,
@@ -413,7 +419,9 @@ describe("validateAdjudication", () => {
       unverified_assumptions: [],
     });
 
-    expect(validateAdjudication(candidate(), judge, context()).decisions[0]).toMatchObject({
+    expect(
+      validateAdjudication(candidate(), judge, context()).decisions[0],
+    ).toMatchObject({
       effective_decision: "needs_verification",
       gate_eligible: false,
     });
@@ -484,7 +492,9 @@ describe("validateAdjudication", () => {
       unverified_assumptions: [],
     });
 
-    expect(validateAdjudication(candidate(), judge, context()).decisions[0]).toMatchObject({
+    expect(
+      validateAdjudication(candidate(), judge, context()).decisions[0],
+    ).toMatchObject({
       effective_decision: "needs_verification",
       issues: expect.arrayContaining(["base_head_context_required"]),
     });

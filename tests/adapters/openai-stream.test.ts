@@ -36,10 +36,9 @@ describe("OpenAI-compatible SSE reconstruction", () => {
     ].join("");
 
     await expect(
-      parseOpenAIChatStream(
-        chunkedBody([new TextEncoder().encode(stream)]),
-        { signal: new AbortController().signal },
-      ),
+      parseOpenAIChatStream(chunkedBody([new TextEncoder().encode(stream)]), {
+        signal: new AbortController().signal,
+      }),
     ).resolves.toMatchObject({
       message: { role: "assistant", content: "metadata-safe" },
       finish_reason: "stop",
@@ -53,8 +52,12 @@ describe("OpenAI-compatible SSE reconstruction", () => {
       'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"1","function":{"name":"file","arguments":"th\\":\\"src/a.ts\\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}}\n\n',
       "data: [DONE]\n\n",
     ].join("");
-    const euroStart = new TextEncoder().encode(stream.slice(0, stream.indexOf("€"))).length;
-    const rocketStart = new TextEncoder().encode(stream.slice(0, stream.indexOf("🚀"))).length;
+    const euroStart = new TextEncoder().encode(
+      stream.slice(0, stream.indexOf("€")),
+    ).length;
+    const rocketStart = new TextEncoder().encode(
+      stream.slice(0, stream.indexOf("🚀")),
+    ).length;
 
     const result = await parseOpenAIChatStream(
       chunkedBody(
@@ -140,10 +143,10 @@ describe("OpenAI-compatible SSE reconstruction", () => {
     const stream =
       'data: {"choices":[{"index":0,"delta":{"content":"too large"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n';
     await expect(
-      parseOpenAIChatStream(
-        chunkedBody([new TextEncoder().encode(stream)]),
-        { signal: new AbortController().signal, maximumBytes: 32 },
-      ),
+      parseOpenAIChatStream(chunkedBody([new TextEncoder().encode(stream)]), {
+        signal: new AbortController().signal,
+        maximumBytes: 32,
+      }),
     ).rejects.toMatchObject({
       code: "response_too_large",
     });

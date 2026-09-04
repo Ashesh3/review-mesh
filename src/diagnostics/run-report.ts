@@ -539,7 +539,9 @@ const persistedRunSummaryDataSchema = z.looseObject({
   logical_lenses: persistedLogicalLensCountsSchema.optional(),
   model_runs: persistedModelRunCountsSchema.optional(),
   suite: persistedModelRunCountsSchema.optional(),
+  raw_findings: nonNegativeIntegerSchema.optional(),
   unique_findings: nonNegativeIntegerSchema.optional(),
+  gate_findings: nonNegativeIntegerSchema.optional(),
   advisory_findings: nonNegativeIntegerSchema.optional(),
   incomplete_lenses: z.array(persistedString).max(1_024).optional(),
   not_evaluated_lenses: z.array(persistedString).max(1_024).optional(),
@@ -911,6 +913,18 @@ interface ParsedReportRecord {
   reportedPath?: string;
   reportedIncompleteLenses?: string[];
   reportedModelTotal?: number;
+  reportedIntegrity?: {
+    line: number;
+    recordType: "run.completed" | "run.summary";
+    resultManifest?: Array<Record<string, unknown>>;
+    resultsComplete?: boolean;
+    rawFindings?: number;
+    uniqueFindings?: number;
+    gateFindings?: number;
+    advisoryFindings?: number;
+    coverageOutcome?: string;
+    completedRuns?: number;
+  };
   reportedLogicalLenses?: RunReport["logical_lenses"];
   reviewers: Map<string, ReviewerMetadata>;
   terminals: Map<string, ReviewerTerminal>;
@@ -1387,9 +1401,25 @@ function parseTerminalRecord(
 function parseReportedSummary(
   parsed: ParsedReportRecord,
   value: unknown,
+  line: number,
+  recordType: "run.completed" | "run.summary",
 ): void {
   const data = asRecord(value);
   if (data === undefined) return;
+  const hasCurrentIntegrityFields = [
+    data.result_manifest,
+    data.results_complete,
+    data.raw_findings,
+    data.gate_findings,
+  ].some((field) => field !== undefined);
+  if (hasCurrentIntegrityFields && parsed.reportedIntegrity !== undefined) {
+    throw invalidRecordError(
+      line,
+      recordType,
+      "a duplicate current completion integrity contract",
+      ["result_manifest"],
+    );
+  }
   const status = nonEmptyString(data.status);
   if (status !== undefined) parsed.reportedStatus = status;
   const gateOutcome = nonEmptyString(data.gate_outcome);
@@ -1450,6 +1480,40 @@ function parseReportedSummary(
     nonNegativeInteger(modelRuns?.total) ??
     nonNegativeInteger(asRecord(data.suite)?.total);
   if (modelTotal !== undefined) parsed.reportedModelTotal = modelTotal;
+  if (hasCurrentIntegrityFields) {
+    parsed.reportedIntegrity = {
+      line,
+      recordType,
+      ...(Array.isArray(data.result_manifest)
+        ? {
+            resultManifest: data.result_manifest
+              .map(asRecord)
+              .filter(
+                (item): item is Record<string, unknown> => item !== undefined,
+              ),
+          }
+        : {}),
+      ...(typeof data.results_complete === "boolean"
+        ? { resultsComplete: data.results_complete }
+        : {}),
+      ...(nonNegativeInteger(data.raw_findings) === undefined
+        ? {}
+        : { rawFindings: nonNegativeInteger(data.raw_findings)! }),
+      ...(nonNegativeInteger(data.unique_findings) === undefined
+        ? {}
+        : { uniqueFindings: nonNegativeInteger(data.unique_findings)! }),
+      ...(nonNegativeInteger(data.gate_findings) === undefined
+        ? {}
+        : { gateFindings: nonNegativeInteger(data.gate_findings)! }),
+      ...(nonNegativeInteger(data.advisory_findings) === undefined
+        ? {}
+        : { advisoryFindings: nonNegativeInteger(data.advisory_findings)! }),
+      ...(coverageOutcome === undefined ? {} : { coverageOutcome }),
+      ...(nonNegativeInteger(modelRuns?.completed) === undefined
+        ? {}
+        : { completedRuns: nonNegativeInteger(modelRuns?.completed)! }),
+    };
+  }
   if (Array.isArray(data.reviewers)) {
     for (const reviewer of data.reviewers) {
       parseTerminalRecord(parsed, reviewer, 1);
@@ -1527,13 +1591,14 @@ function parsePublicEvent(
   }
   if (event === "run.completed") {
     parsed.terminalEventSeen = true;
-    parseReportedSummary(parsed, data);
+    parseReportedSummary(parsed, data, line, "run.completed");
   }
 }
 
 function parsePrivateRecord(
   parsed: ParsedReportRecord,
   value: PrivateRecord,
+  line: number,
 ): void {
   if (value.record === "resolution") {
     parseResolution(parsed, value.resolution);
@@ -1634,6 +1699,8 @@ function parsePrivateRecord(
     parseReportedSummary(
       parsed,
       "summary" in value ? value.summary : value.data,
+      line,
+      "run.summary",
     );
   }
 }
@@ -1733,7 +1800,7 @@ async function parseRunRecord(
         );
       }
       try {
-        parsePrivateRecord(parsed, privateRecord.data);
+        parsePrivateRecord(parsed, privateRecord.data, line);
       } catch (error) {
         if (error instanceof RunReportError) {
           const normalized = invalidRecordError(
@@ -1938,8 +2005,7 @@ function parseRawFindings(parsed: ParsedReportRecord): ParsedFinding[] {
             }),
         ...(duplicateOf === undefined ? {} : { duplicate_of: duplicateOf }),
         gate_eligible:
-          effectiveSeverity !== "low" &&
-          effectiveClassification !== "advisory" &&
+          effectiveClassification === "confirmed_defect" &&
           adjudication !== "rejected" &&
           adjudication !== "needs_verification",
         adjudication,
@@ -2150,6 +2216,112 @@ function recognizedCoverageOutcome(
   return undefined;
 }
 
+function currentIntegrityError(
+  integrity: NonNullable<ParsedReportRecord["reportedIntegrity"]>,
+  description: string,
+  paths: string[],
+): RunReportError {
+  return invalidRecordError(
+    integrity.line,
+    integrity.recordType,
+    description,
+    paths,
+  );
+}
+
+function validateCurrentCompletionIntegrity(
+  parsed: ParsedReportRecord,
+  counts: { raw: number; unique: number; gate: number; advisory: number },
+): void {
+  const integrity = parsed.reportedIntegrity;
+  if (integrity === undefined) return;
+  const fields = [
+    integrity.resultManifest,
+    integrity.resultsComplete,
+    integrity.rawFindings,
+    integrity.uniqueFindings,
+    integrity.gateFindings,
+    integrity.advisoryFindings,
+  ];
+  if (fields.some((value) => value === undefined)) {
+    throw currentIntegrityError(
+      integrity,
+      "an incomplete current completion integrity contract",
+      ["result_manifest", "results_complete", "raw_findings"],
+    );
+  }
+  const authoritative = new Map(
+    [...parsed.terminals.values()]
+      .filter(
+        (terminal) =>
+          terminal.result !== undefined &&
+          terminal.resultDigest !== undefined &&
+          terminal.resultByteCount !== undefined,
+      )
+      .map((terminal) => [terminal.reviewerId, terminal] as const),
+  );
+  const seen = new Set<string>();
+  for (const entry of integrity.resultManifest!) {
+    const reviewerId = nonEmptyString(entry.reviewer_id);
+    const digest = nonEmptyString(entry.digest);
+    const byteCount = nonNegativeInteger(entry.byte_count);
+    const manifestLensId = nonEmptyString(entry.lens_id);
+    const artifactPath = nonEmptyString(entry.artifact_path);
+    const terminal =
+      reviewerId === undefined ? undefined : authoritative.get(reviewerId);
+    const reviewer =
+      reviewerId === undefined ? undefined : parsed.reviewers.get(reviewerId);
+    if (
+      reviewerId === undefined ||
+      seen.has(reviewerId) ||
+      terminal === undefined ||
+      digest !== terminal.resultDigest ||
+      byteCount !== terminal.resultByteCount ||
+      manifestLensId === undefined ||
+      manifestLensId !== reviewer?.lensId ||
+      (parsed.reportedPath === undefined
+        ? artifactPath !== undefined
+        : artifactPath !== parsed.reportedPath)
+    ) {
+      throw currentIntegrityError(
+        integrity,
+        "a result manifest that does not match authoritative reviewer results",
+        ["result_manifest"],
+      );
+    }
+    seen.add(reviewerId);
+  }
+  if (seen.size !== authoritative.size) {
+    throw currentIntegrityError(
+      integrity,
+      "a result manifest missing an authoritative reviewer result",
+      ["result_manifest"],
+    );
+  }
+  const expectedComplete =
+    integrity.coverageOutcome === "complete" &&
+    integrity.resultManifest!.length === integrity.completedRuns;
+  if (integrity.resultsComplete !== expectedComplete) {
+    throw currentIntegrityError(
+      integrity,
+      "an inconsistent results_complete value",
+      ["results_complete"],
+    );
+  }
+  if (
+    integrity.rawFindings !== counts.raw ||
+    integrity.uniqueFindings !== counts.unique ||
+    integrity.gateFindings !== counts.gate ||
+    integrity.advisoryFindings !== counts.advisory
+  ) {
+    throw currentIntegrityError(
+      integrity,
+      "canonical finding counts that do not match verified reviewer results",
+      ["raw_findings", "unique_findings", "gate_findings", "advisory_findings"],
+    );
+  }
+}
+
 export async function readRunReport({
   runsDirectory,
   runId,
@@ -2194,6 +2366,12 @@ export async function readRunReport({
     rawFindings as readonly CanonicalRawFinding[],
     { gatePolicies },
   );
+  try {
+    validateCurrentCompletionIntegrity(parsed, canonical.counts);
+  } catch (error) {
+    if (!(error instanceof RunReportError) || !bestEffort) throw error;
+    addRecordWarning(parsed, error);
+  }
   const findings = canonical.consolidated;
   const lensStates = logicalLensStates(parsed, rawFindings);
   const derivedIncompleteLenses = [...lensStates]
@@ -2448,12 +2626,10 @@ export function renderRunReportMarkdown(report: RunReport): string {
   }
   lines.push("", "## Findings", "");
   const gateFindings = report.findings.filter(
-    (finding) =>
-      finding.severity !== "low" && finding.classification !== "advisory",
+    (finding) => finding.gate_eligible === true,
   );
   const advisories = report.findings.filter(
-    (finding) =>
-      finding.severity === "low" || finding.classification === "advisory",
+    (finding) => finding.gate_eligible !== true,
   );
   if (gateFindings.length === 0) {
     lines.push("No findings were available in the persisted report.");

@@ -678,9 +678,7 @@ describe("report and findings commands", () => {
           http_status: 422,
           provider_request_id: "request-stream-1",
           correlation_headers: { "cf-ray": "ray-stream-1" },
-          validation_issues: [
-            expect.objectContaining({ path: "$.stream" }),
-          ],
+          validation_issues: [expect.objectContaining({ path: "$.stream" })],
           attempt_count: 1,
           retry_outcome: "not_attempted",
         }),

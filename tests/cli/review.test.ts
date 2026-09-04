@@ -428,11 +428,20 @@ describe("review-mesh review", () => {
     const topic = await runCli(fixture, ["help", "events"], "");
     expect(topic).toMatchObject({ exitCode: 0, stderr: "" });
     expect(topic.stdout).toContain("REVIEW-MESH EVENTS");
+    expect(topic.stdout).toContain(
+      "reviewer.result      Complete sanitized result/digest in full-jsonl mode.",
+    );
+    expect(topic.stdout).toContain(
+      "run.completed        Outcomes, canonical counts, result manifest, and artifact.",
+    );
     expect(topic.stdout).toContain("run.completed");
 
     const commandHelp = await runCli(fixture, ["review", "--help"], "");
     expect(commandHelp).toMatchObject({ exitCode: 0, stderr: "" });
     expect(commandHelp.stdout).toContain("REVIEW-MESH REVIEW");
+    expect(commandHelp.stdout).toContain(
+      "Full JSONL, no ANSI, and aggregate heartbeats are the defaults.",
+    );
 
     const version = await runCli(fixture, ["--version"], "");
     expect(version).toMatchObject({ exitCode: 0, stderr: "" });

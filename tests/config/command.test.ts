@@ -120,7 +120,7 @@ describe("config command", () => {
     expect(
       await runConfigCommand({ args: ["show"], configFile: file, ...shown }),
     ).toBe(0);
-    expect(shown.stdout()).toContain('schema_version = "5"');
+    expect(shown.stdout()).toContain('schema_version = "6"');
 
     const validated = streams();
     expect(
@@ -144,7 +144,7 @@ describe("config command", () => {
       }),
     ).toBe(0);
     expect(JSON.parse(io.stdout())).toMatchObject({
-      schema_version: "5",
+      schema_version: "6",
       agents: [{ id: "gemini", default: true }],
       projects: [],
     });
@@ -235,11 +235,11 @@ describe("config command", () => {
     const exported = JSON.parse(io.stdout());
     expect(exported).toMatchObject({
       schema_version: "1",
-      config_schema_version: "5",
+      config_schema_version: "6",
       path: file,
       exists: true,
       migrated: false,
-      config: { schema_version: "5" },
+      config: { schema_version: "6" },
     });
     expect(exported.revision).toMatch(/^[a-f0-9]{64}$/);
     expect(exported.config.agents.gemini.instructions).toBe("review");
@@ -382,7 +382,7 @@ describe("config command", () => {
       }),
     ).toBe(0);
     const saved = (await loadManagedConfig(file)).config;
-    expect(saved.schema_version).toBe("5");
+    expect(saved.schema_version).toBe("6");
     expect(saved.execution.max_concurrency).toBe(4);
   });
 

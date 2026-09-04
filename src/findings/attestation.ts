@@ -24,7 +24,9 @@ export interface AdjudicationValidationAttestation {
 }
 
 function digest(value: unknown): string {
-  return createHash("sha256").update(canonicalJson(value), "utf8").digest("hex");
+  return createHash("sha256")
+    .update(canonicalJson(value), "utf8")
+    .digest("hex");
 }
 
 function contextDigest(
@@ -54,11 +56,12 @@ export function createAdjudicationValidationAttestation(input: {
     adjudication_digest: reviewerResultDigest(input.adjudicationResult),
     context_head: input.contextHead,
     context_digest: contextDigest(input.contextHead, input.validationContext),
-    verification_digest: digest(input.validationContext.evidenceVerification ?? null),
-    evidence_verification:
-      input.validationContext.evidenceVerification ?? {
-        by_source_finding_id: {},
-      },
+    verification_digest: digest(
+      input.validationContext.evidenceVerification ?? null,
+    ),
+    evidence_verification: input.validationContext.evidenceVerification ?? {
+      by_source_finding_id: {},
+    },
     outcome,
   };
   return { ...base, attestation_digest: digest(base) };

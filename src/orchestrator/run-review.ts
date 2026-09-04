@@ -369,9 +369,8 @@ function gateFindingCount(reviewer: ResolvedReviewer, result: unknown): number {
   const policy = policyFor(reviewer, reviewer.modelCount ?? 1);
   return parsed.data.actionable_findings.filter(
     (finding) =>
-      finding.severity !== "low" &&
       (!("classification" in finding) ||
-        finding.classification !== "advisory") &&
+        finding.classification === "confirmed_defect") &&
       meetsGateThresholds(
         {
           severity: finding.severity,
@@ -491,10 +490,38 @@ export async function runReviewRound({
     byte_count: number;
     artifact_path?: string;
   }> = [];
+  const persistedResultStorage: Array<{
+    persisted(): void | Promise<void>;
+    abandoned(): void | Promise<void>;
+  }> = [];
   let interrupted = signal.aborted;
   let writerUsable = true;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   let optionalPending: Promise<void> | undefined;
+
+  const settleWithin = async (
+    operation: PromiseLike<unknown>,
+    maximumMs: number,
+  ): Promise<void> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.resolve(operation).catch(() => undefined),
+      new Promise<void>((resolve) => {
+        timer = clock.setTimeout(resolve, maximumMs);
+      }),
+    ]);
+    if (timer !== undefined) clock.clearTimeout(timer);
+  };
+
+  const settleResultStorage = async (
+    operation: (() => void | Promise<void>) | undefined,
+  ): Promise<void> => {
+    if (operation === undefined) return;
+    await settleWithin(
+      Promise.resolve().then(operation),
+      config.execution.shutdown_grace_period_ms,
+    );
+  };
 
   const awaitOptional = async (): Promise<void> => {
     const pending = optionalPending;
@@ -731,6 +758,10 @@ export async function runReviewRound({
     reviewer: ResolvedReviewer,
     result: unknown,
     isolation: IsolationLevel,
+    resultStorage?: {
+      persisted(): void | Promise<void>;
+      abandoned(): void | Promise<void>;
+    },
   ): Promise<ModelExecution> => {
     const mode = reviewerMode(reviewer);
     const parsed =
@@ -738,6 +769,7 @@ export async function runReviewRound({
         ? adjudicationResultSchema.safeParse(result)
         : reviewerResultSchema.safeParse(result);
     if (!parsed.success) {
+      await settleResultStorage(resultStorage?.persisted);
       const failure = adapterFailure.invalidResult(
         "The adapter returned an invalid reviewer result.",
         false,
@@ -752,6 +784,7 @@ export async function runReviewRound({
       return { outcome: "incomplete", failure };
     }
     if (mode !== "adjudication" && parsed.data.schema_version !== "3") {
+      await settleResultStorage(resultStorage?.persisted);
       const failure = adapterFailure.invalidResult(
         "The adapter returned a legacy reviewer result for a v3 review request.",
         false,
@@ -769,6 +802,7 @@ export async function runReviewRound({
     try {
       accepted = sanitizeCurrentReviewerOutput(parsed.data);
     } catch (error) {
+      await settleResultStorage(resultStorage?.persisted);
       const failure =
         error instanceof ResultSanitizationError
           ? sanitizeAdapterFailure(
@@ -802,6 +836,7 @@ export async function runReviewRound({
       reviewer.isolationPolicy === "require_enforced" &&
       isolation !== "enforced_read_only"
     ) {
+      await settleResultStorage(resultStorage?.persisted);
       const failure = adapterFailure.unavailable(
         "The adapter did not achieve the required enforced read-only isolation.",
         false,
@@ -885,7 +920,11 @@ export async function runReviewRound({
           ? {}
           : { adjudication_validation: adjudicationValidation }),
       });
+      if (resultStorage !== undefined) {
+        persistedResultStorage.push(resultStorage);
+      }
     } catch (error) {
+      await settleResultStorage(resultStorage?.abandoned);
       const failure = sanitizeAdapterFailure(
         "persistence_failed",
         error instanceof Error ? error.message : error,
@@ -952,11 +991,36 @@ export async function runReviewRound({
       });
     }
     if (mode === "adjudication") {
+      const sourceFindings =
+        sourceResult !== undefined &&
+        sourceResult.schema_version === "3" &&
+        "actionable_findings" in sourceResult
+          ? new Map(
+              sourceResult.actionable_findings.map((finding) => [
+                finding.id,
+                finding,
+              ]),
+            )
+          : new Map();
+      const policy = policyFor(reviewer, reviewer.modelCount ?? 1);
       return {
         outcome:
-          (adjudicationOutcome?.decisions.some(
-            (decision) => decision.gate_eligible,
-          ) ?? false)
+          (adjudicationOutcome?.decisions.some((decision) => {
+            if (!decision.gate_eligible) return false;
+            const finding =
+              decision.effective_finding ??
+              sourceFindings.get(decision.source_finding_id);
+            return (
+              finding !== undefined &&
+              meetsGateThresholds(
+                {
+                  severity: finding.severity,
+                  confidence: finding.confidence,
+                },
+                policy.gate,
+              )
+            );
+          }) ?? false)
             ? "findings"
             : "pass",
       };
@@ -971,20 +1035,6 @@ export async function runReviewRound({
       await job?.adapter?.forceCleanup?.().catch(() => undefined);
     });
     return runtime.cleanup;
-  };
-
-  const settleWithin = async (
-    operation: PromiseLike<unknown>,
-    maximumMs: number,
-  ): Promise<void> => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([
-      Promise.resolve(operation).catch(() => undefined),
-      new Promise<void>((resolve) => {
-        timer = clock.setTimeout(resolve, maximumMs);
-      }),
-    ]);
-    if (timer !== undefined) clock.clearTimeout(timer);
   };
 
   const execute = async (
@@ -1250,6 +1300,7 @@ export async function runReviewRound({
               reviewer,
               terminal.result,
               terminal.isolation,
+              terminal.resultStorage,
             );
             recordCircuitSuccess(reviewer);
             return result;
@@ -1940,6 +1991,13 @@ export async function runReviewRound({
         suite: aggregate.modelRuns,
       },
     });
+    const cleanupStarted = persistedResultStorage
+      .splice(0)
+      .map((storage) => settleResultStorage(storage.persisted));
+    await settleWithin(
+      Promise.allSettled(cleanupStarted),
+      config.execution.shutdown_grace_period_ms,
+    );
     return {
       status: aggregate.status,
       gateOutcome: aggregate.gateOutcome,
@@ -1949,6 +2007,16 @@ export async function runReviewRound({
       totalElapsedMs,
     };
   } finally {
+    if (persistedResultStorage.length > 0) {
+      await settleWithin(
+        Promise.allSettled(
+          persistedResultStorage
+            .splice(0)
+            .map((storage) => settleResultStorage(storage.abandoned)),
+        ),
+        config.execution.shutdown_grace_period_ms,
+      );
+    }
     signal.removeEventListener("abort", abort);
     if (heartbeat !== undefined) clock.clearInterval(heartbeat);
     for (const runtime of active.values()) {

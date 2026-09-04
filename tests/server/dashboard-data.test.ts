@@ -5,6 +5,7 @@ import {
   readFile,
   rename,
   rm,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -1191,6 +1192,17 @@ describe("dashboard data", () => {
     await writeFile(
       join(appPaths.runsDirectory, "newer.jsonl"),
       `${JSON.stringify({ record: "resolution", run_id: "newer", resolution: { reviewers: [] }, padding: "x".repeat(2_000) })}\n`,
+    );
+    const now = Date.now();
+    await utimes(
+      join(appPaths.runsDirectory, "older.jsonl"),
+      new Date(now - 2_000),
+      new Date(now - 2_000),
+    );
+    await utimes(
+      join(appPaths.runsDirectory, "newer.jsonl"),
+      new Date(now),
+      new Date(now),
     );
 
     const snapshot = await readDashboardSnapshot({

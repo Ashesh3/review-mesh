@@ -91,10 +91,15 @@ describe("verifyAdjudicationEvidence", () => {
 
   it("rejects symlink escapes", async () => {
     const workspace = await fixture();
-    const outside = await mkdtemp(join(tmpdir(), "review-mesh-evidence-outside-"));
+    const outside = await mkdtemp(
+      join(tmpdir(), "review-mesh-evidence-outside-"),
+    );
     roots.push(outside);
     await writeFile(join(outside, "outside.ts"), "secret\n");
-    await symlink(join(outside, "outside.ts"), join(workspace, "src", "link.ts"));
+    await symlink(
+      join(outside, "outside.ts"),
+      join(workspace, "src", "link.ts"),
+    );
 
     const verification = await verifyAdjudicationEvidence({
       workspace,

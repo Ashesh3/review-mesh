@@ -1,9 +1,7 @@
 export type CanonicalFindingSeverity = "critical" | "high" | "medium" | "low";
 export type CanonicalFindingConfidence = "high" | "medium" | "low";
 export type CanonicalFindingClassification =
-  | "confirmed_defect"
-  | "needs_verification"
-  | "advisory";
+  "confirmed_defect" | "needs_verification" | "advisory";
 export type CanonicalAdjudicationDisposition =
   | "unadjudicated"
   | "confirmed"
@@ -136,7 +134,8 @@ function uniqueEvidence(
   values: readonly CanonicalFindingEvidence[],
 ): CanonicalFindingEvidence[] {
   const unique = new Map<string, CanonicalFindingEvidence>();
-  for (const value of values) unique.set(evidenceKey(value), structuredClone(value));
+  for (const value of values)
+    unique.set(evidenceKey(value), structuredClone(value));
   return [...unique.values()].sort(
     (left, right) =>
       (left.path ?? "\uffff").localeCompare(right.path ?? "\uffff") ||
@@ -156,7 +155,8 @@ function uniqueSources(
   values: readonly CanonicalFindingSource[],
 ): CanonicalFindingSource[] {
   const unique = new Map<string, CanonicalFindingSource>();
-  for (const value of values) unique.set(sourceKey(value), structuredClone(value));
+  for (const value of values)
+    unique.set(sourceKey(value), structuredClone(value));
   return [...unique.values()].sort(
     (left, right) =>
       left.reviewer_id.localeCompare(right.reviewer_id) ||
@@ -240,7 +240,9 @@ function consolidateGroup(
       ...finding.duplicate_finding_ids,
     ]),
   );
-  const descriptions = uniqueSorted(ordered.map((finding) => finding.description));
+  const descriptions = uniqueSorted(
+    ordered.map((finding) => finding.description),
+  );
   const directions = uniqueSorted(
     ordered.map((finding) => finding.suggested_direction),
   );
@@ -281,8 +283,8 @@ function consolidateGroup(
 function gateEligible(finding: CanonicalRawFinding): boolean {
   return (
     finding.gate_eligible ??
-    (finding.severity !== "low" &&
-      finding.classification === "confirmed_defect")
+    (finding.classification === "confirmed_defect" &&
+      severityRank[finding.severity] >= severityRank.medium)
   );
 }
 
@@ -292,6 +294,7 @@ function thresholdEligible(
 ): boolean {
   if (finding.adjudication === "needs_verification") return false;
   if (finding.classification === "advisory") return false;
+  if (finding.classification === "needs_verification") return false;
   if (policy === undefined) return gateEligible(finding);
   return (
     severityRank[finding.severity] >= severityRank[policy.minimumSeverity] &&
@@ -333,13 +336,16 @@ export function canonicalizeFindings(
         ),
       };
     })
-    .map((finding) => ({
-      ...finding,
-      gate_eligible: thresholdEligible(
-        finding,
-        options.gatePolicies?.[finding.lens_id],
-      ),
-    }));
+    .map((finding) => {
+      const { gate_eligible: _priorGateEligible, ...policyFinding } = finding;
+      return {
+        ...finding,
+        gate_eligible: thresholdEligible(
+          policyFinding,
+          options.gatePolicies?.[finding.lens_id],
+        ),
+      };
+    });
   const sets = new DisjointSet(findings.length);
   const explicitRoots = new Map<string, number>();
   const sourceRefs = new Map<string, number>();

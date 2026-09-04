@@ -4,6 +4,7 @@ import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import type { CurrentReviewerOutput } from "../protocol/schemas.js";
 import { currentReviewerOutputSchema } from "../protocol/schemas.js";
 import { reviewerResultDigest } from "../results/digest.js";
+import { readRunReport, RunReportError } from "./run-report.js";
 import { readRunRecordLines } from "./run-record-reader.js";
 
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
@@ -453,6 +454,119 @@ function applyPublicResult(
   }
 }
 
+function validateStatusCompletionIntegrity(
+  completed: Record<string, unknown>,
+  reviewers: readonly ReviewerSnapshot[],
+  canonicalCounts: {
+    raw: number;
+    unique: number;
+    gate: number;
+    advisory: number;
+  },
+  completedLine: number,
+): void {
+  const manifest = Array.isArray(completed.result_manifest)
+    ? completed.result_manifest
+    : undefined;
+  const resultsComplete =
+    typeof completed.results_complete === "boolean"
+      ? completed.results_complete
+      : undefined;
+  const countValues = [
+    integer(completed.raw_findings),
+    integer(completed.unique_findings),
+    integer(completed.gate_findings),
+    integer(completed.advisory_findings),
+  ];
+  const manifestPresent =
+    manifest !== undefined || resultsComplete !== undefined;
+  const countsPresent = countValues.some((value) => value !== undefined);
+  if (!manifestPresent && !countsPresent) return;
+  const fail = (message: string, paths: string[]): never => {
+    throw new RunStatusError(
+      "invalid_run_record",
+      message,
+      completedLine,
+      "run.completed",
+      paths,
+    );
+  };
+  if (
+    (manifestPresent &&
+      (manifest === undefined || resultsComplete === undefined)) ||
+    (countsPresent && countValues.some((value) => value === undefined))
+  ) {
+    fail("The current completion integrity contract is incomplete.", [
+      "result_manifest",
+      "results_complete",
+      "raw_findings",
+    ]);
+  }
+  const authoritative = new Map(
+    reviewers
+      .filter(
+        (reviewer) =>
+          reviewer.complete_result !== undefined &&
+          reviewer.result_digest !== undefined &&
+          reviewer.result_byte_count !== undefined,
+      )
+      .map((reviewer) => [reviewer.reviewer_id, reviewer] as const),
+  );
+  if (manifestPresent) {
+    const seen = new Set<string>();
+    for (const value of manifest!) {
+      const entry = asRecord(value);
+      const id = text(entry?.reviewer_id);
+      const reviewer = id === undefined ? undefined : authoritative.get(id);
+      if (
+        id === undefined ||
+        seen.has(id) ||
+        reviewer === undefined ||
+        text(entry?.digest) !== reviewer.result_digest ||
+        integer(entry?.byte_count) !== reviewer.result_byte_count ||
+        text(entry?.lens_id) === undefined ||
+        text(entry?.lens_id) !== reviewer.lens_id ||
+        (text(completed.report_path) === undefined
+          ? text(entry?.artifact_path) !== undefined
+          : text(entry?.artifact_path) !== text(completed.report_path))
+      ) {
+        fail(
+          "The result manifest does not match authoritative reviewer results.",
+          ["result_manifest"],
+        );
+      }
+      seen.add(id!);
+    }
+    if (seen.size !== authoritative.size) {
+      fail("The result manifest omits an authoritative reviewer result.", [
+        "result_manifest",
+      ]);
+    }
+    const completedRuns = integer(asRecord(completed.model_runs)?.completed);
+    const expectedComplete =
+      text(completed.coverage_outcome) === "complete" &&
+      manifest!.length === completedRuns;
+    if (resultsComplete !== expectedComplete) {
+      fail("The results_complete value is inconsistent.", ["results_complete"]);
+    }
+  }
+  if (countsPresent) {
+    if (
+      countValues[0] !== canonicalCounts.raw ||
+      countValues[1] !== canonicalCounts.unique ||
+      countValues[2] !== canonicalCounts.gate ||
+      countValues[3] !== canonicalCounts.advisory
+    ) {
+      fail("The canonical count tuple does not match reviewer results.", [
+        "raw_findings",
+        "unique_findings",
+        "gate_findings",
+        "advisory_findings",
+      ]);
+    }
+  }
+}
+
 export async function readRunStatus({
   runsDirectory,
   runId,
@@ -465,6 +579,7 @@ export async function readRunStatus({
   await afterOpen?.();
   const reviewers = new Map<string, ReviewerSnapshot>();
   let completed: Record<string, unknown> | undefined;
+  let completedLine = 0;
   let lastSeq = 0;
   let resolvedModelTotal = 0;
   let legacySuite: Record<string, unknown> | undefined;
@@ -556,6 +671,7 @@ export async function readRunStatus({
       }
       if (eventName === "run.completed") {
         completed = data;
+        completedLine = line;
         legacySuite = asRecord(data.suite);
         const terminals = Array.isArray(data.reviewers) ? data.reviewers : [];
         for (const terminal of terminals) {
@@ -688,6 +804,43 @@ export async function readRunStatus({
   }
 
   const values = [...reviewers.values()];
+  const hasCurrentIntegrity =
+    completed !== undefined &&
+    [
+      completed.result_manifest,
+      completed.results_complete,
+      completed.raw_findings,
+      completed.gate_findings,
+    ].some((value) => value !== undefined);
+  if (completed !== undefined && hasCurrentIntegrity) {
+    let canonicalCounts: {
+      raw: number;
+      unique: number;
+      gate: number;
+      advisory: number;
+    };
+    try {
+      canonicalCounts = (await readRunReport({ runsDirectory, runId }))
+        .finding_counts;
+    } catch (error) {
+      if (error instanceof RunReportError) {
+        throw new RunStatusError(
+          error.code,
+          error.message,
+          error.line,
+          error.recordType,
+          error.schemaPaths,
+        );
+      }
+      throw error;
+    }
+    validateStatusCompletionIntegrity(
+      completed,
+      values,
+      canonicalCounts,
+      completedLine,
+    );
+  }
   for (const reviewer of values) applyCause(reviewer, reviewers);
   const selected =
     reviewerId === undefined

@@ -119,10 +119,12 @@ During a run, consume stdout as JSONL until run.completed. The caller cannot
 disable, replace, reorder, or select mandatory reviewers. A positional WORKSPACE
 and a piped non-empty JSON request are mutually exclusive.
 
-Compact JSONL, no ANSI, and aggregate heartbeats are the defaults; the explicit
-flags document and enforce that integration contract. --details-file writes the
-sanitized detailed artifact to a new caller-selected path and fails rather than
-overwriting an existing file.
+Full JSONL, no ANSI, and aggregate heartbeats are the defaults. Full mode emits
+reviewer.result with the complete sanitized v3 result, digest, and byte count in
+the original invocation. Select --output-mode compact-jsonl explicitly for the
+compatibility/operations stream; its terminal manifest still identifies the
+authoritative artifact. --details-file writes the sanitized detailed artifact
+to a new caller-selected path and fails rather than overwriting an existing file.
 
 Exit codes: 0 passed, 1 findings, 2 invalid request/config/usage,
 3 incomplete reviewer/runtime, 4 interrupted.
@@ -218,7 +220,7 @@ USAGE
   review-mesh config effective [WORKSPACE] --json
                                       Resolve the safe effective agent roster
   review-mesh config export --json   Export full config plus revision
-  review-mesh config apply --json    Atomically apply a full schema-v6 config with CAS
+  review-mesh config apply --json    Atomically apply a complete config with CAS
   review-mesh config copilot login [--device-code|--web-flow] [--host URL]
   review-mesh config copilot status [--json]
   review-mesh config copilot models [--json]
@@ -324,10 +326,11 @@ Sequence and meaning:
   reviewer.progress    Capability probe, queue state, or adapter activity.
   reviewer.started     One reviewer started, with model/effort/timeout.
   suite.heartbeat      Aggregate liveness, deadlines, and stale activity.
-  reviewer.completed   Valid terminal result for one reviewer.
+  reviewer.completed   Compact lifecycle summary for one valid result.
+  reviewer.result      Complete sanitized result/digest in full-jsonl mode.
   reviewer.incomplete  Reviewer/runtime did not return a valid result.
   reviewer.skipped     A later fallback was not needed after findings/failure.
-  run.completed        Compact gate/coverage outcome and artifact reference.
+  run.completed        Outcomes, canonical counts, result manifest, and artifact.
 
 Always continue reading until run.completed or process termination. Operational
 failures advance to eligible fallbacks; clean passes stop at configured quorum.
@@ -399,13 +402,16 @@ adapter protocol section for full request and limit details.
 Review Mesh uses one trusted global config.toml. Run 'review-mesh config path'
 for its exact platform path. Workspace .review-mesh.toml files are ignored.
 
-Schema version 5 contains:
+Schema version 6 contains:
   execution    max concurrency, heartbeat interval, shutdown grace, primary
-               distribution, provider limits, circuit breaking, and retries
+               distribution/concentration policy, provider limits, circuit
+               breaking, retries, and exact-continuation attempts
   diagnostics  sanitized run persistence and retention
-  adapters     trusted runtime registrations and environment-variable names
+  adapters     trusted runtime registrations, environment-variable names, and
+               OpenAI-compatible streaming mode
   agents       scalar model/effort or model_runs, purpose, instructions,
-               isolation, timeout, and optional per-run adapter overrides
+               isolation, timeout, applicability, required context, quorum,
+               outage acknowledgement, and optional per-run adapter overrides
   defaults     ordered fallback agent roster
   projects     project-name roster/guidance/context overrides
 
@@ -421,9 +427,12 @@ For autonomous changes, use export/apply with revision compare-and-swap:
   review-mesh config apply --json
 
 Export contains instruction and runtime fields and should be treated as
-sensitive. Apply accepts a complete v2-v5 document, not a patch; legacy
-documents are promoted to v5 when saved. Use 'review-mesh schema config --json' and
-'review-mesh config --help' for exact details.
+sensitive. Readers/export migrate legacy v1-v5 documents in memory. Apply
+accepts one complete schema-v2 through schema-v6 document, not a patch; legacy
+inputs are migrated and saved canonically as v6 with behavior-preserving
+applicability, context, primary-order, and streaming defaults. Use
+'review-mesh schema config --json' and 'review-mesh config --help' for exact
+details.
 `,
   "exit-codes": `REVIEW-MESH EXIT CODES
 

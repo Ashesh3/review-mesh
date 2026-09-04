@@ -3,9 +3,7 @@ import { z } from "zod";
 const DEFAULT_MAXIMUM_STREAM_BYTES = 8 * 1024 * 1024;
 
 export type OpenAIStreamErrorCode =
-  | "cancelled"
-  | "invalid_stream"
-  | "response_too_large";
+  "cancelled" | "invalid_stream" | "response_too_large";
 
 export class OpenAIStreamError extends Error {
   constructor(

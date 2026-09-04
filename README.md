@@ -7,10 +7,12 @@ eligible fallback providers; a logical lens is incomplete only after recovery
 options are exhausted.
 
 Transient failures use bounded same-model retry with jittered exponential
-backoff and bounded provider `Retry-After` guidance. Provider-group circuits count
-only qualifying outages, cool down before one half-open probe, and reset after
-success. Public output is compact JSONL with one aggregate suite heartbeat;
-detailed context and results remain in the sanitized persisted artifact.
+backoff and bounded provider `Retry-After` guidance. Provider-group circuits
+count only qualifying outages, cool down before one half-open probe, and reset
+after success. Review Mesh v8 defaults to `full-jsonl`: every complete sanitized
+reviewer result is returned during the original invocation, with the same digest
+and byte count used by the immutable artifact. `compact-jsonl` remains an
+explicit operations/compatibility mode.
 
 ```text
 current directory or request JSON -> review-mesh review -> trusted project/default roster -> live JSONL -> run.completed
@@ -22,6 +24,7 @@ It is designed for automation, coding agents, CI, and local review loops:
 - Trusted global/default or project-specific agent rosters; callers cannot override them through review input.
 - Parallel logical agents with ordered per-agent model fallback across runtimes.
 - Strict structured findings with evidence and optional file/line locations.
+- Complete reviewer-result v3 Markdown and structured findings on default stdout.
 - Independent `gate_outcome` and `coverage_outcome` dimensions.
 - Configurable diverse pass quorum, provider concurrency, and cooldown/half-open circuit breaking.
 - Safe failure diagnostics, persisted attempt causality, and best-effort artifact salvage.
@@ -47,7 +50,8 @@ review-mesh --help
 review-mesh describe . --json
 review-mesh schema request --json
 review-mesh doctor . --adapter gateway --model claude-opus-5 --structured-output
-review-mesh review . --output-mode compact-jsonl --no-ansi --heartbeat aggregate --details-file review-details.jsonl
+review-mesh review . --no-ansi --heartbeat aggregate --details-file review-details.jsonl
+review-mesh review . --output-mode compact-jsonl --no-ansi --heartbeat aggregate
 review-mesh serve
 review-mesh config --help
 ```
@@ -63,6 +67,15 @@ options.
 The selection object includes `project_name` and `project_name_source`, plus
 `matched_project_name` when a configured project entry matched. This makes the
 automatic identity decision inspectable before a review starts.
+
+`review-mesh doctor . --structured-output` preflights the selected reviewer by
+using its real model, effort, tools, structured-result schema, streaming mode,
+same-model retry, continuation, and deadline rules against a Review Mesh-owned
+synthetic workspace. It reports authentication/model readiness, streaming
+negotiation, read-tool execution, complete result production, and schema
+validation separately. Failures retain the same typed sanitized HTTP status,
+validation path, request/correlation ID, attempt, and retry diagnostics as a
+live review, so a tool failure is not mislabeled as structured-output failure.
 
 ## Web dashboard
 
@@ -103,12 +116,13 @@ For an AI caller, identity and scope are separate:
 
 ### Download a standalone executable
 
-Release `v7.2.0` refreshes the embedded observer with an Astryx-inspired,
-dependency-free interface: a clearer app shell, accessible inline SVG icons,
-larger interaction targets, responsive review records, improved long-value
-handling, and reduced-motion support. It retains the resilient multi-provider
-review path, agent-first CLI, public event protocol v5, compact reporting, and
-self-contained Bun executables that do not require Node.js or Bun:
+Release `v8.0.0` is a breaking review-delivery and configuration release. The
+default review output is now lossless `full-jsonl`; live reviewer results use
+schema v3; current configuration is schema v6; length-limited provider output
+uses exact continuation; OpenAI-compatible streaming is configurable; strict
+artifacts reproduce the public digests and canonical counts; and structured
+doctor runs the real reviewer path. The self-contained Bun executables do not
+require Node.js or Bun:
 
 - Windows x64: `review-mesh-windows-x64.exe`
 - Linux x64 (glibc): `review-mesh-linux-x64`
@@ -116,21 +130,23 @@ self-contained Bun executables that do not require Node.js or Bun:
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v7.2.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
+Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v8.0.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
 .\review-mesh.exe review
 ```
 
 Linux:
 
 ```bash
-curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v7.2.0/review-mesh-linux-x64
+curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v8.0.0/review-mesh-linux-x64
 chmod +x ./review-mesh-linux-x64
 ./review-mesh-linux-x64 review
 ```
 
 Each executable contains Review Mesh and its JavaScript dependencies. Git, trusted configuration, credentials, and separately configured command/provider runtimes remain external.
 
-Release binaries are built with Bun 1.4.0. Verify downloads against `SHA256SUMS.txt` from the release assets.
+Release binaries are built with Bun 1.4.0. Download and verify the exact checksum
+manifest from
+`https://github.com/Ashesh3/review-mesh/releases/download/v8.0.0/SHA256SUMS.txt`.
 
 ### Build the portable Node.js file
 
@@ -270,9 +286,22 @@ inspection. Permanent failures stop immediately, and every finalization cycle
 remains bounded by the reviewer deadline.
 
 If structured result production ends with `finish_reason = "length"`, the
-adapter retries from that checkpoint with a compact-result instruction and a
-larger output allowance. Exhausted truncation recovery remains fallback-eligible
-but does not count as a provider-circuit outage.
+adapter preserves the exact partial response and asks the same model to continue
+from that stopping point without repeating, rewriting, condensing, or dropping
+prior content. Fragments are appended in order and parsed only after completion,
+within the original deadline and `execution.continuation_attempts` limit. The
+assembled serialized result is limited to 16 MiB; exceeding it produces the
+typed `result_too_large` incomplete outcome instead of a shortened review.
+
+OpenAI-compatible adapters accept `streaming = "auto" | "required" |
+"disabled"`. New schema-v6 configuration defaults to `auto`, which requests
+bounded cancellable SSE and accepts a valid non-streaming JSON response. If
+streaming is clearly unsupported, `auto` falls back once to non-streaming;
+`required` fails readiness and `disabled` preserves the JSON path. Streaming
+reduces fixed proxy-origin timeout exposure but cannot prevent an upstream HTTP
+524 that occurs before the first response byte. Empty or equivalent malformed
+HTTP-200 provider envelopes retry the identical finalization request once before
+the reviewer becomes fallback-eligible; they do not qualify provider circuits.
 
 OpenAI-compatible failures use bounded safe diagnostics such as precise failure
 codes, HTTP status, bounded `Retry-After`, allowlisted correlation headers,
@@ -314,13 +343,14 @@ export REVIEW_MESH_OPENAI_API_KEY="your-key"
 Create the global configuration shown below, replacing model IDs and project names as needed:
 
 ```toml
-schema_version = "5"
+schema_version = "6"
 
 [execution]
 max_concurrency = 2
 heartbeat_interval_ms = 15000
 shutdown_grace_period_ms = 5000
 distribute_primaries = true
+continuation_attempts = 2
 default_provider_concurrency = 2
 circuit_breaker_threshold = 2
 circuit_breaker_cooldown_ms = 30000
@@ -338,6 +368,7 @@ max_runs = 50
 type = "openai_compatible"
 base_url_env = "REVIEW_MESH_OPENAI_BASE_URL"
 api_key_env = "REVIEW_MESH_OPENAI_API_KEY"
+streaming = "auto"
 
 [agents.opus-5]
 adapter = "gateway"
@@ -347,6 +378,8 @@ purpose = "Architecture, security, and lifecycle review"
 instructions = "Inspect architecture, lifecycle ownership, trust boundaries, security, and regressions. Report only actionable evidence-backed defects."
 isolation = "prefer_enforced"
 timeout_ms = 1800000
+applicability = { mode = "always" }
+required_context = []
 
 [agents.gemini-3-7-flash]
 adapter = "gateway"
@@ -356,6 +389,8 @@ purpose = "Correctness, reliability, and edge-case review"
 instructions = "Inspect the full scope for actionable correctness, integration, and test-coverage defects. Cite precise file and line evidence."
 isolation = "prefer_enforced"
 timeout_ms = 900000
+applicability = { mode = "always" }
+required_context = []
 
 [agents.mai-code-1-1-flash]
 adapter = "gateway"
@@ -365,6 +400,8 @@ purpose = "Implementation quality and regression review"
 instructions = "Inspect implementation bugs, state handling, schemas, error paths, and missing regressions. Report only actionable findings."
 isolation = "prefer_enforced"
 timeout_ms = 900000
+applicability = { mode = "always" }
+required_context = []
 
 [agents.sol-5-6-fast]
 adapter = "gateway"
@@ -374,6 +411,8 @@ purpose = "Implementation, protocol, and compatibility review"
 instructions = "Inspect concurrency, cancellation, protocol invariants, error handling, compatibility, and tests. Report only actionable findings."
 isolation = "prefer_enforced"
 timeout_ms = 900000
+applicability = { mode = "always" }
+required_context = []
 
 [agents.kimi-k3]
 adapter = "gateway"
@@ -383,6 +422,8 @@ purpose = "Independent systems and robustness review"
 instructions = "Inspect systems design, robustness, maintainability, portability, and boundary validation. Report only actionable findings."
 isolation = "prefer_enforced"
 timeout_ms = 900000
+applicability = { mode = "always" }
+required_context = []
 
 [defaults]
 agents = ["opus-5", "gemini-3-7-flash", "mai-code-1-1-flash", "sol-5-6-fast", "kimi-k3"]
@@ -404,12 +445,13 @@ ordered model fallbacks. Use `model_runs` instead of the scalar `model` and
 `effort` fields:
 
 ```toml
-schema_version = "5"
+schema_version = "6"
 
 [adapters.gateway]
 type = "openai_compatible"
 base_url_env = "REVIEW_MESH_OPENAI_BASE_URL"
 api_key_env = "REVIEW_MESH_OPENAI_API_KEY"
+streaming = "auto"
 
 [adapters.github]
 type = "copilot"
@@ -423,6 +465,7 @@ model_runs = [
 ]
 pass_quorum = 2
 minimum_provider_groups = 2
+allow_zero_outage_tolerance = true
 adjudication = "required"
 gate_minimum_severity = "medium"
 gate_minimum_confidence = "medium"
@@ -431,11 +474,8 @@ instructions = "Review architecture, trust boundaries, lifecycle ownership, and 
 isolation = "prefer_enforced"
 timeout_ms = 1800000
 
-[agents.architecture.applicability]
-any_changed_paths = ["src/**", "tests/**", "package.json"]
-
-# A metadata-dependent lens can additionally declare:
-# required_context = ["/pull_request/number", "/work_items"]
+applicability = { mode = "changed_paths", any_changed_paths = ["src/**", "tests/**", "package.json"] }
+required_context = []
 
 [defaults]
 agents = ["architecture"]
@@ -451,13 +491,27 @@ agent.
 
 Review Mesh expands that example into the concrete reviewer IDs
 `architecture::opus` and `architecture::grok`. With
-`execution.distribute_primaries = true` (the v5 default), successive
+`execution.distribute_primaries = true` (the schema-v6 default), successive
 multi-model logical lenses rotate their starting run deterministically while
 retaining the configured order cyclically. Configured `a, b, c` chains begin as
 `a, b, c`, then `b, c, a`, then `c, a, b`; scalar lenses do not consume a
 rotation slot. Set the option to `false` to keep every chain in declaration
-order. Migrated v1-v4 configurations are pinned to `false`, so upgrading does
-not silently change their primary model.
+order. Migrated v1-v5 configurations preserve their prior primary order, so
+upgrading does not silently change provider selection.
+
+Every schema-v6 lens declares `applicability.mode` (`always` or bounded
+`changed_paths`) and `required_context`, even when the latter is empty. Missing
+declared inputs yield deterministic `not_applicable` or
+`not_evaluated_missing_input` outcomes; Review Mesh never infers prerequisites
+from a lens name. Managed migration fills `always` and an empty context list for
+legacy lenses rather than inventing deployment globs or pull-request metadata.
+
+Five-model v6 lenses default to a three-pass, three-provider-group quorum.
+Multi-provider policies that tolerate no provider outage are invalid unless the
+lens explicitly sets `allow_zero_outage_tolerance = true`. New multi-lens,
+multi-provider suites distribute primaries; a suite that still concentrates
+every primary on one group must explicitly set
+`execution.allow_provider_concentration = true`.
 
 The effective roster reports execution-order `model_index` and original
 `configured_model_index`; the persisted private run resolution keeps the same
@@ -497,7 +551,10 @@ Every model that actually runs receives the same purpose, trusted instructions,
 isolation policy, runtime options, project guidance, and per-run timeout.
 Review Mesh preserves raw findings and builds a deterministic consolidated set
 with provenance, duplicate ids, reconciled severity, confidence, classification,
-and external assumptions. Each fallback
+and external assumptions. `run.completed.unique_findings` is exactly the count
+returned by `findings --deduplicate`; `raw_findings`, `gate_findings`, and
+`advisory_findings` are separate meanings and gate thresholds never redefine the
+unique count. Each fallback
 is a complete provider request, so agents that repeatedly pass can still consume
 additional tokens, quota, and cost. Concurrent logical agents can also observe
 different live-worktree states if another process modifies the workspace.
@@ -617,11 +674,10 @@ The menu can list, add, edit, and remove global scalar or multi-model agents;
 create and select adapters, including per-run overrides; set the ordered default
 roster; add, edit, or remove project-name assignments and context; and edit
 execution/diagnostic settings. Each successful change is validated and saved
-immediately using an atomic replacement. Existing version 1, scalar-agent
-version 2, or path-keyed version 3 configuration is read and migrated to version
-4 when it is saved
-through the menu; this canonical rewrite does not preserve TOML comments, so
-keep a backup when migrating a hand-edited file.
+immediately using an atomic replacement. Existing schema versions 1 through 5
+are read and migrated to schema v6 when saved. The canonical TOML rewrite does
+not preserve comments or hand formatting, so make and verify an exact backup
+before migrating a hand-edited file.
 
 During v3 migration, an existing project path is resolved with the same Git
 repository-name rules used at runtime. A stale or missing path falls back to its
@@ -661,17 +717,25 @@ as sensitive. To update configuration non-interactively, edit the exported
 {
   "schema_version": "1",
   "expected_revision": "<revision from config export>",
-  "config": { "schema_version": "5" }
+  "config": { "schema_version": "6" }
 }
 ```
 
-The `config` value above is abbreviated; send the complete desired v5 document.
+The `config` value above is abbreviated; send the complete desired v6 document.
 Apply is whole-document, limited to 5 MiB of JSON input (the config file remains
 limited to 4 MiB), validated before publication, and
 uses revision compare-and-swap plus atomic replacement. A stale revision fails
 with `config_conflict` instead of overwriting another Review Mesh writer. Do not
 modify the config simultaneously with an external editor, which does not honor
 Review Mesh's update lock.
+
+Migration is deliberately behavior-preserving: legacy lenses receive explicit
+`applicability = { mode = "always" }` and `required_context = []`; primary
+distribution and OpenAI-compatible streaming retain their legacy behavior.
+Review the sensitive exported whole document before applying it. Do not invent
+new provider mappings, deployment globs, or required metadata for an unknown
+roster, and never put an export containing trusted instructions/runtime fields
+in the repository or logs.
 
 Generated structural JSON Schemas are available directly from the executable:
 
@@ -706,8 +770,9 @@ For a truly one-file deployment, use `openai_compatible`. Provider-native adapte
 
 ## JSONL events
 
-Every non-empty stdout line is one strict schema-version `5` JSON object. Review
-requests and reviewer-result objects use schema version `2`. All events in a
+Every non-empty stdout line is one strict public event schema-version `5` JSON
+object. Review requests use schema version `2`; live reviewer results use schema
+version `3` (persisted result versions 1 and 2 remain readable). All events in a
 run share one `run_id`; `seq` starts at `1` and increases monotonically;
 `run.completed` is final once a valid run begins and stdout remains available.
 `suite.resolved` stays compact: it reports logical-lens and model-run totals,
@@ -727,10 +792,20 @@ completed, incomplete, and skipped model runs without inventing percentages.
 | `reviewer.started`    | One reviewer began, with its model, effort, and timeout.      |
 | `reviewer.progress`   | Factual probing, queued, reviewing, or validating activity.   |
 | `suite.heartbeat`     | Aggregate liveness, deadlines, stale time, and dual counters. |
-| `reviewer.completed`  | One strict reviewer result.                                   |
+| `reviewer.completed`  | Compact lifecycle summary for one valid reviewer result.      |
+| `reviewer.result`     | Full sanitized result, byte count, digest, and artifact link. |
 | `reviewer.incomplete` | One reviewer failed to return a valid terminal result.        |
 | `reviewer.skipped`    | A later model was bypassed after prior findings/failure.      |
-| `run.completed`       | Compact gate/coverage summary and report artifact path.       |
+| `run.completed`       | Outcomes, canonical counts, result manifest, and artifact.    |
+
+`review-mesh review` defaults to `--output-mode full-jsonl`. Full mode emits
+the exact sanitized result in `reviewer.result` during the original invocation;
+stdout honors backpressure and never substitutes the 1,000-character lifecycle
+summary. `--output-mode compact-jsonl` suppresses that public payload for
+operations compatibility, but the terminal manifest still identifies every
+digest, byte count, and authoritative immutable artifact. A completed full run
+asserts `results_complete: true`; a closed or failed output stream cannot claim
+completeness.
 
 `reviewer.progress` is phase-level. High-frequency adapter activity is retained
 as sanitized private `reviewer.activity` records for the dashboard and latest
@@ -773,33 +848,45 @@ Example final event:
   "timestamp": "2026-08-31T11:45:35.446Z",
   "data": {
     "gate_outcome": "findings",
-    "coverage_outcome": "partial",
+    "coverage_outcome": "complete",
     "exit_code": 1,
     "consistency_mode": "live_worktree",
     "total_elapsed_ms": 26895,
     "logical_lenses": {
-      "total": 8,
+      "total": 1,
       "pending": 0,
-      "findings": 4,
-      "passed": 1,
-      "incomplete": 3,
+      "findings": 1,
+      "passed": 0,
+      "incomplete": 0,
       "not_applicable": 0,
       "not_evaluated": 0
     },
     "model_runs": {
-      "total": 40,
+      "total": 1,
       "deferred": 0,
       "queued": 0,
       "running": 0,
-      "completed": 9,
-      "incomplete": 3,
-      "skipped": 28
+      "completed": 1,
+      "incomplete": 0,
+      "skipped": 0
     },
-    "unique_findings": 8,
-    "advisory_findings": 4,
-    "incomplete_lenses": ["event-reliability", "security-compliance"],
-    "not_evaluated_lenses": ["change-readiness"],
-    "report_path": ".../run_....jsonl"
+    "raw_findings": 2,
+    "unique_findings": 1,
+    "gate_findings": 1,
+    "advisory_findings": 0,
+    "incomplete_lenses": [],
+    "not_evaluated_lenses": [],
+    "report_path": ".../run_....jsonl",
+    "result_manifest": [
+      {
+        "reviewer_id": "correctness::primary",
+        "lens_id": "correctness",
+        "digest": "<sha256 of canonical sanitized result>",
+        "byte_count": 48217,
+        "artifact_path": ".../run_....jsonl"
+      }
+    ],
+    "results_complete": true
   }
 }
 ```
@@ -825,8 +912,9 @@ Each completed reviewer returns:
 
 ```json
 {
-  "schema_version": "2",
+  "schema_version": "3",
   "verdict": "fail",
+  "review_markdown": "# Review\n\nThe complete human-readable review, without silent shortening.",
   "summary": "One actionable defect was found.",
   "actionable_findings": [
     {
@@ -835,6 +923,9 @@ Each completed reviewer returns:
       "confidence": "high",
       "classification": "confirmed_defect",
       "external_assumptions": [],
+      "category": "correctness",
+      "verification": "The cited branch accepts count=0 and reaches division.",
+      "change_impact": "The base branch rejected zero; the reviewed head removed that guard.",
       "title": "Zero count is not rejected",
       "description": "The implementation violates the documented contract.",
       "evidence": [
@@ -852,7 +943,20 @@ Each completed reviewer returns:
 }
 ```
 
-`pass` requires an empty `actionable_findings` array. `fail` requires at least one finding.
+`pass` requires an empty `actionable_findings` array. `fail` requires at least
+one finding. `summary` is an index, never a replacement for `review_markdown`.
+Sanitization redacts credential-shaped values once, then the same accepted
+object feeds orchestration, stdout, the immutable artifact, reports, findings,
+and the dashboard. Its SHA-256 digest and UTF-8 byte count are public so callers
+can verify round-trip completeness.
+
+Adjudication uses a separate decision schema keyed by candidate/source finding
+ID. Confirmed or adjusted decisions require cited evidence; reliability,
+concurrency, lifecycle, and cleanup defects additionally require ordered
+execution proof with at least two cited steps and an explicit failure point, and
+change-scoped findings require a cited base/head comparison. Missing required
+proof downgrades the candidate to non-gating `needs_verification` while retaining
+the candidate and adjudicator reviews in the raw artifact.
 
 ## Isolation and consistency
 
@@ -887,8 +991,9 @@ Exactly one terminal is required:
 {
   "type": "result",
   "result": {
-    "schema_version": "1",
+    "schema_version": "3",
     "verdict": "pass",
+    "review_markdown": "# Review\n\nNo actionable findings.",
     "summary": "No actionable findings.",
     "actionable_findings": [],
     "informational_notes": []
@@ -920,15 +1025,23 @@ npm run verify
 
 Useful scripts:
 
-| Script                      | Purpose                                                                                 |
-| --------------------------- | --------------------------------------------------------------------------------------- |
-| `npm run build`             | Type-check and generate the one-file CLI.                                               |
-| `npm run build:portable`    | Generate only `dist/review-mesh.mjs`.                                                   |
-| `npm run build:standalone`  | With Bun 1.4.0, generate Windows/Linux x64 executables and checksums in `dist/release`. |
-| `npm run verify:standalone` | Build standalone artifacts and smoke-test the Windows executable on Windows.            |
-| `npm test`                  | Run offline tests.                                                                      |
-| `npm run test:live`         | Run explicitly configured provider smoke tests.                                         |
-| `npm run format:check`      | Check formatting.                                                                       |
-| `npm run verify`            | Formatting, typecheck, tests, and portable build.                                       |
+| Script                      | Purpose                                                                                                  |
+| --------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `npm run build`             | Type-check and generate the one-file CLI.                                                                |
+| `npm run build:portable`    | Generate only `dist/review-mesh.mjs`.                                                                    |
+| `npm run build:standalone`  | With Bun 1.4.0, generate Windows/Linux x64 executables and checksums in `dist/release`.                  |
+| `npm run verify:standalone` | Build and execute both Windows and Linux x64 release binaries against the full-result/artifact contract. |
+| `npm test`                  | Run offline tests.                                                                                       |
+| `npm run test:live`         | Run explicitly configured provider smoke tests.                                                          |
+| `npm run format:check`      | Check formatting.                                                                                        |
+| `npm run verify`            | Formatting, typecheck, tests, and portable build.                                                        |
 
 The portable acceptance suite copies `review-mesh.mjs` outside the repository and runs it without `node_modules`, including a real embedded-adapter protocol round against a local test server.
+
+On Windows, Linux standalone acceptance runs the release binary through WSL
+Ubuntu and a copied Python command-adapter fixture; it does not depend on the
+repository's `node_modules` or install packages in WSL. `verify:standalone`
+passes only when both release executables are actually executed. The build
+requires Bun 1.4.0; when the cross-target runtime must be supplied explicitly,
+`BUN_LINUX_X64_EXE` must point to the official Linux x64 Bun whose SHA-256 is
+`33d56b070be6a9e3da0ab013038b43d1645d0534ca811ecdba4472599117eb4b`.
