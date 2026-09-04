@@ -217,6 +217,13 @@ export function createActivityTracker(options: ActivityTrackerOptions) {
       if (!phases.has(input.phase))
         throw new TypeError("unknown reviewer activity phase");
       const reviewer = reviewerFor(input.reviewerId, input.at);
+      if (
+        reviewer.attemptId !== undefined &&
+        (input.attemptId !== reviewer.attemptId ||
+          input.at < reviewer.admittedAt)
+      ) {
+        return { meaningful: false, phaseChanged: false, retained: false };
+      }
       const phaseChanged = reviewer.phase !== input.phase;
       reviewer.phase = input.phase;
       reviewer.summary.first_at = Math.min(reviewer.summary.first_at, input.at);

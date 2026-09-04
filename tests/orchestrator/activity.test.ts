@@ -33,6 +33,38 @@ describe("bounded run activity", () => {
     expect(tracker.snapshot("a", 600_030).lastProgressAgeMs).toBe(10);
   });
 
+  it("ignores stale attempt state and material events before mutating the current attempt", () => {
+    const tracker = createActivityTracker({ startedAt: 0 });
+    tracker.admitAttempt("a", "current", 100);
+    tracker.record({
+      reviewerId: "a",
+      attemptId: "current",
+      phase: "reviewing",
+      at: 101,
+    });
+    const records = tracker.records();
+    const summary = tracker.summaries();
+    tracker.record({
+      reviewerId: "a",
+      attemptId: "old",
+      phase: "terminal",
+      at: 200,
+      material: "failure",
+    });
+    tracker.record({
+      reviewerId: "a",
+      phase: "terminal",
+      at: 201,
+      material: "terminal",
+    });
+    expect(tracker.records()).toEqual(records);
+    expect(tracker.summaries()).toEqual(summary);
+    expect(tracker.snapshot("a", 202)).toMatchObject({
+      phase: "reviewing",
+      coalescedCount: 0,
+    });
+  });
+
   it("does not let one reviewer exhaust another reviewer's progress identities", () => {
     const tracker = createActivityTracker({
       startedAt: 0,
