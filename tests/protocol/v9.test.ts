@@ -8,6 +8,20 @@ import {
   reviewRequestV3Schema,
   reviewerResultV4Schema,
 } from "../../src/protocol/schemas.js";
+import {
+  providerReviewerResultV4JsonSchema,
+  resultPageJsonSchema,
+} from "../../src/protocol/json-schema.js";
+import type {
+  ResultKind,
+  ResultPageKind,
+  V9CoverageProofKind,
+  V9CoverageStatus,
+  V9FindingCategory,
+  V9FindingClassification,
+  V9FindingConfidence,
+  V9FindingSeverity,
+} from "../../src/protocol/schemas.js";
 
 const sha256 = "a".repeat(64);
 
@@ -101,11 +115,7 @@ describe("v9 review request schema", () => {
       workspace: "/work/demo",
       instructions: "Review",
       review_scope: { mode: "changes" },
-      pull_request: {
-        work_items: [{}],
-        validation: [{}],
-        contract_impact: {},
-      },
+      pull_request: {},
     });
     const valueInvalid = reviewRequestV3Schema.safeParse({
       schema_version: "3",
@@ -127,6 +137,36 @@ describe("v9 review request schema", () => {
     expect(absent.success).toBe(true);
     expect(valueInvalid.success).toBe(true);
     expect(wrongType.success).toBe(false);
+    expect(
+      reviewRequestV3Schema.safeParse({
+        schema_version: "3",
+        project_name: "demo",
+        workspace: "/work/demo",
+        instructions: "Review",
+        review_scope: { mode: "changes" },
+        pull_request: { work_items: [{}] },
+      }).success,
+    ).toBe(false);
+    expect(
+      reviewRequestV3Schema.safeParse({
+        schema_version: "3",
+        project_name: "demo",
+        workspace: "/work/demo",
+        instructions: "Review",
+        review_scope: { mode: "changes" },
+        pull_request: { validation: [{}] },
+      }).success,
+    ).toBe(false);
+    expect(
+      reviewRequestV3Schema.safeParse({
+        schema_version: "3",
+        project_name: "demo",
+        workspace: "/work/demo",
+        instructions: "Review",
+        review_scope: { mode: "changes" },
+        pull_request: { contract_impact: {} },
+      }).success,
+    ).toBe(false);
   });
 
   it("measures named request field limits as UTF-8 bytes", () => {
@@ -157,6 +197,40 @@ describe("v9 review request schema", () => {
 });
 
 describe("v9 result schemas", () => {
+  it("exports inferred types for every v9 enum and page discriminant", () => {
+    const values: [
+      V9FindingSeverity,
+      V9FindingConfidence,
+      V9FindingClassification,
+      V9FindingCategory,
+      V9CoverageProofKind,
+      V9CoverageStatus,
+      ResultKind,
+      ResultPageKind,
+    ] = [
+      "high",
+      "high",
+      "confirmed_defect",
+      "correctness",
+      "observed",
+      "complete",
+      "reviewer",
+      "header",
+    ];
+    expect(values).toHaveLength(8);
+  });
+
+  it("declares provider-facing character and UTF-8 byte bounds in JSON Schema", () => {
+    const provider = JSON.stringify(providerReviewerResultV4JsonSchema);
+    const pages = JSON.stringify(resultPageJsonSchema);
+    for (const serialized of [provider, pages]) {
+      expect(serialized).toContain('"maxLength"');
+      expect(serialized).toContain('"x-review-mesh-max-utf8-bytes"');
+    }
+    expect(provider).toContain('"x-review-mesh-max-utf8-bytes":1024');
+    expect(provider).toContain('"x-review-mesh-max-utf8-bytes":768');
+    expect(pages).toContain('"x-review-mesh-max-utf8-bytes":24576');
+  });
   it("keeps provider content separate from core-owned change coverage", () => {
     expect(
       providerReviewerResultV4Schema.safeParse(validProviderResult).success,
@@ -191,6 +265,35 @@ describe("v9 result schemas", () => {
         actionable_findings: [
           { ...validFinding, title: `${"😀".repeat(64)}a` },
         ],
+      }).success,
+    ).toBe(false);
+  });
+
+  it("requires workspace-relative evidence and canonical attestation paths", () => {
+    for (const path of ["/src/index.ts", "../src/index.ts", "src\\index.ts"]) {
+      expect(
+        providerReviewerResultV4Schema.safeParse({
+          ...validProviderResult,
+          actionable_findings: [
+            {
+              ...validFinding,
+              evidence: [{ ...validFinding.evidence[0], path }],
+            },
+          ],
+        }).success,
+      ).toBe(false);
+    }
+    const decomposed = "cafe\u0301.ts";
+    expect(decomposed).not.toBe(decomposed.normalize("NFC"));
+    expect(
+      providerReviewerResultV4Schema.safeParse({
+        ...validProviderResult,
+        coverage_attestation: {
+          scope_digest: sha256,
+          entries: [
+            { path: decomposed, method: "full_file", snapshot_digest: sha256 },
+          ],
+        },
       }).success,
     ).toBe(false);
   });
@@ -379,5 +482,170 @@ describe("public event v6", () => {
         },
       }).success,
     ).toBe(false);
+  });
+
+  it.each([
+    [
+      "clear with partial coverage",
+      { run_outcome: "clear", coverage_outcome: "partial" },
+    ],
+    [
+      "clear with gate findings",
+      { run_outcome: "clear", gate_outcome: "gate_findings" },
+    ],
+    ["clear with exit one", { run_outcome: "clear", exit_code: 1 }],
+    ["wrong non-gating count", { non_gating_subfindings: 10 }],
+    [
+      "gate outcome without eligible findings",
+      { gate_outcome: "gate_findings", run_outcome: "inconclusive" },
+    ],
+    ["more atomics than sources", { raw_source_findings: 10 }],
+  ])("rejects contradictory terminal outcome: %s", (_name, override) => {
+    const base = {
+      schema_version: "6",
+      event: "run.completed",
+      run_id: "run-1",
+      seq: 9,
+      timestamp: "2026-09-05T10:00:00.000Z",
+      data: {
+        run_outcome: "inconclusive",
+        gate_outcome: "no_gate_findings",
+        coverage_outcome: "partial",
+        exit_code: 3,
+        raw_source_findings: 11,
+        atomic_subfindings: 11,
+        canonical_roots: 0,
+        gate_eligible_subfindings: 0,
+        advisory_subfindings: 11,
+        rejected_subfindings: 0,
+        needs_verification_subfindings: 0,
+        non_gating_subfindings: 11,
+        incomplete_lenses: 2,
+        result_delivery: {
+          completed_results: 26,
+          artifact: "complete",
+          planned_public_stream: "references_only",
+        },
+        artifact: {
+          path: ".review-mesh/runs/run-1.jsonl",
+          sha256,
+          byte_count: 1234,
+          completed_results: 26,
+        },
+        lens_summaries: [],
+        exclusions: [],
+        warnings: [],
+        deficit_samples: [],
+      },
+    };
+    expect(
+      publicEventV6Schema.safeParse({
+        ...base,
+        data: { ...base.data, ...override },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects unbounded lens summaries and terminal events at 16 KiB", () => {
+    const event = {
+      schema_version: "6",
+      event: "run.completed",
+      run_id: "run-1",
+      seq: 9,
+      timestamp: "2026-09-05T10:00:00.000Z",
+      data: {
+        run_outcome: "clear",
+        gate_outcome: "no_gate_findings",
+        coverage_outcome: "complete",
+        exit_code: 0,
+        raw_source_findings: 0,
+        atomic_subfindings: 0,
+        canonical_roots: 0,
+        gate_eligible_subfindings: 0,
+        advisory_subfindings: 0,
+        rejected_subfindings: 0,
+        needs_verification_subfindings: 0,
+        non_gating_subfindings: 0,
+        incomplete_lenses: 0,
+        result_delivery: {
+          completed_results: 1,
+          artifact: "complete",
+          planned_public_stream: "references_only",
+        },
+        artifact: {
+          path: ".review-mesh/runs/run-1.jsonl",
+          sha256,
+          byte_count: 1234,
+          completed_results: 1,
+        },
+        lens_summaries: [
+          { lens_id: "l1", outcome: "passed", message: "x".repeat(129) },
+        ],
+        exclusions: [],
+        warnings: [],
+        deficit_samples: [],
+      },
+    };
+    expect(publicEventV6Schema.safeParse(event).success).toBe(false);
+    expect(
+      publicEventV6Schema.safeParse({
+        ...event,
+        data: {
+          ...event.data,
+          lens_summaries: [],
+          warnings: ["x".repeat(16 * 1_024)],
+        },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("keeps a maximally populated bounded terminal event below 16 KiB", () => {
+    const id = "x".repeat(128);
+    const event = {
+      schema_version: "6",
+      event: "run.completed",
+      run_id: id,
+      request_id: id,
+      seq: 9,
+      timestamp: "2026-09-05T10:00:00.000Z",
+      data: {
+        run_outcome: "clear",
+        gate_outcome: "no_gate_findings",
+        coverage_outcome: "complete",
+        exit_code: 0,
+        raw_source_findings: 0,
+        atomic_subfindings: 0,
+        canonical_roots: 0,
+        gate_eligible_subfindings: 0,
+        advisory_subfindings: 0,
+        rejected_subfindings: 0,
+        needs_verification_subfindings: 0,
+        non_gating_subfindings: 0,
+        incomplete_lenses: 0,
+        result_delivery: {
+          completed_results: 1,
+          artifact: "complete",
+          planned_public_stream: "references_only",
+        },
+        artifact: {
+          path: "p".repeat(4_096),
+          sha256,
+          byte_count: 1234,
+          completed_results: 1,
+        },
+        lens_summaries: Array.from({ length: 8 }, () => ({
+          lens_id: id,
+          outcome: "passed",
+          message: id,
+        })),
+        exclusions: Array.from({ length: 8 }, () => id),
+        warnings: Array.from({ length: 8 }, () => id),
+        deficit_samples: Array.from({ length: 8 }, () => id),
+      },
+    };
+    expect(Buffer.byteLength(JSON.stringify(event), "utf8")).toBeLessThan(
+      16 * 1_024,
+    );
+    expect(publicEventV6Schema.safeParse(event).success).toBe(true);
   });
 });

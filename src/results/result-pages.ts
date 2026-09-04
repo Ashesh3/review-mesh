@@ -134,6 +134,8 @@ export function createResultPageCollector(
     "header";
   const seenFindingIds = new Set<string>();
   const seenDecisionIds = new Set<string>();
+  let acceptedCoverageEntries = 0;
+  let acceptedNarrativeFragments = 0;
 
   function assignedCandidateIds(pageIndex: number): readonly string[] {
     if (options.resultKind !== "adjudication" || pageIndex === 0) return [];
@@ -175,6 +177,19 @@ export function createResultPageCollector(
       return "coverage";
     }
     if (page.page_kind === "narrative") {
+      const header = accepted[0]?.page;
+      if (
+        header?.result_kind === "reviewer" &&
+        header.page_kind === "header" &&
+        acceptedCoverageEntries !==
+          (header.payload.coverage_attestation?.entry_count ?? 0)
+      ) {
+        fail(
+          "protocol_violation",
+          "narrative pages cannot start before declared coverage entries are complete",
+          raw,
+        );
+      }
       if (phase === "findings" || phase === "decisions")
         fail(
           "protocol_violation",
@@ -184,19 +199,20 @@ export function createResultPageCollector(
       return "narrative";
     }
     if (page.page_kind === "findings") {
-      if (phase === "coverage") {
-        const header = accepted[0]?.page;
-        if (
-          header?.result_kind === "reviewer" &&
-          header.page_kind === "header" &&
-          header.payload.narrative_fragment_count > 0
-        ) {
-          fail(
-            "protocol_violation",
-            "findings cannot precede declared narrative pages",
-            raw,
-          );
-        }
+      const header = accepted[0]?.page;
+      if (
+        header?.result_kind === "reviewer" &&
+        header.page_kind === "header" &&
+        (acceptedCoverageEntries !==
+          (header.payload.coverage_attestation?.entry_count ?? 0) ||
+          acceptedNarrativeFragments !==
+            header.payload.narrative_fragment_count)
+      ) {
+        fail(
+          "protocol_violation",
+          "findings cannot precede declared coverage and narrative content",
+          raw,
+        );
       }
       return "findings";
     }
@@ -246,6 +262,39 @@ export function createResultPageCollector(
     if (page.page_count <= page.page_index)
       fail("protocol_violation", "page index exceeds declared count", raw);
     const nextPhase = validateOrdering(page, raw);
+    let nextCoverageEntries = acceptedCoverageEntries;
+    let nextNarrativeFragments = acceptedNarrativeFragments;
+    if (page.result_kind === "reviewer" && page.page_kind === "coverage") {
+      const header = accepted[0]?.page;
+      nextCoverageEntries += page.payload.entries.length;
+      if (
+        header?.result_kind !== "reviewer" ||
+        header.page_kind !== "header" ||
+        nextCoverageEntries >
+          (header.payload.coverage_attestation?.entry_count ?? 0)
+      ) {
+        fail(
+          "protocol_violation",
+          "coverage entries exceed the declared count",
+          raw,
+        );
+      }
+    }
+    if (page.result_kind === "reviewer" && page.page_kind === "narrative") {
+      const header = accepted[0]?.page;
+      nextNarrativeFragments += 1;
+      if (
+        header?.result_kind !== "reviewer" ||
+        header.page_kind !== "header" ||
+        nextNarrativeFragments > header.payload.narrative_fragment_count
+      ) {
+        fail(
+          "protocol_violation",
+          "narrative fragments exceed the declared count",
+          raw,
+        );
+      }
+    }
 
     let findingIds: string[] = [];
     if (page.result_kind === "reviewer" && page.page_kind === "findings") {
@@ -272,6 +321,8 @@ export function createResultPageCollector(
 
     pageCount ??= page.page_count;
     phase = nextPhase;
+    acceptedCoverageEntries = nextCoverageEntries;
+    acceptedNarrativeFragments = nextNarrativeFragments;
     for (const id of findingIds) seenFindingIds.add(id);
     for (const id of decisionIds) seenDecisionIds.add(id);
     accepted.push({ raw, page });

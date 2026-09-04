@@ -7,21 +7,30 @@ function utf8String(
   options: { minimumBytes?: number } = {},
 ) {
   const minimumBytes = options.minimumBytes ?? 0;
-  return z.string().superRefine((value, ctx) => {
-    const bytes = utf8Bytes(value);
-    if (bytes < minimumBytes) {
-      ctx.addIssue({
-        code: "custom",
-        message: `must contain at least ${minimumBytes} UTF-8 byte`,
-      });
-    }
-    if (bytes > maximumBytes) {
-      ctx.addIssue({
-        code: "custom",
-        message: `must contain at most ${maximumBytes} UTF-8 bytes`,
-      });
-    }
-  });
+  return z
+    .string()
+    .min(minimumBytes)
+    .max(maximumBytes)
+    .meta({
+      description: `${minimumBytes}-${maximumBytes} UTF-8 bytes`,
+      "x-review-mesh-min-utf8-bytes": minimumBytes,
+      "x-review-mesh-max-utf8-bytes": maximumBytes,
+    })
+    .superRefine((value, ctx) => {
+      const bytes = utf8Bytes(value);
+      if (bytes < minimumBytes) {
+        ctx.addIssue({
+          code: "custom",
+          message: `must contain at least ${minimumBytes} UTF-8 byte`,
+        });
+      }
+      if (bytes > maximumBytes) {
+        ctx.addIssue({
+          code: "custom",
+          message: `must contain at most ${maximumBytes} UTF-8 bytes`,
+        });
+      }
+    });
 }
 
 const nonEmpty = (maximumBytes: number) =>
@@ -125,19 +134,19 @@ const readinessString = (maximumBytes: number) => utf8String(maximumBytes);
 const workspaceReferenceSchema = readinessString(2 * 1_024);
 
 const workItemSchema = z.strictObject({
-  id: readinessString(128).optional(),
+  id: readinessString(128),
   url: readinessString(2_048).optional(),
   title: readinessString(512).optional(),
 });
 const validationSchema = z.strictObject({
-  name: readinessString(256).optional(),
-  status: z.enum(["passed", "failed", "not_run"]).optional(),
+  name: readinessString(256),
+  status: z.enum(["passed", "failed", "not_run"]),
   details: readinessString(2 * 1_024).optional(),
   url: readinessString(2_048).optional(),
 });
 const contractImpactSchema = z.strictObject({
-  status: z.enum(["none", "changed", "unknown"]).optional(),
-  summary: readinessString(8 * 1_024).optional(),
+  status: z.enum(["none", "changed", "unknown"]),
+  summary: readinessString(8 * 1_024),
   references: z.array(workspaceReferenceSchema).max(32).optional(),
 });
 export const pullRequestV3Schema = z.strictObject({
@@ -164,6 +173,16 @@ const reviewPathSchema = nonEmpty(4_096).refine(
     !value.split("/").includes("..") &&
     !/[\u0000-\u001f]/u.test(value),
   "review paths must be literal workspace-relative paths",
+);
+const evidencePathSchema = nonEmpty(1_024).refine(
+  (value) =>
+    !value.startsWith("/") &&
+    !value.startsWith(":") &&
+    !/^[A-Za-z]:/u.test(value) &&
+    !value.includes("\\") &&
+    !value.split("/").includes("..") &&
+    !/[\u0000-\u001f]/u.test(value),
+  "evidence paths must be forward-slash workspace-relative paths",
 );
 const reviewPathsSchema = z.array(reviewPathSchema).min(1).optional();
 const reviewScopeSchema = z.discriminatedUnion("mode", [
@@ -197,7 +216,7 @@ export const reviewRequestV3Schema = z.strictObject({
 
 const findingEvidenceV4Schema = z
   .strictObject({
-    path: nonEmpty(1_024).optional(),
+    path: evidencePathSchema.optional(),
     start_line: positiveInteger.optional(),
     end_line: positiveInteger.optional(),
     detail: nonEmpty(512),
@@ -289,7 +308,10 @@ export const changeCoverageResultSchema = z
 
 export const coverageAttestationEntrySchema = z
   .strictObject({
-    path: nonEmpty(1_024),
+    path: evidencePathSchema.refine(
+      (value) => value === value.normalize("NFC"),
+      "coverage attestation paths must be NFC normalized",
+    ),
     method: z.enum(["full_file", "diff", "deleted_diff"]),
     snapshot_digest: digestSchema.optional(),
   })
@@ -521,35 +543,111 @@ const resultDeliverySchema = z.strictObject({
   artifact: z.enum(["complete", "not_requested", "failed"]),
   planned_public_stream: z.enum(["complete", "references_only"]),
 });
-const v6RunCompletedDataSchema = z.strictObject({
-  run_outcome: v9RunOutcomeSchema,
-  gate_outcome: v9GateOutcomeSchema,
-  coverage_outcome: v9CoverageOutcomeSchema,
-  exit_code: z.number().int().min(0).max(4),
-  raw_source_findings: nonNegativeInteger,
-  atomic_subfindings: nonNegativeInteger,
-  canonical_roots: nonNegativeInteger,
-  gate_eligible_subfindings: nonNegativeInteger,
-  advisory_subfindings: nonNegativeInteger,
-  rejected_subfindings: nonNegativeInteger,
-  needs_verification_subfindings: nonNegativeInteger,
-  non_gating_subfindings: nonNegativeInteger,
-  incomplete_lenses: nonNegativeInteger,
-  result_delivery: resultDeliverySchema,
-  artifact: artifactReferenceSchema,
-  lens_summaries: z.array(z.record(z.string(), z.unknown())).max(8),
-  exclusions: z.array(boundedId).max(8),
-  warnings: z.array(boundedId).max(8),
-  deficit_samples: z.array(boundedId).max(8),
-  omitted_lens_summaries_count: nonNegativeInteger.optional(),
-  omitted_exclusions_count: nonNegativeInteger.optional(),
-  omitted_warnings_count: nonNegativeInteger.optional(),
-  omitted_deficit_samples_count: nonNegativeInteger.optional(),
-  lens_summaries_digest: digestSchema.optional(),
-  exclusions_digest: digestSchema.optional(),
-  warnings_digest: digestSchema.optional(),
-  deficit_samples_digest: digestSchema.optional(),
+const v6LensSummarySchema = z.strictObject({
+  lens_id: boundedId,
+  outcome: z.enum([
+    "passed",
+    "findings",
+    "incomplete",
+    "not_applicable",
+    "not_evaluated",
+  ]),
+  message: utf8String(128).optional(),
 });
+const v6RunCompletedDataSchema = z
+  .strictObject({
+    run_outcome: v9RunOutcomeSchema,
+    gate_outcome: v9GateOutcomeSchema,
+    coverage_outcome: v9CoverageOutcomeSchema,
+    exit_code: z.number().int().min(0).max(4),
+    raw_source_findings: nonNegativeInteger,
+    atomic_subfindings: nonNegativeInteger,
+    canonical_roots: nonNegativeInteger,
+    gate_eligible_subfindings: nonNegativeInteger,
+    advisory_subfindings: nonNegativeInteger,
+    rejected_subfindings: nonNegativeInteger,
+    needs_verification_subfindings: nonNegativeInteger,
+    out_of_scope_subfindings: nonNegativeInteger.optional(),
+    policy_non_gating_subfindings: nonNegativeInteger.optional(),
+    non_gating_subfindings: nonNegativeInteger,
+    incomplete_lenses: nonNegativeInteger,
+    result_delivery: resultDeliverySchema,
+    artifact: artifactReferenceSchema,
+    lens_summaries: z.array(v6LensSummarySchema).max(8),
+    exclusions: z.array(boundedId).max(8),
+    warnings: z.array(boundedId).max(8),
+    deficit_samples: z.array(boundedId).max(8),
+    omitted_lens_summaries_count: nonNegativeInteger.optional(),
+    omitted_exclusions_count: nonNegativeInteger.optional(),
+    omitted_warnings_count: nonNegativeInteger.optional(),
+    omitted_deficit_samples_count: nonNegativeInteger.optional(),
+    lens_summaries_digest: digestSchema.optional(),
+    exclusions_digest: digestSchema.optional(),
+    warnings_digest: digestSchema.optional(),
+    deficit_samples_digest: digestSchema.optional(),
+  })
+  .superRefine((value, ctx) => {
+    const expectedRunOutcome =
+      value.run_outcome === "cancelled"
+        ? "cancelled"
+        : value.coverage_outcome === "partial"
+          ? "inconclusive"
+          : value.gate_outcome === "gate_findings"
+            ? "gate_findings"
+            : "clear";
+    if (value.run_outcome !== expectedRunOutcome)
+      ctx.addIssue({
+        code: "custom",
+        message: `run_outcome must be ${expectedRunOutcome}`,
+      });
+    const expectedExitCode =
+      value.run_outcome === "cancelled"
+        ? 4
+        : value.coverage_outcome === "partial"
+          ? 3
+          : value.gate_outcome === "gate_findings"
+            ? 1
+            : 0;
+    if (value.exit_code !== expectedExitCode)
+      ctx.addIssue({
+        code: "custom",
+        message: `exit_code must be ${expectedExitCode}`,
+      });
+    const expectedNonGating =
+      value.atomic_subfindings - value.gate_eligible_subfindings;
+    if (value.non_gating_subfindings !== expectedNonGating)
+      ctx.addIssue({
+        code: "custom",
+        message:
+          "non_gating_subfindings must equal atomic minus gate-eligible subfindings",
+      });
+    if (
+      value.raw_source_findings < value.atomic_subfindings ||
+      value.gate_eligible_subfindings > value.atomic_subfindings ||
+      value.non_gating_subfindings > value.atomic_subfindings
+    )
+      ctx.addIssue({
+        code: "custom",
+        message: "derived finding counts cannot exceed atomic_subfindings",
+      });
+    if (
+      (value.gate_outcome === "gate_findings") !==
+      value.gate_eligible_subfindings > 0
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message: "gate_outcome must match gate_eligible_subfindings",
+      });
+    }
+    if (
+      value.result_delivery.completed_results !==
+      value.artifact.completed_results
+    )
+      ctx.addIssue({
+        code: "custom",
+        message: "artifact completed_results must match result delivery",
+      });
+  });
 const v6EventEnvelope = {
   schema_version: z.literal("6"),
   run_id: nonEmpty(128),
@@ -587,7 +685,7 @@ const v6GenericEventDataSchema = z.strictObject({
   detail_ref: boundedId.optional(),
   message: nonEmpty(1_000).optional(),
 });
-export const publicEventV6Schema = z.discriminatedUnion("event", [
+const publicEventV6BaseSchema = z.discriminatedUnion("event", [
   z.strictObject({
     ...v6EventEnvelope,
     event: z.literal("run.completed"),
@@ -673,6 +771,19 @@ export const publicEventV6Schema = z.discriminatedUnion("event", [
     data: v6GenericEventDataSchema,
   }),
 ]);
+export const publicEventV6Schema = publicEventV6BaseSchema.superRefine(
+  (value, ctx) => {
+    if (
+      value.event === "run.completed" &&
+      Buffer.byteLength(JSON.stringify(value), "utf8") >= 16 * 1_024
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message: "run.completed must remain below 16 KiB",
+      });
+    }
+  },
+);
 
 export type ReviewRequestV3 = z.infer<typeof reviewRequestV3Schema>;
 export type PullRequestV3 = z.infer<typeof pullRequestV3Schema>;
@@ -693,3 +804,13 @@ export type V9RunOutcome = z.infer<typeof v9RunOutcomeSchema>;
 export type V9GateOutcome = z.infer<typeof v9GateOutcomeSchema>;
 export type V9CoverageOutcome = z.infer<typeof v9CoverageOutcomeSchema>;
 export type V9IncompleteReason = z.infer<typeof v9IncompleteReasonSchema>;
+export type V9FindingSeverity = z.infer<typeof v9FindingSeveritySchema>;
+export type V9FindingConfidence = z.infer<typeof v9FindingConfidenceSchema>;
+export type V9FindingClassification = z.infer<
+  typeof v9FindingClassificationSchema
+>;
+export type V9FindingCategory = z.infer<typeof v9FindingCategorySchema>;
+export type V9CoverageProofKind = z.infer<typeof v9CoverageProofKindSchema>;
+export type V9CoverageStatus = z.infer<typeof v9CoverageStatusSchema>;
+export type ResultKind = z.infer<typeof resultKindSchema>;
+export type ResultPageKind = z.infer<typeof resultPageKindSchema>;

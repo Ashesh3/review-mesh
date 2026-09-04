@@ -367,6 +367,88 @@ describe("reviewer result page collector", () => {
     expect(() => collector.assemble()).toThrow(ResultPageError);
   });
 
+  it("rejects a findings transition before all declared narrative fragments without advancing", () => {
+    const collector = createResultPageCollector({
+      resultId: "partial-narrative",
+      resultKind: "reviewer",
+    });
+    const pages = reviewerPages("partial-narrative");
+    collector.addPage(pages[0]!);
+    collector.addPage(pages[1]!);
+    const findingPage = JSON.parse(pages[3]!) as any;
+    findingPage.page_index = 2;
+    findingPage.previous_page_digest = digest(pages[1]!);
+    expect(() => collector.addPage(rawPage(findingPage))).toThrow(
+      ResultPageError,
+    );
+    expect(collector.nextRequest().pageIndex).toBe(2);
+    collector.addPage(pages[2]!);
+    expect(collector.nextRequest().pageIndex).toBe(3);
+  });
+
+  it("rejects a narrative transition before all declared coverage entries without advancing", () => {
+    const entries = [
+      { path: "a.ts", method: "diff" },
+      { path: "b.ts", method: "diff" },
+    ];
+    const header = rawPage({
+      schema_version: "1",
+      kind: "review-mesh.result-page",
+      result_id: "partial-coverage",
+      result_kind: "reviewer",
+      result_schema_version: "4",
+      page_index: 0,
+      page_count: 4,
+      page_kind: "header",
+      previous_page_digest: null,
+      payload: {
+        verdict: "pass",
+        summary: "No findings.",
+        informational_notes: [],
+        narrative_byte_count: 1,
+        narrative_fragment_count: 1,
+        actionable_finding_count: 0,
+        coverage_attestation: {
+          scope_digest: "a".repeat(64),
+          entry_count: 2,
+          entries_digest: digest(JSON.stringify(entries)),
+        },
+      },
+    });
+    const coverage = rawPage({
+      schema_version: "1",
+      kind: "review-mesh.result-page",
+      result_id: "partial-coverage",
+      result_kind: "reviewer",
+      result_schema_version: "4",
+      page_index: 1,
+      page_count: 4,
+      page_kind: "coverage",
+      previous_page_digest: digest(header),
+      payload: { entries: [entries[0]] },
+    });
+    const narrative = rawPage({
+      schema_version: "1",
+      kind: "review-mesh.result-page",
+      result_id: "partial-coverage",
+      result_kind: "reviewer",
+      result_schema_version: "4",
+      page_index: 2,
+      page_count: 4,
+      page_kind: "narrative",
+      previous_page_digest: digest(coverage),
+      payload: { text_fragment: "x" },
+    });
+    const collector = createResultPageCollector({
+      resultId: "partial-coverage",
+      resultKind: "reviewer",
+    });
+    collector.addPage(header);
+    collector.addPage(coverage);
+    expect(() => collector.addPage(narrative)).toThrow(ResultPageError);
+    expect(collector.nextRequest().pageIndex).toBe(2);
+  });
+
   it("rejects a false or non-canonical coverage attestation", () => {
     const entries = [
       { path: "z.ts", method: "diff" },
