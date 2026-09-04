@@ -235,6 +235,7 @@ export function roundInput(
       heartbeat_interval_ms: 100,
       shutdown_grace_period_ms: 50,
       distribute_primaries: false,
+      allow_provider_concentration: false,
       default_provider_concurrency: 2,
       provider_limits: {},
       circuit_breaker_threshold: 2,

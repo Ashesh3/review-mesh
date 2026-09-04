@@ -84,6 +84,108 @@ function v5(projectName: string): TrustedConfigV5 {
 }
 
 describe("global configuration", () => {
+  it("defaults a five-model v6 lens to a resilient three-by-three quorum", () => {
+    const config = {
+      schema_version: "6",
+      execution: {
+        max_concurrency: 2,
+        heartbeat_interval_ms: 1_000,
+        shutdown_grace_period_ms: 1_000,
+      },
+      diagnostics: { persist_runs: false, max_runs: 10 },
+      adapters: {
+        gateway: {
+          type: "openai_compatible",
+          base_url_env: "BASE_URL",
+          api_key_env: "API_KEY",
+        },
+      },
+      agents: {
+        resilience: {
+          adapter: "gateway",
+          model_runs: ["one", "two", "three", "four", "five"].map((id) => ({
+            id,
+            model: id,
+            provider_group: id,
+          })),
+          purpose: "Resilient review",
+          instructions: "Review.",
+          isolation: "prefer_enforced",
+          timeout_ms: 60_000,
+          applicability: { mode: "always" },
+          required_context: [],
+        },
+      },
+      defaults: { agents: ["resilience"] },
+      projects: {},
+    };
+
+    const resolved = resolveConfig({ trusted: config as never });
+    expect(resolved.reviewers[0]?.policy).toMatchObject({
+      applicability: { mode: "always" },
+      requiredCallerContext: [],
+      passQuorum: 3,
+      minimumProviderGroups: 3,
+      allowZeroOutageTolerance: false,
+    });
+  });
+
+  it("distributes v6 primaries and defaults new streaming while legacy remains disabled", () => {
+    const current = {
+      ...v5("demo"),
+      schema_version: "6",
+      agents: {
+        first: {
+          adapter: "gateway",
+          model_runs: [
+            { id: "one", model: "one", provider_group: "one" },
+            { id: "two", model: "two", provider_group: "two" },
+          ],
+          purpose: "First",
+          instructions: "Review.",
+          isolation: "prefer_enforced",
+          timeout_ms: 60_000,
+          applicability: { mode: "always" },
+          required_context: [],
+          allow_zero_outage_tolerance: true,
+        },
+        second: {
+          adapter: "gateway",
+          model_runs: [
+            { id: "one", model: "one", provider_group: "one" },
+            { id: "two", model: "two", provider_group: "two" },
+          ],
+          purpose: "Second",
+          instructions: "Review.",
+          isolation: "prefer_enforced",
+          timeout_ms: 60_000,
+          applicability: { mode: "always" },
+          required_context: [],
+          allow_zero_outage_tolerance: true,
+        },
+      },
+      defaults: { agents: ["first", "second"] },
+      projects: {},
+    };
+    const resolvedCurrent = resolveConfig({ trusted: current as never });
+    expect(resolvedCurrent.reviewers.map(({ id }) => id)).toEqual([
+      "first::one",
+      "first::two",
+      "second::two",
+      "second::one",
+    ]);
+    expect(resolvedCurrent.reviewers[0]?.adapter).toMatchObject({
+      type: "openai_compatible",
+      streaming: "auto",
+    });
+
+    const resolvedLegacy = resolveConfig({ trusted: v5("demo") });
+    expect(resolvedLegacy.reviewers[0]?.adapter).toMatchObject({
+      type: "openai_compatible",
+      streaming: "disabled",
+    });
+  });
+
   it("keeps v1 trusted configs as global defaults", () => {
     expect(resolveConfig({ trusted: trustedConfig() }).reviewers[0]?.id).toBe(
       "baseline",
@@ -650,7 +752,7 @@ instructions_file = "project.md"
         configFile: join(configDirectory, "config.toml"),
         workspace,
       });
-      expect(loaded.trusted.schema_version).toBe("5");
+      expect(loaded.trusted.schema_version).toBe("6");
       const resolved = resolveConfig(loaded);
       expect(resolved.reviewers[0]?.instruction_layers).toEqual([
         { source: "trusted", content: "Agent instructions." },

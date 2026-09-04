@@ -13,6 +13,170 @@ import {
 
 describe("v6 review feedback semantics", () => {
   afterEach(() => vi.useRealTimers());
+  it("skips an unmatched deployment lens before probing or running providers", async () => {
+    const deployment = fakeAdapterReturning(passResult());
+    const completion = await runReviewRound(
+      roundInput({
+        adapters: { deployment },
+        context: resolvedContext({
+          git: {
+            is_repository: true,
+            root: "F:\\Projects\\demo",
+            branch: "feature",
+            head: "abc",
+            merge_base: "def",
+            status_entries: [],
+            changed_files: ["src/service.ts"],
+            diff_stat: "1 file changed",
+            diff: "diff",
+            truncated: {
+              status_entries: false,
+              changed_files: false,
+              diff_stat: false,
+              diff: false,
+            },
+          },
+        }),
+        config: {
+          reviewers: [
+            {
+              agentId: "deployment",
+              policy: {
+                applicability: {
+                  mode: "changed_paths",
+                  anyChangedPaths: ["deploy/**"],
+                },
+                requiredCallerContext: [],
+                passQuorum: 1,
+                minimumProviderGroups: 1,
+                allowZeroOutageTolerance: false,
+                adjudication: "off",
+                gateMinimumSeverity: "medium",
+                gateMinimumConfidence: "medium",
+              },
+            },
+          ],
+        },
+      }),
+    );
+
+    expect(deployment.probeCalls).toHaveLength(0);
+    expect(deployment.runCalls).toBe(0);
+    expect(completion.reviewers[0]).toMatchObject({
+      status: "skipped",
+      reason: "not_applicable",
+    });
+  });
+
+  it("reports missing pull-request context before any provider call", async () => {
+    const readiness = fakeAdapterReturning(passResult());
+    const events: PublicEvent[] = [];
+    const completion = await runReviewRound(
+      roundInput({
+        adapters: { readiness },
+        onEvent: (event) => events.push(event),
+        context: resolvedContext({ caller_context: {} }),
+        config: {
+          reviewers: [
+            {
+              agentId: "change-readiness",
+              policy: {
+                applicability: { mode: "always" },
+                requiredCallerContext: ["/pull_request/number"],
+                passQuorum: 1,
+                minimumProviderGroups: 1,
+                allowZeroOutageTolerance: false,
+                adjudication: "off",
+                gateMinimumSeverity: "medium",
+                gateMinimumConfidence: "medium",
+              },
+            },
+          ],
+        },
+      }),
+    );
+
+    expect(readiness.probeCalls).toHaveLength(0);
+    expect(readiness.runCalls).toBe(0);
+    expect(completion.reviewers[0]).toMatchObject({
+      status: "skipped",
+      reason: "not_evaluated_missing_input",
+      missing_inputs: ["/pull_request/number"],
+    });
+    expect(
+      events.find(
+        (event) =>
+          event.event === "reviewer.skipped" &&
+          event.reviewer_id === "readiness",
+      ),
+    ).toMatchObject({
+      data: { missing_inputs: ["/pull_request/number"] },
+    });
+  });
+
+  it("passes a distributed five-model lens after two provider outages and three clean groups", async () => {
+    const outages = ["first", "second"].map(
+      () =>
+        new FakeAdapter({
+          onRun: (queue) => {
+            queue.push({
+              type: "failure",
+              failure: adapterFailure.unavailable("provider outage", false),
+              isolation: "runtime_read_only",
+            });
+          },
+        }),
+    );
+    const clean = ["third", "fourth", "fifth"].map((id) =>
+      fakeAdapterReturning(passResult(`${id} clean.`)),
+    );
+    const first = outages[0]!;
+    const second = outages[1]!;
+    const third = clean[0]!;
+    const fourth = clean[1]!;
+    const fifth = clean[2]!;
+    const completion = await runReviewRound(
+      roundInput({
+        adapters: { first, second, third, fourth, fifth },
+        config: {
+          reviewers: ["first", "second", "third", "fourth", "fifth"].map(
+            (id, index) => ({
+              id: `resilience::${id}`,
+              agentId: "resilience",
+              modelIndex: index,
+              modelCount: 5,
+              providerGroup: `provider-${id}`,
+              ...(index === 0
+                ? {}
+                : {
+                    previousReviewerId: `resilience::${["first", "second", "third", "fourth", "fifth"][index - 1]}`,
+                  }),
+              policy: {
+                applicability: { mode: "always" },
+                requiredCallerContext: [],
+                passQuorum: 3,
+                minimumProviderGroups: 3,
+                allowZeroOutageTolerance: false,
+                adjudication: "off",
+                gateMinimumSeverity: "medium",
+                gateMinimumConfidence: "medium",
+              },
+            }),
+          ),
+        },
+      }),
+    );
+
+    expect(
+      [first, second, third, fourth, fifth].map((item) => item.runCalls),
+    ).toEqual([1, 1, 1, 1, 1]);
+    expect(completion).toMatchObject({
+      status: "passed",
+      coverageOutcome: "complete",
+      exitCode: 0,
+    });
+  });
+
   it("fails over after an operational protocol failure and recovers lens coverage", async () => {
     const first = new FakeAdapter({
       onRun: (queue) => {
@@ -458,7 +622,10 @@ describe("v6 review feedback semantics", () => {
             {
               agentId: "deployment",
               policy: {
-                applicability: { anyChangedPaths: ["deploy/**"] },
+                applicability: {
+                  mode: "changed_paths",
+                  anyChangedPaths: ["deploy/**"],
+                },
                 passQuorum: 1,
                 minimumProviderGroups: 1,
                 adjudication: "required",
@@ -521,7 +688,10 @@ describe("v6 review feedback semantics", () => {
           reviewers: [
             {
               policy: {
-                applicability: { anyChangedPaths: ["deploy/**"] },
+                applicability: {
+                  mode: "changed_paths",
+                  anyChangedPaths: ["deploy/**"],
+                },
                 passQuorum: 1,
                 minimumProviderGroups: 1,
                 adjudication: "off",
@@ -703,8 +873,7 @@ describe("v6 review feedback semantics", () => {
     expect(
       records.find(
         (record) =>
-          record.record === "reviewer.result" &&
-          record.mode === "adjudication",
+          record.record === "reviewer.result" && record.mode === "adjudication",
       ),
     ).toMatchObject({
       adjudication_validation: {
@@ -712,7 +881,11 @@ describe("v6 review feedback semantics", () => {
         adjudication_digest: expect.stringMatching(/^[a-f0-9]{64}$/u),
         verification_digest: expect.stringMatching(/^[a-f0-9]{64}$/u),
         attestation_digest: expect.stringMatching(/^[a-f0-9]{64}$/u),
-        outcome: { decisions: [expect.objectContaining({ source_finding_id: "candidate" })] },
+        outcome: {
+          decisions: [
+            expect.objectContaining({ source_finding_id: "candidate" }),
+          ],
+        },
       },
     });
   });

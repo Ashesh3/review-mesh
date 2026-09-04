@@ -10,6 +10,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { describeEffectiveConfig } from "../../src/config/effective.js";
+import { describeTool } from "../../src/discovery/description.js";
+import { renderHelp } from "../../src/discovery/help.js";
+import { jsonSchema } from "../../src/discovery/schema.js";
 import {
   serializeManagedConfig,
   type ManagedConfig,
@@ -24,11 +27,12 @@ async function fixture() {
   await mkdir(workspace);
   const projectName = "project";
   const config: ManagedConfig = {
-    schema_version: "5",
+    schema_version: "6",
     execution: {
       max_concurrency: 2,
       heartbeat_interval_ms: 5000,
       shutdown_grace_period_ms: 1000,
+      allow_provider_concentration: false,
     },
     diagnostics: { persist_runs: true, max_runs: 20 },
     adapters: {
@@ -48,6 +52,8 @@ async function fixture() {
         runtime: { private_runtime: "SECRET RUNTIME" },
         isolation: "prefer_enforced",
         timeout_ms: 900000,
+        applicability: { mode: "always" },
+        required_context: [],
       },
     },
     defaults: { agents: ["reviewer"] },
@@ -95,6 +101,13 @@ describe("effective configuration description", () => {
           streaming: "required",
           model: "private-model",
           instruction_sources: ["trusted", "project"],
+          policy: {
+            applicability: { mode: "always" },
+            requiredCallerContext: [],
+            passQuorum: 1,
+            minimumProviderGroups: 1,
+            allowZeroOutageTolerance: false,
+          },
         },
       ],
       credential_environment: [
@@ -106,6 +119,45 @@ describe("effective configuration description", () => {
     expect(encoded).not.toContain("SECRET");
     expect(encoded).not.toContain("https://secret.example");
     expect(encoded).not.toContain("private_runtime");
+  });
+
+  it("surfaces topology, outage tolerance, applicability, and required context in effective and discovery output", async () => {
+    const { file, workspace } = await fixture();
+    const effective = await describeEffectiveConfig({
+      configFile: file,
+      workspace,
+      environment: {},
+    });
+    expect(effective).toMatchObject({
+      valid: true,
+      config_schema_version: "6",
+      execution: { allow_provider_concentration: false },
+      reviewers: [
+        {
+          provider_group: "gateway",
+          policy: {
+            applicability: { mode: "always" },
+            requiredCallerContext: [],
+            allowZeroOutageTolerance: false,
+          },
+        },
+      ],
+    });
+
+    const described = await describeTool({ configFile: file, workspace });
+    expect(described.configuration).toMatchObject(effective);
+    const configSchema = JSON.stringify(jsonSchema("config"));
+    expect(configSchema).toContain('"6"');
+    expect(configSchema).toContain("allow_provider_concentration");
+    expect(configSchema).toContain("allow_zero_outage_tolerance");
+    expect(configSchema).toContain("required_context");
+    expect(configSchema).toContain("changed_paths");
+    const help = `${renderHelp("config")}\n${renderHelp("schema")}\n${renderHelp("adapters")}`;
+    expect(help).toContain("schema-v6");
+    expect(help).toContain("allow_provider_concentration");
+    expect(help).toContain("allow_zero_outage_tolerance");
+    expect(help).toContain("applicability.mode");
+    expect(help).toContain("required_context");
   });
 
   it("describes each expanded model run with its fallback activation", async () => {

@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { CopilotAccountService } from "../../src/copilot/account.js";
 import {
   loadManagedConfig,
+  normalizeManagedConfig,
   serializeManagedConfig,
   type ManagedConfig,
 } from "../../src/config/manage.js";
@@ -101,6 +102,8 @@ describe("config menu", () => {
       adapter: "github",
       model: "gpt-test",
       effort: "high",
+      applicability: { mode: "always" },
+      required_context: [],
     });
   });
 
@@ -155,6 +158,7 @@ describe("config menu", () => {
       "Review architecture and trust boundaries.",
       "900000",
       "n",
+      "y",
       "q",
     ]);
 
@@ -182,6 +186,9 @@ describe("config menu", () => {
       instructions: "Review architecture and trust boundaries.",
       isolation: "prefer_enforced",
       timeout_ms: 900000,
+      applicability: { mode: "always" },
+      required_context: [],
+      allow_zero_outage_tolerance: true,
     });
   });
 
@@ -227,6 +234,10 @@ describe("config menu", () => {
     const saved = await loadManagedConfig(file);
     expect(saved.config.defaults?.agents).toEqual(["gemini"]);
     expect(saved.config.agents.gemini?.effort).toBe("high");
+    expect(saved.config.agents.gemini).toMatchObject({
+      applicability: { mode: "always" },
+      required_context: [],
+    });
     expect(saved.config.adapters.gateway).toMatchObject({
       type: "openai_compatible",
       streaming: "auto",
@@ -288,7 +299,10 @@ describe("config menu", () => {
         },
       },
     };
-    await writeFile(file, serializeManagedConfig(initial));
+    await writeFile(
+      file,
+      serializeManagedConfig(normalizeManagedConfig(initial)),
+    );
     const loaded = await loadManagedConfig(file);
     const output = new PassThrough();
     let transcript = "";
@@ -315,6 +329,7 @@ describe("config menu", () => {
       "200",
       "300",
       "n",
+      "y",
       "n",
       "7",
       "g",
@@ -353,6 +368,7 @@ describe("config menu", () => {
       heartbeat_interval_ms: 200,
       shutdown_grace_period_ms: 300,
       distribute_primaries: false,
+      allow_provider_concentration: true,
     });
     expect(saved.diagnostics).toEqual({ persist_runs: false, max_runs: 7 });
   });
@@ -362,7 +378,7 @@ describe("config menu", () => {
     roots.push(directory);
     const file = join(directory, "config.toml");
     const initial: ManagedConfig = {
-      schema_version: "5",
+      schema_version: "6",
       execution: {
         max_concurrency: 2,
         heartbeat_interval_ms: 100,
@@ -390,7 +406,10 @@ describe("config menu", () => {
       defaults: { agents: ["architecture"] },
       projects: {},
     };
-    await writeFile(file, serializeManagedConfig(initial));
+    await writeFile(
+      file,
+      serializeManagedConfig(normalizeManagedConfig(initial)),
+    );
     let loaded = await loadManagedConfig(file);
     await runConfigMenu({
       configFile: file,
@@ -495,7 +514,10 @@ describe("config menu", () => {
       defaults: { agents: ["architecture"] },
       projects: {},
     };
-    await writeFile(file, serializeManagedConfig(initial));
+    await writeFile(
+      file,
+      serializeManagedConfig(normalizeManagedConfig(initial)),
+    );
     const loaded = await loadManagedConfig(file);
     await runConfigMenu({
       configFile: file,
@@ -586,12 +608,13 @@ describe("config menu", () => {
       output,
     });
     expect(loaded.config).toEqual<ManagedConfig>({
-      schema_version: "5",
+      schema_version: "6",
       execution: {
         max_concurrency: 2,
         heartbeat_interval_ms: 15000,
         shutdown_grace_period_ms: 5000,
         distribute_primaries: true,
+        allow_provider_concentration: false,
         default_provider_concurrency: 2,
         provider_limits: {},
         circuit_breaker_threshold: 2,
@@ -671,7 +694,10 @@ describe("config menu", () => {
       defaults: { agents: ["one"] },
       projects: { [stored]: { agents: ["one"] } },
     };
-    await writeFile(file, serializeManagedConfig(initial));
+    await writeFile(
+      file,
+      serializeManagedConfig(normalizeManagedConfig(initial)),
+    );
     const loaded = await loadManagedConfig(file);
     await runConfigMenu({
       configFile: file,

@@ -57,6 +57,7 @@ import {
   DEFAULT_GATE_THRESHOLDS,
   evaluateLensPolicy,
   evaluatePassQuorum,
+  providerOutageTolerance,
   meetsGateThresholds,
   type LensPolicy,
 } from "./lens-policy.js";
@@ -346,12 +347,8 @@ function policyFor(
 ): LensPolicy {
   const policy = reviewer.policy;
   return {
-    ...(policy?.applicability === undefined
-      ? {}
-      : { applicability: policy.applicability }),
-    ...(policy?.requiredCallerContext === undefined
-      ? {}
-      : { requiredCallerContext: policy.requiredCallerContext }),
+    applicability: policy?.applicability ?? { mode: "always" },
+    requiredCallerContext: policy?.requiredCallerContext ?? [],
     pass: {
       passQuorum: policy?.passQuorum ?? _modelCount,
       minimumProviderGroups: policy?.minimumProviderGroups ?? 1,
@@ -707,10 +704,7 @@ export async function runReviewRound({
       await finalizeIncomplete(reviewer, failure, isolation);
       return { outcome: "incomplete", failure };
     }
-    if (
-      mode !== "adjudication" &&
-      parsed.data.schema_version !== "3"
-    ) {
+    if (mode !== "adjudication" && parsed.data.schema_version !== "3") {
       const failure = adapterFailure.invalidResult(
         "The adapter returned a legacy reviewer result for a v3 review request.",
         false,
@@ -777,9 +771,7 @@ export async function runReviewRound({
         ? undefined
         : state.reviewer(sourceReviewerId).result;
     const adjudicationResult =
-      mode === "adjudication" && "decisions" in accepted
-        ? accepted
-        : undefined;
+      mode === "adjudication" && "decisions" in accepted ? accepted : undefined;
     const evidenceVerification =
       adjudicationResult === undefined
         ? undefined
@@ -792,13 +784,12 @@ export async function runReviewRound({
         ? undefined
         : {
             reviewScope: context.review_scope.mode,
-            git:
-              context.git.is_repository
-                ? {
-                    changedFiles: context.git.changed_files,
-                    diff: context.git.diff,
-                  }
-                : { changedFiles: [], diff: "" },
+            git: context.git.is_repository
+              ? {
+                  changedFiles: context.git.changed_files,
+                  diff: context.git.diff,
+                }
+              : { changedFiles: [], diff: "" },
             evidenceVerification,
           };
     const adjudicationOutcome =
@@ -807,7 +798,11 @@ export async function runReviewRound({
       sourceResult !== undefined &&
       sourceResult.schema_version === "3" &&
       "actionable_findings" in sourceResult
-        ? validateAdjudication(sourceResult, adjudicationResult, validationContext)
+        ? validateAdjudication(
+            sourceResult,
+            adjudicationResult,
+            validationContext,
+          )
         : undefined;
     const adjudicationValidation =
       adjudicationOutcome === undefined ||
@@ -1371,6 +1366,8 @@ export async function runReviewRound({
           heartbeat_interval_ms: config.execution.heartbeat_interval_ms,
           shutdown_grace_period_ms: config.execution.shutdown_grace_period_ms,
           distribute_primaries: config.execution.distribute_primaries,
+          allow_provider_concentration:
+            config.execution.allow_provider_concentration,
           default_provider_concurrency:
             config.execution.default_provider_concurrency,
           provider_limits: { ...config.execution.provider_limits },
@@ -1402,12 +1399,38 @@ export async function runReviewRound({
             }),
         lenses: [...chains.entries()].map(([id, chain]) => {
           const policy = policyFor(chain[0]!.reviewer, chain.length);
+          const providerGroups = chain.map((job) =>
+            providerGroup(job.reviewer),
+          );
           return {
             id,
             purpose: chain[0]!.reviewer.purpose,
             model_runs: chain.length,
             pass_quorum: policy.pass.passQuorum,
             minimum_provider_groups: policy.pass.minimumProviderGroups,
+            provider_groups: providerGroups,
+            distinct_provider_groups: new Set(providerGroups).size,
+            provider_outage_tolerance: providerOutageTolerance(
+              policy.pass,
+              providerGroups,
+            ),
+            applicability:
+              policy.applicability.mode === "always"
+                ? { mode: "always" as const }
+                : {
+                    mode: "changed_paths" as const,
+                    any_changed_paths: [
+                      ...policy.applicability.anyChangedPaths,
+                    ],
+                    ...(policy.applicability.caseSensitive === undefined
+                      ? {}
+                      : {
+                          case_sensitive: policy.applicability.caseSensitive,
+                        }),
+                  },
+            required_context: [...policy.requiredCallerContext],
+            allow_zero_outage_tolerance:
+              chain[0]!.reviewer.policy?.allowZeroOutageTolerance ?? false,
             adjudication: chain[0]!.reviewer.policy?.adjudication ?? "off",
           };
         }),
@@ -1558,8 +1581,11 @@ export async function runReviewRound({
               ) {
                 reviewer.policy = {
                   ...(reviewer.policy ?? {
+                    applicability: { mode: "always" },
+                    requiredCallerContext: [],
                     passQuorum: policy.pass.passQuorum,
                     minimumProviderGroups: policy.pass.minimumProviderGroups,
+                    allowZeroOutageTolerance: false,
                     adjudication: "required",
                     gateMinimumSeverity: policy.gate.minimumSeverity,
                     gateMinimumConfidence: policy.gate.minimumConfidence,
@@ -1733,9 +1759,12 @@ export async function runReviewRound({
                     const sourceResult = state.reviewer(reviewer.id).result;
                     adjudicator.policy = {
                       ...(adjudicator.policy ?? {
+                        applicability: { mode: "always" },
+                        requiredCallerContext: [],
                         passQuorum: policy.pass.passQuorum,
                         minimumProviderGroups:
                           policy.pass.minimumProviderGroups,
+                        allowZeroOutageTolerance: false,
                         adjudication: "required",
                         gateMinimumSeverity: policy.gate.minimumSeverity,
                         gateMinimumConfidence: policy.gate.minimumConfidence,

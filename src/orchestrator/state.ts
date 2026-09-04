@@ -315,8 +315,11 @@ export function createSuiteState(
       state.mode = "adjudication";
       state.reviewer.policy = {
         ...(state.reviewer.policy ?? {
+          applicability: { mode: "always" },
+          requiredCallerContext: [],
           passQuorum: 1,
           minimumProviderGroups: 1,
+          allowZeroOutageTolerance: false,
           adjudication: "required",
           gateMinimumSeverity: "medium",
           gateMinimumConfidence: "medium",

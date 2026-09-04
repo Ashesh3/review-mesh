@@ -12,7 +12,12 @@ export type ReviewScopeMode = "changes" | "full";
 export type FindingSeverity = "critical" | "high" | "medium" | "low";
 export type FindingConfidence = "high" | "medium" | "low";
 
+export interface AlwaysApplicabilityPolicy {
+  mode: "always";
+}
+
 export interface ChangedPathApplicabilityPolicy {
+  mode: "changed_paths";
   /**
    * The lens applies when at least one changed workspace-relative path matches
    * at least one pattern. Full-scope reviews bypass this filter.
@@ -21,6 +26,9 @@ export interface ChangedPathApplicabilityPolicy {
   /** Git path matching is case-sensitive unless trusted policy opts out. */
   caseSensitive?: boolean;
 }
+
+export type LensApplicabilityPolicy =
+  AlwaysApplicabilityPolicy | ChangedPathApplicabilityPolicy;
 
 export interface PassQuorumPolicy {
   /** Number of independently completed clean model runs required for a pass. */
@@ -35,12 +43,12 @@ export interface GateThresholds {
 }
 
 export interface LensPolicy {
-  applicability?: ChangedPathApplicabilityPolicy;
+  applicability: LensApplicabilityPolicy;
   /**
    * Each entry is either a safe top-level caller-context key or an RFC 6901
    * JSON Pointer such as /pull_request/number.
    */
-  requiredCallerContext?: readonly string[];
+  requiredCallerContext: readonly string[];
   pass: PassQuorumPolicy;
   gate: GateThresholds;
 }
@@ -260,9 +268,8 @@ export function changedPathMatchesGlob(
   );
 }
 
-function validateApplicabilityPolicy(
-  policy: ChangedPathApplicabilityPolicy,
-): void {
+function validateApplicabilityPolicy(policy: LensApplicabilityPolicy): void {
+  if (policy.mode === "always") return;
   if (
     policy.anyChangedPaths.length === 0 ||
     policy.anyChangedPaths.length > MAX_GLOB_PATTERNS
@@ -423,6 +430,47 @@ export function validatePassQuorumFeasibility(
   }
 }
 
+/**
+ * Returns the number of arbitrary provider-group outages the roster can
+ * tolerate while still being capable of satisfying the configured quorum.
+ */
+export function providerOutageTolerance(
+  policy: PassQuorumPolicy,
+  eligibleProviderGroups: readonly string[],
+): number {
+  validatePassQuorumPolicy(policy);
+  for (const providerGroup of eligibleProviderGroups) {
+    validateProviderGroup(providerGroup);
+  }
+  if (
+    eligibleProviderGroups.length < policy.passQuorum ||
+    new Set(eligibleProviderGroups).size < policy.minimumProviderGroups
+  ) {
+    return 0;
+  }
+  const counts = new Map<string, number>();
+  for (const providerGroup of eligibleProviderGroups) {
+    counts.set(providerGroup, (counts.get(providerGroup) ?? 0) + 1);
+  }
+  const largestGroupsFirst = [...counts.values()].sort(
+    (left, right) => right - left,
+  );
+  let remainingRuns = eligibleProviderGroups.length;
+  let tolerance = 0;
+  for (const groupRunCount of largestGroupsFirst) {
+    const remainingGroups = counts.size - tolerance - 1;
+    if (
+      remainingRuns - groupRunCount < policy.passQuorum ||
+      remainingGroups < policy.minimumProviderGroups
+    ) {
+      break;
+    }
+    remainingRuns -= groupRunCount;
+    tolerance += 1;
+  }
+  return tolerance;
+}
+
 export function evaluatePassQuorum(
   policy: PassQuorumPolicy,
   cleanPasses: readonly CleanModelPass[],
@@ -512,9 +560,7 @@ export function meetsGateThresholds(
 }
 
 export function validateLensPolicy(policy: LensPolicy): void {
-  if (policy.applicability !== undefined) {
-    validateApplicabilityPolicy(policy.applicability);
-  }
+  validateApplicabilityPolicy(policy.applicability);
   validateRequiredCallerContext(policy.requiredCallerContext);
   validatePassQuorumPolicy(policy.pass);
   // Index access intentionally validates enum-like runtime input as well as
@@ -541,7 +587,7 @@ export function evaluateLensPolicy(
 
   if (
     input.reviewScopeMode === "changes" &&
-    policy.applicability !== undefined
+    policy.applicability.mode === "changed_paths"
   ) {
     const caseSensitive = policy.applicability.caseSensitive ?? true;
     const patterns = policy.applicability.anyChangedPaths.map((pattern) =>
@@ -570,7 +616,7 @@ export function evaluateLensPolicy(
     }
   }
 
-  const missing = (policy.requiredCallerContext ?? []).filter(
+  const missing = policy.requiredCallerContext.filter(
     (selector) => !hasRequiredCallerContext(input.callerContext, selector),
   );
   if (missing.length > 0) {

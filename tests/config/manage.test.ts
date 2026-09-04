@@ -30,11 +30,12 @@ async function root(): Promise<string> {
 
 function config(): ManagedConfig {
   return {
-    schema_version: "5",
+    schema_version: "6",
     execution: {
       max_concurrency: 2,
       heartbeat_interval_ms: 15_000,
       shutdown_grace_period_ms: 5_000,
+      allow_provider_concentration: false,
     },
     diagnostics: { persist_runs: true, max_runs: 50 },
     adapters: {
@@ -53,10 +54,47 @@ function config(): ManagedConfig {
         instructions: "Review carefully.",
         isolation: "prefer_enforced",
         timeout_ms: 900_000,
+        applicability: { mode: "always" },
+        required_context: [],
       },
     },
     defaults: { agents: ["gemini"] },
     projects: {},
+  };
+}
+
+function legacyConfig(version: "2" | "4" | "5"): Record<string, unknown> {
+  const current = config();
+  const agents = Object.fromEntries(
+    Object.entries(current.agents).map(([id, agent]) => {
+      const {
+        applicability: _applicability,
+        required_context: _requiredContext,
+        allow_zero_outage_tolerance: _allowZeroOutageTolerance,
+        ...legacy
+      } = agent;
+      return [id, legacy];
+    }),
+  );
+  const {
+    allow_provider_concentration: _allowProviderConcentration,
+    ...v5Execution
+  } = current.execution;
+  const {
+    distribute_primaries: _distributePrimaries,
+    default_provider_concurrency: _defaultProviderConcurrency,
+    provider_limits: _providerLimits,
+    circuit_breaker_threshold: _circuitBreakerThreshold,
+    circuit_breaker_cooldown_ms: _circuitBreakerCooldownMs,
+    retry_attempts: _retryAttempts,
+    retry_backoff_ms: _retryBackoffMs,
+    ...legacyExecution
+  } = v5Execution;
+  return {
+    ...current,
+    schema_version: version,
+    execution: version === "5" ? v5Execution : legacyExecution,
+    agents,
   };
 }
 
@@ -67,7 +105,81 @@ afterEach(async () => {
 });
 
 describe("managed configuration", () => {
-  it("round-trips a native v4 configuration", () => {
+  it("migrates v5 lenses to explicit v6 policy without inventing prerequisites", () => {
+    const legacy = legacyConfig("5") as {
+      agents: Record<string, Record<string, unknown>>;
+    };
+    legacy.agents.gemini!.applicability = {
+      any_changed_paths: ["deploy/**"],
+    };
+    const result = parseManagedConfig(`${stringify(legacy)}\n`);
+
+    expect(result.migrated).toBe(true);
+    expect(result.config.schema_version).toBe("6");
+    expect(result.config.agents.gemini).toMatchObject({
+      applicability: {
+        mode: "changed_paths",
+        any_changed_paths: ["deploy/**"],
+      },
+      required_context: [],
+    });
+    expect(result.config.adapters.gateway).toMatchObject({
+      type: "openai_compatible",
+      streaming: "disabled",
+    });
+  });
+
+  it("preserves an explicitly strict legacy quorum by acknowledging it", () => {
+    const legacy = legacyConfig("5") as {
+      agents: Record<string, Record<string, unknown>>;
+    };
+    legacy.agents.gemini = {
+      adapter: "gateway",
+      model_runs: [
+        { id: "one", model: "one", provider_group: "one" },
+        { id: "two", model: "two", provider_group: "two" },
+        { id: "three", model: "three", provider_group: "three" },
+        { id: "four", model: "four", provider_group: "four" },
+        { id: "five", model: "five", provider_group: "five" },
+      ],
+      purpose: "Strict legacy review",
+      instructions: "Review.",
+      isolation: "prefer_enforced",
+      timeout_ms: 60_000,
+      pass_quorum: 5,
+      minimum_provider_groups: 5,
+    };
+
+    const migrated = parseManagedConfig(`${stringify(legacy)}\n`).config;
+    expect(migrated.agents.gemini).toMatchObject({
+      pass_quorum: 5,
+      minimum_provider_groups: 5,
+      allow_zero_outage_tolerance: true,
+      applicability: { mode: "always" },
+      required_context: [],
+    });
+  });
+
+  it("normalizes managed saves to schema v6", () => {
+    const serialized = serializeManagedConfig(
+      legacyConfig("5") as unknown as ManagedConfig,
+    );
+    expect(parseManagedConfig(serialized)).toMatchObject({
+      migrated: false,
+      config: {
+        schema_version: "6",
+        execution: { allow_provider_concentration: false },
+        agents: {
+          gemini: {
+            applicability: { mode: "always" },
+            required_context: [],
+          },
+        },
+      },
+    });
+  });
+
+  it("round-trips a native v6 configuration", () => {
     const configured = config();
     configured.adapters.gateway = {
       type: "openai_compatible",
@@ -101,6 +213,9 @@ describe("managed configuration", () => {
       instructions: "Review architecture.",
       isolation: "prefer_enforced",
       timeout_ms: 900_000,
+      applicability: { mode: "always" },
+      required_context: [],
+      allow_zero_outage_tolerance: true,
     };
 
     const parsed = parseManagedConfig(serializeManagedConfig(multi));
@@ -116,6 +231,9 @@ describe("managed configuration", () => {
       instructions: "Review architecture.",
       isolation: "prefer_enforced",
       timeout_ms: 900_000,
+      applicability: { mode: "always" },
+      required_context: [],
+      allow_zero_outage_tolerance: true,
     };
     expect(() => serializeManagedConfig(invalidId)).toThrow(/model run id/i);
 
@@ -130,6 +248,8 @@ describe("managed configuration", () => {
       instructions: "Review architecture.",
       isolation: "prefer_enforced",
       timeout_ms: 900_000,
+      applicability: { mode: "always" },
+      required_context: [],
     };
     expect(() => serializeManagedConfig(duplicateRun)).toThrow(/unique/i);
 
@@ -154,6 +274,8 @@ describe("managed configuration", () => {
       instructions: "Review architecture.",
       isolation: "prefer_enforced",
       timeout_ms: 900_000,
+      applicability: { mode: "always" },
+      required_context: [],
     };
     collision.agents["architecture::opus"] = {
       adapter: "gateway",
@@ -162,6 +284,8 @@ describe("managed configuration", () => {
       instructions: "Review collisions.",
       isolation: "prefer_enforced",
       timeout_ms: 900_000,
+      applicability: { mode: "always" },
+      required_context: [],
     };
     expect(() => serializeManagedConfig(collision)).toThrow(
       /expanded reviewer id collision/i,
@@ -175,6 +299,8 @@ describe("managed configuration", () => {
       instructions: "Review architecture.",
       isolation: "prefer_enforced",
       timeout_ms: 900_000,
+      applicability: { mode: "always" },
+      required_context: [],
     };
     expect(() => serializeManagedConfig(singleRun)).toThrow(/at least two/i);
   });
@@ -214,13 +340,10 @@ append_instructions = "extra"
   });
 
   it("reads scalar v2 configuration and promotes it to managed v4", () => {
-    const legacyV2 = serializeManagedConfig(config()).replace(
-      'schema_version = "5"',
-      'schema_version = "2"',
-    );
+    const legacyV2 = `${stringify(legacyConfig("2"))}\n`;
     const result = parseManagedConfig(legacyV2);
     expect(result.migrated).toBe(true);
-    expect(result.config.schema_version).toBe("5");
+    expect(result.config.schema_version).toBe("6");
     expect(result.config.execution.distribute_primaries).toBe(false);
     expect(result.config.agents.gemini).toMatchObject({
       model: "gemini-flash",
@@ -228,18 +351,15 @@ append_instructions = "extra"
     });
   });
 
-  it("preserves configured primary order when promoting v4 to v5", () => {
-    const legacyV4 = serializeManagedConfig(config()).replace(
-      'schema_version = "5"',
-      'schema_version = "4"',
-    );
+  it("preserves configured primary order when promoting v4 to v6", () => {
+    const legacyV4 = `${stringify(legacyConfig("4"))}\n`;
     const result = parseManagedConfig(legacyV4);
     expect(result).toMatchObject({ migrated: true });
     expect(result.config.execution.distribute_primaries).toBe(false);
   });
 
   it("migrates path-keyed v3 projects to names and rejects collisions", () => {
-    const legacyV3 = config() as unknown as Record<string, unknown>;
+    const legacyV3 = legacyConfig("5");
     legacyV3.schema_version = "3";
     legacyV3.projects = {
       "C:/work/payments": { agents: ["gemini"] },
@@ -373,6 +493,8 @@ agents = ["gemini"]
         : { instructions: current.instructions }),
       isolation: current.isolation,
       timeout_ms: current.timeout_ms,
+      applicability: current.applicability ?? { mode: "always" },
+      required_context: current.required_context ?? [],
       ...(current.runtime === undefined ? {} : { runtime: current.runtime }),
     };
     expect(() => serializeManagedConfig(invalid)).toThrow(
@@ -398,6 +520,9 @@ agents = ["gemini"]
       instructions: "Review architecture.",
       isolation: "prefer_enforced",
       timeout_ms: 900_000,
+      applicability: { mode: "always" },
+      required_context: [],
+      allow_zero_outage_tolerance: true,
     };
 
     expect(() => serializeManagedConfig(invalid)).toThrow(

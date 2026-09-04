@@ -23,6 +23,8 @@ import {
 
 function policy(overrides: Partial<LensPolicy> = {}): LensPolicy {
   return {
+    applicability: { mode: "always" },
+    requiredCallerContext: [],
     pass: { ...DEFAULT_PASS_QUORUM_POLICY },
     gate: { ...DEFAULT_GATE_THRESHOLDS },
     ...overrides,
@@ -30,6 +32,20 @@ function policy(overrides: Partial<LensPolicy> = {}): LensPolicy {
 }
 
 describe("changed-path applicability", () => {
+  it("treats explicit always applicability as independent of changed paths", () => {
+    expect(
+      evaluateLensPolicy(
+        policy({
+          applicability: { mode: "always" } as LensPolicy["applicability"],
+        }),
+        {
+          reviewScopeMode: "changes",
+          changedPaths: ["src/index.ts"],
+        },
+      ),
+    ).toEqual({ status: "applicable" });
+  });
+
   it.each([
     ["deploy/**", "deploy/service.yaml"],
     ["deploy/**", "deploy/nested/service.yaml"],
@@ -89,7 +105,10 @@ describe("changed-path applicability", () => {
   it("marks an irrelevant lens not applicable before inspecting required inputs", () => {
     const result = evaluateLensPolicy(
       policy({
-        applicability: { anyChangedPaths: ["deploy/**", "**/Dockerfile"] },
+        applicability: {
+          mode: "changed_paths",
+          anyChangedPaths: ["deploy/**", "**/Dockerfile"],
+        },
         requiredCallerContext: ["/pull_request/number"],
       }),
       {
@@ -107,7 +126,10 @@ describe("changed-path applicability", () => {
   it("reports missing inputs only after the changed surface matches", () => {
     const result = evaluateLensPolicy(
       policy({
-        applicability: { anyChangedPaths: ["deploy/**"] },
+        applicability: {
+          mode: "changed_paths",
+          anyChangedPaths: ["deploy/**"],
+        },
         requiredCallerContext: ["/pull_request/number", "work_item"],
       }),
       {
@@ -130,7 +152,10 @@ describe("changed-path applicability", () => {
     expect(
       evaluateLensPolicy(
         policy({
-          applicability: { anyChangedPaths: ["deploy/**"] },
+          applicability: {
+            mode: "changed_paths",
+            anyChangedPaths: ["deploy/**"],
+          },
           requiredCallerContext: ["/pull_request/number"],
         }),
         {
@@ -147,6 +172,7 @@ describe("changed-path applicability", () => {
       evaluateLensPolicy(
         policy({
           applicability: {
+            mode: "changed_paths",
             anyChangedPaths: ["src/**", "src/exact.ts"],
           },
         }),
@@ -165,7 +191,12 @@ describe("changed-path applicability", () => {
   it("validates the complete changed-path list before accepting an early match", () => {
     expect(() =>
       evaluateLensPolicy(
-        policy({ applicability: { anyChangedPaths: ["src/**"] } }),
+        policy({
+          applicability: {
+            mode: "changed_paths",
+            anyChangedPaths: ["src/**"],
+          },
+        }),
         {
           reviewScopeMode: "changes",
           changedPaths: ["src/index.ts", "../outside.ts"],
@@ -176,11 +207,20 @@ describe("changed-path applicability", () => {
 
   it("rejects empty and duplicate applicability policies", () => {
     expect(() =>
-      validateLensPolicy(policy({ applicability: { anyChangedPaths: [] } })),
+      validateLensPolicy(
+        policy({
+          applicability: { mode: "changed_paths", anyChangedPaths: [] },
+        }),
+      ),
     ).toThrow(/requires/i);
     expect(() =>
       validateLensPolicy(
-        policy({ applicability: { anyChangedPaths: ["src/**", "src/**"] } }),
+        policy({
+          applicability: {
+            mode: "changed_paths",
+            anyChangedPaths: ["src/**", "src/**"],
+          },
+        }),
       ),
     ).toThrow(/duplicate/i);
   });

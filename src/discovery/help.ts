@@ -218,7 +218,7 @@ USAGE
   review-mesh config effective [WORKSPACE] --json
                                       Resolve the safe effective agent roster
   review-mesh config export --json   Export full config plus revision
-  review-mesh config apply --json    Atomically apply a full v5 config with CAS
+  review-mesh config apply --json    Atomically apply a full schema-v6 config with CAS
   review-mesh config copilot login [--device-code|--web-flow] [--host URL]
   review-mesh config copilot status [--json]
   review-mesh config copilot models [--json]
@@ -250,6 +250,13 @@ config_conflict and must export again. This serialization covers Review Mesh
 writers; do not run an external editor concurrently with config apply. Export
 includes trusted instruction and runtime fields, so treat it as sensitive;
 effective/describe redact them.
+
+Schema-v6 saves require every lens to declare applicability.mode as always or
+changed_paths and to include required_context, even when it is empty. New
+OpenAI-compatible adapters default streaming to auto. Multi-lens suites that
+concentrate every primary on one provider require
+execution.allow_provider_concentration=true. Multi-provider lenses with zero
+provider-outage tolerance require allow_zero_outage_tolerance=true on the lens.
 
 For the complete supported TOML shape, use:
   review-mesh schema config --json
@@ -286,7 +293,7 @@ Prints JSON Schema generated from the runtime Zod schemas:
   events   JSONL event object emitted by a valid review run
   run-status  Compact active or completed run/reviewer status snapshot
   result   Terminal result required from each reviewer
-  config   Trusted global configuration (v1-v4 legacy or v5 current)
+  config   Trusted global configuration (v1-v5 legacy or schema-v6 current)
   config-apply  Revision-guarded full-config update request
   diagnostic    Stable public diagnostic fields
   command-adapter-event  External reviewer JSONL event union
@@ -347,11 +354,15 @@ Every agent chooses a required default adapter plus either one exact model and
 optional effort, or ordered model_runs with explicit run ids, exact models,
 optional effort, and optional per-run adapter overrides. Multi-model agents
 expand to concrete reviewer ids such as architecture::opus and
-architecture::grok. Current v5 configuration distributes primaries by default:
+architecture::grok. Current schema-v6 configuration distributes primaries by default:
 successive multi-model logical lenses rotate their configured model runs
 cyclically, while scalar lenses do not consume a rotation slot. Set
 execution.distribute_primaries=false to preserve declaration order for every
-lens; migrated v1-v4 configurations use false for compatibility. Existing
+lens; migrated v1-v5 configurations preserve their prior order for compatibility.
+Every lens explicitly declares applicability.mode and required_context. Strict
+provider concentration and zero-outage quorum require the explicit
+allow_provider_concentration and allow_zero_outage_tolerance acknowledgements.
+Existing
 scalar agents retain their original ids. Global max_concurrency applies across
 logical agents. Each agent starts its effective primary model and advances
 through its cyclic order after a clean pass or operational failure until quorum,

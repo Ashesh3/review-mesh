@@ -441,9 +441,7 @@ export const adapterFailureDiagnosticsSchema = z.strictObject({
   repair_attempted: z.boolean().optional(),
   repair_outcome: z.enum(["not_attempted", "succeeded", "failed"]).optional(),
   attempt_count: positiveInteger.optional(),
-  retry_outcome: z
-    .enum(["not_attempted", "succeeded", "exhausted"])
-    .optional(),
+  retry_outcome: z.enum(["not_attempted", "succeeded", "exhausted"]).optional(),
 });
 export const reviewerTerminalRecordSchema = z.discriminatedUnion("status", [
   z.strictObject({
@@ -536,6 +534,7 @@ const executionSchema = z.strictObject({
   heartbeat_interval_ms: positiveInteger,
   shutdown_grace_period_ms: positiveInteger,
   distribute_primaries: z.boolean().optional(),
+  allow_provider_concentration: z.boolean().optional(),
   default_provider_concurrency: positiveInteger.optional(),
   provider_limits: z.record(nonEmptyString, positiveInteger).optional(),
   circuit_breaker_threshold: positiveInteger.optional(),
@@ -592,6 +591,21 @@ const publicEventSchemas = [
             model_runs: positiveInteger,
             pass_quorum: positiveInteger,
             minimum_provider_groups: positiveInteger,
+            provider_groups: z.array(nonEmptyString).min(1).optional(),
+            distinct_provider_groups: positiveInteger.optional(),
+            provider_outage_tolerance: nonNegativeInteger.optional(),
+            applicability: z
+              .discriminatedUnion("mode", [
+                z.strictObject({ mode: z.literal("always") }),
+                z.strictObject({
+                  mode: z.literal("changed_paths"),
+                  any_changed_paths: z.array(nonEmptyString).min(1).max(256),
+                  case_sensitive: z.boolean().optional(),
+                }),
+              ])
+              .optional(),
+            required_context: z.array(nonEmptyString).max(256).optional(),
+            allow_zero_outage_tolerance: z.boolean().optional(),
             adjudication: z.enum(["off", "required"]),
           }),
         )

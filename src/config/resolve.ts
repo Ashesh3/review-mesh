@@ -12,6 +12,7 @@ import {
   type TrustedConfigV3,
   type TrustedConfigV4,
   type TrustedConfigV5,
+  type TrustedConfigV6,
 } from "./schemas.js";
 import {
   DEFAULT_GATE_THRESHOLDS,
@@ -55,6 +56,27 @@ function configuredAdapter(
     throw new Error(`${label} references unknown adapter ${adapterId}`);
   }
   return adapter;
+}
+
+function adaptersForResolution(
+  config:
+    | TrustedConfigV2
+    | TrustedConfigV3
+    | TrustedConfigV4
+    | TrustedConfigV5
+    | TrustedConfigV6,
+): TrustedConfigV2["adapters"] {
+  return Object.fromEntries(
+    Object.entries(config.adapters).map(([id, adapter]) => [
+      id,
+      adapter.type === "openai_compatible" && adapter.streaming === undefined
+        ? {
+            ...adapter,
+            streaming: config.schema_version === "6" ? "auto" : "disabled",
+          }
+        : adapter,
+    ]),
+  );
 }
 
 function resolveReviewer(
@@ -114,17 +136,27 @@ function resolveReviewer(
 
 function resolvedPolicy(profile: AgentProfile): ResolvedReviewer["policy"] {
   const candidate = profile as AgentProfile & {
-    applicability?: {
-      any_changed_paths: string[];
-      case_sensitive?: boolean;
-    };
+    applicability?:
+      | {
+          any_changed_paths: string[];
+          case_sensitive?: boolean;
+        }
+      | { mode: "always" }
+      | {
+          mode: "changed_paths";
+          any_changed_paths: string[];
+          case_sensitive?: boolean;
+        };
     required_context?: string[];
     pass_quorum?: number;
     minimum_provider_groups?: number;
     adjudication?: "off" | "required";
     gate_minimum_severity?: "critical" | "high" | "medium" | "low";
     gate_minimum_confidence?: "high" | "medium" | "low";
+    allow_zero_outage_tolerance?: boolean;
   };
+  const isV6 =
+    candidate.applicability !== undefined && "mode" in candidate.applicability;
   if (
     !("model_runs" in profile) &&
     !("pass_quorum" in profile) &&
@@ -138,8 +170,12 @@ function resolvedPolicy(profile: AgentProfile): ResolvedReviewer["policy"] {
   const passQuorum =
     candidate.pass_quorum ??
     ("model_runs" in profile
-      ? Math.min(2, profile.model_runs.length)
-      : DEFAULT_PASS_QUORUM_POLICY.passQuorum);
+      ? isV6 && profile.model_runs.length === 5
+        ? 3
+        : Math.min(2, profile.model_runs.length)
+      : isV6
+        ? 1
+        : DEFAULT_PASS_QUORUM_POLICY.passQuorum);
   const distinctProviderGroups =
     "model_runs" in profile
       ? new Set(
@@ -149,23 +185,38 @@ function resolvedPolicy(profile: AgentProfile): ResolvedReviewer["policy"] {
         ).size
       : 1;
   const minimumProviderGroups =
-    candidate.minimum_provider_groups ?? Math.min(2, distinctProviderGroups);
-  const policy: NonNullable<ResolvedReviewer["policy"]> = {
-    ...(candidate.applicability === undefined
-      ? {}
-      : {
-          applicability: {
+    candidate.minimum_provider_groups ??
+    (isV6 && "model_runs" in profile && profile.model_runs.length === 5
+      ? 3
+      : Math.min(2, distinctProviderGroups));
+  const applicability =
+    candidate.applicability === undefined
+      ? { mode: "always" as const }
+      : "mode" in candidate.applicability
+        ? candidate.applicability.mode === "always"
+          ? { mode: "always" as const }
+          : {
+              mode: "changed_paths" as const,
+              anyChangedPaths: [...candidate.applicability.any_changed_paths],
+              ...(candidate.applicability.case_sensitive === undefined
+                ? {}
+                : {
+                    caseSensitive: candidate.applicability.case_sensitive,
+                  }),
+            }
+        : {
+            mode: "changed_paths" as const,
             anyChangedPaths: [...candidate.applicability.any_changed_paths],
             ...(candidate.applicability.case_sensitive === undefined
               ? {}
               : { caseSensitive: candidate.applicability.case_sensitive }),
-          },
-        }),
-    ...(candidate.required_context === undefined
-      ? {}
-      : { requiredCallerContext: [...candidate.required_context] }),
+          };
+  const policy: NonNullable<ResolvedReviewer["policy"]> = {
+    applicability,
+    requiredCallerContext: [...(candidate.required_context ?? [])],
     passQuorum,
     minimumProviderGroups,
+    allowZeroOutageTolerance: candidate.allow_zero_outage_tolerance ?? false,
     adjudication:
       candidate.adjudication ?? ("model_runs" in profile ? "required" : "off"),
     gateMinimumSeverity:
@@ -176,12 +227,8 @@ function resolvedPolicy(profile: AgentProfile): ResolvedReviewer["policy"] {
       DEFAULT_GATE_THRESHOLDS.minimumConfidence,
   };
   validateLensPolicy({
-    ...(policy.applicability === undefined
-      ? {}
-      : { applicability: policy.applicability }),
-    ...(policy.requiredCallerContext === undefined
-      ? {}
-      : { requiredCallerContext: policy.requiredCallerContext }),
+    applicability,
+    requiredCallerContext: [...(candidate.required_context ?? [])],
     pass: {
       passQuorum: policy.passQuorum,
       minimumProviderGroups: policy.minimumProviderGroups,
@@ -277,7 +324,7 @@ function requireUniqueResolvedIds(
 }
 
 function requireUniqueExpandedAgentIds(
-  config: TrustedConfigV3 | TrustedConfigV4 | TrustedConfigV5,
+  config: TrustedConfigV3 | TrustedConfigV4 | TrustedConfigV5 | TrustedConfigV6,
 ): void {
   const ids = new Set<string>();
   for (const [agentId, profile] of Object.entries(config.agents)) {
@@ -334,6 +381,7 @@ function resolveV1(
     execution: {
       ...config.execution,
       distribute_primaries: false,
+      allow_provider_concentration: false,
       default_provider_concurrency: 2,
       provider_limits: {},
       circuit_breaker_threshold: 2,
@@ -352,7 +400,12 @@ function resolveV1(
 }
 
 function resolveV2(
-  config: TrustedConfigV2 | TrustedConfigV3 | TrustedConfigV4 | TrustedConfigV5,
+  config:
+    | TrustedConfigV2
+    | TrustedConfigV3
+    | TrustedConfigV4
+    | TrustedConfigV5
+    | TrustedConfigV6,
   workspace: string | undefined,
   projectName: string | undefined,
   projectNameSource: ResolveConfigInput["projectNameSource"],
@@ -360,25 +413,31 @@ function resolveV2(
   if (
     config.schema_version === "3" ||
     config.schema_version === "4" ||
-    config.schema_version === "5"
+    config.schema_version === "5" ||
+    config.schema_version === "6"
   ) {
     requireUniqueExpandedAgentIds(config);
   }
   const selectedByName =
-    config.schema_version === "4" || config.schema_version === "5"
+    config.schema_version === "4" ||
+    config.schema_version === "5" ||
+    config.schema_version === "6"
       ? selectProjectByName(config.projects, projectName)
       : undefined;
   const selectedByPath =
-    config.schema_version === "4" || config.schema_version === "5"
+    config.schema_version === "4" ||
+    config.schema_version === "5" ||
+    config.schema_version === "6"
       ? undefined
       : selectProject(config.projects, workspace);
   const project = (selectedByName ?? selectedByPath)?.project;
+  const adapters = adaptersForResolution(config);
   const agentIds = project?.agents ?? config.defaults?.agents;
   if (agentIds === undefined || agentIds.length === 0) {
     throw new Error("no agents are configured for the requested project");
   }
   const distributePrimaries =
-    config.schema_version === "5"
+    config.schema_version === "5" || config.schema_version === "6"
       ? (config.execution.distribute_primaries ?? true)
       : false;
   let rotatableLensIndex = 0;
@@ -392,7 +451,7 @@ function resolveV2(
     return resolveAgent(
       id,
       agent,
-      config.adapters,
+      adapters,
       project?.instructions,
       primaryOffset,
     );
@@ -402,6 +461,10 @@ function resolveV2(
     execution: {
       ...config.execution,
       distribute_primaries: distributePrimaries,
+      allow_provider_concentration:
+        "allow_provider_concentration" in config.execution
+          ? (config.execution.allow_provider_concentration ?? false)
+          : false,
       default_provider_concurrency:
         "default_provider_concurrency" in config.execution
           ? (config.execution.default_provider_concurrency ?? 2)

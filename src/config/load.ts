@@ -9,6 +9,7 @@ import {
   trustedConfigV3Schema,
   trustedConfigV4Schema,
   trustedConfigV5Schema,
+  trustedConfigV6Schema,
   type AgentProfile,
   type ProjectConfig,
   type ReviewerProfile,
@@ -272,7 +273,10 @@ async function resolveInstructionFiles(
   }
   if (trusted.schema_version === "4")
     return trustedConfigV4Schema.parse(resolved);
-  return trustedConfigV5Schema.parse(resolved);
+  if (trusted.schema_version === "5") {
+    return trustedConfigV5Schema.parse(resolved);
+  }
+  return trustedConfigV6Schema.parse(resolved);
 }
 
 export async function loadConfigFiles(
@@ -302,8 +306,12 @@ export async function loadConfigFiles(
   );
   const resolvedTrusted =
     instructionsResolved.schema_version === "2" ||
-    instructionsResolved.schema_version === "3"
-      ? await migrateLegacyConfig(instructionsResolved)
+    instructionsResolved.schema_version === "3" ||
+    instructionsResolved.schema_version === "4" ||
+    instructionsResolved.schema_version === "5"
+      ? trustedConfigV6Schema.parse(
+          await migrateLegacyConfig(instructionsResolved),
+        )
       : instructionsResolved;
 
   const workspace = await realpath(input.workspace);

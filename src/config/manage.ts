@@ -19,12 +19,13 @@ import type {
   TrustedConfigV2,
   TrustedConfigV3,
   TrustedConfigV4,
+  TrustedConfigV5,
 } from "./schemas.js";
 import type { JsonValue } from "../protocol/schemas.js";
 import {
   trustedConfigSchema,
   trustedConfigV4Schema,
-  trustedConfigV5Schema,
+  trustedConfigV6Schema,
   validateAdapterEffort,
 } from "./schemas.js";
 import { validateProjectKeys } from "./project-paths.js";
@@ -50,7 +51,9 @@ interface ManagedAgentBase {
   timeout_ms: number;
   runtime?: Record<string, JsonValue> | undefined;
   applicability?:
+    | { mode: "always" }
     | {
+        mode: "changed_paths";
         any_changed_paths: string[];
         case_sensitive?: boolean | undefined;
       }
@@ -58,6 +61,7 @@ interface ManagedAgentBase {
   required_context?: string[] | undefined;
   pass_quorum?: number | undefined;
   minimum_provider_groups?: number | undefined;
+  allow_zero_outage_tolerance?: boolean | undefined;
   adjudication?: "off" | "required" | undefined;
   gate_minimum_severity?: "critical" | "high" | "medium" | "low" | undefined;
   gate_minimum_confidence?: "high" | "medium" | "low" | undefined;
@@ -95,12 +99,13 @@ export interface ManagedProject {
 }
 
 export interface ManagedConfig {
-  schema_version: "5";
+  schema_version: "5" | "6";
   execution: {
     max_concurrency: number;
     heartbeat_interval_ms: number;
     shutdown_grace_period_ms: number;
     distribute_primaries?: boolean | undefined;
+    allow_provider_concentration?: boolean | undefined;
     default_provider_concurrency?: number | undefined;
     provider_limits?: Record<string, number> | undefined;
     circuit_breaker_threshold?: number | undefined;
@@ -227,31 +232,20 @@ function preserveLegacyPrimaryOrder<T extends { execution: object }>(
 }
 
 function requireManagedConfig(value: unknown): ManagedConfig {
-  let record = asRecord(value);
-  if (record?.schema_version === "4") {
-    const legacy = trustedConfigV4Schema.parse(value);
-    record = {
-      ...(clone(legacy) as TrustedConfigV4),
-      schema_version: "5",
-      execution: {
-        ...legacy.execution,
-        distribute_primaries: false,
-      },
-    };
-    value = record;
-  }
+  const record = asRecord(value);
   if (
-    record?.schema_version !== "5" ||
+    record?.schema_version !== "6" ||
     asRecord(record.execution) === undefined ||
     asRecord(record.diagnostics) === undefined ||
     asRecord(record.adapters) === undefined ||
     asRecord(record.agents) === undefined
   ) {
-    throw new Error("configuration is not a Review Mesh v5 configuration");
+    throw new Error("configuration is not a Review Mesh v6 configuration");
   }
   const config = clone(
-    trustedConfigV5Schema.parse(value) as unknown as ManagedConfig,
+    trustedConfigV6Schema.parse(value) as unknown as ManagedConfig,
   );
+  config.execution.allow_provider_concentration ??= false;
   validateProjectNames(config.projects);
   requireAssignments(config);
   const expandedReviewerIds = new Set<string>();
@@ -309,6 +303,157 @@ function requireManagedConfig(value: unknown): ManagedConfig {
     }
   }
   return config;
+}
+
+type LegacyAgent = TrustedConfigV5["agents"][string];
+
+function legacyProviderGroups(agent: LegacyAgent): string[] {
+  if (!("model_runs" in agent)) {
+    return [agent.provider_group ?? agent.adapter];
+  }
+  return agent.model_runs.map(
+    (run) => run.provider_group ?? run.adapter ?? agent.adapter,
+  );
+}
+
+function toleratesOneProviderOutage(
+  providerGroups: readonly string[],
+  passQuorum: number,
+  minimumProviderGroups: number,
+): boolean {
+  if (new Set(providerGroups).size <= 1) return true;
+  for (const providerGroup of new Set(providerGroups)) {
+    const remaining = providerGroups.filter(
+      (candidate) => candidate !== providerGroup,
+    );
+    if (
+      remaining.length < passQuorum ||
+      new Set(remaining).size < minimumProviderGroups
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function migrateLegacyAgent(agent: LegacyAgent): ManagedAgent {
+  const legacyApplicability = agent.applicability;
+  const migrated = clone(agent) as unknown as ManagedAgent;
+  migrated.applicability =
+    legacyApplicability !== undefined
+      ? {
+          mode: "changed_paths",
+          any_changed_paths: [...legacyApplicability.any_changed_paths],
+          ...(legacyApplicability.case_sensitive === undefined
+            ? {}
+            : { case_sensitive: legacyApplicability.case_sensitive }),
+        }
+      : { mode: "always" };
+  migrated.required_context = [...(migrated.required_context ?? [])];
+  if ("model_runs" in migrated) {
+    const providerGroups = legacyProviderGroups(agent);
+    const passQuorum =
+      migrated.pass_quorum ?? Math.min(2, migrated.model_runs.length);
+    const minimumProviderGroups =
+      migrated.minimum_provider_groups ??
+      Math.min(2, new Set(providerGroups).size);
+    migrated.pass_quorum = passQuorum;
+    migrated.minimum_provider_groups = minimumProviderGroups;
+    if (
+      !toleratesOneProviderOutage(
+        providerGroups,
+        passQuorum,
+        minimumProviderGroups,
+      )
+    ) {
+      migrated.allow_zero_outage_tolerance = true;
+    }
+  }
+  return migrated;
+}
+
+function migrateLegacyAdapters(
+  adapters: TrustedConfigV5["adapters"],
+): ManagedConfig["adapters"] {
+  return Object.fromEntries(
+    Object.entries(adapters).map(([id, adapter]) => [
+      id,
+      adapter.type === "openai_compatible" && adapter.streaming === undefined
+        ? { ...clone(adapter), streaming: "disabled" as const }
+        : clone(adapter),
+    ]),
+  );
+}
+
+function primaryProviderGroups(
+  agents: ManagedConfig["agents"],
+  roster: readonly string[],
+  distributePrimaries: boolean,
+): { all: Set<string>; primary: Set<string> } | undefined {
+  const all = new Set<string>();
+  const primary = new Set<string>();
+  let rotatableLensIndex = 0;
+  for (const agentId of roster) {
+    const agent = agents[agentId];
+    if (agent === undefined) return undefined;
+    if ("model_runs" in agent) {
+      const groups = agent.model_runs.map(
+        (run) => run.provider_group ?? run.adapter ?? agent.adapter,
+      );
+      for (const group of groups) all.add(group);
+      primary.add(
+        groups[distributePrimaries ? rotatableLensIndex++ % groups.length : 0]!,
+      );
+    } else {
+      const group = agent.provider_group ?? agent.adapter;
+      all.add(group);
+      primary.add(group);
+    }
+  }
+  return { all, primary };
+}
+
+function legacyNeedsProviderConcentrationAcknowledgement(
+  config: Omit<ManagedConfig, "schema_version">,
+): boolean {
+  const rosters = [
+    ...(config.defaults === undefined ? [] : [config.defaults.agents]),
+    ...Object.values(config.projects ?? {}).flatMap((project) =>
+      project.agents === undefined ? [] : [project.agents],
+    ),
+  ];
+  const distributePrimaries = config.execution.distribute_primaries ?? true;
+  return rosters.some((roster) => {
+    if (roster.length < 2) return false;
+    const groups = primaryProviderGroups(
+      config.agents,
+      roster,
+      distributePrimaries,
+    );
+    return (
+      groups !== undefined && groups.all.size > 1 && groups.primary.size === 1
+    );
+  });
+}
+
+function migrateLegacyShape(
+  config: Omit<TrustedConfigV5, "schema_version">,
+): ManagedConfig {
+  const migrated: Omit<ManagedConfig, "schema_version"> = {
+    ...clone(config),
+    execution: { ...clone(config.execution) },
+    adapters: migrateLegacyAdapters(config.adapters),
+    agents: Object.fromEntries(
+      Object.entries(config.agents).map(([id, agent]) => [
+        id,
+        migrateLegacyAgent(agent),
+      ]),
+    ),
+  };
+  if (legacyNeedsProviderConcentrationAcknowledgement(migrated)) {
+    migrated.execution.allow_provider_concentration = true;
+  }
+  return requireManagedConfig({ ...migrated, schema_version: "6" });
 }
 
 function requireAssignments(config: ManagedConfig): void {
@@ -375,15 +520,14 @@ export function migrateV1Config(value: unknown): ManagedConfig {
     defaults.push(id);
   }
 
-  return requireManagedConfig({
-    schema_version: "5",
+  return migrateLegacyShape({
     execution: {
       ...clone(record.execution as ManagedConfig["execution"]),
       distribute_primaries: false,
     },
     diagnostics: clone(record.diagnostics as ManagedConfig["diagnostics"]),
-    adapters: clone(record.adapters as ManagedConfig["adapters"]),
-    agents,
+    adapters: clone(record.adapters as TrustedConfigV5["adapters"]),
+    agents: agents as unknown as TrustedConfigV5["agents"],
     defaults: { agents: defaults },
     projects: {},
   });
@@ -395,9 +539,10 @@ export function migrateV2Config(value: unknown): ManagedConfig {
   if (parsed.schema_version !== "2") {
     throw new Error("configuration is not a Review Mesh v2 configuration");
   }
-  return requireManagedConfig({
-    ...preserveLegacyPrimaryOrder(clone(parsed) as TrustedConfigV2),
-    schema_version: "5",
+  return migrateLegacyShape({
+    ...(preserveLegacyPrimaryOrder(
+      clone(parsed) as TrustedConfigV2,
+    ) as unknown as Omit<TrustedConfigV5, "schema_version">),
     projects: migrateLegacyProjects(parsed.projects),
   });
 }
@@ -454,9 +599,10 @@ export function migrateV3Config(value: unknown): ManagedConfig {
     throw new Error("configuration is not a Review Mesh v3 configuration");
   }
   validateProjectKeys(parsed.projects);
-  return requireManagedConfig({
-    ...preserveLegacyPrimaryOrder(clone(parsed) as TrustedConfigV3),
-    schema_version: "5",
+  return migrateLegacyShape({
+    ...(preserveLegacyPrimaryOrder(
+      clone(parsed) as TrustedConfigV3,
+    ) as unknown as Omit<TrustedConfigV5, "schema_version">),
     projects: migrateLegacyProjects(parsed.projects),
   });
 }
@@ -469,25 +615,32 @@ export async function migrateLegacyConfig(
   if (parsed.schema_version === "1") return migrateV1Config(parsed);
   if (parsed.schema_version === "2") {
     validateProjectKeys(parsed.projects);
-    return requireManagedConfig({
-      ...preserveLegacyPrimaryOrder(clone(parsed) as TrustedConfigV2),
-      schema_version: "5",
+    return migrateLegacyShape({
+      ...(preserveLegacyPrimaryOrder(
+        clone(parsed) as TrustedConfigV2,
+      ) as unknown as Omit<TrustedConfigV5, "schema_version">),
       projects: await migrateLegacyProjectsByIdentity(parsed.projects),
     });
   }
   if (parsed.schema_version === "3") {
     validateProjectKeys(parsed.projects);
-    return requireManagedConfig({
-      ...preserveLegacyPrimaryOrder(clone(parsed) as TrustedConfigV3),
-      schema_version: "5",
+    return migrateLegacyShape({
+      ...(preserveLegacyPrimaryOrder(
+        clone(parsed) as TrustedConfigV3,
+      ) as unknown as Omit<TrustedConfigV5, "schema_version">),
       projects: await migrateLegacyProjectsByIdentity(parsed.projects),
     });
   }
   if (parsed.schema_version === "4") {
-    return requireManagedConfig({
-      ...preserveLegacyPrimaryOrder(clone(parsed) as TrustedConfigV4),
-      schema_version: "5",
-    });
+    return migrateLegacyShape(
+      preserveLegacyPrimaryOrder(
+        clone(parsed) as TrustedConfigV4,
+      ) as unknown as Omit<TrustedConfigV5, "schema_version">,
+    );
+  }
+  if (parsed.schema_version === "5") {
+    const { schema_version: _schemaVersion, ...legacy } = clone(parsed);
+    return migrateLegacyShape(legacy);
   }
   return requireManagedConfig(parsed);
 }
@@ -507,19 +660,27 @@ export function parseManagedConfig(text: string): {
   if (version === "4") {
     const legacy = trustedConfigV4Schema.parse(parsed);
     return {
-      config: requireManagedConfig({
-        ...preserveLegacyPrimaryOrder(clone(legacy) as TrustedConfigV4),
-        schema_version: "5",
-      }),
+      config: migrateLegacyShape(
+        preserveLegacyPrimaryOrder(
+          clone(legacy) as TrustedConfigV4,
+        ) as unknown as Omit<TrustedConfigV5, "schema_version">,
+      ),
       migrated: true,
     };
+  }
+  if (version === "5") {
+    const legacy = trustedConfigSchema.parse(parsed);
+    if (legacy.schema_version !== "5") throw new Error("invalid v5 config");
+    const { schema_version: _schemaVersion, ...shape } = clone(legacy);
+    return { config: migrateLegacyShape(shape), migrated: true };
   }
   return { config: requireManagedConfig(parsed), migrated: false };
 }
 
 export function serializeManagedConfig(config: ManagedConfig): string {
-  requireAssignments(config);
-  const validated = requireManagedConfig(config);
+  const normalized = normalizeManagedConfig(config);
+  requireAssignments(normalized);
+  const validated = requireManagedConfig(normalized);
   const text = `${stringify(validated)}\n`;
   if (Buffer.byteLength(text, "utf8") > MAX_CONFIG_BYTES) {
     throw new Error("configuration file exceeds the 4 MiB limit");
@@ -528,14 +689,34 @@ export function serializeManagedConfig(config: ManagedConfig): string {
   return text;
 }
 
+/** Normalizes an in-memory legacy managed shape before a v6-only save. */
+export function normalizeManagedConfig(config: ManagedConfig): ManagedConfig {
+  if (config.schema_version === "6") {
+    const normalized = clone(config);
+    normalized.execution.allow_provider_concentration ??= false;
+    for (const agent of Object.values(normalized.agents)) {
+      agent.applicability ??= { mode: "always" };
+      agent.required_context ??= [];
+    }
+    return normalized;
+  }
+  const parsed = trustedConfigSchema.parse(config);
+  if (parsed.schema_version !== "5") {
+    throw new Error("configuration is not a Review Mesh v5 configuration");
+  }
+  const { schema_version: _schemaVersion, ...legacy } = clone(parsed);
+  return migrateLegacyShape(legacy);
+}
+
 export function emptyManagedConfig(): ManagedConfig {
   return {
-    schema_version: "5",
+    schema_version: "6",
     execution: {
       max_concurrency: 2,
       heartbeat_interval_ms: 15_000,
       shutdown_grace_period_ms: 5_000,
       distribute_primaries: true,
+      allow_provider_concentration: false,
       default_provider_concurrency: 2,
       provider_limits: {},
       circuit_breaker_threshold: 2,

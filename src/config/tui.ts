@@ -9,6 +9,7 @@ import type { CopilotAccountService } from "../copilot/account.js";
 import type { JsonValue } from "../protocol/schemas.js";
 import {
   listConfig,
+  normalizeManagedConfig,
   requireEnvironmentName,
   requireSafeIdentifier,
   saveManagedConfig,
@@ -17,6 +18,11 @@ import {
   type ManagedConfig,
 } from "./manage.js";
 import { requireProjectName } from "./project-names.js";
+import {
+  providerOutageTolerance,
+  validateCallerContextRequirement,
+  validateChangedPathGlob,
+} from "../orchestrator/lens-policy.js";
 
 export interface ConfigPrompter {
   ask(question: string, signal?: AbortSignal): Promise<string>;
@@ -175,6 +181,82 @@ function chooseAgents(value: string, config: ManagedConfig): string[] {
       throw new Error(`unknown agent: ${id}`);
   }
   return [...new Set(ids)];
+}
+
+function commaSeparatedValues(
+  value: string,
+  label: string,
+  validate: (candidate: string) => void,
+): string[] {
+  const values = value
+    .split(",")
+    .map((candidate) => candidate.trim())
+    .filter(Boolean);
+  const seen = new Set<string>();
+  for (const candidate of values) {
+    validate(candidate);
+    if (seen.has(candidate))
+      throw new Error(`duplicate ${label}: ${candidate}`);
+    seen.add(candidate);
+  }
+  return values;
+}
+
+function agentProviderGroups(
+  config: ManagedConfig,
+  agent: ManagedAgent,
+): string[] {
+  return agent.model_runs === undefined
+    ? [agent.provider_group ?? agent.adapter]
+    : agent.model_runs.map(
+        (run) => run.provider_group ?? run.adapter ?? agent.adapter,
+      );
+}
+
+function defaultAgentPassQuorum(agent: ManagedAgent): number {
+  if (agent.model_runs === undefined) return 1;
+  return agent.model_runs.length === 5
+    ? 3
+    : Math.min(2, agent.model_runs.length);
+}
+
+function defaultAgentProviderGroups(agent: ManagedAgent): number {
+  const distinct = new Set(
+    agent.model_runs === undefined
+      ? [agent.provider_group ?? agent.adapter]
+      : agent.model_runs.map(
+          (run) => run.provider_group ?? run.adapter ?? agent.adapter,
+        ),
+  ).size;
+  return agent.model_runs?.length === 5 ? 3 : Math.min(2, distinct);
+}
+
+async function zeroOutageAcknowledgement(
+  options: ConfigMenuOptions,
+  agent: ManagedAgent,
+  current = false,
+): Promise<boolean> {
+  const providerGroups = agentProviderGroups(options.config, agent);
+  if (
+    new Set(providerGroups).size <= 1 ||
+    providerOutageTolerance(
+      {
+        passQuorum: agent.pass_quorum ?? defaultAgentPassQuorum(agent),
+        minimumProviderGroups:
+          agent.minimum_provider_groups ?? defaultAgentProviderGroups(agent),
+      },
+      providerGroups,
+    ) > 0
+  ) {
+    return false;
+  }
+  return yes(
+    await answer(
+      options.prompt,
+      `This lens cannot tolerate one provider outage. Acknowledge this strict policy? [${current ? "Y/n" : "y/N"}]: `,
+      current ? "y" : "n",
+    ),
+  );
 }
 
 function storedProjectName(candidate: string, config: ManagedConfig): string {
@@ -535,7 +617,13 @@ async function addAgent(options: ConfigMenuOptions): Promise<void> {
       ? "require_enforced"
       : "prefer_enforced",
     timeout_ms: timeout,
+    applicability: { mode: "always" },
+    required_context: [],
   };
+  agent.allow_zero_outage_tolerance = await zeroOutageAcknowledgement(
+    options,
+    agent,
+  );
   config.agents[id] = agent;
   if (
     firstAgent ||
@@ -604,10 +692,10 @@ async function editAgent(options: ConfigMenuOptions): Promise<void> {
     timeout_ms: timeout,
     ...(current.runtime === undefined ? {} : { runtime: current.runtime }),
     ...(current.applicability === undefined
-      ? {}
+      ? { applicability: { mode: "always" } as const }
       : { applicability: current.applicability }),
     ...(current.required_context === undefined
-      ? {}
+      ? { required_context: [] }
       : { required_context: current.required_context }),
     ...(current.pass_quorum === undefined
       ? {}
@@ -615,6 +703,11 @@ async function editAgent(options: ConfigMenuOptions): Promise<void> {
     ...(current.minimum_provider_groups === undefined
       ? {}
       : { minimum_provider_groups: current.minimum_provider_groups }),
+    ...(current.allow_zero_outage_tolerance === undefined
+      ? {}
+      : {
+          allow_zero_outage_tolerance: current.allow_zero_outage_tolerance,
+        }),
     ...(current.adjudication === undefined
       ? {}
       : { adjudication: current.adjudication }),
@@ -625,6 +718,25 @@ async function editAgent(options: ConfigMenuOptions): Promise<void> {
       ? {}
       : { gate_minimum_confidence: current.gate_minimum_confidence }),
   };
+  if (edited.model_runs !== undefined) {
+    edited.pass_quorum = Math.min(
+      edited.pass_quorum ?? defaultAgentPassQuorum(edited),
+      edited.model_runs.length,
+    );
+    edited.minimum_provider_groups = Math.min(
+      edited.minimum_provider_groups ?? defaultAgentProviderGroups(edited),
+      edited.pass_quorum,
+      new Set(agentProviderGroups(options.config, edited)).size,
+    );
+  } else {
+    edited.pass_quorum = 1;
+    edited.minimum_provider_groups = 1;
+  }
+  edited.allow_zero_outage_tolerance = await zeroOutageAcknowledgement(
+    options,
+    edited,
+    current.allow_zero_outage_tolerance ?? false,
+  );
   config.agents[id] = edited;
   const isDefault = config.defaults?.agents.includes(id) === true;
   const makeDefault = yes(
@@ -643,6 +755,97 @@ async function editAgent(options: ConfigMenuOptions): Promise<void> {
     );
     if (config.defaults.agents.length === 0) delete config.defaults;
   }
+}
+
+async function editAgentPolicy(options: ConfigMenuOptions): Promise<void> {
+  const id = await answer(options.prompt, "Agent id for policy: ");
+  const agent = options.config.agents[id];
+  if (agent === undefined) throw new Error(`unknown agent: ${id}`);
+  const currentApplicability = agent.applicability ?? {
+    mode: "always" as const,
+  };
+  const mode = (
+    await answer(
+      options.prompt,
+      `Applicability mode (always or changed_paths) [${currentApplicability.mode}]: `,
+      currentApplicability.mode,
+    )
+  ).toLowerCase();
+  if (mode !== "always" && mode !== "changed_paths") {
+    throw new Error("applicability mode must be always or changed_paths");
+  }
+  if (mode === "always") {
+    agent.applicability = { mode: "always" };
+  } else {
+    const currentPatterns =
+      currentApplicability.mode === "changed_paths"
+        ? currentApplicability.any_changed_paths.join(",")
+        : "";
+    const patterns = commaSeparatedValues(
+      await answer(
+        options.prompt,
+        `Changed-path globs${currentPatterns === "" ? "" : ` [${currentPatterns}]`}: `,
+        currentPatterns === "" ? undefined : currentPatterns,
+      ),
+      "changed-path glob",
+      validateChangedPathGlob,
+    );
+    if (patterns.length === 0) {
+      throw new Error("changed_paths applicability requires at least one glob");
+    }
+    const caseSensitive = yes(
+      await answer(
+        options.prompt,
+        `Case-sensitive changed-path matching? [${currentApplicability.mode !== "changed_paths" || currentApplicability.case_sensitive !== false ? "Y/n" : "y/N"}]: `,
+        currentApplicability.mode !== "changed_paths" ||
+          currentApplicability.case_sensitive !== false
+          ? "y"
+          : "n",
+      ),
+    );
+    agent.applicability = {
+      mode: "changed_paths",
+      any_changed_paths: patterns,
+      case_sensitive: caseSensitive,
+    };
+  }
+  agent.required_context = commaSeparatedValues(
+    await answer(
+      options.prompt,
+      `Required caller-context selectors [${(agent.required_context ?? []).join(",")}]: `,
+      (agent.required_context ?? []).join(","),
+    ),
+    "caller-context selector",
+    validateCallerContextRequirement,
+  );
+  if (agent.model_runs !== undefined) {
+    agent.pass_quorum = positiveInteger(
+      await answer(
+        options.prompt,
+        `Pass quorum [${agent.pass_quorum ?? defaultAgentPassQuorum(agent)}]: `,
+        String(agent.pass_quorum ?? defaultAgentPassQuorum(agent)),
+      ),
+      "pass quorum",
+    );
+    agent.minimum_provider_groups = positiveInteger(
+      await answer(
+        options.prompt,
+        `Minimum provider groups [${agent.minimum_provider_groups ?? defaultAgentProviderGroups(agent)}]: `,
+        String(
+          agent.minimum_provider_groups ?? defaultAgentProviderGroups(agent),
+        ),
+      ),
+      "minimum provider groups",
+    );
+  } else {
+    agent.pass_quorum = 1;
+    agent.minimum_provider_groups = 1;
+  }
+  agent.allow_zero_outage_tolerance = await zeroOutageAcknowledgement(
+    options,
+    agent,
+    agent.allow_zero_outage_tolerance ?? false,
+  );
 }
 
 async function removeAgent(options: ConfigMenuOptions): Promise<void> {
@@ -797,6 +1000,13 @@ async function editSettings(options: ConfigMenuOptions): Promise<void> {
       execution.distribute_primaries !== false ? "y" : "n",
     ),
   );
+  execution.allow_provider_concentration = yes(
+    await answer(
+      options.prompt,
+      `Allow every logical lens primary to concentrate on one provider group? [${execution.allow_provider_concentration === true ? "Y/n" : "y/N"}]: `,
+      execution.allow_provider_concentration === true ? "y" : "n",
+    ),
+  );
   diagnostics.persist_runs = yes(
     await answer(
       options.prompt,
@@ -903,6 +1113,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
           "l) List agents and projects",
           "a) Add agent",
           "e) Edit agent",
+          "y) Edit agent policy",
           "r) Remove agent",
           "p) Add project assignment",
           "o) Edit project assignment",
@@ -928,6 +1139,9 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
         } else if (choice === "e") {
           await editAgent(options);
           changed = true;
+        } else if (choice === "y") {
+          await editAgentPolicy(options);
+          changed = true;
         } else if (choice === "r") {
           await removeAgent(options);
           changed = true;
@@ -950,6 +1164,13 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
         else throw new Error("unknown menu choice");
 
         if (changed) {
+          const normalized = normalizeManagedConfig(options.config);
+          for (const key of Object.keys(options.config) as Array<
+            keyof ManagedConfig
+          >) {
+            delete options.config[key];
+          }
+          Object.assign(options.config, normalized);
           snapshot = await saveManagedConfig(
             options.configFile,
             options.config,

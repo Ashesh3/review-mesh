@@ -8,6 +8,7 @@ import {
 } from "./manage.js";
 import { getAppPaths } from "./paths.js";
 import { resolveConfig } from "./resolve.js";
+import { providerOutageTolerance } from "../orchestrator/lens-policy.js";
 
 export interface DescribeEffectiveConfigInput {
   configFile?: string;
@@ -19,7 +20,7 @@ export interface DescribeEffectiveConfigInput {
 export interface DescribeResolvedConfigInput {
   configFile: string;
   revision: string;
-  configSchemaVersion: "1" | "2" | "3" | "4" | "5";
+  configSchemaVersion: "1" | "2" | "3" | "4" | "5" | "6";
   migrated: boolean;
   workspace: string;
   resolved: ReturnType<typeof resolveConfig>;
@@ -41,7 +42,7 @@ export interface EffectiveConfigDescription {
   valid: true;
   config_path: string;
   revision: string;
-  config_schema_version: "1" | "2" | "3" | "4" | "5";
+  config_schema_version: "1" | "2" | "3" | "4" | "5" | "6";
   migrated: boolean;
   workspace: string;
   selection: {
@@ -83,6 +84,12 @@ export interface EffectiveConfigDescription {
     instruction_sources: Array<"trusted" | "project">;
     provider_group: string;
     attempt_timeout_ms: number;
+    provider_topology: {
+      provider_groups: string[];
+      distinct_provider_groups: number;
+      outage_tolerance: number;
+      zero_outage_tolerance_acknowledged: boolean;
+    };
     policy?: NonNullable<
       ReturnType<typeof resolveConfig>["reviewers"][number]["policy"]
     >;
@@ -212,41 +219,61 @@ export function describeResolvedConfig(
     },
     execution: structuredClone(input.resolved.execution),
     diagnostics: structuredClone(input.resolved.diagnostics),
-    reviewers: input.resolved.reviewers.map((reviewer) => ({
-      id: reviewer.id,
-      agent_id: reviewer.agentId ?? reviewer.id,
-      model_index: reviewer.modelIndex ?? 0,
-      configured_model_index:
-        reviewer.configuredModelIndex ?? reviewer.modelIndex ?? 0,
-      model_count: reviewer.modelCount ?? 1,
-      ...(reviewer.previousReviewerId === undefined
-        ? {}
-        : { previous_reviewer_id: reviewer.previousReviewerId }),
-      activation:
-        (reviewer.modelIndex ?? 0) === 0
-          ? "immediate"
-          : reviewer.policy === undefined
-            ? "after_clear_pass"
-            : "after_lens_progress",
-      purpose: reviewer.purpose,
-      adapter_id: reviewer.adapterId,
-      adapter_type: reviewer.adapter.type,
-      ...(reviewer.adapter.type === "openai_compatible"
-        ? { streaming: reviewer.adapter.streaming ?? "disabled" }
-        : {}),
-      model: reviewer.model,
-      ...(reviewer.effort === undefined ? {} : { effort: reviewer.effort }),
-      isolation_policy: reviewer.isolationPolicy,
-      timeout_ms: reviewer.timeoutMs,
-      instruction_sources: reviewer.instruction_layers.map(
-        (layer) => layer.source,
-      ),
-      provider_group: reviewer.providerGroup ?? reviewer.adapterId,
-      attempt_timeout_ms: reviewer.attemptTimeoutMs ?? reviewer.timeoutMs,
-      ...(reviewer.policy === undefined
-        ? {}
-        : { policy: structuredClone(reviewer.policy) }),
-    })),
+    reviewers: input.resolved.reviewers.map((reviewer) => {
+      const lensMembers = lenses.get(reviewer.agentId ?? reviewer.id) ?? [
+        reviewer,
+      ];
+      const providerGroups = lensMembers.map(
+        (member) => member.providerGroup ?? member.adapterId,
+      );
+      const policy = reviewer.policy;
+      const pass = {
+        passQuorum: policy?.passQuorum ?? lensMembers.length,
+        minimumProviderGroups: policy?.minimumProviderGroups ?? 1,
+      };
+      return {
+        id: reviewer.id,
+        agent_id: reviewer.agentId ?? reviewer.id,
+        model_index: reviewer.modelIndex ?? 0,
+        configured_model_index:
+          reviewer.configuredModelIndex ?? reviewer.modelIndex ?? 0,
+        model_count: reviewer.modelCount ?? 1,
+        ...(reviewer.previousReviewerId === undefined
+          ? {}
+          : { previous_reviewer_id: reviewer.previousReviewerId }),
+        activation:
+          (reviewer.modelIndex ?? 0) === 0
+            ? "immediate"
+            : reviewer.policy === undefined
+              ? "after_clear_pass"
+              : "after_lens_progress",
+        purpose: reviewer.purpose,
+        adapter_id: reviewer.adapterId,
+        adapter_type: reviewer.adapter.type,
+        ...(reviewer.adapter.type === "openai_compatible"
+          ? { streaming: reviewer.adapter.streaming ?? "disabled" }
+          : {}),
+        model: reviewer.model,
+        ...(reviewer.effort === undefined ? {} : { effort: reviewer.effort }),
+        isolation_policy: reviewer.isolationPolicy,
+        timeout_ms: reviewer.timeoutMs,
+        instruction_sources: reviewer.instruction_layers.map(
+          (layer) => layer.source,
+        ),
+        provider_group: reviewer.providerGroup ?? reviewer.adapterId,
+        attempt_timeout_ms: reviewer.attemptTimeoutMs ?? reviewer.timeoutMs,
+        provider_topology: {
+          provider_groups: [...providerGroups],
+          distinct_provider_groups: new Set(providerGroups).size,
+          outage_tolerance: providerOutageTolerance(pass, providerGroups),
+          zero_outage_tolerance_acknowledged:
+            policy?.allowZeroOutageTolerance ?? false,
+        },
+        ...(reviewer.policy === undefined
+          ? {}
+          : { policy: structuredClone(reviewer.policy) }),
+      };
+    }),
     credential_environment: names.map((name) => ({
       name,
       present:

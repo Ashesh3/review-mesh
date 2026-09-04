@@ -499,11 +499,9 @@ export async function runConfigCommand(
         return 2;
       }
       const desired =
-        request.config.schema_version === "2" ||
-        request.config.schema_version === "3" ||
-        request.config.schema_version === "4"
-          ? await migrateLegacyConfig(request.config)
-          : request.config;
+        request.config.schema_version === "6"
+          ? request.config
+          : await migrateLegacyConfig(request.config);
       const desiredText = serializeManagedConfig(desired);
       if (
         !loaded.migrated &&
