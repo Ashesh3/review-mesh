@@ -18,6 +18,7 @@ export interface ActivityInput {
   message?: string;
   progress?: MeaningfulProgress;
   material?: MaterialActivity;
+  attemptId?: string;
 }
 
 export interface ActivityRecord {
@@ -60,6 +61,10 @@ interface ReviewerActivity {
   summary: ActivitySummary;
   phase: string;
   coalesced: number;
+  attemptId?: string;
+  admittedAt: number;
+  progressAt: number;
+  identities: Map<string, number>;
 }
 
 const phases = new Set([
@@ -99,8 +104,6 @@ export function createActivityTracker(options: ActivityTrackerOptions) {
     "maximumIdentities",
   );
   const reviewers = new Map<string, ReviewerActivity>();
-  // Hashed identities are bounded and never reveal provider-supplied strings.
-  const identities = new Map<string, number>();
   const retained: Array<{
     value: ActivityRecord;
     bytes: number;
@@ -108,12 +111,50 @@ export function createActivityTracker(options: ActivityTrackerOptions) {
   }> = [];
   let byteCount = 0;
 
+  function reviewerFor(reviewerId: string, at: number): ReviewerActivity {
+    if (!reviewerId || Buffer.byteLength(reviewerId, "utf8") > 128)
+      throw new TypeError("reviewer ID must contain 1-128 UTF-8 bytes");
+    if (!Number.isSafeInteger(at) || at < options.startedAt)
+      throw new TypeError("activity time precedes run start or is invalid");
+    let reviewer = reviewers.get(reviewerId);
+    if (reviewer === undefined) {
+      if (reviewers.size >= 1024)
+        throw new Error("activity reviewer limit exceeded");
+      reviewer = {
+        phase: "",
+        coalesced: 0,
+        admittedAt: options.startedAt,
+        progressAt: options.startedAt,
+        identities: new Map(),
+        summary: {
+          reviewer_id: reviewerId,
+          first_at: at,
+          last_at: at,
+          last_progress_at: options.startedAt,
+          suppressed_count: 0,
+          overflow: false,
+          identity_overflow: false,
+          material_counts: {},
+          phases: [],
+        },
+      };
+      reviewers.set(reviewerId, reviewer);
+    }
+    return reviewer;
+  }
+
   function newProgress(
     input: ActivityInput,
     reviewer: ReviewerActivity,
   ): boolean {
     const progress = input.progress;
     if (progress === undefined) return false;
+    if (
+      reviewer.attemptId !== undefined &&
+      input.attemptId !== reviewer.attemptId
+    )
+      return false;
+    if (input.at < reviewer.admittedAt) return false;
     if (
       !progress.identity ||
       Buffer.byteLength(progress.identity, "utf8") > 4096
@@ -124,7 +165,7 @@ export function createActivityTracker(options: ActivityTrackerOptions) {
         JSON.stringify([input.reviewerId, progress.kind, progress.identity]),
       )
       .digest("hex");
-    const old = identities.get(key);
+    const old = reviewer.identities.get(key);
     let current = 1;
     if (progress.kind === "bytes") {
       if (!Number.isSafeInteger(progress.bytes) || progress.bytes! < 0)
@@ -134,11 +175,12 @@ export function createActivityTracker(options: ActivityTrackerOptions) {
       current = progress.bytes!;
       if (current === 0 || (old !== undefined && current <= old)) return false;
     } else if (old !== undefined) return false;
-    if (old === undefined && identities.size >= maximumIdentities) {
+    if (old === undefined && reviewer.identities.size >= maximumIdentities) {
       reviewer.summary.identity_overflow = true;
       return false;
     }
-    identities.set(key, current);
+    reviewer.identities.set(key, current);
+    reviewer.progressAt = Math.max(reviewer.progressAt, input.at);
     reviewer.summary.last_progress_at = Math.max(
       reviewer.summary.last_progress_at,
       input.at,
@@ -156,43 +198,28 @@ export function createActivityTracker(options: ActivityTrackerOptions) {
     get byteCount() {
       return byteCount;
     },
+    admitAttempt(reviewerId: string, attemptId: string, at: number): void {
+      if (!attemptId || Buffer.byteLength(attemptId, "utf8") > 128)
+        throw new TypeError("attempt ID must contain 1-128 UTF-8 bytes");
+      const reviewer = reviewerFor(reviewerId, at);
+      if (reviewer.attemptId === attemptId || at < reviewer.admittedAt)
+        throw new Error("attempt admission must advance to a new attempt");
+      reviewer.attemptId = attemptId;
+      reviewer.admittedAt = at;
+      reviewer.progressAt = at;
+      reviewer.identities.clear();
+    },
     record(input: ActivityInput): {
       meaningful: boolean;
       phaseChanged: boolean;
       retained: boolean;
     } {
-      if (
-        !input.reviewerId ||
-        Buffer.byteLength(input.reviewerId, "utf8") > 128
-      )
-        throw new TypeError("reviewer ID must contain 1-128 UTF-8 bytes");
       if (!phases.has(input.phase))
         throw new TypeError("unknown reviewer activity phase");
-      if (!Number.isSafeInteger(input.at) || input.at < options.startedAt)
-        throw new TypeError("activity time precedes run start or is invalid");
-      let reviewer = reviewers.get(input.reviewerId);
-      if (reviewer === undefined) {
-        if (reviewers.size >= 1024)
-          throw new Error("activity reviewer limit exceeded");
-        reviewer = {
-          phase: "",
-          coalesced: 0,
-          summary: {
-            reviewer_id: input.reviewerId,
-            first_at: input.at,
-            last_at: input.at,
-            last_progress_at: options.startedAt,
-            suppressed_count: 0,
-            overflow: false,
-            identity_overflow: false,
-            material_counts: {},
-            phases: [],
-          },
-        };
-        reviewers.set(input.reviewerId, reviewer);
-      }
+      const reviewer = reviewerFor(input.reviewerId, input.at);
       const phaseChanged = reviewer.phase !== input.phase;
       reviewer.phase = input.phase;
+      reviewer.summary.first_at = Math.min(reviewer.summary.first_at, input.at);
       reviewer.summary.last_at = Math.max(reviewer.summary.last_at, input.at);
       let phase = reviewer.summary.phases.find(
         (value) => value.phase === input.phase,
@@ -207,6 +234,7 @@ export function createActivityTracker(options: ActivityTrackerOptions) {
         reviewer.summary.phases.push(phase);
       }
       phase.last_at = Math.max(phase.last_at, input.at);
+      phase.first_at = Math.min(phase.first_at, input.at);
       phase.events += 1;
       if (input.material !== undefined)
         reviewer.summary.material_counts[input.material] =
@@ -232,11 +260,13 @@ export function createActivityTracker(options: ActivityTrackerOptions) {
       };
       const bytes = Buffer.byteLength(JSON.stringify(value) + "\n", "utf8");
       const priority =
-        input.material === "terminal" || input.material === "failure"
-          ? 3
-          : input.material !== undefined || phaseChanged
-            ? 2
-            : 1;
+        input.material === "terminal"
+          ? 4
+          : input.material === "failure"
+            ? 3
+            : input.material !== undefined || phaseChanged
+              ? 2
+              : 1;
       // Reserve room for failures/terminal transitions by evicting ordinary
       // activity. All omitted material remains counted in the final summary.
       while (
@@ -268,7 +298,7 @@ export function createActivityTracker(options: ActivityTrackerOptions) {
       return {
         lastProgressAgeMs: Math.max(
           0,
-          now - (reviewer?.summary.last_progress_at ?? options.startedAt),
+          now - (reviewer?.progressAt ?? options.startedAt),
         ),
         coalescedCount,
         phase: reviewer?.phase ?? "queued",

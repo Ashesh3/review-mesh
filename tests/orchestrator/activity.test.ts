@@ -2,6 +2,102 @@ import { describe, expect, it } from "vitest";
 import { createActivityTracker } from "../../src/orchestrator/activity.js";
 
 describe("bounded run activity", () => {
+  it("starts no-progress at admission and accepts reused identities in a new attempt", () => {
+    const tracker = createActivityTracker({ startedAt: 0 });
+    tracker.record({ reviewerId: "a", phase: "queued", at: 1 });
+    tracker.admitAttempt("a", "attempt-1", 300_000);
+    expect(tracker.snapshot("a", 300_010).lastProgressAgeMs).toBe(10);
+    tracker.record({
+      reviewerId: "a",
+      phase: "reviewing",
+      at: 300_020,
+      attemptId: "attempt-1",
+      progress: { kind: "tool", identity: "read-1" },
+    });
+    tracker.admitAttempt("a", "attempt-2", 600_000);
+    tracker.record({
+      reviewerId: "a",
+      phase: "reviewing",
+      at: 600_005,
+      attemptId: "attempt-1",
+      progress: { kind: "tool", identity: "late" },
+    });
+    expect(tracker.snapshot("a", 600_010).lastProgressAgeMs).toBe(10);
+    tracker.record({
+      reviewerId: "a",
+      phase: "reviewing",
+      at: 600_020,
+      attemptId: "attempt-2",
+      progress: { kind: "tool", identity: "read-1" },
+    });
+    expect(tracker.snapshot("a", 600_030).lastProgressAgeMs).toBe(10);
+  });
+
+  it("does not let one reviewer exhaust another reviewer's progress identities", () => {
+    const tracker = createActivityTracker({
+      startedAt: 0,
+      maximumIdentities: 1,
+    });
+    tracker.record({
+      reviewerId: "a",
+      phase: "reviewing",
+      at: 1,
+      progress: { kind: "tool", identity: "a" },
+    });
+    tracker.record({
+      reviewerId: "a",
+      phase: "reviewing",
+      at: 2,
+      progress: { kind: "tool", identity: "b" },
+    });
+    tracker.record({
+      reviewerId: "b",
+      phase: "reviewing",
+      at: 3,
+      progress: { kind: "tool", identity: "a" },
+    });
+    expect(tracker.snapshot("b", 4).lastProgressAgeMs).toBe(1);
+  });
+
+  it("retains terminal activity after failures fill the buffer", () => {
+    const tracker = createActivityTracker({ startedAt: 0, maximumRecords: 2 });
+    tracker.record({
+      reviewerId: "a",
+      phase: "reviewing",
+      at: 1,
+      material: "failure",
+    });
+    tracker.record({
+      reviewerId: "a",
+      phase: "reviewing",
+      at: 2,
+      material: "failure",
+    });
+    tracker.record({
+      reviewerId: "a",
+      phase: "terminal",
+      at: 3,
+      material: "terminal",
+    });
+    expect(
+      tracker.records().some((record) => record.material === "terminal"),
+    ).toBe(true);
+    expect(tracker.summaries()[0]?.material_counts).toEqual({
+      failure: 2,
+      terminal: 1,
+    });
+  });
+
+  it("keeps first and last timestamps correct for out-of-order delivery", () => {
+    const tracker = createActivityTracker({ startedAt: 0 });
+    tracker.record({ reviewerId: "a", phase: "reviewing", at: 20 });
+    tracker.record({ reviewerId: "a", phase: "reviewing", at: 10 });
+    expect(tracker.summaries()[0]).toMatchObject({
+      first_at: 10,
+      last_at: 20,
+      phases: [{ first_at: 10, last_at: 20 }],
+    });
+  });
   it("does not count duplicate phase text or a repeated progress identity as progress", () => {
     const tracker = createActivityTracker({ startedAt: 0 });
     tracker.record({
