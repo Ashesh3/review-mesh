@@ -237,6 +237,7 @@ Public event v6 uses this closed incomplete-reason enum:
 - `queue_deadline_exceeded`;
 - `probe_deadline_exceeded`;
 - `attempt_deadline_exceeded`;
+- `model_candidate_deadline_exceeded`;
 - `no_progress_timeout`;
 - `lens_deadline_exceeded`;
 - `run_deadline_exceeded`;
@@ -346,11 +347,13 @@ responsible. It is independent of `applicability`: applicability decides
 whether a lens runs; change coverage decides what a running lens must inspect.
 A profile with no relevant path match is `not_applicable`, not a clean pass.
 
-New profiles default to `relevant_paths = ["**"]`,
-`minimum_inspection = "full_file"`, and `proof = "observed"`. Migration derives
-relevant paths from an existing `changed_paths` applicability policy when one
-exists, otherwise `["**"]`. It uses the v9 `full_file` and `observed` defaults;
-this is a deliberate strengthening of clean-review semantics.
+New profiles default to `relevant_paths = ["**"]` and
+`minimum_inspection = "full_file"`. The proof default is `observed` when the
+selected adapter advertises Review Mesh-mediated reads and `attested`
+otherwise; the TUI and effective config always display the selected value.
+Migration derives relevant paths from an existing `changed_paths`
+applicability policy when one exists, otherwise `["**"]`. The v9 full-file
+default is a deliberate strengthening of clean-review semantics.
 
 `minimum_inspection = "diff"` accepts inspection of the complete untruncated
 diff hunk for the path when core verifies that those exact diff bytes were
@@ -370,8 +373,11 @@ attested and never represents it as core-observed. Deleted files are covered by
 the complete base-to-head diff and are labelled `deleted_diff`.
 
 `proof = "observed"` requires Review Mesh to mediate the file read and hash the
-response bytes itself. All built-in v9 adapters with Review Mesh-owned file
-tools must provide this capability. Command-protocol v2 may add bounded
+response bytes itself. The OpenAI-compatible, Claude, and Copilot adapters use
+Review Mesh-owned tools in v9 and provide this capability. The pinned Codex SDK
+does not expose an in-process tool-handler transport, so the Codex adapter is
+attested-only in v9; migrating it to observed proof requires a later SDK or a
+separately designed local broker transport. Command-protocol v2 may add bounded
 `file_access` claims and a coverage attestation, but an external process reading
 files directly remains `attested`; protocol v1 has neither claim and is legacy
 attested-only. A future command adapter may advertise observed proof only if
@@ -1126,10 +1132,11 @@ Migration rules are:
 2. add the adaptive suite deadline and five-minute no-progress timeout when no
    v7 deadline policy exists;
 3. derive lens relevance from existing changed-path applicability or `["**"]`,
-   use `full_file`, and choose `observed` only for a built-in adapter whose
-   reads are mediated and hashed by Review Mesh; migrate command-protocol v1,
-   command-protocol v2 without a Review Mesh-owned read broker, and other
-   opaque adapters to `attested` with a stable upgrade warning;
+   use `full_file`, and choose `observed` only for OpenAI-compatible, Claude,
+   and Copilot adapters whose v9 reads are mediated and hashed by Review Mesh;
+   migrate Codex, command-protocol v1, command-protocol v2 without a Review
+   Mesh-owned read broker, and other opaque adapters to `attested` with a
+   stable upgrade warning;
 4. set undeclared lens kind to `generic`; never infer change-readiness from its
    name;
 5. preserve explicit strict 5-of-5 behavior and surface its warnings; and
