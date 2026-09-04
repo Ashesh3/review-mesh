@@ -7,6 +7,10 @@ import type {
   AdjudicationResult,
   ReviewerResultV3,
 } from "../../src/protocol/schemas.js";
+import type {
+  AdjudicationResultV2,
+  ReviewerResultV4,
+} from "../../src/protocol/v9.js";
 import {
   createAdjudicationValidationAttestation,
   verifyAdjudicationValidationAttestation,
@@ -85,6 +89,78 @@ function adjudication(
 }
 
 describe("validateAdjudication", () => {
+  it("validates all 80 v2 decisions without losing v4 claim or proof fields", () => {
+    const actionable_findings = Array.from({ length: 80 }, (_, index) => ({
+      id: `candidate-${index}`,
+      severity: "high" as const,
+      title: `Candidate ${index}`,
+      description: `Candidate ${index} describes a defect.`,
+      evidence: [
+        {
+          path: `src/file-${index}.ts`,
+          start_line: 1,
+          end_line: 2,
+          detail: `Candidate ${index} evidence.`,
+        },
+      ],
+      suggested_direction: `Repair candidate ${index}.`,
+      confidence: "high" as const,
+      classification: "confirmed_defect" as const,
+      external_assumptions: [],
+      category: "correctness" as const,
+      verification: `Verify candidate ${index}.`,
+      change_impact: `Candidate ${index} is introduced by HEAD.`,
+      claim: {
+        trigger: `Trigger ${index}`,
+        affected_behavior: `Behavior ${index}`,
+        outcome: `Outcome ${index}`,
+      },
+    }));
+    const candidates: ReviewerResultV4 = {
+      schema_version: "4",
+      verdict: "fail",
+      review_markdown: "# Candidates",
+      summary: "Eighty candidates.",
+      actionable_findings,
+      informational_notes: [],
+      change_coverage: {
+        status: "complete",
+        proof_kind: "observed",
+        scope_digest: "a".repeat(64),
+        inspected_count: 80,
+        deficit_count: 0,
+        deficit_sample: [],
+      },
+    };
+    const judge: AdjudicationResultV2 = {
+      schema_version: "2",
+      kind: "review-mesh.adjudication-result",
+      verdict: "pass",
+      review_markdown: "# Decisions",
+      summary: "Every candidate was rejected.",
+      actionable_findings: [],
+      decisions: actionable_findings.map((finding) => ({
+        source_finding_id: finding.id,
+        decision: "rejected" as const,
+        rationale: `Candidate ${finding.id} is not a defect.`,
+        cited_evidence: [],
+        unverified_assumptions: [],
+      })),
+      informational_notes: [],
+    };
+
+    const outcome = validateAdjudication(candidates, judge, {
+      reviewScope: "full",
+    });
+
+    expect(outcome.complete).toBe(true);
+    expect(outcome.decisions).toHaveLength(80);
+    expect(outcome.candidate_result.actionable_findings[79]).toMatchObject({
+      claim: actionable_findings[79]!.claim,
+    });
+    expect(outcome.adjudication_result.schema_version).toBe("2");
+  });
+
   it("downgrades a contradictory confirmation missing ordered and base/head proof without hiding either review", () => {
     const judge = adjudication({
       source_finding_id: "enum-post-ingest",

@@ -3,6 +3,7 @@ import type {
   AdjudicationResult,
   ReviewerResultV3,
 } from "../protocol/schemas.js";
+import type { AdjudicationResultV2, ReviewerResultV4 } from "../protocol/v9.js";
 import { canonicalJson, reviewerResultDigest } from "../results/digest.js";
 import {
   validateAdjudication,
@@ -41,8 +42,8 @@ function contextDigest(
 }
 
 export function createAdjudicationValidationAttestation(input: {
-  candidateResult: ReviewerResultV3;
-  adjudicationResult: AdjudicationResult;
+  candidateResult: ReviewerResultV3 | ReviewerResultV4;
+  adjudicationResult: AdjudicationResult | AdjudicationResultV2;
   contextHead: string | null;
   validationContext: AdjudicationValidationContext;
 }): AdjudicationValidationAttestation {
@@ -69,8 +70,8 @@ export function createAdjudicationValidationAttestation(input: {
 
 export function verifyAdjudicationValidationAttestation(input: {
   attestation: AdjudicationValidationAttestation;
-  candidateResult: ReviewerResultV3;
-  adjudicationResult: AdjudicationResult;
+  candidateResult: ReviewerResultV3 | ReviewerResultV4;
+  adjudicationResult: AdjudicationResult | AdjudicationResultV2;
   contextHead: string | null;
   validationContext: Pick<AdjudicationValidationContext, "reviewScope" | "git">;
 }): AdjudicationOutcome | undefined {

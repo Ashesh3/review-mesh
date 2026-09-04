@@ -2,6 +2,9 @@ import { constants } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import type { AdjudicationResult } from "../protocol/schemas.js";
+import type { AdjudicationResultV2 } from "../protocol/v9.js";
+
+type VerifiableAdjudicationResult = AdjudicationResult | AdjudicationResultV2;
 
 export const MAX_EVIDENCE_BYTES_PER_PATH = 1024 * 1024;
 
@@ -61,7 +64,7 @@ const nativeFileSystem: EvidenceVerifierFileSystem = {
 
 export interface VerifyAdjudicationEvidenceInput {
   workspace: string;
-  adjudicationResult: AdjudicationResult;
+  adjudicationResult: VerifiableAdjudicationResult;
   beforeIdentityCheck?: () => Promise<void>;
   fileSystem?: EvidenceVerifierFileSystem;
   platform?: NodeJS.Platform;
@@ -100,7 +103,7 @@ function sameIdentity(
 }
 
 function citations(
-  result: AdjudicationResult["decisions"][number],
+  result: VerifiableAdjudicationResult["decisions"][number],
 ): Citation[] {
   return [
     ...result.cited_evidence,
