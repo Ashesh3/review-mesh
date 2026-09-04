@@ -511,7 +511,7 @@ describe("dashboard data", () => {
     const adjudicationValidation = createAdjudicationValidationAttestation({
       candidateResult,
       adjudicationResult,
-      contextHead: null,
+      contextHead: "dashboard-head",
       validationContext: {
         reviewScope: "full",
         git: { changedFiles: [], diff: "" },
@@ -525,6 +525,19 @@ describe("dashboard data", () => {
     await writeFile(
       join(appPaths.runsDirectory, "run-adjudicated.jsonl"),
       [
+        {
+          record: "context",
+          run_id: "run-adjudicated",
+          context: {
+            review_scope: { mode: "full" },
+            git: {
+              is_repository: true,
+              head: "dashboard-head",
+              changed_files: [],
+              diff: "",
+            },
+          },
+        },
         {
           record: "resolution",
           run_id: "run-adjudicated",
@@ -660,7 +673,7 @@ describe("dashboard data", () => {
     const adjudicationValidation = createAdjudicationValidationAttestation({
       candidateResult: candidate,
       adjudicationResult,
-      contextHead: null,
+      contextHead: "invalid-proof-head",
       validationContext: {
         reviewScope: "changes",
         git: { changedFiles: [], diff: "" },
@@ -683,6 +696,19 @@ describe("dashboard data", () => {
             workspace: "C:/demo",
             instructions: "Review changes.",
             review_scope: { mode: "changes" },
+          },
+        },
+        {
+          record: "context",
+          run_id: runId,
+          context: {
+            review_scope: { mode: "changes" },
+            git: {
+              is_repository: true,
+              head: "invalid-proof-head",
+              changed_files: [],
+              diff: "",
+            },
           },
         },
         {

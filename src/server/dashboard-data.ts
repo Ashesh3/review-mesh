@@ -19,7 +19,10 @@ import {
   type CanonicalGatePolicy,
   type CanonicalRawFinding,
 } from "../findings/canonical.js";
-import { validateAdjudication } from "../findings/adjudication.js";
+import {
+  failClosedAdjudicationOutcome,
+  validateAdjudication,
+} from "../findings/adjudication.js";
 import {
   verifyAdjudicationValidationAttestation,
   type AdjudicationValidationAttestation,
@@ -869,6 +872,8 @@ function runSummaryFromParsed(parsed: ParsedRunFile): DashboardRunSummary {
   const scope = asRecord(context.review_scope);
   const completion = eventData(parsed.completed);
   const reviewers = buildReviewerRuntime(parsed);
+  const persistedContext = parsed.context ?? {};
+  const persistedGit = asRecord(persistedContext.git);
   const activeFile = parsed.completed === undefined && parsed.candidate.active;
   const lastUpdate = Math.max(
     Date.parse(parsed.latestTimestamp ?? parsed.candidate.modifiedAt),
@@ -881,19 +886,30 @@ function runSummaryFromParsed(parsed: ParsedRunFile): DashboardRunSummary {
       ? fresh
       : processIsLikelyAlive(parsed.candidate.owner));
   const stale = activeFile && !active;
-  const findings =
-    integer(completion.unique_findings) ??
-    canonicalizeFindings(
-      rawFindings(
-        reviewers,
-        scope?.mode === "changes" ? "changes" : "full",
-      ) as readonly CanonicalRawFinding[],
-      { gatePolicies: dashboardGatePolicies(reviewers) },
-    ).counts.unique;
+  const canonical = canonicalizeFindings(
+    rawFindings(
+      reviewers,
+      scope?.mode === "changes" ? "changes" : "full",
+      {
+        changedFiles: Array.isArray(persistedGit?.changed_files)
+          ? persistedGit.changed_files
+              .map(text)
+              .filter((value): value is string => value !== undefined)
+          : [],
+        diff: text(persistedGit?.diff) ?? "",
+      },
+      typeof persistedGit?.head === "string" ? persistedGit.head : null,
+    ) as readonly CanonicalRawFinding[],
+    { gatePolicies: dashboardGatePolicies(reviewers) },
+  );
+  const findings = integer(completion.unique_findings) ?? canonical.counts.unique;
   const hasIncomplete = reviewers.some(
     (reviewer) => reviewer.state === "incomplete",
   );
-  const hasFindings = findings > 0;
+  const hasFindings =
+    canonical.counts.raw > 0
+      ? canonical.counts.gate > 0
+      : text(completion.gate_outcome) === "findings";
   const status = stale
     ? "stale"
     : active
@@ -934,9 +950,11 @@ function runSummaryFromParsed(parsed: ParsedRunFile): DashboardRunSummary {
     ...(integer(completion.total_elapsed_ms) === undefined
       ? {}
       : { total_elapsed_ms: integer(completion.total_elapsed_ms)! }),
-    gate_outcome:
-      text(completion.gate_outcome) ??
-      (hasFindings ? "findings" : activeFile ? "pending" : "passed"),
+    gate_outcome: hasFindings
+      ? "findings"
+      : activeFile
+        ? "pending"
+        : "passed",
     coverage_outcome:
       text(completion.coverage_outcome) ??
       (activeFile ? "in_progress" : hasIncomplete ? "partial" : "complete"),
@@ -1248,6 +1266,7 @@ function rawFindings(
     changedFiles: [],
     diff: "",
   },
+  contextHead: string | null = null,
 ): RawRunFinding[] {
   const values: RawRunFinding[] = [];
   const adjudicationDecisions = new Map<
@@ -1271,15 +1290,25 @@ function rawFindings(
       reviewer.result,
     );
     if (!candidateResult.success || !adjudicationResult.success) continue;
+    const validationContext = { reviewScope, git: gitContext } as const;
     const attestation = reviewer.adjudication_validation;
-    if (attestation === undefined) continue;
-    const outcome = verifyAdjudicationValidationAttestation({
-      attestation,
-      candidateResult: candidateResult.data,
-      adjudicationResult: adjudicationResult.data,
-      contextHead: null,
-    });
-    if (outcome === undefined) continue;
+    const outcome =
+      attestation === undefined
+        ? failClosedAdjudicationOutcome(
+            candidateResult.data,
+            adjudicationResult.data,
+          )
+        : (verifyAdjudicationValidationAttestation({
+            attestation,
+            candidateResult: candidateResult.data,
+            adjudicationResult: adjudicationResult.data,
+            contextHead,
+            validationContext,
+          }) ??
+          failClosedAdjudicationOutcome(
+            candidateResult.data,
+            adjudicationResult.data,
+          ));
     const decisions = new Map(
       outcome.decisions.map((decision) => [
         decision.source_finding_id,
@@ -1488,7 +1517,7 @@ export async function readDashboardRun(input: {
           .filter((value): value is string => value !== undefined)
       : [],
     diff: text(git?.diff) ?? "",
-  });
+  }, typeof git?.head === "string" ? git.head : null);
   const canonical = canonicalizeFindings(
     raw as readonly CanonicalRawFinding[],
     { gatePolicies: dashboardGatePolicies(reviewers) },

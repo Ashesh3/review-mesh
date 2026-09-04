@@ -207,3 +207,59 @@ Observed:
 - Pure adjudication validation now requires an authoritative core verification map; candidate evidence cannot self-authenticate.
 - The orchestrator verifies evidence before gate evaluation and persists a validation attestation bound to candidate/adjudicator digests, context head, evidence-verification digest, and exact effective outcome.
 - Strict reports and dashboard data consume and verify the persisted attestation, never rereading the workspace or re-trusting raw model proof after the run.
+
+## Fix round 4
+
+### RED
+
+Command:
+
+```powershell
+npx vitest run tests/findings/evidence-verifier.test.ts
+```
+
+Observed:
+
+- Exit code 1.
+- Three regressions failed: repeated citations reopened the same path, evidence beyond the 1 MiB proof bound was read as ordinary line metadata, and a same-size/same-mtime Windows replacement with unavailable file IDs remained verified.
+
+Command:
+
+```powershell
+npx vitest run tests/diagnostics/run-report.test.ts tests/server/dashboard-data.test.ts
+```
+
+Observed:
+
+- Exit code 1 while adding strict missing/invalid-attestation fixtures until persisted records satisfied the production schemas; the behavioral assertions then exposed the required fail-closed path.
+
+### GREEN
+
+Command:
+
+```powershell
+npx vitest run tests/findings/evidence-verifier.test.ts tests/findings/adjudication.test.ts tests/protocol/prompt.test.ts tests/orchestrator/state.test.ts tests/orchestrator/review-feedback.test.ts tests/diagnostics/run-report.test.ts tests/server/dashboard-data.test.ts
+npm run typecheck
+git diff --check
+```
+
+Observed:
+
+- Exit code 0.
+- 7 test files passed; 105 tests passed.
+- Source and test TypeScript projects passed.
+- No whitespace errors.
+
+### Fixes
+
+- Missing or invalid validation attestations now deterministically downgrade every required candidate decision to non-gating `needs_verification` while retaining both raw results.
+- Attestations bind the persisted context HEAD plus a digest of review scope and authoritative Git evidence context; report and dashboard verify against the same persisted context.
+- Evidence is opened without following links, pre-open `lstat` is compared with handle identity, reads are bounded to 1 MiB through the open handle, and post-read handle/path identity is rechecked.
+- Windows zero/unreliable file IDs require independent birthtime/ctime plus size identity; a facade regression proves same-size/same-mtime replacement fails.
+- Evidence verification is cached per path within an adjudication, including ordered and base/head citations.
+
+### Self-review
+
+- Raw candidate and adjudicator results remain unchanged; only the derived adjudication outcome fails closed.
+- No workspace reread was added to report/dashboard consumers.
+- The 1 MiB bound rejects unprovable later line ranges as unverified instead of reading the full file or throwing.

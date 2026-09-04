@@ -632,6 +632,7 @@ describe("validateAdjudication", () => {
         candidateResult,
         adjudicationResult,
         contextHead: "abc123",
+        validationContext,
       }),
     ).toEqual(attestation.outcome);
     expect(
@@ -640,6 +641,7 @@ describe("validateAdjudication", () => {
         candidateResult,
         adjudicationResult,
         contextHead: "different",
+        validationContext,
       }),
     ).toBeUndefined();
   });

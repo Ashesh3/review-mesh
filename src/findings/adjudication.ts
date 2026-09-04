@@ -32,7 +32,8 @@ export type AdjudicationValidationIssue =
   | "base_head_comparison_required"
   | "base_head_citation_required"
   | "base_head_context_required"
-  | "core_evidence_verification_required";
+  | "core_evidence_verification_required"
+  | "validation_attestation_required";
 
 export interface EffectiveAdjudicationDecision {
   source_finding_id: string;
@@ -52,6 +53,40 @@ export interface AdjudicationOutcome {
   adjudication_result: AdjudicationResult;
   decisions: EffectiveAdjudicationDecision[];
   unknown_source_finding_ids: string[];
+}
+
+export function failClosedAdjudicationOutcome(
+  candidateResult: ReviewerResultV3,
+  adjudicationResult: AdjudicationResult,
+): AdjudicationOutcome {
+  const decisionsById = new Map(
+    adjudicationResult.decisions.map((decision) => [
+      decision.source_finding_id,
+      decision,
+    ]),
+  );
+  return {
+    complete: false,
+    candidate_result: structuredClone(candidateResult),
+    adjudication_result: structuredClone(adjudicationResult),
+    decisions: candidateResult.actionable_findings.map((candidate) => {
+      const decision = decisionsById.get(candidate.id);
+      return {
+        source_finding_id: candidate.id,
+        requested_decision: decision?.decision ?? "missing",
+        effective_decision: "needs_verification",
+        gate_eligible: false,
+        issues: ["validation_attestation_required"],
+        ...(decision === undefined ? {} : { decision: structuredClone(decision) }),
+      };
+    }),
+    unknown_source_finding_ids: adjudicationResult.decisions
+      .map((decision) => decision.source_finding_id)
+      .filter(
+        (id) => !candidateResult.actionable_findings.some((finding) => finding.id === id),
+      )
+      .sort(),
+  };
 }
 
 const orderedProofCategories = new Set([

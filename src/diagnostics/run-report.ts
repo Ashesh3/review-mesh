@@ -20,7 +20,10 @@ import {
   canonicalizeFindings,
   type CanonicalRawFinding,
 } from "../findings/canonical.js";
-import { validateAdjudication } from "../findings/adjudication.js";
+import {
+  failClosedAdjudicationOutcome,
+  validateAdjudication,
+} from "../findings/adjudication.js";
 import type {
   AdjudicationOutcome,
   AdjudicationValidationContext,
@@ -117,6 +120,7 @@ const adjudicationValidationSchema = z.looseObject({
   candidate_digest: digestSchema,
   adjudication_digest: digestSchema,
   context_head: z.string().nullable(),
+  context_digest: digestSchema.optional(),
   verification_digest: digestSchema,
   evidence_verification: z.unknown(),
   outcome: z.unknown(),
@@ -1700,21 +1704,29 @@ function parseRawFindings(parsed: ParsedReportRecord): ParsedFinding[] {
       !("actionable_findings" in sourceResult)
     )
       continue;
-    const attestation = metadata.adjudicationValidation;
-    if (attestation === undefined) continue;
     const reviewScope =
       asRecord(parsed.request?.review_scope)?.mode === "changes"
         ? "changes"
         : "full";
     const git = asRecord(parsed.context?.git);
-    const outcome = verifyAdjudicationValidationAttestation({
-      attestation,
-      candidateResult: sourceResult,
-      adjudicationResult: result,
-      contextHead:
-        typeof git?.head === "string" ? git.head : null,
-    });
-    if (outcome === undefined) continue;
+    const validationContext = {
+      reviewScope,
+      git: {
+        changedFiles: stringArray(git?.changed_files),
+        diff: typeof git?.diff === "string" ? git.diff : "",
+      },
+    } as const;
+    const attestation = metadata.adjudicationValidation;
+    const outcome =
+      attestation === undefined
+        ? failClosedAdjudicationOutcome(sourceResult, result)
+        : (verifyAdjudicationValidationAttestation({
+            attestation,
+            candidateResult: sourceResult,
+            adjudicationResult: result,
+            contextHead: typeof git?.head === "string" ? git.head : null,
+            validationContext,
+          }) ?? failClosedAdjudicationOutcome(sourceResult, result));
     adjudicationDecisions.set(
       metadata.adjudicatesReviewerId,
       new Map(
@@ -2039,11 +2051,7 @@ export async function readRunReport({
     .sort((left, right) => left.localeCompare(right));
   const incompleteLenses =
     parsed.reportedIncompleteLenses ?? derivedIncompleteLenses;
-  const gateOutcome =
-    recognizedGateOutcome(parsed.reportedGateOutcome) ??
-    (canonical.counts.gate > 0
-      ? "findings"
-      : "passed");
+  const gateOutcome = canonical.counts.gate > 0 ? "findings" : "passed";
   const coverageOutcome =
     parsed.recordWarnings.length > 0
       ? "partial"

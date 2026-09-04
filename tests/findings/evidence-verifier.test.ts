@@ -1,8 +1,22 @@
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdtemp,
+  mkdir,
+  open,
+  realpath,
+  rm,
+  symlink,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { verifyAdjudicationEvidence } from "../../src/findings/evidence-verifier.js";
+import {
+  MAX_EVIDENCE_BYTES_PER_PATH,
+  verifyAdjudicationEvidence,
+  type EvidenceVerifierFileSystem,
+} from "../../src/findings/evidence-verifier.js";
 import type { AdjudicationResult } from "../../src/protocol/schemas.js";
 
 const roots: string[] = [];
@@ -114,6 +128,96 @@ describe("verifyAdjudicationEvidence", () => {
         await writeFile(join(workspace, "src", "ingest.ts"), "replacement\n");
       },
     });
+    expect(verification.by_source_finding_id.candidate).toMatchObject({
+      verified: false,
+      failures: expect.arrayContaining(["identity_changed"]),
+    });
+  });
+
+  it("opens and reads repeated citations from one path only once", async () => {
+    const workspace = await fixture();
+    let opens = 0;
+    const fileSystem: EvidenceVerifierFileSystem = {
+      realpath,
+      lstat: (path) => lstat(path, { bigint: true }),
+      open: async (path, flags) => {
+        opens += 1;
+        const handle = await open(path, flags);
+        return {
+          stat: () => handle.stat({ bigint: true }),
+          read: handle.read.bind(handle),
+          close: handle.close.bind(handle),
+        };
+      },
+    };
+
+    const verification = await verifyAdjudicationEvidence({
+      workspace,
+      adjudicationResult: result(),
+      fileSystem,
+    });
+
+    expect(verification.by_source_finding_id.candidate?.verified).toBe(true);
+    expect(opens).toBe(1);
+  });
+
+  it("rejects a citation that cannot be proven within the evidence byte bound", async () => {
+    const workspace = await fixture();
+    await writeFile(
+      join(workspace, "src", "ingest.ts"),
+      "x".repeat(MAX_EVIDENCE_BYTES_PER_PATH + 1),
+    );
+
+    const verification = await verifyAdjudicationEvidence({
+      workspace,
+      adjudicationResult: result("src/ingest.ts", 2),
+    });
+
+    expect(verification.by_source_finding_id.candidate).toMatchObject({
+      verified: false,
+      failures: expect.arrayContaining(["evidence_too_large"]),
+    });
+  });
+
+  it("rejects same-size same-mtime replacement when Windows file ids are unavailable", async () => {
+    const workspace = await fixture();
+    const path = join(workspace, "src", "ingest.ts");
+    const original = await lstat(path);
+    const zeroIdentity = (stats: Awaited<ReturnType<typeof lstat>>) => ({
+      dev: 0n,
+      ino: 0n,
+      size: BigInt(stats.size),
+      mtimeNs: BigInt(Math.trunc(Number(stats.mtimeMs) * 1_000_000)),
+      ctimeNs: BigInt(Math.trunc(Number(stats.ctimeMs) * 1_000_000)),
+      birthtimeNs: BigInt(Math.trunc(Number(stats.birthtimeMs) * 1_000_000)),
+      isFile: () => stats.isFile(),
+      isSymbolicLink: () => stats.isSymbolicLink(),
+    });
+    const fileSystem: EvidenceVerifierFileSystem = {
+      realpath,
+      lstat: async (target) => zeroIdentity(await lstat(target)),
+      open: async (target, flags) => {
+        const handle = await open(target, flags);
+        return {
+          stat: async () => zeroIdentity(await handle.stat()),
+          read: handle.read.bind(handle),
+          close: handle.close.bind(handle),
+        };
+      },
+    };
+
+    const verification = await verifyAdjudicationEvidence({
+      workspace,
+      adjudicationResult: result(),
+      platform: "win32",
+      fileSystem,
+      beforeIdentityCheck: async () => {
+        await rm(path);
+        await writeFile(path, "red\nnew\nother\n");
+        await utimes(path, original.atime, original.mtime);
+      },
+    });
+
     expect(verification.by_source_finding_id.candidate).toMatchObject({
       verified: false,
       failures: expect.arrayContaining(["identity_changed"]),

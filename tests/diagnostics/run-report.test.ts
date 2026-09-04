@@ -1249,12 +1249,25 @@ describe("finding consolidation and rendering", () => {
     const attestation = createAdjudicationValidationAttestation({
       candidateResult: candidate,
       adjudicationResult: adjudication,
-      contextHead: null,
+      contextHead: "persisted-head",
       validationContext,
     });
     await writeFile(
       join(runsDirectory, `${runId}.jsonl`),
       [
+        line({
+          record: "context",
+          run_id: runId,
+          context: {
+            review_scope: { mode: "full" },
+            git: {
+              is_repository: true,
+              head: "persisted-head",
+              changed_files: [],
+              diff: "",
+            },
+          },
+        }),
         line({
           record: "resolution",
           run_id: runId,
@@ -1307,4 +1320,114 @@ describe("finding consolidation and rendering", () => {
       advisory: 0,
     });
   });
+
+  it.each(["missing", "invalid"] as const)(
+    "downgrades required adjudication with %s validation attestation",
+    async (attestationState) => {
+      const { runsDirectory } = await fixture();
+      const runId = `run-${attestationState}-attestation`;
+      const candidate = resultV3("# Review\n\nCandidate.");
+      candidate.verdict = "fail";
+      candidate.actionable_findings = [
+        {
+          id: "candidate",
+          severity: "high",
+          title: "Candidate",
+          description: "Candidate description.",
+          evidence: [{ path: "src/item.ts", start_line: 1, end_line: 1, detail: "Evidence." }],
+          suggested_direction: "Fix.",
+          confidence: "high",
+          classification: "confirmed_defect",
+          external_assumptions: [],
+          category: "correctness",
+          verification: "Verified.",
+        },
+      ];
+      const adjudication = {
+        schema_version: "1" as const,
+        kind: "review-mesh.adjudication-result" as const,
+        verdict: "fail" as const,
+        review_markdown: "# Adjudication\n\nConfirmed.",
+        summary: "Confirmed.",
+        actionable_findings: [] as [],
+        decisions: [{
+          source_finding_id: "candidate",
+          decision: "confirmed" as const,
+          rationale: "Confirmed.",
+          cited_evidence: [{ path: "src/item.ts", start_line: 1, end_line: 1, detail: "Evidence." }],
+          unverified_assumptions: [],
+        }],
+        informational_notes: [],
+      };
+      const valid = createAdjudicationValidationAttestation({
+        candidateResult: candidate,
+        adjudicationResult: adjudication,
+        contextHead: "head",
+        validationContext: {
+          reviewScope: "full",
+          git: { changedFiles: [], diff: "" },
+          evidenceVerification: {
+            by_source_finding_id: { candidate: { verified: true, failures: [] } },
+          },
+        },
+      });
+      await writeFile(
+        join(runsDirectory, `${runId}.jsonl`),
+        [
+          line({ record: "request", run_id: runId, request: {
+            schema_version: "2",
+            project_name: "demo",
+            workspace: "C:/demo",
+            instructions: "Review.",
+            review_scope: { mode: "full" },
+          } }),
+          line({ record: "context", run_id: runId, context: { git: { head: "head", changed_files: [], diff: "" } } }),
+          line({ record: "resolution", run_id: runId, resolution: { reviewers: [
+            { id: "lens::source", agent_id: "lens" },
+            { id: "lens::judge", agent_id: "lens", policy: {
+              passQuorum: 1,
+              minimumProviderGroups: 1,
+              adjudication: "required",
+              gateMinimumSeverity: "medium",
+              gateMinimumConfidence: "medium",
+              mode: "adjudication",
+              adjudicatesReviewerId: "lens::source",
+            } },
+          ] } }),
+          line({
+            record: "reviewer.result",
+            run_id: runId,
+            reviewer_id: "lens::source",
+            digest: reviewerResultDigest(candidate),
+            byte_count: Buffer.byteLength(JSON.stringify(candidate)),
+            result: candidate,
+          }),
+          line({
+            record: "reviewer.result",
+            run_id: runId,
+            reviewer_id: "lens::judge",
+            mode: "adjudication",
+            adjudicates_reviewer_id: "lens::source",
+            digest: reviewerResultDigest(adjudication),
+            byte_count: Buffer.byteLength(JSON.stringify(adjudication)),
+            result: adjudication,
+            ...(attestationState === "missing"
+              ? {}
+              : { adjudication_validation: { ...valid, context_head: "wrong" } }),
+          }),
+        ].join(""),
+      );
+
+      const report = await readRunReport({ runsDirectory, runId });
+      expect(report.raw_findings).toEqual([
+        expect.objectContaining({
+          classification: "needs_verification",
+          adjudication: "needs_verification",
+          gate_eligible: false,
+        }),
+      ]);
+      expect(report.finding_counts).toEqual({ raw: 1, unique: 1, gate: 0, advisory: 1 });
+      expect(report.gate_outcome).toBe("passed");
+    },
+  );
 });
