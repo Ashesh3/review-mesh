@@ -287,6 +287,38 @@ describe("resolveContext", () => {
     ).rejects.toMatchObject({ code: "review_base_unresolvable" });
   });
 
+  it.each([
+    { stdout: "", stderr: "probe failed with token secret", exitCode: 1 },
+    { stdout: "unknown\n", stderr: "", exitCode: 0 },
+  ])(
+    "fails closed when the shallow-history probe is unavailable or malformed",
+    async (probe) => {
+      const workspace = await mkdtemp(
+        join(tmpdir(), "review-mesh-shallow-probe-"),
+      );
+      directories.push(workspace);
+      const git: GitRunner = {
+        async run(args) {
+          if (args.includes("--is-inside-work-tree"))
+            return { stdout: "true\n", stderr: "", exitCode: 0 };
+          if (args.includes("--is-shallow-repository")) return probe;
+          return { stdout: "", stderr: "", exitCode: 0 };
+        },
+      };
+      const error = await resolveContext({
+        request: request({ workspace }),
+        git,
+      }).catch((value: unknown) => value);
+      expect(error).toMatchObject({
+        code: "change_scope_collection_failed",
+        diagnostics: expect.objectContaining({
+          stage: "shallow_history_probe",
+        }),
+      });
+      expect(JSON.stringify(error)).not.toContain("token secret");
+    },
+  );
+
   it("preserves raw diff identity and explicit changed path kinds", async () => {
     const repo = await createGitFixture();
     fixtures.push(repo);
@@ -312,6 +344,40 @@ describe("resolveContext", () => {
     );
   });
 
+  it("preserves spaces and committed deletion kinds using NUL-delimited Git metadata", async () => {
+    const repo = await createGitFixture();
+    fixtures.push(repo);
+    await repo.write("removed file.ts", "remove me\n");
+    await repo.write("kept file.ts", "before\n");
+    await execa("git", ["add", "--", "removed file.ts", "kept file.ts"], {
+      cwd: repo.path,
+    });
+    await execa("git", ["commit", "-m", "Add spaced files"], {
+      cwd: repo.path,
+    });
+    await rm(join(repo.path, "removed file.ts"));
+    await writeFile(join(repo.path, "kept file.ts"), "after\n", "utf8");
+    await execa("git", ["add", "-A"], { cwd: repo.path });
+    await execa("git", ["commit", "-m", "Delete spaced file"], {
+      cwd: repo.path,
+    });
+
+    const resolved = await resolveContext({
+      request: request({
+        workspace: repo.path,
+        review_scope: { mode: "changes", base: "HEAD~1", head: "HEAD" },
+      }),
+      git: createGitRunner(),
+    });
+    if (!resolved.git.is_repository) throw new Error("expected Git");
+    expect(resolved.git.changed_paths).toEqual(
+      expect.arrayContaining([
+        { path: "removed file.ts", kind: "deleted" },
+        { path: "kept file.ts", kind: "tracked" },
+      ]),
+    );
+  });
+
   it("fails closed when Git cannot produce a complete change scope", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "review-mesh-scope-fail-"));
     directories.push(workspace);
@@ -321,6 +387,9 @@ describe("resolveContext", () => {
       async run(args) {
         if (args.includes("--is-inside-work-tree")) {
           return { stdout: "true\n", stderr: "", exitCode: 0 };
+        }
+        if (args.includes("--is-shallow-repository")) {
+          return { stdout: "false\n", stderr: "", exitCode: 0 };
         }
         if (args.includes("--show-toplevel")) {
           return { stdout: `${workspace}\n`, stderr: "", exitCode: 0 };
@@ -339,12 +408,9 @@ describe("resolveContext", () => {
           };
         }
         if (args[0] === "merge-base") {
-          return { stdout: `${"b".repeat(40)}\n`, stderr: "", exitCode: 0 };
-        }
-        if (args[0] === "merge-base") {
           return { stdout: `${base}\n`, stderr: "", exitCode: 0 };
         }
-        if (args[0] === "diff" && args.includes("--name-only")) {
+        if (args[0] === "diff" && args.includes("--name-status")) {
           return { stdout: "", stderr: "failed", exitCode: 1 };
         }
         return { stdout: "", stderr: "", exitCode: 0 };
@@ -444,6 +510,9 @@ describe("resolveContext", () => {
         (commands as string[][]).push([...args]);
         if (args.includes("--is-inside-work-tree")) {
           return { stdout: "true\n", stderr: "", exitCode: 0 };
+        }
+        if (args.includes("--is-shallow-repository")) {
+          return { stdout: "false\n", stderr: "", exitCode: 0 };
         }
         if (args.includes("--show-toplevel")) {
           return { stdout: `${workspace}\n`, stderr: "", exitCode: 0 };
@@ -556,6 +625,9 @@ describe("resolveContext", () => {
         if (args.includes("--is-inside-work-tree")) {
           return { stdout: "true\n", stderr: "", exitCode: 0 };
         }
+        if (args.includes("--is-shallow-repository")) {
+          return { stdout: "false\n", stderr: "", exitCode: 0 };
+        }
         if (args.includes("--show-toplevel")) {
           return { stdout: `${workspace}\n`, stderr: "", exitCode: 0 };
         }
@@ -583,9 +655,9 @@ describe("resolveContext", () => {
             outputTruncated: true,
           };
         }
-        if (args[0] === "diff" && args.includes("--name-only")) {
+        if (args[0] === "diff" && args.includes("--name-status")) {
           return {
-            stdout: "truncated-path\0",
+            stdout: "M\0truncated-path\0",
             stderr: "",
             exitCode: 0,
             outputTruncated: true,

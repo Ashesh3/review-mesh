@@ -175,6 +175,43 @@ function boundedPaths(
   };
 }
 
+function boundedNameStatus(
+  value: string,
+  maximum: number,
+): {
+  values: Array<{ path: string; kind: "tracked" | "deleted" }>;
+  truncated: boolean;
+} {
+  const fields = value.split("\0");
+  if (fields.at(-1) === "") fields.pop();
+  const values: Array<{ path: string; kind: "tracked" | "deleted" }> = [];
+  let malformed = false;
+  for (let index = 0; index < fields.length && values.length < maximum;) {
+    const status = fields[index++] ?? "";
+    const firstPath = fields[index++];
+    if (
+      !/^(?:[ACDMRTUXB]|[CR][0-9]{0,3})$/u.test(status) ||
+      firstPath === undefined ||
+      firstPath.length === 0
+    ) {
+      malformed = true;
+      break;
+    }
+    const path = /^[CR]/u.test(status) ? fields[index++] : firstPath;
+    if (path === undefined || path.length === 0) {
+      malformed = true;
+      break;
+    }
+    values.push({ path, kind: status.startsWith("D") ? "deleted" : "tracked" });
+  }
+  return {
+    values,
+    truncated:
+      malformed ||
+      (values.length >= maximum && fields.length > values.length * 2),
+  };
+}
+
 function pathspecArgs(paths: readonly string[] | undefined): string[] {
   return paths === undefined || paths.length === 0 ? [] : ["--", ...paths];
 }
@@ -317,7 +354,25 @@ export async function resolveContext({
     workspace,
     signal,
   );
-  const shallow = trimOutput(shallowResult) === "true";
+  const shallowText = trimOutput(shallowResult);
+  if (
+    shallowResult.exitCode !== 0 ||
+    (shallowText !== "true" && shallowText !== "false")
+  ) {
+    throw new ReviewScopeError(
+      "Review Mesh could not determine whether Git history is shallow.",
+      "change_scope_collection_failed",
+      undefined,
+      {
+        stage: "shallow_history_probe",
+        error:
+          shallowResult.exitCode === 0
+            ? "Git returned an invalid shallow-history response."
+            : "Git could not complete the shallow-history probe.",
+      },
+    );
+  }
+  const shallow = shallowText === "true";
   const [rootResult, headResult, branchResult] = await Promise.all([
     run(git, ["rev-parse", "--show-toplevel"], workspace, signal),
     run(git, ["rev-parse", "HEAD"], workspace, signal),
@@ -491,7 +546,7 @@ export async function resolveContext({
             "diff",
             "--no-ext-diff",
             "--no-textconv",
-            "--name-only",
+            "--name-status",
             "-z",
             mergeBase,
             requestedHead.resolved,
@@ -502,7 +557,14 @@ export async function resolveContext({
         ),
     run(
       git,
-      ["diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z", ...paths],
+      [
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--name-status",
+        "-z",
+        ...paths,
+      ],
       workspace,
       signal,
     ),
@@ -529,7 +591,7 @@ export async function resolveContext({
         "--no-ext-diff",
         "--no-textconv",
         "--cached",
-        "--name-only",
+        "--name-status",
         "-z",
         ...paths,
       ],
@@ -587,18 +649,30 @@ export async function resolveContext({
     statusResult.exitCode === 0 ? statusResult.stdout : "",
     MAX_STATUS_ENTRIES,
   );
-  const committedPaths = boundedPaths(
+  const committedStatuses = boundedNameStatus(
     committedPathsResult.exitCode === 0 ? committedPathsResult.stdout : "",
     MAX_CHANGED_FILES,
   );
-  const unstagedPaths = boundedPaths(
+  const unstagedStatuses = boundedNameStatus(
     unstagedPathsResult.exitCode === 0 ? unstagedPathsResult.stdout : "",
     MAX_CHANGED_FILES,
   );
-  const stagedPaths = boundedPaths(
+  const stagedStatuses = boundedNameStatus(
     stagedPathsResult.exitCode === 0 ? stagedPathsResult.stdout : "",
     MAX_CHANGED_FILES,
   );
+  const committedPaths = {
+    values: committedStatuses.values.map((entry) => entry.path),
+    truncated: committedStatuses.truncated,
+  };
+  const unstagedPaths = {
+    values: unstagedStatuses.values.map((entry) => entry.path),
+    truncated: unstagedStatuses.truncated,
+  };
+  const stagedPaths = {
+    values: stagedStatuses.values.map((entry) => entry.path),
+    truncated: stagedStatuses.truncated,
+  };
   const untrackedPaths = boundedPaths(
     untrackedPathsResult.exitCode === 0 ? untrackedPathsResult.stdout : "",
     MAX_CHANGED_FILES,
@@ -612,9 +686,12 @@ export async function resolveContext({
     ]),
   ];
   const statusKind = new Map<string, "tracked" | "deleted" | "untracked">();
-  for (const path of committedPaths.values) statusKind.set(path, "tracked");
-  for (const path of unstagedPaths.values) statusKind.set(path, "tracked");
-  for (const path of stagedPaths.values) statusKind.set(path, "tracked");
+  for (const entry of committedStatuses.values)
+    statusKind.set(entry.path, entry.kind);
+  for (const entry of unstagedStatuses.values)
+    statusKind.set(entry.path, entry.kind);
+  for (const entry of stagedStatuses.values)
+    statusKind.set(entry.path, entry.kind);
   for (const path of untrackedPaths.values) statusKind.set(path, "untracked");
   for (const line of status.values) {
     if (!line.startsWith("1 ") && !line.startsWith("2 ")) continue;

@@ -9,6 +9,11 @@ import type {
   ReviewerOutput,
 } from "../protocol/schemas.js";
 import type { ReviewerPromptBundle } from "../protocol/prompt.js";
+import type { ChangeCoverageLedger } from "../context/change-coverage.js";
+import type {
+  ResultPageCollector,
+  ResultPageCollectorOptions,
+} from "../results/result-pages.js";
 import type { AdapterFailure } from "./errors.js";
 
 export interface AdapterCapabilities {
@@ -23,6 +28,8 @@ export interface AdapterCapabilities {
   message?: string;
   /** Readiness failed transiently and may be probed once more. */
   retryable?: boolean;
+  observed_file_access?: boolean;
+  progress_observable?: boolean;
 }
 
 export interface AdapterReviewInput {
@@ -33,11 +40,19 @@ export interface AdapterReviewInput {
   resultJsonSchema: Record<string, unknown>;
   isolationPolicy: IsolationPolicy;
   signal: AbortSignal;
+  coverage?: ChangeCoverageLedger;
+  resultPages?: ResultPageCollector | ResultPageCollectorOptions;
 }
 
 export type AdapterEvent =
-  | { type: "progress"; phase: string; message?: string }
-  | { type: "activity"; message: string }
+  | {
+      type: "progress";
+      phase: string;
+      message?: string;
+      identity?: string;
+      byteCount?: number;
+    }
+  | { type: "activity"; message: string; identity?: string; byteCount?: number }
   | {
       type: "result";
       result: ReviewerOutput;
