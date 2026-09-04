@@ -488,13 +488,14 @@ export async function readRunStatus({
       }
       const event = asRecord(value);
       if (event === undefined) continue;
+      const recordType = text(event.record) ?? text(event.event);
       const recordRunId = text(event.run_id);
-      if (recordRunId !== undefined && recordRunId !== runId) {
+      if (recordType !== undefined && recordRunId !== runId) {
         throw new RunStatusError(
           "invalid_run_record",
-          `The persisted run record has a mismatched run_id at JSONL line ${line}.`,
+          `The persisted run record has a missing or mismatched run_id at JSONL line ${line}.`,
           line,
-          text(event.record) ?? text(event.event) ?? "unknown",
+          recordType,
           ["run_id"],
         );
       }

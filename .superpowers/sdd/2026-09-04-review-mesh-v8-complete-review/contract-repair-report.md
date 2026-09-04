@@ -90,3 +90,27 @@ This report ships in the repair commit `Guarantee end-to-end full review deliver
 - `npm run typecheck`: passed.
 - Targeted Prettier check: passed.
 - `git diff --check`: passed.
+
+## Independent review fix round 2
+
+### Finding addressed
+
+Status accepted recognized current public events and private records whose `run_id` was absent. Historical public schema-v3/v4 envelopes and every private record schema since their introduction required `run_id`, so there is no supported missing-identity legacy form to preserve.
+
+### RED evidence
+
+- Focused missing-identity test: 3 failed. A schema-v5 `run.started`, private `reviewer.result`, and private `context` all resolved instead of rejecting.
+
+### Fix
+
+- Status now requires every recognized object (`record` or `event`) to carry a non-empty `run_id` equal to the requested run. Unrecognized JSON objects retain the prior ignore behavior.
+- Existing schema-v4 status fixtures with valid `run_id` remain readable, preserving the actual legacy contract without inventing an unsupported missing-id exception.
+
+### GREEN evidence
+
+- Focused identity tests: 4 passed.
+- Full status suite: 21 passed.
+- Final 17-file focused suite: 17 files passed; 383 passed, 3 skipped.
+- `npm run typecheck`: passed.
+- Targeted Prettier check: passed.
+- `git diff --check`: passed.

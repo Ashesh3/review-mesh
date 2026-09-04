@@ -33,6 +33,59 @@ afterEach(async () => {
 });
 
 describe("readRunStatus", () => {
+  it.each([
+    {
+      name: "schema-v5 public event",
+      record: {
+        schema_version: "5",
+        event: "run.started",
+        seq: 1,
+        timestamp: "2026-09-04T00:00:00.000Z",
+        data: { consistency_mode: "live_worktree" },
+      },
+      recordType: "run.started",
+    },
+    {
+      name: "current private reviewer result",
+      record: (() => {
+        const result: ReviewerResultV3 = {
+          schema_version: "3",
+          verdict: "pass",
+          review_markdown: "# Review",
+          summary: "No findings.",
+          actionable_findings: [],
+          informational_notes: [],
+        };
+        return {
+          record: "reviewer.result",
+          reviewer_id: "security",
+          digest: reviewerResultDigest(result),
+          byte_count: Buffer.byteLength(JSON.stringify(result), "utf8"),
+          result,
+        };
+      })(),
+      recordType: "reviewer.result",
+    },
+    {
+      name: "current private context",
+      record: { record: "context", context: {} },
+      recordType: "context",
+    },
+  ])("rejects a $name without run_id", async ({ record, recordType }) => {
+    const { runsDirectory } = await fixture();
+    const runId = `run-missing-${recordType.replaceAll(".", "-")}`;
+    await writeFile(join(runsDirectory, `${runId}.jsonl`), line(record));
+
+    await expect(readRunStatus({ runsDirectory, runId })).rejects.toMatchObject(
+      {
+        code: "invalid_run_record",
+        line: 1,
+        recordType,
+        schemaPaths: ["run_id"],
+      },
+    );
+  });
+
   it("rejects every record whose run_id does not match the requested run", async () => {
     const { runsDirectory } = await fixture();
     const runId = "run-expected";
