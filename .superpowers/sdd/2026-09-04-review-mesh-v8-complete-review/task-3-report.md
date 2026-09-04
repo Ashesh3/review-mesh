@@ -95,3 +95,39 @@ Observed:
 - Legacy ordinary-reviewer adjudication artifacts remain readable for compatibility, but only the new dedicated result carries enforceable candidate decisions.
 - No broad suite rerun was performed after the exact focused Task 3 suite and typecheck, per parent instruction.
 
+## Fix round 1
+
+### RED
+
+Command:
+
+```powershell
+npx vitest run tests/findings/adjudication.test.ts tests/server/dashboard-data.test.ts tests/diagnostics/run-report.test.ts
+```
+
+Observed:
+
+- Exit code 1.
+- Four focused regressions reproduced: location-free proof gated, adjusted payload was ignored, dashboard trusted requested adjudication decisions, and advisory-only report fallback returned findings.
+
+### GREEN
+
+Command:
+
+```powershell
+npm run typecheck
+npx vitest run tests/findings/canonical.test.ts tests/findings/adjudication.test.ts tests/protocol/prompt.test.ts tests/orchestrator/state.test.ts tests/orchestrator/review-feedback.test.ts tests/diagnostics/run-report.test.ts tests/server/dashboard-data.test.ts
+```
+
+Observed:
+
+- Exit code 0.
+- Source and test TypeScript projects passed.
+- 7 test files passed; 83 tests passed.
+
+### Fixes
+
+- Dashboard now parses the source/adjudicator results and calls `validateAdjudication` before canonicalization.
+- Confirmation/adjustment proof requires concrete repository-relative path and positive line citations, including every ordered step, the failure point, and both base/head behaviors.
+- Adjusted decisions produce an effective finding used by live/report/dashboard canonical counts while the original candidate and full adjudicator review remain stored.
+- Report fallback derives `gate_outcome` from canonical gate-effective count, so advisory-only artifacts pass.

@@ -13,11 +13,15 @@ export type AdjudicationValidationIssue =
   | "duplicate_decision"
   | "unknown_source_finding_id"
   | "cited_evidence_required"
+  | "cited_evidence_location_required"
   | "adjusted_finding_required"
   | "ordered_execution_proof_required"
   | "ordered_execution_steps_invalid"
+  | "ordered_execution_citation_required"
   | "failure_point_invalid"
-  | "base_head_comparison_required";
+  | "failure_point_citation_required"
+  | "base_head_comparison_required"
+  | "base_head_citation_required";
 
 export interface EffectiveAdjudicationDecision {
   source_finding_id: string;
@@ -28,6 +32,7 @@ export interface EffectiveAdjudicationDecision {
   gate_eligible: boolean;
   issues: AdjudicationValidationIssue[];
   decision?: AdjudicationDecision;
+  effective_finding?: ReviewerResultV3["actionable_findings"][number];
 }
 
 export interface AdjudicationOutcome {
@@ -47,17 +52,64 @@ const orderedProofCategories = new Set([
 
 function validOrderedProof(decision: AdjudicationDecision): {
   ordered: boolean;
+  citations: boolean;
   failurePoint: boolean;
+  failurePointCitation: boolean;
 } {
   const proof = decision.ordered_execution_proof;
-  if (proof === undefined) return { ordered: false, failurePoint: false };
+  if (proof === undefined)
+    return {
+      ordered: false,
+      citations: false,
+      failurePoint: false,
+      failurePointCitation: false,
+    };
   const orders = proof.steps.map((step) => step.order);
   const ordered =
     proof.steps.length >= 2 &&
     new Set(orders).size === orders.length &&
     orders.every((order, index) => index === 0 || order > orders[index - 1]!);
   const failurePoint = orders.includes(proof.failure_point.step_order);
-  return { ordered, failurePoint };
+  return {
+    ordered,
+    citations: proof.steps.every((step) => concreteCitation(step.citation)),
+    failurePoint,
+    failurePointCitation: concreteCitation(proof.failure_point.citation),
+  };
+}
+
+function concreteCitation(value: {
+  path?: string | undefined;
+  start_line?: number | undefined;
+  end_line?: number | undefined;
+} | undefined): boolean {
+  if (value === undefined) return false;
+  return (
+    typeof value.path === "string" &&
+    value.path.length > 0 &&
+    !value.path.startsWith("/") &&
+    !/^[A-Za-z]:/u.test(value.path) &&
+    !value.path.includes("\\") &&
+    typeof value.start_line === "number" &&
+    Number.isSafeInteger(value.start_line) &&
+    value.start_line > 0 &&
+    (value.end_line === undefined ||
+      (Number.isSafeInteger(value.end_line) &&
+        value.end_line >= value.start_line))
+  );
+}
+
+function adjustedFinding(
+  candidate: ReviewerResultV3["actionable_findings"][number],
+  decision: AdjudicationDecision,
+): ReviewerResultV3["actionable_findings"][number] | undefined {
+  const adjusted = decision.adjusted_finding;
+  if (adjusted === undefined) return undefined;
+  return {
+    ...structuredClone(candidate),
+    ...structuredClone(adjusted),
+    id: candidate.id,
+  };
 }
 
 export function validateAdjudication(
@@ -100,6 +152,12 @@ export function validateAdjudication(
         issues.push("cited_evidence_required");
       }
       if (
+        decision.decision !== "rejected" &&
+        !decision.cited_evidence.every(concreteCitation)
+      ) {
+        issues.push("cited_evidence_location_required");
+      }
+      if (
         decision.decision === "adjusted" &&
         decision.adjusted_finding === undefined
       ) {
@@ -114,7 +172,11 @@ export function validateAdjudication(
           issues.push("ordered_execution_proof_required");
         } else {
           if (!proof.ordered) issues.push("ordered_execution_steps_invalid");
+          if (!proof.citations)
+            issues.push("ordered_execution_citation_required");
           if (!proof.failurePoint) issues.push("failure_point_invalid");
+          if (!proof.failurePointCitation)
+            issues.push("failure_point_citation_required");
         }
       }
       if (
@@ -124,6 +186,15 @@ export function validateAdjudication(
       ) {
         issues.push("base_head_comparison_required");
       }
+      if (
+        decision.decision !== "rejected" &&
+        decision.base_head_comparison !== undefined &&
+        (!concreteCitation(decision.base_head_comparison.base.citation) ||
+          !concreteCitation(decision.base_head_comparison.head.citation))
+      ) {
+        issues.push("base_head_citation_required");
+      }
+      const effectiveFinding = adjustedFinding(candidate, decision);
       return {
         source_finding_id: candidate.id,
         requested_decision: decision.decision,
@@ -133,9 +204,16 @@ export function validateAdjudication(
             : issues.length === 0
               ? decision.decision
               : "needs_verification",
-        gate_eligible: decision.decision !== "rejected" && issues.length === 0,
+        gate_eligible:
+          decision.decision !== "rejected" &&
+          issues.length === 0 &&
+          (effectiveFinding ?? candidate).severity !== "low" &&
+          (effectiveFinding ?? candidate).classification === "confirmed_defect",
         issues,
         decision,
+        ...(effectiveFinding === undefined
+          ? {}
+          : { effective_finding: effectiveFinding }),
       };
     },
   );

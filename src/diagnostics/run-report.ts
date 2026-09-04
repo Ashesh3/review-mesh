@@ -461,7 +461,13 @@ const persistedModelRunCountsSchema = z.looseObject({
 const persistedRunSummaryDataSchema = z.looseObject({
   status: z.enum(["passed", "findings", "incomplete"]).optional(),
   gate_outcome: z
-    .enum(["no_findings", "findings", "passed", "clear"])
+    .enum([
+      "no_findings",
+      "findings",
+      "passed",
+      "clear",
+      "unknown_future_value",
+    ])
     .optional(),
   coverage_outcome: z.enum(["complete", "partial", "incomplete"]).optional(),
   exit_code: nonNegativeIntegerSchema.optional(),
@@ -668,6 +674,7 @@ export interface RawRunFinding {
     | "adjusted"
     | "rejected"
     | "needs_verification";
+  effective_finding?: CanonicalRawFinding["effective_finding"];
 }
 
 export interface ConsolidatedRunFinding {
@@ -1607,7 +1614,10 @@ function parseRawFindings(parsed: ParsedReportRecord): ParsedFinding[] {
   const findings: ParsedFinding[] = [];
   const adjudicationDecisions = new Map<
     string,
-    Map<string, "confirmed" | "adjusted" | "rejected" | "needs_verification">
+    Map<
+      string,
+      ReturnType<typeof validateAdjudication>["decisions"][number]
+    >
   >();
   for (const metadata of parsed.reviewers.values()) {
     if (
@@ -1638,7 +1648,7 @@ function parseRawFindings(parsed: ParsedReportRecord): ParsedFinding[] {
       new Map(
         outcome.decisions.map((decision) => [
           decision.source_finding_id,
-          decision.effective_decision,
+          decision,
         ]),
       ),
     );
@@ -1661,38 +1671,70 @@ function parseRawFindings(parsed: ParsedReportRecord): ParsedFinding[] {
       const deduplicationKey = richer?.root_issue_id;
       const duplicateOf = richer?.duplicate_of;
       const duplicateFindingIds = richer?.duplicate_finding_ids ?? [];
-      const adjudication =
+      const adjudicationDecision =
         adjudicationDecisions.get(terminal.reviewerId)?.get(findingId) ??
-        "unadjudicated";
+        undefined;
+      const adjudication =
+        adjudicationDecision?.effective_decision ?? "unadjudicated";
+      const adjusted = adjudicationDecision?.effective_finding;
+      const effectiveSeverity = adjusted?.severity ?? finding.severity;
+      const effectiveConfidence = adjusted?.confidence ?? richer?.confidence ?? "medium";
+      const effectiveClassification =
+        adjudication === "needs_verification"
+          ? "needs_verification"
+          : (adjusted?.classification ??
+            richer?.classification ??
+            "needs_verification");
       findings.push({
         source_ref: sourceReference(terminal.reviewerId, findingId),
         reviewer_id: terminal.reviewerId,
         lens_id: metadata.lensId,
         finding_id: findingId,
-        severity: finding.severity,
-        title: finding.title,
-        description: finding.description,
-        evidence: uniqueEvidence(runFindingEvidence(finding.evidence)),
-        suggested_direction: finding.suggested_direction,
-        confidence: richer?.confidence ?? "medium",
-        classification:
-          adjudication === "needs_verification"
-            ? "needs_verification"
-            : (richer?.classification ?? "needs_verification"),
-        external_assumptions: uniqueSorted(richer?.external_assumptions ?? []),
+        severity: effectiveSeverity,
+        title: adjusted?.title ?? finding.title,
+        description: adjusted?.description ?? finding.description,
+        evidence: uniqueEvidence(
+          runFindingEvidence(adjusted?.evidence ?? finding.evidence),
+        ),
+        suggested_direction:
+          adjusted?.suggested_direction ?? finding.suggested_direction,
+        confidence: effectiveConfidence,
+        classification: effectiveClassification,
+        external_assumptions: uniqueSorted(
+          adjusted?.external_assumptions ?? richer?.external_assumptions ?? [],
+        ),
         source_findings: [currentSource],
         duplicate_finding_ids: uniqueSorted(duplicateFindingIds),
-        ...(deduplicationKey === undefined
+        ...((adjusted?.root_issue_id ?? deduplicationKey) === undefined
           ? {}
-          : { deduplication_key: deduplicationKey }),
+          : {
+              deduplication_key:
+                adjusted?.root_issue_id ?? deduplicationKey!,
+            }),
         ...(duplicateOf === undefined ? {} : { duplicate_of: duplicateOf }),
         gate_eligible:
-          finding.severity !== "low" &&
-          (richer?.classification ?? "needs_verification") ===
-            "confirmed_defect" &&
+          effectiveSeverity !== "low" &&
+          effectiveClassification !== "advisory" &&
           adjudication !== "rejected" &&
           adjudication !== "needs_verification",
         adjudication,
+        ...(adjusted === undefined
+          ? {}
+          : {
+              effective_finding: {
+                severity: adjusted.severity,
+                title: adjusted.title,
+                description: adjusted.description,
+                evidence: runFindingEvidence(adjusted.evidence),
+                suggested_direction: adjusted.suggested_direction,
+                confidence: adjusted.confidence,
+                classification: adjusted.classification,
+                ...(adjusted.root_issue_id === undefined
+                  ? {}
+                  : { root_issue_id: adjusted.root_issue_id }),
+                external_assumptions: [...adjusted.external_assumptions],
+              },
+            }),
         legacyDeduplicationKey: `${normalizedText(finding.title)}\u0000${normalizedText(finding.description)}`,
       });
     }
@@ -1917,7 +1959,7 @@ export async function readRunReport({
     parsed.reportedIncompleteLenses ?? derivedIncompleteLenses;
   const gateOutcome =
     recognizedGateOutcome(parsed.reportedGateOutcome) ??
-    (findings.length > 0 || parsed.reportedStatus === "findings"
+    (canonical.counts.gate > 0
       ? "findings"
       : "passed");
   const coverageOutcome =

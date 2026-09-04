@@ -46,6 +46,17 @@ export interface CanonicalRawFinding {
   category?: string;
   verification?: string;
   change_impact?: string;
+  effective_finding?: {
+    severity: CanonicalFindingSeverity;
+    title: string;
+    description: string;
+    evidence: CanonicalFindingEvidence[];
+    suggested_direction: string;
+    confidence: CanonicalFindingConfidence;
+    classification: CanonicalFindingClassification;
+    root_issue_id?: string;
+    external_assumptions: string[];
+  };
 }
 
 export interface CanonicalConsolidatedFinding {
@@ -271,7 +282,29 @@ export function canonicalizeFindings(
   values: readonly CanonicalRawFinding[],
 ): CanonicalFindingSet {
   const raw = values.map((value) => structuredClone(value)).sort(compareRaw);
-  const findings = raw.filter((finding) => finding.adjudication !== "rejected");
+  const findings = raw
+    .filter((finding) => finding.adjudication !== "rejected")
+    .map((finding) => {
+      if (
+        finding.adjudication !== "adjusted" ||
+        finding.effective_finding === undefined
+      ) {
+        return finding;
+      }
+      return {
+        ...finding,
+        ...structuredClone(finding.effective_finding),
+        finding_id: finding.finding_id,
+        source_ref: finding.source_ref,
+        reviewer_id: finding.reviewer_id,
+        lens_id: finding.lens_id,
+        source_findings: finding.source_findings,
+        duplicate_finding_ids: finding.duplicate_finding_ids,
+        gate_eligible:
+          finding.effective_finding.severity !== "low" &&
+          finding.effective_finding.classification === "confirmed_defect",
+      };
+    });
   const sets = new DisjointSet(findings.length);
   const explicitRoots = new Map<string, number>();
   const sourceRefs = new Map<string, number>();

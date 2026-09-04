@@ -468,13 +468,30 @@ function rawFindingsForStates(
       ]) ?? [],
     );
     for (const finding of reviewer.result.actionable_findings) {
-      const confidence =
-        "confidence" in finding ? finding.confidence : "medium";
-      const classification =
-        "classification" in finding
-          ? finding.classification
-          : "needs_verification";
       const decision = decisions.get(finding.id);
+      const adjusted = decision?.effective_finding;
+      const effectiveFinding =
+        adjusted === undefined
+          ? finding
+          : {
+              ...finding,
+              ...adjusted,
+              id: finding.id,
+            };
+      const confidence =
+        "confidence" in effectiveFinding &&
+        (effectiveFinding.confidence === "high" ||
+          effectiveFinding.confidence === "medium" ||
+          effectiveFinding.confidence === "low")
+          ? effectiveFinding.confidence
+          : "medium";
+      const classification =
+        "classification" in effectiveFinding &&
+        (effectiveFinding.classification === "confirmed_defect" ||
+          effectiveFinding.classification === "needs_verification" ||
+          effectiveFinding.classification === "advisory")
+          ? effectiveFinding.classification
+          : "needs_verification";
       const adjudication =
         decision === undefined
           ? "unadjudicated"
@@ -489,11 +506,11 @@ function rawFindingsForStates(
           : classification;
       const policy = reviewer.reviewer.policy;
       const thresholdEligible =
-        finding.severity !== "low" &&
+        effectiveFinding.severity !== "low" &&
         effectiveClassification !== "advisory" &&
         (policy === undefined ||
           meetsGateThresholds(
-            { severity: finding.severity, confidence },
+            { severity: effectiveFinding.severity, confidence },
             {
               minimumSeverity: policy.gateMinimumSeverity,
               minimumConfidence: policy.gateMinimumConfidence,
@@ -504,10 +521,10 @@ function rawFindingsForStates(
         reviewer_id: reviewer.reviewer.id,
         lens_id: lensId(reviewer.reviewer),
         finding_id: finding.id,
-        severity: finding.severity,
-        title: finding.title,
-        description: finding.description,
-        evidence: finding.evidence.map((evidence) => ({
+        severity: effectiveFinding.severity,
+        title: effectiveFinding.title,
+        description: effectiveFinding.description,
+        evidence: effectiveFinding.evidence.map((evidence) => ({
           ...(evidence.path === undefined ? {} : { path: evidence.path }),
           ...(evidence.start_line === undefined
             ? {}
@@ -517,12 +534,13 @@ function rawFindingsForStates(
             : { end_line: evidence.end_line }),
           detail: evidence.detail,
         })),
-        suggested_direction: finding.suggested_direction,
+        suggested_direction: effectiveFinding.suggested_direction,
         confidence,
         classification: effectiveClassification,
         external_assumptions:
-          "external_assumptions" in finding
-            ? [...finding.external_assumptions]
+          "external_assumptions" in effectiveFinding &&
+          Array.isArray(effectiveFinding.external_assumptions)
+            ? [...effectiveFinding.external_assumptions]
             : [],
         source_findings: [
           { reviewer_id: reviewer.reviewer.id, finding_id: finding.id },
@@ -531,9 +549,9 @@ function rawFindingsForStates(
           "duplicate_finding_ids" in finding
             ? [...(finding.duplicate_finding_ids ?? [])]
             : [],
-        ...(!!("root_issue_id" in finding) &&
-        typeof finding.root_issue_id === "string"
-          ? { root_issue_id: finding.root_issue_id }
+        ...(!!("root_issue_id" in effectiveFinding) &&
+        typeof effectiveFinding.root_issue_id === "string"
+          ? { root_issue_id: effectiveFinding.root_issue_id }
           : {}),
         ...(!!("duplicate_of" in finding) &&
         typeof finding.duplicate_of === "string"
@@ -544,6 +562,34 @@ function rawFindingsForStates(
           adjudication !== "rejected" &&
           adjudication !== "needs_verification",
         adjudication,
+        ...(adjusted === undefined
+          ? {}
+          : {
+              effective_finding: {
+                severity: adjusted.severity,
+                title: adjusted.title,
+                description: adjusted.description,
+                evidence: adjusted.evidence.map((evidence) => ({
+                  ...(evidence.path === undefined
+                    ? {}
+                    : { path: evidence.path }),
+                  ...(evidence.start_line === undefined
+                    ? {}
+                    : { start_line: evidence.start_line }),
+                  ...(evidence.end_line === undefined
+                    ? {}
+                    : { end_line: evidence.end_line }),
+                  detail: evidence.detail,
+                })),
+                suggested_direction: adjusted.suggested_direction,
+                confidence: adjusted.confidence,
+                classification: adjusted.classification,
+                ...(adjusted.root_issue_id === undefined
+                  ? {}
+                  : { root_issue_id: adjusted.root_issue_id }),
+                external_assumptions: [...adjusted.external_assumptions],
+              },
+            }),
         ...(!!("category" in finding) && typeof finding.category === "string"
           ? { category: finding.category }
           : {}),

@@ -18,6 +18,11 @@ import {
   canonicalizeFindings,
   type CanonicalRawFinding,
 } from "../findings/canonical.js";
+import { validateAdjudication } from "../findings/adjudication.js";
+import {
+  adjudicationResultSchema,
+  reviewerResultV3Schema,
+} from "../protocol/schemas.js";
 
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 const ACTIVE_RUN_FILE =
@@ -867,7 +872,10 @@ function runSummaryFromParsed(parsed: ParsedRunFile): DashboardRunSummary {
   const findings =
     integer(completion.unique_findings) ??
     canonicalizeFindings(
-      rawFindings(reviewers) as readonly CanonicalRawFinding[],
+      rawFindings(
+        reviewers,
+        scope?.mode === "changes" ? "changes" : "full",
+      ) as readonly CanonicalRawFinding[],
     ).counts.unique;
   const hasIncomplete = reviewers.some(
     (reviewer) => reviewer.state === "incomplete",
@@ -1220,11 +1228,14 @@ function normalizeFinding(value: RawRunFinding | ConsolidatedRunFinding) {
   return bounded(value) as Record<string, unknown>;
 }
 
-function rawFindings(reviewers: readonly ReviewerRuntime[]): RawRunFinding[] {
+function rawFindings(
+  reviewers: readonly ReviewerRuntime[],
+  reviewScope: "changes" | "full" = "full",
+): RawRunFinding[] {
   const values: RawRunFinding[] = [];
   const adjudicationDecisions = new Map<
     string,
-    Map<string, "confirmed" | "adjusted" | "rejected" | "needs_verification">
+    Map<string, ReturnType<typeof validateAdjudication>["decisions"][number]>
   >();
   for (const reviewer of reviewers) {
     if (
@@ -1234,24 +1245,26 @@ function rawFindings(reviewers: readonly ReviewerRuntime[]): RawRunFinding[] {
     ) {
       continue;
     }
-    const decisions = new Map<
-      string,
-      "confirmed" | "adjusted" | "rejected" | "needs_verification"
-    >();
-    for (const value of reviewer.result.decisions) {
-      const decision = asRecord(value);
-      const id = text(decision?.source_finding_id);
-      const requested = text(decision?.decision);
-      if (
-        id === undefined ||
-        (requested !== "confirmed" &&
-          requested !== "adjusted" &&
-          requested !== "rejected")
-      ) {
-        continue;
-      }
-      decisions.set(id, requested);
-    }
+    const source = reviewers.find(
+      (candidate) =>
+        candidate.reviewer_id === reviewer.adjudicates_reviewer_id,
+    );
+    const candidateResult = reviewerResultV3Schema.safeParse(source?.result);
+    const adjudicationResult = adjudicationResultSchema.safeParse(
+      reviewer.result,
+    );
+    if (!candidateResult.success || !adjudicationResult.success) continue;
+    const outcome = validateAdjudication(
+      candidateResult.data,
+      adjudicationResult.data,
+      { reviewScope },
+    );
+    const decisions = new Map(
+      outcome.decisions.map((decision) => [
+        decision.source_finding_id,
+        decision,
+      ]),
+    );
     adjudicationDecisions.set(reviewer.adjudicates_reviewer_id, decisions);
   }
   for (const reviewer of reviewers) {
@@ -1267,6 +1280,16 @@ function rawFindings(reviewers: readonly ReviewerRuntime[]): RawRunFinding[] {
       const confidence = text(finding.confidence) ?? "medium";
       const classification =
         text(finding.classification) ?? "needs_verification";
+      const adjudicationDecision = adjudicationDecisions
+        .get(reviewer.reviewer_id)
+        ?.get(findingId);
+      const adjusted = adjudicationDecision?.effective_finding;
+      const effectiveSeverity = adjusted?.severity ?? severity;
+      const effectiveConfidence = adjusted?.confidence ?? confidence;
+      const effectiveClassification =
+        adjudicationDecision?.effective_decision === "needs_verification"
+          ? "needs_verification"
+          : (adjusted?.classification ?? classification);
       if (
         !["critical", "high", "medium", "low"].includes(severity ?? "") ||
         !["high", "medium", "low"].includes(confidence) ||
@@ -1300,20 +1323,34 @@ function rawFindings(reviewers: readonly ReviewerRuntime[]): RawRunFinding[] {
         reviewer_id: reviewer.reviewer_id,
         lens_id: reviewer.lens_id,
         finding_id: findingId,
-        severity: severity as RawRunFinding["severity"],
-        title: text(finding.title) ?? "Untitled finding",
-        description: text(finding.description) ?? "Finding detail unavailable.",
-        evidence,
+        severity: effectiveSeverity as RawRunFinding["severity"],
+        title: adjusted?.title ?? text(finding.title) ?? "Untitled finding",
+        description:
+          adjusted?.description ??
+          text(finding.description) ??
+          "Finding detail unavailable.",
+        evidence:
+          adjusted?.evidence.map((entry) => ({
+            ...(entry.path === undefined ? {} : { path: entry.path }),
+            ...(entry.start_line === undefined
+              ? {}
+              : { start_line: entry.start_line }),
+            ...(entry.end_line === undefined
+              ? {}
+              : { end_line: entry.end_line }),
+            detail: entry.detail,
+          })) ?? evidence,
         suggested_direction:
+          adjusted?.suggested_direction ??
           text(finding.suggested_direction) ??
           "Investigate and correct the defect.",
-        confidence: confidence as RawRunFinding["confidence"],
-        classification: classification as RawRunFinding["classification"],
-        external_assumptions: Array.isArray(finding.external_assumptions)
+        confidence: effectiveConfidence as RawRunFinding["confidence"],
+        classification: effectiveClassification as RawRunFinding["classification"],
+        external_assumptions: adjusted?.external_assumptions ?? (Array.isArray(finding.external_assumptions)
           ? finding.external_assumptions
               .map(text)
               .filter((entry): entry is string => entry !== undefined)
-          : [],
+          : []),
         source_findings: [
           { reviewer_id: reviewer.reviewer_id, finding_id: findingId },
         ],
@@ -1322,21 +1359,49 @@ function rawFindings(reviewers: readonly ReviewerRuntime[]): RawRunFinding[] {
               .map(text)
               .filter((entry): entry is string => entry !== undefined)
           : [],
-        ...(text(finding.root_issue_id) === undefined
+        ...((adjusted?.root_issue_id ?? text(finding.root_issue_id)) === undefined
           ? {}
-          : { deduplication_key: text(finding.root_issue_id)! }),
+          : {
+              deduplication_key:
+                adjusted?.root_issue_id ?? text(finding.root_issue_id)!,
+            }),
         ...(text(finding.duplicate_of) === undefined
           ? {}
           : { duplicate_of: text(finding.duplicate_of)! }),
         gate_eligible:
-          severity !== "low" &&
-          classification === "confirmed_defect" &&
-          adjudicationDecisions
-            .get(reviewer.reviewer_id)
-            ?.get(findingId) !== "rejected",
+          effectiveSeverity !== "low" &&
+          effectiveClassification !== "advisory" &&
+          adjudicationDecision?.effective_decision !== "rejected" &&
+          adjudicationDecision?.effective_decision !== "needs_verification",
         adjudication:
-          adjudicationDecisions.get(reviewer.reviewer_id)?.get(findingId) ??
+          adjudicationDecision?.effective_decision ??
           "unadjudicated",
+        ...(adjusted === undefined
+          ? {}
+          : {
+              effective_finding: {
+                severity: adjusted.severity,
+                title: adjusted.title,
+                description: adjusted.description,
+                evidence: adjusted.evidence.map((entry) => ({
+                  ...(entry.path === undefined ? {} : { path: entry.path }),
+                  ...(entry.start_line === undefined
+                    ? {}
+                    : { start_line: entry.start_line }),
+                  ...(entry.end_line === undefined
+                    ? {}
+                    : { end_line: entry.end_line }),
+                  detail: entry.detail,
+                })),
+                suggested_direction: adjusted.suggested_direction,
+                confidence: adjusted.confidence,
+                classification: adjusted.classification,
+                ...(adjusted.root_issue_id === undefined
+                  ? {}
+                  : { root_issue_id: adjusted.root_issue_id }),
+                external_assumptions: [...adjusted.external_assumptions],
+              },
+            }),
       });
     }
   }
@@ -1359,7 +1424,11 @@ export async function readDashboardRun(input: {
       : { reviewer_id: event.reviewer_id }),
     data: bounded(event.data),
   }));
-  const raw = rawFindings(reviewers);
+  const scope =
+    asRecord(parsed.request?.review_scope)?.mode === "changes"
+      ? "changes"
+      : "full";
+  const raw = rawFindings(reviewers, scope);
   const canonical = canonicalizeFindings(
     raw as readonly CanonicalRawFinding[],
   );

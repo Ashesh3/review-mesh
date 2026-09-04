@@ -1103,4 +1103,46 @@ describe("finding consolidation and rendering", () => {
     expect(findings.deduplicated).toHaveLength(1);
     expect(report.finding_counts.unique).toBe(findings.deduplicated.length);
   });
+
+  it("derives a passed gate outcome when an unrecognized persisted outcome has only advisories", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-advisory-fallback";
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [
+        line({
+          record: "reviewer.result",
+          run_id: runId,
+          reviewer_id: "maintainability",
+          result: resultV2([
+            findingV2({
+              id: "advisory-only",
+              severity: "low",
+              classification: "advisory",
+            }),
+          ]),
+        }),
+        line({
+          record: "run.summary",
+          run_id: runId,
+          summary: {
+            gate_outcome: "unknown_future_value",
+            coverage_outcome: "complete",
+            exit_code: 0,
+          },
+        }),
+      ].join(""),
+    );
+
+    const report = await readRunReport({ runsDirectory, runId });
+
+    expect(report.finding_counts).toEqual({
+      raw: 1,
+      unique: 1,
+      gate: 0,
+      advisory: 1,
+    });
+    expect(report.gate_outcome).toBe("passed");
+    expect(report.status).toBe("passed");
+  });
 });

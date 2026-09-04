@@ -467,6 +467,8 @@ describe("dashboard data", () => {
       confidence: "high",
       classification: "confirmed_defect",
       external_assumptions: [],
+      category: "correctness",
+      verification: "Candidate verification.",
     };
     await writeFile(
       join(appPaths.runsDirectory, "run-adjudicated.jsonl"),
@@ -499,8 +501,9 @@ describe("dashboard data", () => {
           run_id: "run-adjudicated",
           reviewer_id: "lens::source",
           result: {
-            schema_version: "2",
+            schema_version: "3",
             verdict: "fail",
+            review_markdown: "# Review\n\nCandidate.",
             summary: "Candidate",
             actionable_findings: [finding],
             informational_notes: [],
@@ -524,7 +527,14 @@ describe("dashboard data", () => {
                 source_finding_id: "candidate",
                 decision: "rejected",
                 rationale: "The candidate is not supported by the code.",
-                cited_evidence: [{ detail: "Contradictory code evidence." }],
+                cited_evidence: [
+                  {
+                    path: "src/candidate.ts",
+                    start_line: 1,
+                    end_line: 1,
+                    detail: "Contradictory code evidence.",
+                  },
+                ],
                 unverified_assumptions: [],
               },
             ],
@@ -570,6 +580,131 @@ describe("dashboard data", () => {
         raw: [expect.objectContaining({ finding_id: "candidate" })],
         consolidated: [],
         counts: { raw: 1, unique: 0, gate: 0, advisory: 0 },
+      },
+    });
+  });
+
+  it("downgrades invalid adjudication proof with the same canonical classification and counts as reports", async () => {
+    const { appPaths } = await fixture();
+    const runId = "run-invalid-proof";
+    const candidate = {
+      schema_version: "3",
+      verdict: "fail",
+      review_markdown: "# Review\n\nCandidate reliability defect.",
+      summary: "Candidate reliability defect.",
+      actionable_findings: [
+        {
+          id: "candidate",
+          severity: "high",
+          title: "Post-ingest enum throw",
+          description: "The candidate says mapping throws after ingest.",
+          evidence: [
+            {
+              path: "src/ingest.ts",
+              start_line: 40,
+              end_line: 45,
+              detail: "Candidate evidence.",
+            },
+          ],
+          suggested_direction: "Prevent the throw.",
+          confidence: "high",
+          classification: "confirmed_defect",
+          external_assumptions: [],
+          category: "reliability",
+          verification: "Candidate verification.",
+          change_impact: "Candidate claims HEAD introduced the throw.",
+        },
+      ],
+      informational_notes: [],
+    };
+    await writeFile(
+      join(appPaths.runsDirectory, `${runId}.jsonl`),
+      [
+        {
+          record: "request",
+          run_id: runId,
+          request: {
+            schema_version: "2",
+            project_name: "demo",
+            workspace: "C:/demo",
+            instructions: "Review changes.",
+            review_scope: { mode: "changes" },
+          },
+        },
+        {
+          record: "resolution",
+          run_id: runId,
+          resolution: {
+            reviewers: [
+              { id: "lens::source", agent_id: "lens" },
+              {
+                id: "lens::judge",
+                agent_id: "lens",
+                policy: {
+                  passQuorum: 1,
+                  minimumProviderGroups: 1,
+                  adjudication: "required",
+                  gateMinimumSeverity: "medium",
+                  gateMinimumConfidence: "medium",
+                  mode: "adjudication",
+                  adjudicatesReviewerId: "lens::source",
+                },
+              },
+            ],
+          },
+        },
+        {
+          record: "reviewer.result",
+          run_id: runId,
+          reviewer_id: "lens::source",
+          result: candidate,
+        },
+        {
+          record: "reviewer.result",
+          run_id: runId,
+          reviewer_id: "lens::judge",
+          mode: "adjudication",
+          adjudicates_reviewer_id: "lens::source",
+          result: {
+            schema_version: "1",
+            kind: "review-mesh.adjudication-result",
+            verdict: "fail",
+            review_markdown: "# Adjudication\n\nRepeated without proof.",
+            summary: "Repeated candidate.",
+            actionable_findings: [],
+            decisions: [
+              {
+                source_finding_id: "candidate",
+                decision: "confirmed",
+                rationale: "Confirmed by prose only.",
+                cited_evidence: [{ detail: "No repository location." }],
+                unverified_assumptions: [],
+              },
+            ],
+            informational_notes: [],
+          },
+        },
+      ]
+        .map((record) => JSON.stringify(record))
+        .join("\n") + "\n",
+    );
+
+    const run = await readDashboardRun({ appPaths, runId });
+
+    expect(run).toMatchObject({
+      findings: {
+        raw: [
+          expect.objectContaining({
+            finding_id: "candidate",
+            classification: "needs_verification",
+            adjudication: "needs_verification",
+            gate_eligible: false,
+          }),
+        ],
+        consolidated: [
+          expect.objectContaining({ classification: "needs_verification" }),
+        ],
+        counts: { raw: 1, unique: 1, gate: 0, advisory: 1 },
       },
     });
   });

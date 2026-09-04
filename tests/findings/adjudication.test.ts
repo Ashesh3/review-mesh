@@ -141,6 +141,12 @@ describe("validateAdjudication", () => {
         ],
         failure_point: {
           step_order: 2,
+          citation: {
+            path: "src/ingest.ts",
+            start_line: 40,
+            end_line: 45,
+            detail: "The exception escapes at this concrete location.",
+          },
           detail: "The exception escapes at the second step.",
         },
       },
@@ -175,6 +181,166 @@ describe("validateAdjudication", () => {
         issues: [],
       }),
     ]);
+  });
+
+  it("rejects detail-only proof citations as needs verification", () => {
+    const judge = adjudication({
+      source_finding_id: "enum-post-ingest",
+      decision: "confirmed",
+      rationale: "The prose claims a confirmed ordering defect.",
+      cited_evidence: [{ detail: "No concrete repository location." }],
+      ordered_execution_proof: {
+        steps: [
+          {
+            order: 1,
+            description: "First step.",
+            citation: { detail: "No path or line." },
+          },
+          {
+            order: 2,
+            description: "Second step.",
+            citation: { detail: "Still no path or line." },
+          },
+        ],
+        failure_point: {
+          step_order: 2,
+          detail: "The claimed failure point has no concrete citation.",
+        },
+      },
+      base_head_comparison: {
+        base: {
+          behavior: "Base behavior by assertion only.",
+          citation: { detail: "No base location." },
+        },
+        head: {
+          behavior: "HEAD behavior by assertion only.",
+          citation: { detail: "No HEAD location." },
+        },
+        impact: "Claimed change impact.",
+      },
+      unverified_assumptions: [],
+    });
+
+    expect(validateAdjudication(candidate(), judge, context()).decisions).toEqual([
+      expect.objectContaining({
+        effective_decision: "needs_verification",
+        gate_eligible: false,
+        issues: expect.arrayContaining([
+          "cited_evidence_location_required",
+          "ordered_execution_citation_required",
+          "failure_point_citation_required",
+          "base_head_citation_required",
+        ]),
+      }),
+    ]);
+  });
+
+  it("returns an adjusted effective finding while retaining the original candidate", () => {
+    const judge = adjudication({
+      source_finding_id: "enum-post-ingest",
+      decision: "adjusted",
+      rationale: "The defect exists but is low-severity and advisory.",
+      cited_evidence: [
+        {
+          path: "src/ingest.ts",
+          start_line: 40,
+          end_line: 45,
+          detail: "The fallback prevents batch failure.",
+        },
+      ],
+      adjusted_finding: {
+        severity: "low",
+        title: "Unknown enum uses fallback",
+        description: "The behavior is observable but does not abort ingestion.",
+        evidence: [
+          {
+            path: "src/ingest.ts",
+            start_line: 40,
+            end_line: 45,
+            detail: "The catch maps to a safe sentinel.",
+          },
+        ],
+        suggested_direction: "Document the fallback.",
+        confidence: "high",
+        classification: "advisory",
+        root_issue_id: "enum-fallback",
+        external_assumptions: [],
+      },
+      ordered_execution_proof: {
+        steps: [
+          {
+            order: 1,
+            description: "Mapping is attempted.",
+            citation: {
+              path: "src/ingest.ts",
+              start_line: 40,
+              end_line: 42,
+              detail: "Mapping is attempted here.",
+            },
+          },
+          {
+            order: 2,
+            description: "Fallback catches the unknown value.",
+            citation: {
+              path: "src/ingest.ts",
+              start_line: 43,
+              end_line: 45,
+              detail: "Fallback occurs here.",
+            },
+          },
+        ],
+        failure_point: {
+          step_order: 2,
+          citation: {
+            path: "src/ingest.ts",
+            start_line: 43,
+            end_line: 45,
+            detail: "The candidate's claimed failure is contained here.",
+          },
+          detail: "The effective issue is limited to fallback observability.",
+        },
+      },
+      base_head_comparison: {
+        base: {
+          behavior: "Base rejected the unknown value.",
+          citation: {
+            path: "src/ingest.ts",
+            start_line: 40,
+            end_line: 42,
+            detail: "Base behavior in the supplied diff.",
+          },
+        },
+        head: {
+          behavior: "HEAD catches and maps it.",
+          citation: {
+            path: "src/ingest.ts",
+            start_line: 43,
+            end_line: 45,
+            detail: "HEAD behavior in the supplied diff.",
+          },
+        },
+        impact: "The change reduced the impact to advisory fallback behavior.",
+      },
+      unverified_assumptions: [],
+    });
+
+    const outcome = validateAdjudication(candidate(), judge, context());
+
+    expect(outcome.candidate_result.actionable_findings[0]).toMatchObject({
+      severity: "high",
+      title: "Unknown enum throws after ingest",
+    });
+    expect(outcome.decisions[0]).toMatchObject({
+      effective_decision: "adjusted",
+      gate_eligible: false,
+      effective_finding: {
+        id: "enum-post-ingest",
+        severity: "low",
+        title: "Unknown enum uses fallback",
+        classification: "advisory",
+        root_issue_id: "enum-fallback",
+      },
+    });
   });
 
   it("requires exactly one decision for each candidate source id", () => {

@@ -6,6 +6,7 @@ import {
   summarizeSuite,
 } from "../../src/orchestrator/state.js";
 import type { RunStatus } from "../../src/protocol/schemas.js";
+import { validateAdjudication } from "../../src/findings/adjudication.js";
 import {
   completedFail,
   completedPass,
@@ -174,6 +175,103 @@ describe("suite state", () => {
     expect(aggregate.uniqueFindings).toBe(1);
     expect(aggregate.gateFindings).toBe(1);
     expect(aggregate.advisoryFindings).toBe(0);
+  });
+
+  it("uses an adjusted advisory finding for live canonical counts while preserving the source result", () => {
+    const sourceReviewer = resolvedReviewer({
+      id: "reliability::source",
+      agentId: "reliability",
+      policy: {
+        passQuorum: 1,
+        minimumProviderGroups: 1,
+        adjudication: "required",
+        gateMinimumSeverity: "medium",
+        gateMinimumConfidence: "medium",
+      },
+    });
+    const judgeReviewer = resolvedReviewer({
+      id: "reliability::judge",
+      agentId: "reliability",
+      policy: {
+        passQuorum: 1,
+        minimumProviderGroups: 1,
+        adjudication: "required",
+        gateMinimumSeverity: "medium",
+        gateMinimumConfidence: "medium",
+      },
+    });
+    const state = createSuiteState([sourceReviewer, judgeReviewer]);
+    state.transition(sourceReviewer.id, "starting");
+    state.transition(sourceReviewer.id, "reviewing");
+    const candidate = completedFail(sourceReviewer.id).result;
+    if (candidate.schema_version !== "3") throw new Error("v3 fixture required");
+    candidate.actionable_findings[0]!.category = "correctness";
+    state.complete(sourceReviewer.id, candidate, "enforced_read_only");
+    state.setAdjudication(judgeReviewer.id, sourceReviewer.id);
+    state.transition(judgeReviewer.id, "starting");
+    state.transition(judgeReviewer.id, "reviewing");
+    const adjudication = {
+      schema_version: "1" as const,
+      kind: "review-mesh.adjudication-result" as const,
+      verdict: "pass" as const,
+      review_markdown: "# Adjudication\n\nAdjusted to advisory.",
+      summary: "Adjusted.",
+      actionable_findings: [] as [],
+      decisions: [
+        {
+          source_finding_id: `${sourceReviewer.id}-finding`,
+          decision: "adjusted" as const,
+          rationale: "The fallback avoids the defect.",
+          cited_evidence: [
+            {
+              path: "src/reliability.ts",
+              start_line: 10,
+              end_line: 12,
+              detail: "The fallback handles it.",
+            },
+          ],
+          adjusted_finding: {
+            severity: "low" as const,
+            title: "Fallback is undocumented",
+            description: "The behavior is advisory only.",
+            evidence: [
+              {
+                path: "src/reliability.ts",
+                start_line: 10,
+                end_line: 12,
+                detail: "The fallback handles it.",
+              },
+            ],
+            suggested_direction: "Document it.",
+            confidence: "high" as const,
+            classification: "advisory" as const,
+            external_assumptions: [],
+          },
+          unverified_assumptions: [],
+        },
+      ],
+      informational_notes: [],
+    };
+    const outcome = validateAdjudication(candidate, adjudication, {
+      reviewScope: "full",
+    });
+    state.complete(
+      judgeReviewer.id,
+      adjudication,
+      "enforced_read_only",
+      outcome,
+    );
+
+    const aggregate = aggregateRun(state);
+
+    expect(state.reviewer(sourceReviewer.id).result).toEqual(candidate);
+    expect(aggregate).toMatchObject({
+      rawFindings: 1,
+      uniqueFindings: 1,
+      gateFindings: 0,
+      advisoryFindings: 1,
+      gateOutcome: "no_findings",
+    });
   });
 
   it("isolates caller-owned inputs and returned snapshots from stored state", () => {

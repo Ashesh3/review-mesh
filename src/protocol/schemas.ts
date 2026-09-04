@@ -302,6 +302,17 @@ export const reviewerResultSchema = z.union([
 ]);
 
 const adjudicationCitationSchema = findingEvidenceV3Schema;
+const adjustedFindingSchema = z.strictObject({
+  severity: findingSeveritySchema,
+  title: completeResultText,
+  description: completeResultText,
+  evidence: z.array(findingEvidenceV3Schema).min(1).max(256),
+  suggested_direction: completeResultText,
+  confidence: findingConfidenceSchema,
+  classification: findingClassificationSchema,
+  root_issue_id: nonEmptyString.optional(),
+  external_assumptions: z.array(completeResultText).max(128),
+});
 const orderedExecutionProofSchema = z.strictObject({
   steps: z
     .array(
@@ -315,6 +326,7 @@ const orderedExecutionProofSchema = z.strictObject({
     .max(32),
   failure_point: z.strictObject({
     step_order: positiveInteger,
+    citation: adjudicationCitationSchema.optional(),
     detail: completeResultText,
   }),
 });
@@ -334,7 +346,7 @@ export const adjudicationDecisionSchema = z.strictObject({
   decision: z.enum(["confirmed", "rejected", "adjusted"]),
   rationale: completeResultText,
   cited_evidence: z.array(adjudicationCitationSchema).max(256),
-  adjusted_finding: actionableFindingV3Schema.optional(),
+  adjusted_finding: adjustedFindingSchema.optional(),
   ordered_execution_proof: orderedExecutionProofSchema.optional(),
   base_head_comparison: baseHeadComparisonSchema.optional(),
   unverified_assumptions: z.array(completeResultText).max(128),
