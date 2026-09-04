@@ -86,10 +86,10 @@ export function createHeartbeatBudget(options: {
         JSON.stringify(detailed) + "\n",
         "utf8",
       );
+      if (detailedSize >= 16 * 1024)
+        throw new Error("heartbeat must remain below 16 KiB");
       const nextMinimal =
-        minimalMode ||
-        detailedBytes + detailedSize > maximumBytes ||
-        detailedSize >= 16 * 1024;
+        minimalMode || detailedBytes + detailedSize > maximumBytes;
       const data = nextMinimal ? minimal : detailed;
       const size = Buffer.byteLength(JSON.stringify(data) + "\n", "utf8");
       if (size >= 16 * 1024)

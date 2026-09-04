@@ -93,4 +93,14 @@ describe("concise public output", () => {
       minimal: true,
     });
   });
+
+  it("rejects oversized detailed events without hiding them in minimal mode", () => {
+    const budget = createHeartbeatBudget({ intervalMs: 1000 });
+    expect(() => budget.select(0, { text: "x".repeat(16 * 1024) }, {})).toThrow(
+      /16 KiB/,
+    );
+    expect(budget.select(0, { elapsed_ms: 0 }, {})).toMatchObject({
+      minimal: false,
+    });
+  });
 });
