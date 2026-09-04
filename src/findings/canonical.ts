@@ -40,6 +40,7 @@ export interface CanonicalFindingClaim {
   outcome: string;
 }
 export interface CanonicalRawFinding {
+  provenance?: "reviewer_result_v4";
   source_ref: string;
   reviewer_id: string;
   lens_id: string;
@@ -215,6 +216,12 @@ const confidenceRank: Record<CanonicalFindingConfidence, number> = {
   medium: 1,
   high: 2,
 };
+const orderedProofCategories = new Set([
+  "reliability",
+  "concurrency",
+  "lifecycle",
+  "cleanup",
+]);
 const gateReasonOrder: readonly CanonicalGateEligibilityReason[] = [
   "classification_not_confirmed",
   "severity_below_threshold",
@@ -490,18 +497,30 @@ function eligibilityForSource(
   )
     reasons.add("adjudication_required");
   if (finding.adjudication === "rejected") reasons.add("adjudication_rejected");
-  if (proof?.evidence_verified === false) reasons.add("evidence_unverified");
+  const currentV4 = finding.provenance === "reviewer_result_v4";
   if (
-    proof?.ordered_proof_required === true &&
-    proof.ordered_proof_verified !== true
+    currentV4
+      ? proof?.evidence_verified !== true
+      : proof?.evidence_verified === false
   )
+    reasons.add("evidence_unverified");
+  const orderedProofRequired =
+    proof?.ordered_proof_required === true ||
+    (currentV4 &&
+      severityRank[finding.severity] >= severityRank.medium &&
+      orderedProofCategories.has(finding.category ?? "other"));
+  if (orderedProofRequired && proof?.ordered_proof_verified !== true)
     reasons.add("ordered_proof_missing");
   if (
     proof?.change_impact_required === true &&
     proof.change_impact_verified !== true
   )
     reasons.add("change_impact_unverified");
-  if (proof?.source_coverage_verified === false)
+  if (
+    currentV4
+      ? proof?.source_coverage_verified !== true
+      : proof?.source_coverage_verified === false
+  )
     reasons.add("source_coverage_unverified");
   if (proof?.out_of_scope === true) reasons.add("out_of_scope");
   if (proof?.policy_non_gating === true || finding.gate_eligible === false)
@@ -876,6 +895,7 @@ export function buildCanonicalRawFindings(
   input: BuildCanonicalRawFindingsInput,
 ): CanonicalRawFinding[] {
   return input.result.actionable_findings.map((finding) => ({
+    provenance: "reviewer_result_v4",
     source_ref: `${input.reviewer_id}#${finding.id}`,
     reviewer_id: input.reviewer_id,
     lens_id: input.lens_id,

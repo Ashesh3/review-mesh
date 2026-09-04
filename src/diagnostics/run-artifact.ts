@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, type FileHandle } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { lstat, open, type FileHandle } from "node:fs/promises";
+import { resolve } from "node:path";
 import { z } from "zod";
 import {
   adjudicationResultV2Schema,
@@ -14,6 +14,7 @@ import { reviewerResultDigest } from "../results/digest.js";
 import { MAX_REVIEWER_RESULT_BYTES } from "../results/sanitize.js";
 import {
   artifactIdentity,
+  createSafeArtifactParent,
   RunArtifactError,
   safeArtifactParent,
   sameArtifactIdentity,
@@ -220,8 +221,7 @@ export async function createRunArtifact(options: {
   beforeFinalVerify?: () => void | Promise<void>;
 }) {
   const path = resolve(options.path);
-  await mkdir(dirname(path), { recursive: true });
-  const parent = await safeArtifactParent(path);
+  const parent = await createSafeArtifactParent(path);
   const handle = await open(
     path,
     constants.O_WRONLY |

@@ -1,5 +1,14 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -38,6 +47,29 @@ async function fixture() {
 }
 
 describe("authoritative run artifact index", () => {
+  it("does not create a missing runs directory through a redirected ancestor", async () => {
+    const { root, reference } = await fixture();
+    const outside = join(root, "outside");
+    const redirected = join(root, "redirected");
+    await mkdir(outside);
+    await symlink(
+      outside,
+      redirected,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+
+    await expect(
+      indexRunArtifact({
+        runsDirectory: join(redirected, "missing"),
+        runId: "run-1",
+        artifact: reference,
+      }),
+    ).rejects.toMatchObject({ code: "artifact_identity_changed" });
+    await expect(lstat(join(outside, "missing"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
   it("verifies exact finalized bytes and records observed stdout separately", async () => {
     const { root, path, reference } = await fixture();
     const runsDirectory = join(root, "runs");

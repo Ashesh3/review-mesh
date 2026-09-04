@@ -337,6 +337,79 @@ describe("v9 canonical findings", () => {
 });
 
 describe("v9 canonical integration builders", () => {
+  it("fails current v4 findings closed when core proof is absent or incomplete", () => {
+    const result: ReviewerResultV4 = {
+      schema_version: "4",
+      verdict: "fail",
+      review_markdown: "# Review",
+      summary: "One reliability failure.",
+      actionable_findings: [
+        {
+          id: "ordering-failure",
+          severity: "high",
+          title: "Retry publishes before validation",
+          description: "The retry publishes state before validation completes.",
+          evidence: [
+            {
+              path: "src/retry.ts",
+              start_line: 10,
+              end_line: 18,
+              detail: "Publish precedes the validation result.",
+            },
+          ],
+          suggested_direction: "Validate before publishing.",
+          confidence: "high",
+          classification: "confirmed_defect",
+          external_assumptions: [],
+          category: "reliability",
+          verification: "Trace validation and publish ordering.",
+          change_impact: "The changed retry branch reverses the ordering.",
+          claim: {
+            trigger: "A failed operation is retried",
+            affected_behavior: "The retry publishes before validation",
+            outcome: "Invalid state becomes visible",
+          },
+        },
+      ],
+      informational_notes: [],
+      change_coverage: {
+        status: "complete",
+        proof_kind: "observed",
+        scope_digest: "a".repeat(64),
+        inspected_count: 1,
+        deficit_count: 0,
+        deficit_sample: [],
+      },
+    };
+    const raw = buildCanonicalRawFindings({
+      reviewer_id: "reliability::primary",
+      lens_id: "reliability",
+      result,
+    });
+
+    expect(canonicalizeFindings(raw).counts.gate_eligible_subfindings).toBe(0);
+    expect(canonicalizeFindings(raw).atomics[0]?.gate_eligibility).toEqual({
+      eligible: false,
+      reasons: [
+        "evidence_unverified",
+        "ordered_proof_missing",
+        "source_coverage_unverified",
+      ],
+    });
+    expect(
+      canonicalizeFindings(raw, {
+        proofBySourceRef: {
+          "reliability::primary#ordering-failure": {
+            evidence_verified: true,
+          },
+        },
+      }).atomics[0]?.gate_eligibility,
+    ).toEqual({
+      eligible: false,
+      reasons: ["ordered_proof_missing", "source_coverage_unverified"],
+    });
+  });
+
   it("converts reviewer result v4 without accepting provider gate state", () => {
     const result: ReviewerResultV4 = {
       schema_version: "4",

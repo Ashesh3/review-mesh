@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
@@ -83,6 +84,29 @@ describe("immutable artifact format two", () => {
     await expect(
       readRunArtifact(join(redirected, "existing.jsonl")),
     ).rejects.toMatchObject({ code: "artifact_identity_changed" });
+  });
+
+  it("does not create missing directories through a redirected ancestor", async () => {
+    const { root } = await fixture();
+    const outside = join(root, "outside");
+    const redirected = join(root, "redirected");
+    await mkdir(outside);
+    await symlink(
+      outside,
+      redirected,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+
+    await expect(
+      createRunArtifact({
+        path: join(redirected, "missing", "run.jsonl"),
+        runId: "run-1",
+        toolVersion: "9.0.0",
+      }),
+    ).rejects.toMatchObject({ code: "artifact_identity_changed" });
+    await expect(lstat(join(outside, "missing"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 
   it("rejects parent replacement during finalization", async () => {

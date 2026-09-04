@@ -9,7 +9,7 @@ import {
   unlink,
   type FileHandle,
 } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
 
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
@@ -110,6 +110,63 @@ export async function safeArtifactParent(
       "The artifact directory identity is unsafe.",
     );
   return { path: canonical, ...artifactIdentity(metadata) };
+}
+
+export async function createSafeArtifactParent(
+  path: string,
+): Promise<ArtifactParentIdentity> {
+  const parent = resolve(dirname(path));
+  const missing: string[] = [];
+  let existing = parent;
+  for (;;) {
+    try {
+      const metadata = await lstat(existing, { bigint: true });
+      if (!metadata.isDirectory() || metadata.isSymbolicLink())
+        throw new RunArtifactError(
+          "artifact_identity_changed",
+          "The artifact directory contains a symbolic link.",
+        );
+      await safeArtifactParent(join(existing, ".review-mesh-parent-check"));
+      break;
+    } catch (error) {
+      if (
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        error.code === "ENOENT"
+      ) {
+        const ancestor = dirname(existing);
+        if (ancestor === existing) throw error;
+        missing.unshift(basename(existing));
+        existing = ancestor;
+        continue;
+      }
+      throw error;
+    }
+  }
+  let current = existing;
+  for (const segment of missing) {
+    current = join(current, segment);
+    try {
+      await mkdir(current);
+    } catch (error) {
+      if (
+        typeof error !== "object" ||
+        error === null ||
+        !("code" in error) ||
+        error.code !== "EEXIST"
+      )
+        throw error;
+    }
+    const metadata = await lstat(current, { bigint: true });
+    if (!metadata.isDirectory() || metadata.isSymbolicLink())
+      throw new RunArtifactError(
+        "artifact_identity_changed",
+        "The artifact directory contains a symbolic link.",
+      );
+    await safeArtifactParent(join(current, ".review-mesh-parent-check"));
+  }
+  return safeArtifactParent(path);
 }
 
 export async function verifyArtifactFile(
@@ -333,8 +390,7 @@ async function writeIndex(
   document: IndexDocument,
   exclusive: boolean,
 ): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
-  const parent = await safeArtifactParent(path);
+  const parent = await createSafeArtifactParent(path);
   const target = exclusive ? path : `${path}.${randomUUID()}.tmp`;
   const handle = await open(
     target,
