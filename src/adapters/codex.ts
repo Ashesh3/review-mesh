@@ -12,6 +12,11 @@ import { getAppPaths } from "../config/paths.js";
 import { currentReviewerOutputSchema } from "../protocol/schemas.js";
 import { adapterFailure } from "./errors.js";
 import {
+  nextPageAssignment,
+  pageCollectorFor,
+  pageFailure,
+} from "./sdk-pages.js";
+import {
   buildAllowlistedEnvironment,
   type AdapterCapabilities,
   type AdapterEvent,
@@ -156,9 +161,11 @@ export function createCodexSdkFacade(
     env: input.env,
     config: input.config,
   });
+  let thread:
+    ReturnType<InstanceType<CodexModule["Codex"]>["startThread"]> | undefined;
   return {
     async start(startInput) {
-      const thread = codex.startThread(startInput.threadOptions);
+      thread ??= codex.startThread(startInput.threadOptions);
       const streamed = await thread.runStreamed(startInput.userPrompt, {
         outputSchema: startInput.outputSchema,
         signal: startInput.signal,
@@ -214,6 +221,8 @@ class CodexAdapter implements ReviewAdapter {
       streaming: true,
       cancellation: true,
       maximumIsolation: "runtime_read_only",
+      observed_file_access: false,
+      progress_observable: true,
       runtime_version: CODEX_SDK_VERSION,
       ...(!this.isolationVerified
         ? { message: ISOLATION_FAILURE }
@@ -313,6 +322,122 @@ class CodexAdapter implements ReviewAdapter {
         config: codexConfiguration(input.prompt.system),
       };
       const facade = this.createFacade(factoryInput);
+      const pages = pageCollectorFor(input);
+      if (pages !== undefined) {
+        while (!pages.collector.complete) {
+          const assignment = nextPageAssignment(
+            pages.collector,
+            pages.resultKind,
+          );
+          const nativeEvents = await facade.start({
+            threadOptions: {
+              model: input.reviewer.model,
+              ...(input.reviewer.effort === undefined
+                ? {}
+                : {
+                    modelReasoningEffort: input.reviewer.effort as Exclude<
+                      ThreadOptions["modelReasoningEffort"],
+                      undefined
+                    >,
+                  }),
+              workingDirectory: input.context.workspace,
+              sandboxMode: "read-only",
+              approvalPolicy: "never",
+              networkAccessEnabled: false,
+              webSearchMode: "disabled",
+              skipGitRepoCheck: input.context.git.is_repository !== true,
+            },
+            systemPrompt: input.prompt.system,
+            userPrompt:
+              assignment.request.pageIndex === 0
+                ? `${input.prompt.user}\n\n${assignment.prompt}`
+                : assignment.prompt,
+            outputSchema: assignment.schema,
+            signal: input.signal,
+          });
+          let completedAgentMessage: string | undefined;
+          let completed = false;
+          for await (const event of nativeEvents) {
+            if (input.signal.aborted) {
+              yield { type: "failure", failure: adapterFailure.cancelled() };
+              return;
+            }
+            if (
+              (event.type === "item.started" ||
+                event.type === "item.updated" ||
+                event.type === "item.completed") &&
+              event.item.type === "file_change"
+            ) {
+              yield {
+                type: "failure",
+                failure: adapterFailure.protocolViolation(
+                  "Codex attempted a file change during a read-only review.",
+                ),
+                isolation: "runtime_read_only",
+              };
+              return;
+            }
+            if (
+              event.type === "item.completed" &&
+              event.item.type === "agent_message"
+            )
+              completedAgentMessage = event.item.text;
+            if (event.type === "turn.failed" || event.type === "error") {
+              yield {
+                type: "failure",
+                failure: adapterFailure.processCrashed(
+                  "The Codex turn failed.",
+                ),
+                isolation: "runtime_read_only",
+              };
+              return;
+            }
+            if (event.type === "turn.completed") completed = true;
+            const activity = activityFor(event);
+            if (activity !== undefined)
+              yield {
+                type: "activity",
+                message: activity,
+                ...(event.type === "item.started" ||
+                event.type === "item.completed"
+                  ? { identity: `${event.item.id}:${event.type}` }
+                  : {}),
+              };
+          }
+          if (!completed || completedAgentMessage === undefined) {
+            yield {
+              type: "failure",
+              failure: adapterFailure.invalidResult(
+                "Codex completed without a completed agent result message.",
+              ),
+              isolation: "runtime_read_only",
+            };
+            return;
+          }
+          try {
+            pages.collector.addPage(completedAgentMessage);
+          } catch (error) {
+            yield {
+              type: "failure",
+              failure: pageFailure(error, "Codex"),
+              isolation: "runtime_read_only",
+            };
+            return;
+          }
+          yield {
+            type: "progress",
+            phase: "result_page",
+            identity: `${assignment.request.resultId}:page:${assignment.request.pageIndex}`,
+            byteCount: Buffer.byteLength(completedAgentMessage, "utf8"),
+          };
+        }
+        yield {
+          type: "result",
+          result: pages.collector.assemble(),
+          isolation: "runtime_read_only",
+        };
+        return;
+      }
       const nativeEvents = await facade.start({
         threadOptions: {
           model: input.reviewer.model,

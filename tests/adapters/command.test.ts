@@ -17,6 +17,7 @@ import type {
 import { buildAllowlistedEnvironment } from "../../src/adapters/types.js";
 import { reviewerResultJsonSchema } from "../../src/protocol/json-schema.js";
 import { buildReviewerPrompt } from "../../src/protocol/prompt.js";
+import { createResultPageCollector } from "../../src/results/result-pages.js";
 import { runReviewRound } from "../../src/orchestrator/run-review.js";
 import {
   resolvedContext,
@@ -101,7 +102,9 @@ async function setup(
     command: process.execPath,
     args: [fixture],
     env_allowlist: envAllowlist,
-    protocol: "review-mesh-command-v1" as const,
+    protocol: mode.startsWith("v2-")
+      ? ("review-mesh-command-v2" as const)
+      : ("review-mesh-command-v1" as const),
   };
   let launchedEnvironment: NodeJS.ProcessEnv | undefined;
   let launchInvocation:
@@ -217,6 +220,89 @@ function controlledProcess(pid: number) {
 }
 
 describe("generic command adapter", () => {
+  it("declares command evidence attested-only", async () => {
+    const prepared = await setup("pass");
+
+    await expect(
+      prepared.adapter.probe(
+        prepared.input.reviewer,
+        prepared.controller.signal,
+      ),
+    ).resolves.toMatchObject({
+      observed_file_access: false,
+      progress_observable: true,
+    });
+  });
+  it("keeps v2 stdin interactive and accepts only core-assigned result pages", async () => {
+    const prepared = await setup("v2-page");
+    prepared.input.resultPages = createResultPageCollector({
+      resultId: "command-pages",
+      resultKind: "reviewer",
+    });
+
+    const output = await collect(prepared.adapter.run(prepared.input));
+
+    expect(output).toContainEqual({
+      type: "activity",
+      message: "fixture page",
+      identity: "activity-1",
+    });
+    expect(output.at(-1)).toMatchObject({
+      type: "result",
+      result: { schema_version: "4", verdict: "pass" },
+    });
+  });
+  it("keeps v2 access claims attested and rejects repeated identities", async () => {
+    const prepared = await setup("v2-duplicate-claim");
+    prepared.input.resultPages = createResultPageCollector({
+      resultId: "command-pages",
+      resultKind: "reviewer",
+    });
+
+    const output = await collect(prepared.adapter.run(prepared.input));
+
+    expect(terminalFailure(output).failure.reason).toBe("protocol_violation");
+    expect(output.find((event) => event.type === "activity")).toMatchObject({
+      identity: "claim-1",
+    });
+  });
+  it("normalizes valid v2 read claims into an attestation without observed proof", async () => {
+    const prepared = await setup("v2-claim-page");
+    prepared.input.resultPages = createResultPageCollector({
+      resultId: "command-pages",
+      resultKind: "reviewer",
+    });
+    prepared.input.coverage = {
+      scopeDigest: "a".repeat(64),
+      readFile: vi.fn(),
+      recordDiffDelivery: vi.fn(),
+      reconcileAttestation: vi.fn(),
+      summary: vi.fn(),
+      entries: vi.fn(),
+      snapshotFiles: vi.fn(() => []),
+      close: vi.fn(async () => undefined),
+    };
+
+    const output = await collect(prepared.adapter.run(prepared.input));
+
+    const result = output.at(-1);
+    expect(result).toMatchObject({
+      type: "result",
+      result: {
+        coverage_attestation: {
+          scope_digest: "a".repeat(64),
+          entries: [
+            {
+              path: "src/a.ts",
+              method: "full_file",
+              snapshot_digest: "b".repeat(64),
+            },
+          ],
+        },
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain("observed");
+  });
   it("translates progress and a passing result using prompt-only isolation by default", async () => {
     const { adapter, input } = await setup("pass");
 

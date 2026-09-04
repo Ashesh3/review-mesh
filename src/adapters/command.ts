@@ -8,8 +8,14 @@ import {
   currentReviewerOutputSchema,
   type IsolationLevel,
 } from "../protocol/schemas.js";
+import { coverageAttestationEntrySchema } from "../protocol/v9.js";
 import { MAX_REVIEWER_RESULT_BYTES } from "../results/sanitize.js";
 import { adapterFailure, sanitizeAdapterFailure } from "./errors.js";
+import {
+  nextPageAssignment,
+  pageCollectorFor,
+  pageFailure,
+} from "./sdk-pages.js";
 import {
   buildAllowlistedEnvironment,
   type AdapterCapabilities,
@@ -24,6 +30,7 @@ const MAX_RESULT_EVENT_BYTES = MAX_REVIEWER_RESULT_BYTES * 6 + 64 * 1024;
 const MAX_STDOUT_BYTES = MAX_RESULT_EVENT_BYTES + 8 * 1024 * 1024;
 const MAX_STDOUT_LINE_BYTES = MAX_RESULT_EVENT_BYTES;
 const MAX_STDERR_BYTES = 64 * 1024;
+const MAX_PROTOCOL_EVENTS = 10_000;
 const PROTOCOL = "review-mesh-command-v1";
 const LAUNCH_ENVIRONMENT_NAMES = [
   "PATH",
@@ -79,6 +86,16 @@ const progressEventSchema = z.strictObject({
 const activityEventSchema = z.strictObject({
   type: z.literal("activity"),
   message: z.string().min(1),
+  identity: z.string().min(1).max(256).optional(),
+});
+const resultPageEventSchema = z.strictObject({
+  type: z.literal("result_page"),
+  page: z.string().min(1),
+});
+const accessClaimEventSchema = z.strictObject({
+  type: z.literal("access_claim"),
+  identity: z.string().min(1).max(256),
+  claim: coverageAttestationEntrySchema,
 });
 const resultEventSchema = z.strictObject({
   type: z.literal("result"),
@@ -94,7 +111,12 @@ const failureEventSchema = z.strictObject({
 });
 
 type ProtocolTerminal =
-  z.infer<typeof resultEventSchema> | z.infer<typeof failureEventSchema>;
+  | z.infer<typeof resultEventSchema>
+  | z.infer<typeof failureEventSchema>
+  | {
+      type: "result";
+      result: Extract<AdapterEvent, { type: "result" }>["result"];
+    };
 
 interface ActiveChild {
   child: CommandProcess;
@@ -214,6 +236,8 @@ class CommandAdapter implements ReviewAdapter {
       streaming: true,
       cancellation: true,
       maximumIsolation: "unknown",
+      observed_file_access: false,
+      progress_observable: true,
     };
   }
 
@@ -243,7 +267,7 @@ class CommandAdapter implements ReviewAdapter {
       }
     }
     Object.assign(env, {
-      REVIEW_MESH_PROTOCOL_VERSION: PROTOCOL,
+      REVIEW_MESH_PROTOCOL_VERSION: this.registration.protocol,
       REVIEW_MESH_RUN_ID: input.runId,
       REVIEW_MESH_REVIEWER_ID: input.reviewer.id,
       REVIEW_MESH_WORKSPACE: input.context.workspace,
@@ -293,7 +317,7 @@ class CommandAdapter implements ReviewAdapter {
     const abort = signalPromise(input.signal);
 
     const request = {
-      protocol: PROTOCOL,
+      protocol: this.registration.protocol,
       run_id: input.runId,
       reviewer_id: input.reviewer.id,
       prompt: input.prompt,
@@ -311,17 +335,32 @@ class CommandAdapter implements ReviewAdapter {
       };
       return;
     }
-    child.stdin.end(JSON.stringify(request));
+    const pages = pageCollectorFor(input);
+    child.stdin.write(`${JSON.stringify(request)}\n`);
+    if (pages === undefined) child.stdin.end();
+    else {
+      const assignment = nextPageAssignment(pages.collector, pages.resultKind);
+      child.stdin.write(
+        `${JSON.stringify({ type: "request_page", request: { result_id: assignment.request.resultId, page_index: assignment.request.pageIndex, previous_page_digest: assignment.request.previousPageDigest, candidate_ids: assignment.request.candidateIds }, schema: assignment.schema })}\n`,
+      );
+    }
 
     let actualIsolation: IsolationLevel = "prompt_only";
     let terminal: ProtocolTerminal | undefined;
     let protocolViolation: string | undefined;
     let eventCount = 0;
+    const identities = new Set<string>();
+    const accessClaims: Array<z.infer<typeof coverageAttestationEntrySchema>> =
+      [];
     let totalBytes = 0;
     let buffered = Buffer.alloc(0);
 
     const acceptLine = (lineBuffer: Buffer): AdapterEvent | undefined => {
       eventCount += 1;
+      if (eventCount > MAX_PROTOCOL_EVENTS) {
+        protocolViolation = "The command exceeded the protocol event limit.";
+        return undefined;
+      }
       const normalized =
         lineBuffer.at(-1) === 0x0d
           ? lineBuffer.subarray(0, lineBuffer.byteLength - 1)
@@ -361,10 +400,74 @@ class CommandAdapter implements ReviewAdapter {
       }
       const activity = activityEventSchema.safeParse(value);
       if (activity.success) {
+        if (
+          activity.data.identity !== undefined &&
+          identities.has(activity.data.identity)
+        ) {
+          protocolViolation = "The command repeated an activity identity.";
+          return undefined;
+        }
+        if (activity.data.identity !== undefined)
+          identities.add(activity.data.identity);
         return {
           type: "activity",
           message: sanitizedPublicMessage(activity.data.message),
+          ...(activity.data.identity === undefined
+            ? {}
+            : { identity: activity.data.identity }),
         };
+      }
+      const accessClaim = accessClaimEventSchema.safeParse(value);
+      if (accessClaim.success && pages !== undefined) {
+        if (identities.has(accessClaim.data.identity)) {
+          protocolViolation = "The command repeated an access claim identity.";
+          return undefined;
+        }
+        identities.add(accessClaim.data.identity);
+        accessClaims.push(accessClaim.data.claim);
+        return {
+          type: "activity",
+          message: "The command reported an attested workspace read.",
+          identity: accessClaim.data.identity,
+        };
+      }
+      const resultPage = resultPageEventSchema.safeParse(value);
+      if (resultPage.success && pages !== undefined) {
+        try {
+          pages.collector.addPage(resultPage.data.page);
+          if (pages.collector.complete) {
+            const result = pages.collector.assemble();
+            if (
+              result.schema_version === "4" &&
+              result.coverage_attestation === undefined &&
+              accessClaims.length > 0 &&
+              input.coverage !== undefined
+            ) {
+              result.coverage_attestation = {
+                scope_digest: input.coverage.scopeDigest,
+                entries: accessClaims.sort((left, right) =>
+                  left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
+                ),
+              };
+            }
+            terminal = {
+              type: "result",
+              result,
+            } as ProtocolTerminal;
+            child.stdin?.end();
+          } else {
+            const assignment = nextPageAssignment(
+              pages.collector,
+              pages.resultKind,
+            );
+            child.stdin?.write(
+              `${JSON.stringify({ type: "request_page", request: { result_id: assignment.request.resultId, page_index: assignment.request.pageIndex, previous_page_digest: assignment.request.previousPageDigest, candidate_ids: assignment.request.candidateIds }, schema: assignment.schema })}\n`,
+            );
+          }
+        } catch (error) {
+          protocolViolation = pageFailure(error, "The command").message;
+        }
+        return undefined;
       }
       const result = resultEventSchema.safeParse(value);
       if (result.success) {

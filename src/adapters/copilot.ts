@@ -7,6 +7,12 @@ import {
 } from "../copilot/runtime.js";
 import { currentReviewerOutputSchema } from "../protocol/schemas.js";
 import { adapterFailure } from "./errors.js";
+import { createReadOnlyFileTools } from "./file-tools.js";
+import {
+  nextPageAssignment,
+  pageCollectorFor,
+  pageFailure,
+} from "./sdk-pages.js";
 import {
   buildAllowlistedEnvironment,
   type AdapterCapabilities,
@@ -114,6 +120,15 @@ export interface CopilotSessionConfig {
   enableHostGitOperations: false;
   availableTools: string[];
   excludedTools: string[];
+  tools?: Array<{
+    name: string;
+    description?: string;
+    parameters?: Record<string, unknown>;
+    handler?: (args: unknown) => Promise<unknown> | unknown;
+    overridesBuiltInTool?: boolean;
+    skipPermission?: boolean;
+    defer?: "auto" | "never";
+  }>;
   mcpServers: Record<string, never>;
   pluginDirectories: string[];
   instructionDirectories: string[];
@@ -357,6 +372,8 @@ function failureCapabilities(message: string): AdapterCapabilities {
     cancellation: true,
     maximumIsolation: "prompt_only",
     runtime_version: COPILOT_SDK_VERSION,
+    observed_file_access: true,
+    progress_observable: true,
     message,
   };
 }
@@ -499,6 +516,8 @@ class CopilotAdapter implements ReviewAdapter {
         cancellation: true,
         maximumIsolation: "prompt_only",
         runtime_version: status.version,
+        observed_file_access: true,
+        progress_observable: true,
         ...(!auth.isAuthenticated
           ? { message: "Copilot authentication is unavailable." }
           : !readiness.available
@@ -531,6 +550,66 @@ class CopilotAdapter implements ReviewAdapter {
     }
 
     const allowShell = allowsShellPromptOnly(input);
+    const pages = pageCollectorFor(input);
+    const coverageTools =
+      input.coverage === undefined
+        ? undefined
+        : createReadOnlyFileTools({ ledger: input.coverage });
+    const coreTools = [
+      {
+        name: "list_files",
+        description: "List files in the pinned Review Mesh snapshot.",
+        parameters: { type: "object" },
+        skipPermission: true,
+        defer: "never" as const,
+        handler: async (args: unknown) =>
+          coverageTools === undefined
+            ? { error: "unavailable" }
+            : coverageTools.listFiles(args as { path?: string }),
+      },
+      {
+        name: "read_file",
+        description: "Read exact bytes from the pinned Review Mesh snapshot.",
+        parameters: { type: "object", required: ["path"] },
+        skipPermission: true,
+        defer: "never" as const,
+        handler: async (args: unknown) => {
+          if (coverageTools === undefined) return { error: "unavailable" };
+          const value = args as {
+            path: string;
+            offset?: number;
+            byte_count?: number;
+          };
+          const delivered = await coverageTools.readFile({
+            path: value.path,
+            ...(value.offset === undefined ? {} : { offset: value.offset }),
+            ...(value.byte_count === undefined
+              ? {}
+              : { byteCount: value.byte_count }),
+          });
+          const serialized = JSON.stringify(delivered.response);
+          delivered.acknowledgeDelivered(serialized);
+          return serialized;
+        },
+      },
+      {
+        name: "search_text",
+        description: "Search text in the pinned Review Mesh snapshot.",
+        parameters: { type: "object", required: ["query"] },
+        skipPermission: true,
+        defer: "never" as const,
+        handler: async (args: unknown) =>
+          coverageTools === undefined
+            ? { error: "unavailable" }
+            : coverageTools.searchText(
+                args as {
+                  query: string;
+                  path?: string;
+                  caseSensitive?: boolean;
+                },
+              ),
+      },
+    ];
     const isolation = allowShell ? "prompt_only" : "runtime_read_only";
     const active = this.createRuntimeClient();
     const nativeEvents = new EventQueue<AdapterEvent>();
@@ -584,10 +663,24 @@ class CopilotAdapter implements ReviewAdapter {
         enableSkills: false,
         enableSessionStore: false,
         enableHostGitOperations: false,
-        availableTools: allowShell
-          ? [...READ_ONLY_TOOLS, ...SHELL_TOOLS]
-          : [...READ_ONLY_TOOLS],
-        excludedTools: [...EXCLUDED_WRITE_TOOLS],
+        availableTools:
+          pages !== undefined
+            ? ["custom:list_files", "custom:read_file", "custom:search_text"]
+            : allowShell
+              ? [...READ_ONLY_TOOLS, ...SHELL_TOOLS]
+              : [...READ_ONLY_TOOLS],
+        excludedTools:
+          pages === undefined
+            ? [...EXCLUDED_WRITE_TOOLS]
+            : [
+                "builtin:view",
+                "builtin:grep",
+                "builtin:glob",
+                "builtin:powershell",
+                "builtin:bash",
+                ...EXCLUDED_WRITE_TOOLS,
+              ],
+        ...(pages === undefined ? {} : { tools: coreTools }),
         mcpServers: {},
         pluginDirectories: [],
         instructionDirectories: [],
@@ -606,6 +699,70 @@ class CopilotAdapter implements ReviewAdapter {
               ),
           isolation,
         };
+        return;
+      }
+      if (pages !== undefined) {
+        while (!pages.collector.complete) {
+          const assignment = nextPageAssignment(
+            pages.collector,
+            pages.resultKind,
+          );
+          const finalMessage = await active.session.sendAndWait(
+            {
+              prompt:
+                pages.collector.nextRequest().pageIndex === 0
+                  ? `${input.prompt.user}\n\n${assignment.prompt}`
+                  : assignment.prompt,
+              agentMode: "interactive",
+            },
+            input.reviewer.timeoutMs,
+          );
+          if (input.signal.aborted) {
+            yield {
+              type: "failure",
+              failure: adapterFailure.cancelled(),
+              isolation,
+            };
+            return;
+          }
+          if (sessionFailure) {
+            yield {
+              type: "failure",
+              failure: adapterFailure.processCrashed(
+                "The Copilot session reported an error.",
+              ),
+              isolation,
+            };
+            return;
+          }
+          if (finalMessage === undefined) {
+            yield {
+              type: "failure",
+              failure: adapterFailure.invalidResult(
+                "Copilot completed without a final assistant result message.",
+              ),
+              isolation,
+            };
+            return;
+          }
+          try {
+            pages.collector.addPage(finalMessage.data.content);
+          } catch (error) {
+            yield {
+              type: "failure",
+              failure: pageFailure(error, "Copilot"),
+              isolation,
+            };
+            return;
+          }
+          yield {
+            type: "progress",
+            phase: "result_page",
+            identity: `${assignment.request.resultId}:page:${assignment.request.pageIndex}`,
+            byteCount: Buffer.byteLength(finalMessage.data.content, "utf8"),
+          };
+        }
+        yield { type: "result", result: pages.collector.assemble(), isolation };
         return;
       }
       const terminal = active.session

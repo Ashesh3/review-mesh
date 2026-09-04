@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import {
   createCopilotAdapter,
@@ -23,6 +24,7 @@ import {
   resolvedReviewer,
 } from "../helpers/fixtures.js";
 import type { ReasoningEffort } from "../../src/config/schemas.js";
+import { createResultPageCollector } from "../../src/results/result-pages.js";
 
 const model = {
   id: "gpt-5.6-copilot",
@@ -238,6 +240,180 @@ function permission(
 }
 
 describe("Copilot adapter", () => {
+  it("registers only core handlers and requests a v9 result page on the same session", async () => {
+    const page = JSON.stringify({
+      schema_version: "1",
+      kind: "review-mesh.result-page",
+      result_id: "copilot-pages",
+      result_kind: "reviewer",
+      result_schema_version: "4",
+      page_index: 0,
+      page_count: 1,
+      page_kind: "header",
+      previous_page_digest: null,
+      payload: {
+        verdict: "pass",
+        summary: "clean",
+        informational_notes: [],
+        narrative_byte_count: 0,
+        narrative_fragment_count: 0,
+        actionable_finding_count: 0,
+        coverage_attestation: null,
+      },
+    });
+    const fake = fakeFactory({ response: finalMessage(page) });
+    const prepared = setup({ createClient: fake.createClient });
+    prepared.input.resultPages = createResultPageCollector({
+      resultId: "copilot-pages",
+      resultKind: "reviewer",
+    });
+
+    const output = await collect(prepared.adapter.run(prepared.input));
+
+    expect(terminalResult(output).result).toMatchObject({
+      schema_version: "4",
+      verdict: "pass",
+    });
+    const config = fake.capture.sessionConfigs[0]!;
+    expect(config.availableTools).toEqual([
+      "custom:list_files",
+      "custom:read_file",
+      "custom:search_text",
+    ]);
+    expect(config.excludedTools).toContain("builtin:view");
+    expect(config.tools?.map((tool) => tool.name)).toEqual([
+      "list_files",
+      "read_file",
+      "search_text",
+    ]);
+    expect(JSON.stringify(fake.capture.sendCalls[0]!.options)).toContain(
+      "copilot-pages",
+    );
+  });
+  it("returns the same serialized body that it credits to observed coverage", async () => {
+    const acknowledgeDelivered = vi.fn(() => true);
+    const fake = fakeFactory({
+      response: finalMessage(
+        JSON.stringify({
+          schema_version: "1",
+          kind: "review-mesh.result-page",
+          result_id: "copilot-read",
+          result_kind: "reviewer",
+          result_schema_version: "4",
+          page_index: 0,
+          page_count: 1,
+          page_kind: "header",
+          previous_page_digest: null,
+          payload: {
+            verdict: "pass",
+            summary: "clean",
+            informational_notes: [],
+            narrative_byte_count: 0,
+            narrative_fragment_count: 0,
+            actionable_finding_count: 0,
+            coverage_attestation: null,
+          },
+        }),
+      ),
+    });
+    const prepared = setup({ createClient: fake.createClient });
+    prepared.input.resultPages = createResultPageCollector({
+      resultId: "copilot-read",
+      resultKind: "reviewer",
+    });
+    prepared.input.coverage = {
+      scopeDigest: "a".repeat(64),
+      readFile: vi.fn(async () => ({
+        ok: true as const,
+        path: "src/a.ts",
+        bytes: Buffer.from("ok"),
+        offset: 0,
+        byteCount: 2,
+        totalByteCount: 2,
+        sha256: "b".repeat(64),
+        snapshotDigest: "b".repeat(64),
+        eof: true,
+        acknowledgeDelivered,
+      })),
+      recordDiffDelivery: vi.fn(),
+      reconcileAttestation: vi.fn(),
+      summary: vi.fn(),
+      entries: vi.fn(),
+      snapshotFiles: vi.fn(() => []),
+      close: vi.fn(async () => undefined),
+    };
+
+    await collect(prepared.adapter.run(prepared.input));
+    const tool = fake.capture.sessionConfigs[0]!.tools!.find(
+      (entry) => entry.name === "read_file",
+    )!;
+    const returned = await tool.handler!({ path: "src/a.ts" });
+
+    expect(typeof returned).toBe("string");
+    expect(JSON.parse(returned as string)).toMatchObject({
+      path: "src/a.ts",
+      content: "b2s=",
+    });
+    expect(acknowledgeDelivered).toHaveBeenCalledOnce();
+  });
+  it("continues v9 pages on the same Copilot session", async () => {
+    const first = JSON.stringify({
+      schema_version: "1",
+      kind: "review-mesh.result-page",
+      result_id: "copilot-two",
+      result_kind: "reviewer",
+      result_schema_version: "4",
+      page_index: 0,
+      page_count: 2,
+      page_kind: "header",
+      previous_page_digest: null,
+      payload: {
+        verdict: "pass",
+        summary: "clean",
+        informational_notes: [],
+        narrative_byte_count: 1,
+        narrative_fragment_count: 1,
+        actionable_finding_count: 0,
+        coverage_attestation: null,
+      },
+    });
+    const second = JSON.stringify({
+      schema_version: "1",
+      kind: "review-mesh.result-page",
+      result_id: "copilot-two",
+      result_kind: "reviewer",
+      result_schema_version: "4",
+      page_index: 1,
+      page_count: 2,
+      page_kind: "narrative",
+      previous_page_digest: createHash("sha256").update(first).digest("hex"),
+      payload: { text_fragment: "x" },
+    });
+    let call = 0;
+    const fake = fakeFactory({ response: finalMessage(first) });
+    const clientFactory: CopilotClientFactory = (options) => {
+      const client = fake.createClient(options);
+      const session = fake.sessions.at(-1)!;
+      session.sendAndWait = vi.fn(async (messageOptions, timeout) => {
+        fake.capture.sendCalls.push({ options: messageOptions, timeout });
+        return finalMessage(call++ === 0 ? first : second);
+      });
+      return client;
+    };
+    const prepared = setup({ createClient: clientFactory });
+    prepared.input.resultPages = createResultPageCollector({
+      resultId: "copilot-two",
+      resultKind: "reviewer",
+    });
+
+    const output = await collect(prepared.adapter.run(prepared.input));
+
+    expect(terminalResult(output).result).toMatchObject({
+      review_markdown: "x",
+    });
+    expect(fake.capture.sessionConfigs).toHaveLength(1);
+    expect(fake.capture.sendCalls).toHaveLength(2);
+  });
   it("probes a fresh client and checks status, auth, and model membership concurrently", async () => {
     const status = deferred<{ version: string; protocolVersion: number }>();
     const auth = deferred<{ isAuthenticated: boolean }>();
@@ -281,6 +457,8 @@ describe("Copilot adapter", () => {
       cancellation: true,
       maximumIsolation: "prompt_only",
       runtime_version: "1.0.11",
+      observed_file_access: true,
+      progress_observable: true,
     });
     expect(fake.capture.lifecycle).toEqual(["start", "stop"]);
     expect(fake.capture.clientOptions).toEqual([

@@ -1,6 +1,8 @@
 import {
+  createSdkMcpServer,
   query as claudeQuery,
   startup as claudeStartup,
+  tool,
   type Options as ClaudeOptions,
   type PermissionResult,
   type SDKMessage,
@@ -8,9 +10,16 @@ import {
   type SDKResultMessage,
   type WarmQuery,
 } from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
 import type { AdapterRegistration } from "../config/schemas.js";
 import { currentReviewerOutputSchema } from "../protocol/schemas.js";
 import { adapterFailure, type AdapterFailure } from "./errors.js";
+import { createReadOnlyFileTools } from "./file-tools.js";
+import {
+  nextPageAssignment,
+  pageCollectorFor,
+  pageFailure,
+} from "./sdk-pages.js";
 import {
   buildAllowlistedEnvironment,
   type AdapterCapabilities,
@@ -31,6 +40,11 @@ const DISALLOWED_TOOLS = [
   "Task",
 ] as const;
 const INSPECTION_TOOLS = new Set(["Read", "Glob", "Grep"]);
+const CORE_INSPECTION_TOOLS = new Set([
+  "mcp__review_mesh__list_files",
+  "mcp__review_mesh__read_file",
+  "mcp__review_mesh__search_text",
+]);
 const TOOL_DENIAL = "Review Mesh denied this tool for a read-only review.";
 const SANDBOX_UNAVAILABLE =
   /\b(?:unavailable|unsupported|not\s+supported|missing\s+dependencies|cannot\s+start)\b/i;
@@ -98,9 +112,12 @@ type AttemptOutcome =
       sandboxUnavailable?: boolean;
     };
 
-function fixedToolPermission() {
+function fixedToolPermission(coreTools = false) {
   return async (toolName: string): Promise<PermissionResult> => {
-    if (INSPECTION_TOOLS.has(toolName)) {
+    if (
+      (coreTools && CORE_INSPECTION_TOOLS.has(toolName)) ||
+      (!coreTools && INSPECTION_TOOLS.has(toolName))
+    ) {
       return { behavior: "allow" };
     }
     return {
@@ -285,6 +302,8 @@ class ClaudeAdapter implements ReviewAdapter {
       cancellation: true,
       maximumIsolation: "unknown",
       runtime_version: CLAUDE_AGENT_SDK_VERSION,
+      observed_file_access: true,
+      progress_observable: true,
       ...(message === undefined ? {} : { message }),
     });
     if (signal.aborted) {
@@ -336,7 +355,81 @@ class ClaudeAdapter implements ReviewAdapter {
     input: AdapterReviewInput,
     abortController: AbortController,
     sandboxed: boolean,
+    resumeSessionId?: string,
   ): ClaudeOptions {
+    const pages = pageCollectorFor(input);
+    const coverageTools =
+      input.coverage === undefined
+        ? undefined
+        : createReadOnlyFileTools({ ledger: input.coverage });
+    const coreTools =
+      coverageTools === undefined
+        ? []
+        : [
+            tool(
+              "list_files",
+              "List files in the pinned Review Mesh snapshot.",
+              { path: z.string().optional() },
+              async (args) => ({
+                content: [
+                  {
+                    type: "text",
+                    text: JSON.stringify(
+                      await coverageTools.listFiles(
+                        args.path === undefined ? {} : { path: args.path },
+                      ),
+                    ),
+                  },
+                ],
+              }),
+            ),
+            tool(
+              "read_file",
+              "Read exact bytes from the pinned Review Mesh snapshot.",
+              {
+                path: z.string(),
+                offset: z.number().int().nonnegative().optional(),
+                byte_count: z.number().int().positive().optional(),
+              },
+              async (args) => {
+                const delivered = await coverageTools.readFile({
+                  path: args.path,
+                  ...(args.offset === undefined ? {} : { offset: args.offset }),
+                  ...(args.byte_count === undefined
+                    ? {}
+                    : { byteCount: args.byte_count }),
+                });
+                const text = JSON.stringify(delivered.response);
+                delivered.acknowledgeDelivered(text);
+                return { content: [{ type: "text", text }] };
+              },
+            ),
+            tool(
+              "search_text",
+              "Search text in the pinned Review Mesh snapshot.",
+              {
+                query: z.string(),
+                path: z.string().optional(),
+                case_sensitive: z.boolean().optional(),
+              },
+              async (args) => ({
+                content: [
+                  {
+                    type: "text",
+                    text: JSON.stringify(
+                      await coverageTools.searchText({
+                        query: args.query,
+                        ...(args.path === undefined ? {} : { path: args.path }),
+                        ...(args.case_sensitive === undefined
+                          ? {}
+                          : { caseSensitive: args.case_sensitive }),
+                      }),
+                    ),
+                  },
+                ],
+              }),
+            ),
+          ];
     const options: ClaudeOptions = {
       cwd: input.context.workspace,
       model: input.reviewer.model,
@@ -350,19 +443,37 @@ class ClaudeAdapter implements ReviewAdapter {
       abortController,
       settingSources: [],
       strictMcpConfig: true,
-      mcpServers: {},
+      mcpServers:
+        pages === undefined
+          ? {}
+          : {
+              review_mesh: createSdkMcpServer({
+                name: "review_mesh",
+                tools: coreTools,
+              }),
+            },
       plugins: [],
       skills: [],
-      tools: [...READ_ONLY_TOOLS],
+      tools: pages === undefined ? [...READ_ONLY_TOOLS] : [],
+      ...(pages === undefined
+        ? {}
+        : {
+            allowedTools: [
+              "mcp__review_mesh__list_files",
+              "mcp__review_mesh__read_file",
+              "mcp__review_mesh__search_text",
+            ],
+          }),
       disallowedTools: [...DISALLOWED_TOOLS],
       permissionMode: "dontAsk",
-      canUseTool: fixedToolPermission(),
+      canUseTool: fixedToolPermission(pages !== undefined),
       systemPrompt: input.prompt.system,
       outputFormat: {
         type: "json_schema",
         schema: input.resultJsonSchema,
       },
       persistSession: false,
+      ...(resumeSessionId === undefined ? {} : { resume: resumeSessionId }),
       env: buildAllowlistedEnvironment(
         this.registration.env_allowlist,
         this.environment,
@@ -389,6 +500,7 @@ class ClaudeAdapter implements ReviewAdapter {
     input: AdapterReviewInput,
     active: ActiveQuery,
     sandboxed: boolean,
+    resumeSessionId?: string,
   ): AsyncGenerator<AdapterEvent, AttemptOutcome> {
     if (active.controller.signal.aborted || input.signal.aborted) {
       return {
@@ -403,7 +515,12 @@ class ClaudeAdapter implements ReviewAdapter {
     try {
       const nativeQuery = this.queryFacade({
         prompt: input.prompt.user,
-        options: this.optionsFor(input, active.controller, sandboxed),
+        options: this.optionsFor(
+          input,
+          active.controller,
+          sandboxed,
+          resumeSessionId,
+        ),
       }) as CloseableQuery;
       active.query = nativeQuery;
       const iterator = nativeQuery[Symbol.asyncIterator]();
@@ -479,8 +596,9 @@ class ClaudeAdapter implements ReviewAdapter {
     input: AdapterReviewInput,
     active: ActiveQuery,
     sandboxed: boolean,
+    resumeSessionId?: string,
   ): AsyncGenerator<AdapterEvent, AttemptOutcome> {
-    const iterator = this.runAttempt(input, active, sandboxed);
+    const iterator = this.runAttempt(input, active, sandboxed, resumeSessionId);
     for (;;) {
       const next = await iterator.next();
       if (next.done) return next.value;
@@ -500,8 +618,35 @@ class ClaudeAdapter implements ReviewAdapter {
     this.activeQueries.add(active);
     try {
       let sandboxed = true;
+      const pages = pageCollectorFor(input);
+      let resumeSessionId: string | undefined;
       for (;;) {
-        const attempt = this.consumeAttempt(input, active, sandboxed);
+        const attemptInput =
+          pages === undefined
+            ? input
+            : (() => {
+                const assignment = nextPageAssignment(
+                  pages.collector,
+                  pages.resultKind,
+                );
+                return {
+                  ...input,
+                  prompt: {
+                    ...input.prompt,
+                    user:
+                      assignment.request.pageIndex === 0
+                        ? `${input.prompt.user}\n\n${assignment.prompt}`
+                        : assignment.prompt,
+                  },
+                  resultJsonSchema: assignment.schema,
+                };
+              })();
+        const attempt = this.consumeAttempt(
+          attemptInput,
+          active,
+          sandboxed,
+          resumeSessionId,
+        );
         let outcome: AttemptOutcome;
         for (;;) {
           const next = await attempt.next();
@@ -537,6 +682,7 @@ class ClaudeAdapter implements ReviewAdapter {
         }
 
         const message = outcome.message;
+        resumeSessionId = message.session_id;
         if (!isKnownResultSubtype(message)) {
           yield {
             type: "failure",
@@ -584,6 +730,35 @@ class ClaudeAdapter implements ReviewAdapter {
               "Claude completed without structured reviewer output.",
             ),
             ...(!sandboxed ? { isolation: "prompt_only" as const } : {}),
+          };
+          return;
+        }
+        if (pages !== undefined) {
+          const assignment = pages.collector.nextRequest();
+          try {
+            pages.collector.addPage(JSON.stringify(message.structured_output));
+          } catch (error) {
+            yield {
+              type: "failure",
+              failure: pageFailure(error, "Claude"),
+              isolation: sandboxed ? "enforced_read_only" : "prompt_only",
+            };
+            return;
+          }
+          yield {
+            type: "progress",
+            phase: "result_page",
+            identity: `${assignment.resultId}:page:${assignment.pageIndex}`,
+            byteCount: Buffer.byteLength(
+              JSON.stringify(message.structured_output),
+              "utf8",
+            ),
+          };
+          if (!pages.collector.complete) continue;
+          yield {
+            type: "result",
+            result: pages.collector.assemble(),
+            isolation: sandboxed ? "enforced_read_only" : "prompt_only",
           };
           return;
         }

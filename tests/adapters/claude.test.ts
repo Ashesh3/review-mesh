@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,6 +25,7 @@ import type { AdapterRegistration } from "../../src/config/schemas.js";
 import { reviewerResultJsonSchema } from "../../src/protocol/json-schema.js";
 import { buildReviewerPrompt } from "../../src/protocol/prompt.js";
 import type { ReviewerResult } from "../../src/protocol/schemas.js";
+import { createResultPageCollector } from "../../src/results/result-pages.js";
 import {
   passResult,
   resolvedContext,
@@ -278,6 +280,195 @@ function setup(
 }
 
 describe("Claude Agent SDK adapter", () => {
+  it("uses core MCP read tools and finalizes a v9 page without SDK-native reads", async () => {
+    const page = {
+      schema_version: "1",
+      kind: "review-mesh.result-page",
+      result_id: "claude-pages",
+      result_kind: "reviewer",
+      result_schema_version: "4",
+      page_index: 0,
+      page_count: 1,
+      page_kind: "header",
+      previous_page_digest: null,
+      payload: {
+        verdict: "pass",
+        summary: "clean",
+        informational_notes: [],
+        narrative_byte_count: 0,
+        narrative_fragment_count: 0,
+        actionable_finding_count: 0,
+        coverage_attestation: null,
+      },
+    };
+    const prepared = setup([messages(successResult(page))]);
+    prepared.input.resultPages = createResultPageCollector({
+      resultId: "claude-pages",
+      resultKind: "reviewer",
+    });
+
+    const output = await collect(prepared.adapter.run(prepared.input));
+
+    expect(terminalResult(output).result).toMatchObject({
+      schema_version: "4",
+      verdict: "pass",
+    });
+    const options = prepared.query.calls[0]!.options;
+    expect(options.tools).toEqual([]);
+    expect(options.allowedTools).toEqual([
+      "mcp__review_mesh__list_files",
+      "mcp__review_mesh__read_file",
+      "mcp__review_mesh__search_text",
+    ]);
+    expect(options.mcpServers).toHaveProperty("review_mesh");
+    expect(prepared.query.calls[0]!.prompt).toContain(
+      '"result_id":"claude-pages"',
+    );
+    const permission = options.canUseTool!;
+    await expect(
+      permission("mcp__review_mesh__read_file", {}, permissionContext()),
+    ).resolves.toEqual({ behavior: "allow" });
+    await expect(
+      permission("Read", {}, permissionContext()),
+    ).resolves.toMatchObject({ behavior: "deny" });
+  });
+  it("credits observed reads only after returning the exact MCP body", async () => {
+    const acknowledgeDelivered = vi.fn(() => true);
+    const prepared = setup([
+      messages(
+        successResult({
+          schema_version: "1",
+          kind: "review-mesh.result-page",
+          result_id: "claude-read",
+          result_kind: "reviewer",
+          result_schema_version: "4",
+          page_index: 0,
+          page_count: 1,
+          page_kind: "header",
+          previous_page_digest: null,
+          payload: {
+            verdict: "pass",
+            summary: "clean",
+            informational_notes: [],
+            narrative_byte_count: 0,
+            narrative_fragment_count: 0,
+            actionable_finding_count: 0,
+            coverage_attestation: null,
+          },
+        }),
+      ),
+    ]);
+    prepared.input.resultPages = createResultPageCollector({
+      resultId: "claude-read",
+      resultKind: "reviewer",
+    });
+    prepared.input.coverage = {
+      scopeDigest: "a".repeat(64),
+      readFile: vi.fn(async () => ({
+        ok: true as const,
+        path: "src/a.ts",
+        bytes: Buffer.from("ok"),
+        offset: 0,
+        byteCount: 2,
+        totalByteCount: 2,
+        sha256: "b".repeat(64),
+        snapshotDigest: "b".repeat(64),
+        eof: true,
+        acknowledgeDelivered,
+      })),
+      recordDiffDelivery: vi.fn(),
+      reconcileAttestation: vi.fn(),
+      summary: vi.fn(),
+      entries: vi.fn(),
+      snapshotFiles: vi.fn(() => []),
+      close: vi.fn(async () => undefined),
+    };
+
+    await collect(prepared.adapter.run(prepared.input));
+    const server = prepared.query.calls[0]!.options.mcpServers!
+      .review_mesh as unknown as {
+      instance: {
+        _registeredTools: Record<
+          string,
+          {
+            handler(
+              args: unknown,
+            ): Promise<{ content: Array<{ text: string }> }>;
+          }
+        >;
+      };
+    };
+    const returned = await server.instance._registeredTools.read_file!.handler({
+      path: "src/a.ts",
+    });
+
+    expect(JSON.parse(returned.content[0]!.text)).toMatchObject({
+      path: "src/a.ts",
+      content: "b2s=",
+    });
+    expect(acknowledgeDelivered).toHaveBeenCalledOnce();
+  });
+  it("continues v9 pages by resuming the same Claude session", async () => {
+    const first = {
+      schema_version: "1",
+      kind: "review-mesh.result-page",
+      result_id: "claude-two",
+      result_kind: "reviewer",
+      result_schema_version: "4",
+      page_index: 0,
+      page_count: 2,
+      page_kind: "header",
+      previous_page_digest: null,
+      payload: {
+        verdict: "pass",
+        summary: "clean",
+        informational_notes: [],
+        narrative_byte_count: 1,
+        narrative_fragment_count: 1,
+        actionable_finding_count: 0,
+        coverage_attestation: null,
+      },
+    };
+    const firstRaw = JSON.stringify(first);
+    const second = {
+      schema_version: "1",
+      kind: "review-mesh.result-page",
+      result_id: "claude-two",
+      result_kind: "reviewer",
+      result_schema_version: "4",
+      page_index: 1,
+      page_count: 2,
+      page_kind: "narrative",
+      previous_page_digest: createHash("sha256").update(firstRaw).digest("hex"),
+      payload: { text_fragment: "x" },
+    };
+    const prepared = setup([
+      messages(successResult(first)),
+      messages(successResult(second)),
+    ]);
+    prepared.input.resultPages = createResultPageCollector({
+      resultId: "claude-two",
+      resultKind: "reviewer",
+    });
+
+    const output = await collect(prepared.adapter.run(prepared.input));
+
+    expect(terminalResult(output).result).toMatchObject({
+      review_markdown: "x",
+    });
+    expect(prepared.query.calls).toHaveLength(2);
+    expect(prepared.query.calls[1]!.options.resume).toBe(
+      "00000000-0000-4000-8000-000000000002",
+    );
+    expect(
+      output
+        .filter(
+          (event): event is Extract<AdapterEvent, { type: "progress" }> =>
+            event.type === "progress" && event.phase === "result_page",
+        )
+        .map((event) => event.identity),
+    ).toEqual(["claude-two:page:0", "claude-two:page:1"]);
+  });
   it("probes runtime initialization with isolated options and never sends a prompt", async () => {
     const warm = warmQuery();
     const startup = vi.fn<ClaudeRuntimeInitializer>(async () => warm);
@@ -296,6 +487,8 @@ describe("Claude Agent SDK adapter", () => {
       cancellation: true,
       maximumIsolation: "unknown",
       runtime_version: "0.3.251",
+      observed_file_access: true,
+      progress_observable: true,
     });
     expect(startup).toHaveBeenCalledOnce();
     const initialization = startup.mock.calls[0]![0];
