@@ -88,6 +88,13 @@ function successResult(structuredOutput?: unknown): SDKMessage {
   });
 }
 
+function truncatedResult(structuredOutput?: unknown): SDKMessage {
+  return sdkMessage({
+    ...(successResult(structuredOutput) as object),
+    stop_reason: "max_tokens",
+  });
+}
+
 function errorResult(
   subtype:
     | "error_during_execution"
@@ -309,10 +316,18 @@ describe("Claude Agent SDK adapter", () => {
 
     const output = await collect(prepared.adapter.run(prepared.input));
 
-    expect(terminalResult(output).result).toMatchObject({
+    const terminal = terminalResult(output);
+    expect(terminal.result).toMatchObject({
       schema_version: "4",
       verdict: "pass",
     });
+    const stored = [];
+    expect(terminal.resultStorage?.serializationBoundary).toBe(
+      "sdk_canonical_json",
+    );
+    for await (const entry of terminal.resultStorage!.pages!())
+      stored.push(entry);
+    expect(stored[0]?.raw).toBe(JSON.stringify(page));
     const options = prepared.query.calls[0]!.options;
     expect(options.tools).toEqual([]);
     expect(options.allowedTools).toEqual([
@@ -332,7 +347,7 @@ describe("Claude Agent SDK adapter", () => {
       permission("Read", {}, permissionContext()),
     ).resolves.toMatchObject({ behavior: "deny" });
   });
-  it("credits observed reads only after returning the exact MCP body", async () => {
+  it("credits observed reads only after the exact MCP body appears in a tool-result carrier", async () => {
     const acknowledgeDelivered = vi.fn(() => true);
     const prepared = setup([
       messages(
@@ -376,6 +391,7 @@ describe("Claude Agent SDK adapter", () => {
         eof: true,
         acknowledgeDelivered,
       })),
+      observedFile: vi.fn(),
       recordDiffDelivery: vi.fn(),
       reconcileAttestation: vi.fn(),
       summary: vi.fn(),
@@ -383,8 +399,29 @@ describe("Claude Agent SDK adapter", () => {
       snapshotFiles: vi.fn(() => []),
       close: vi.fn(async () => undefined),
     };
+    const diff = "diff --git a/src/a.ts b/src/a.ts\n+ok\n";
+    Object.assign(prepared.input.context.git, {
+      is_repository: true,
+      diff,
+      changed_files: ["src/a.ts"],
+      changed_paths: [{ path: "src/a.ts", status: "modified" }],
+      raw_diff: { byte_count: Buffer.byteLength(diff), sha256: "c".repeat(64) },
+      truncated: {
+        diff_stat: false,
+        diff: false,
+        changed_files: false,
+      },
+    });
+    prepared.input.prompt = {
+      ...prepared.input.prompt,
+      user: `${prepared.input.prompt.user}\n${diff}`,
+    };
 
     await collect(prepared.adapter.run(prepared.input));
+    expect(prepared.input.coverage.recordDiffDelivery).toHaveBeenCalledWith(
+      ["src/a.ts"],
+      { byteCount: Buffer.byteLength(diff), sha256: "c".repeat(64) },
+    );
     const server = prepared.query.calls[0]!.options.mcpServers!
       .review_mesh as unknown as {
       instance: {
@@ -393,19 +430,82 @@ describe("Claude Agent SDK adapter", () => {
           {
             handler(
               args: unknown,
+              extra?: unknown,
             ): Promise<{ content: Array<{ text: string }> }>;
           }
         >;
       };
     };
-    const returned = await server.instance._registeredTools.read_file!.handler({
-      path: "src/a.ts",
-    });
+    const returned = await server.instance._registeredTools.read_file!.handler(
+      { path: "src/a.ts" },
+      { toolUseID: "tool-use-test" },
+    );
 
     expect(JSON.parse(returned.content[0]!.text)).toMatchObject({
       path: "src/a.ts",
       content: "b2s=",
     });
+    expect(acknowledgeDelivered).not.toHaveBeenCalled();
+
+    let registered: any;
+    const admittedQuery: ClaudeQueryFacade = (queryInput) => {
+      registered = queryInput.options.mcpServers!.review_mesh as any;
+      return {
+        close: vi.fn(),
+        async *[Symbol.asyncIterator]() {
+          const delivered =
+            await registered.instance._registeredTools.read_file.handler(
+              { path: "src/a.ts" },
+              { toolUseID: "tool-use-test" },
+            );
+          yield sdkMessage({
+            type: "user",
+            message: {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: "tool-use-test",
+                  content: delivered.content[0]!.text,
+                },
+              ],
+            },
+            parent_tool_use_id: null,
+            uuid: "00000000-0000-4000-8000-000000000099",
+            session_id: "00000000-0000-4000-8000-000000000002",
+          });
+          yield successResult({
+            schema_version: "1",
+            kind: "review-mesh.result-page",
+            result_id: "claude-read",
+            result_kind: "reviewer",
+            result_schema_version: "4",
+            page_index: 0,
+            page_count: 1,
+            page_kind: "header",
+            previous_page_digest: null,
+            payload: {
+              verdict: "pass",
+              summary: "clean",
+              informational_notes: [],
+              narrative_byte_count: 0,
+              narrative_fragment_count: 0,
+              actionable_finding_count: 0,
+              coverage_attestation: null,
+            },
+          });
+        },
+      };
+    };
+    const admitted = setup([], { query: admittedQuery });
+    admitted.input.resultPages = createResultPageCollector({
+      resultId: "claude-read",
+      resultKind: "reviewer",
+    });
+    admitted.input.coverage = prepared.input.coverage!;
+    Object.assign(admitted.input.context.git, prepared.input.context.git);
+    admitted.input.prompt = prepared.input.prompt;
+    await collect(admitted.adapter.run(admitted.input));
     expect(acknowledgeDelivered).toHaveBeenCalledOnce();
   });
   it("continues v9 pages by resuming the same Claude session", async () => {
@@ -457,8 +557,15 @@ describe("Claude Agent SDK adapter", () => {
       review_markdown: "x",
     });
     expect(prepared.query.calls).toHaveLength(2);
+    expect(prepared.query.calls[0]!.options.persistSession).toBe(true);
+    expect(prepared.query.calls[0]!.options.env?.CLAUDE_CONFIG_DIR).toMatch(
+      /review-mesh-claude-session-/,
+    );
     expect(prepared.query.calls[1]!.options.resume).toBe(
       "00000000-0000-4000-8000-000000000002",
+    );
+    expect(prepared.query.calls[1]!.options.env?.CLAUDE_CONFIG_DIR).toBe(
+      prepared.query.calls[0]!.options.env?.CLAUDE_CONFIG_DIR,
     );
     expect(
       output
@@ -468,6 +575,21 @@ describe("Claude Agent SDK adapter", () => {
         )
         .map((event) => event.identity),
     ).toEqual(["claude-two:page:0", "claude-two:page:1"]);
+  });
+  it("classifies a Claude max-token page as output truncation", async () => {
+    const prepared = setup([messages(truncatedResult({ partial: true }))]);
+    prepared.input.resultPages = createResultPageCollector({
+      resultId: "claude-truncated",
+      resultKind: "reviewer",
+    });
+    expect(
+      terminalFailure(await collect(prepared.adapter.run(prepared.input)))
+        .failure,
+    ).toMatchObject({
+      reason: "output_truncated",
+      retryable: true,
+      diagnostics: { finish_reason: "length", truncated: true },
+    });
   });
   it("probes runtime initialization with isolated options and never sends a prompt", async () => {
     const warm = warmQuery();
@@ -1024,9 +1146,21 @@ describe("Claude Agent SDK adapter", () => {
     const output = await collect(prepared.adapter.run(prepared.input));
 
     expect(output.slice(0, -1)).toEqual([
-      { type: "activity", message: "Claude is requesting a model response." },
-      { type: "activity", message: "Claude is running an inspection tool." },
-      { type: "activity", message: "Claude is progressing a review task." },
+      {
+        type: "activity",
+        message: "Claude is requesting a model response.",
+        identity: "00000000-0000-4000-8000-000000000007",
+      },
+      {
+        type: "activity",
+        message: "Claude is running an inspection tool.",
+        identity: "00000000-0000-4000-8000-000000000009",
+      },
+      {
+        type: "activity",
+        message: "Claude is progressing a review task.",
+        identity: "00000000-0000-4000-8000-000000000011",
+      },
     ]);
     expect(JSON.stringify(output)).not.toMatch(
       /PRIVATE_|Read_PRIVATE_FILE|tool-secret|task-secret|hook-secret/,

@@ -10,13 +10,19 @@ import {
   type SDKResultMessage,
   type WarmQuery,
 } from "@anthropic-ai/claude-agent-sdk";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { z } from "zod";
 import type { AdapterRegistration } from "../config/schemas.js";
 import { currentReviewerOutputSchema } from "../protocol/schemas.js";
 import { adapterFailure, type AdapterFailure } from "./errors.js";
 import { createReadOnlyFileTools } from "./file-tools.js";
 import {
+  acknowledgeInitialDiffDelivery,
+  createResultPageStorageBridge,
   nextPageAssignment,
+  outputTruncatedFailure,
   pageCollectorFor,
   pageFailure,
 } from "./sdk-pages.js";
@@ -151,6 +157,69 @@ function activityFor(message: SDKMessage): string | undefined {
     return "Claude is progressing a review task.";
   }
   return undefined;
+}
+
+function messageIdentity(message: SDKMessage): string | undefined {
+  return "uuid" in message && typeof message.uuid === "string"
+    ? message.uuid
+    : undefined;
+}
+
+function admittedToolResult(message: SDKMessage):
+  | {
+      toolUseId: string;
+      text: string;
+    }
+  | undefined {
+  if (message.type !== "user" || !Array.isArray(message.message.content)) {
+    return undefined;
+  }
+  for (const block of message.message.content) {
+    if (
+      typeof block === "object" &&
+      block !== null &&
+      "type" in block &&
+      block.type === "tool_result" &&
+      "tool_use_id" in block &&
+      typeof block.tool_use_id === "string" &&
+      "content" in block
+    ) {
+      const text =
+        typeof block.content === "string"
+          ? block.content
+          : Array.isArray(block.content)
+            ? block.content
+                .filter(
+                  (entry): entry is { type: "text"; text: string } =>
+                    typeof entry === "object" &&
+                    entry !== null &&
+                    "type" in entry &&
+                    entry.type === "text" &&
+                    "text" in entry &&
+                    typeof entry.text === "string",
+                )
+                .map((entry) => entry.text)
+                .join("")
+            : undefined;
+      if (text !== undefined) return { toolUseId: block.tool_use_id, text };
+    }
+  }
+  return undefined;
+}
+
+function streamByteCount(message: SDKMessage): number | undefined {
+  if (message.type !== "stream_event") return undefined;
+  const event = message.event;
+  if (event.type !== "content_block_delta") return undefined;
+  const text =
+    event.delta.type === "text_delta"
+      ? event.delta.text
+      : event.delta.type === "input_json_delta"
+        ? event.delta.partial_json
+        : undefined;
+  return text === undefined || text.length === 0
+    ? undefined
+    : Buffer.byteLength(text, "utf8");
 }
 
 function closeQuery(query: CloseableQuery | undefined): void {
@@ -355,7 +424,12 @@ class ClaudeAdapter implements ReviewAdapter {
     input: AdapterReviewInput,
     abortController: AbortController,
     sandboxed: boolean,
+    pendingDeliveries?: Map<
+      string,
+      { text: string; acknowledge(text: string): boolean }
+    >,
     resumeSessionId?: string,
+    sessionDirectory?: string,
   ): ClaudeOptions {
     const pages = pageCollectorFor(input);
     const coverageTools =
@@ -391,7 +465,7 @@ class ClaudeAdapter implements ReviewAdapter {
                 offset: z.number().int().nonnegative().optional(),
                 byte_count: z.number().int().positive().optional(),
               },
-              async (args) => {
+              async (args, extra) => {
                 const delivered = await coverageTools.readFile({
                   path: args.path,
                   ...(args.offset === undefined ? {} : { offset: args.offset }),
@@ -400,7 +474,19 @@ class ClaudeAdapter implements ReviewAdapter {
                     : { byteCount: args.byte_count }),
                 });
                 const text = JSON.stringify(delivered.response);
-                delivered.acknowledgeDelivered(text);
+                const toolUseId =
+                  typeof extra === "object" &&
+                  extra !== null &&
+                  "toolUseID" in extra &&
+                  typeof extra.toolUseID === "string"
+                    ? extra.toolUseID
+                    : undefined;
+                if (toolUseId !== undefined) {
+                  pendingDeliveries?.set(toolUseId, {
+                    text,
+                    acknowledge: delivered.acknowledgeDelivered,
+                  });
+                }
                 return { content: [{ type: "text", text }] };
               },
             ),
@@ -472,12 +558,17 @@ class ClaudeAdapter implements ReviewAdapter {
         type: "json_schema",
         schema: input.resultJsonSchema,
       },
-      persistSession: false,
+      persistSession: sessionDirectory !== undefined,
       ...(resumeSessionId === undefined ? {} : { resume: resumeSessionId }),
-      env: buildAllowlistedEnvironment(
-        this.registration.env_allowlist,
-        this.environment,
-      ),
+      env: {
+        ...buildAllowlistedEnvironment(
+          this.registration.env_allowlist,
+          this.environment,
+        ),
+        ...(sessionDirectory === undefined
+          ? {}
+          : { CLAUDE_CONFIG_DIR: sessionDirectory }),
+      },
       sandbox: sandboxed
         ? {
             enabled: true,
@@ -500,7 +591,12 @@ class ClaudeAdapter implements ReviewAdapter {
     input: AdapterReviewInput,
     active: ActiveQuery,
     sandboxed: boolean,
+    pendingDeliveries?: Map<
+      string,
+      { text: string; acknowledge(text: string): boolean }
+    >,
     resumeSessionId?: string,
+    sessionDirectory?: string,
   ): AsyncGenerator<AdapterEvent, AttemptOutcome> {
     if (active.controller.signal.aborted || input.signal.aborted) {
       return {
@@ -519,7 +615,9 @@ class ClaudeAdapter implements ReviewAdapter {
           input,
           active.controller,
           sandboxed,
+          pendingDeliveries,
           resumeSessionId,
+          sessionDirectory,
         ),
       }) as CloseableQuery;
       active.query = nativeQuery;
@@ -550,9 +648,33 @@ class ClaudeAdapter implements ReviewAdapter {
           continue;
         }
         if (terminal !== undefined) continue;
+        const admitted = admittedToolResult(message);
+        if (admitted !== undefined) {
+          const pending = pendingDeliveries?.get(admitted.toolUseId);
+          if (pending?.text === admitted.text) {
+            pending.acknowledge(admitted.text);
+            pendingDeliveries?.delete(admitted.toolUseId);
+          }
+        }
+        const byteCount = streamByteCount(message);
+        if (byteCount !== undefined) {
+          const identity = messageIdentity(message);
+          yield {
+            type: "progress",
+            phase: "transport",
+            message: "Claude streamed new response bytes.",
+            ...(identity === undefined ? {} : { identity }),
+            byteCount,
+          };
+        }
         const activity = activityFor(message);
         if (activity !== undefined) {
-          yield { type: "activity", message: activity };
+          const identity = messageIdentity(message);
+          yield {
+            type: "activity",
+            message: activity,
+            ...(identity === undefined ? {} : { identity }),
+          };
         }
       }
 
@@ -596,9 +718,21 @@ class ClaudeAdapter implements ReviewAdapter {
     input: AdapterReviewInput,
     active: ActiveQuery,
     sandboxed: boolean,
+    pendingDeliveries?: Map<
+      string,
+      { text: string; acknowledge(text: string): boolean }
+    >,
     resumeSessionId?: string,
+    sessionDirectory?: string,
   ): AsyncGenerator<AdapterEvent, AttemptOutcome> {
-    const iterator = this.runAttempt(input, active, sandboxed, resumeSessionId);
+    const iterator = this.runAttempt(
+      input,
+      active,
+      sandboxed,
+      pendingDeliveries,
+      resumeSessionId,
+      sessionDirectory,
+    );
     for (;;) {
       const next = await iterator.next();
       if (next.done) return next.value;
@@ -616,10 +750,29 @@ class ClaudeAdapter implements ReviewAdapter {
     const abort = () => active.controller.abort(input.signal.reason);
     input.signal.addEventListener("abort", abort, { once: true });
     this.activeQueries.add(active);
+    let sessionDirectory: string | undefined;
+    let pageStorage:
+      ReturnType<typeof createResultPageStorageBridge> | undefined;
+    let resultStorageTransferred = false;
     try {
       let sandboxed = true;
       const pages = pageCollectorFor(input);
+      pageStorage =
+        pages === undefined
+          ? undefined
+          : createResultPageStorageBridge(input, {
+              serializationBoundary: "sdk_canonical_json",
+            });
+      const pendingDeliveries = new Map<
+        string,
+        { text: string; acknowledge(text: string): boolean }
+      >();
+      let initialRequestAdmitted = false;
       let resumeSessionId: string | undefined;
+      sessionDirectory =
+        pages === undefined
+          ? undefined
+          : await mkdtemp(join(tmpdir(), "review-mesh-claude-session-"));
       for (;;) {
         const attemptInput =
           pages === undefined
@@ -645,7 +798,9 @@ class ClaudeAdapter implements ReviewAdapter {
           attemptInput,
           active,
           sandboxed,
+          pendingDeliveries,
           resumeSessionId,
+          sessionDirectory,
         );
         let outcome: AttemptOutcome;
         for (;;) {
@@ -683,6 +838,10 @@ class ClaudeAdapter implements ReviewAdapter {
 
         const message = outcome.message;
         resumeSessionId = message.session_id;
+        if (!initialRequestAdmitted) {
+          acknowledgeInitialDiffDelivery(input);
+          initialRequestAdmitted = true;
+        }
         if (!isKnownResultSubtype(message)) {
           yield {
             type: "failure",
@@ -722,6 +881,15 @@ class ClaudeAdapter implements ReviewAdapter {
           };
           return;
         }
+        if (pages !== undefined && message.stop_reason === "max_tokens") {
+          await pageStorage!.abandon();
+          yield {
+            type: "failure",
+            failure: outputTruncatedFailure("Claude"),
+            isolation: sandboxed ? "enforced_read_only" : "prompt_only",
+          };
+          return;
+        }
 
         if (message.structured_output === undefined) {
           yield {
@@ -735,9 +903,15 @@ class ClaudeAdapter implements ReviewAdapter {
         }
         if (pages !== undefined) {
           const assignment = pages.collector.nextRequest();
+          const raw = JSON.stringify(message.structured_output);
           try {
-            pages.collector.addPage(JSON.stringify(message.structured_output));
+            await pageStorage!.addPage(
+              pages.collector,
+              raw,
+              assignment.pageIndex,
+            );
           } catch (error) {
+            await pageStorage!.abandon();
             yield {
               type: "failure",
               failure: pageFailure(error, "Claude"),
@@ -749,17 +923,16 @@ class ClaudeAdapter implements ReviewAdapter {
             type: "progress",
             phase: "result_page",
             identity: `${assignment.resultId}:page:${assignment.pageIndex}`,
-            byteCount: Buffer.byteLength(
-              JSON.stringify(message.structured_output),
-              "utf8",
-            ),
+            byteCount: Buffer.byteLength(raw, "utf8"),
           };
           if (!pages.collector.complete) continue;
           yield {
             type: "result",
             result: pages.collector.assemble(),
             isolation: sandboxed ? "enforced_read_only" : "prompt_only",
+            resultStorage: pageStorage!.resultStorage(),
           };
+          resultStorageTransferred = true;
           return;
         }
         const parsed = currentReviewerOutputSchema.safeParse(
@@ -787,6 +960,14 @@ class ClaudeAdapter implements ReviewAdapter {
       closeQuery(active.query);
       active.controller.abort();
       this.activeQueries.delete(active);
+      if (!resultStorageTransferred) {
+        await pageStorage?.abandon().catch(() => undefined);
+      }
+      if (sessionDirectory !== undefined) {
+        await rm(sessionDirectory, { recursive: true, force: true }).catch(
+          () => undefined,
+        );
+      }
     }
   }
 

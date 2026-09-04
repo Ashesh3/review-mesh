@@ -12,6 +12,7 @@ import { getAppPaths } from "../config/paths.js";
 import { currentReviewerOutputSchema } from "../protocol/schemas.js";
 import { adapterFailure } from "./errors.js";
 import {
+  createResultPageStorageBridge,
   nextPageAssignment,
   pageCollectorFor,
   pageFailure,
@@ -292,6 +293,9 @@ class CodexAdapter implements ReviewAdapter {
     }
 
     let runtimeHome: RuntimeHome | undefined;
+    let pageStorage:
+      ReturnType<typeof createResultPageStorageBridge> | undefined;
+    let resultStorageTransferred = false;
     try {
       runtimeHome = await this.createRuntimeHome(
         input.runId,
@@ -324,6 +328,7 @@ class CodexAdapter implements ReviewAdapter {
       const facade = this.createFacade(factoryInput);
       const pages = pageCollectorFor(input);
       if (pages !== undefined) {
+        pageStorage = createResultPageStorageBridge(input);
         while (!pages.collector.complete) {
           const assignment = nextPageAssignment(
             pages.collector,
@@ -383,6 +388,7 @@ class CodexAdapter implements ReviewAdapter {
             )
               completedAgentMessage = event.item.text;
             if (event.type === "turn.failed" || event.type === "error") {
+              await pageStorage.abandon();
               yield {
                 type: "failure",
                 failure: adapterFailure.processCrashed(
@@ -405,6 +411,7 @@ class CodexAdapter implements ReviewAdapter {
               };
           }
           if (!completed || completedAgentMessage === undefined) {
+            await pageStorage.abandon();
             yield {
               type: "failure",
               failure: adapterFailure.invalidResult(
@@ -415,8 +422,13 @@ class CodexAdapter implements ReviewAdapter {
             return;
           }
           try {
-            pages.collector.addPage(completedAgentMessage);
+            await pageStorage.addPage(
+              pages.collector,
+              completedAgentMessage,
+              assignment.request.pageIndex,
+            );
           } catch (error) {
+            await pageStorage.abandon();
             yield {
               type: "failure",
               failure: pageFailure(error, "Codex"),
@@ -435,7 +447,9 @@ class CodexAdapter implements ReviewAdapter {
           type: "result",
           result: pages.collector.assemble(),
           isolation: "runtime_read_only",
+          resultStorage: pageStorage.resultStorage(),
         };
+        resultStorageTransferred = true;
         return;
       }
       const nativeEvents = await facade.start({
@@ -572,6 +586,9 @@ class CodexAdapter implements ReviewAdapter {
         isolation: "runtime_read_only",
       };
     } finally {
+      if (!resultStorageTransferred) {
+        await pageStorage?.abandon().catch(() => undefined);
+      }
       if (runtimeHome !== undefined) {
         await this.removeRuntimeHome(runtimeHome).catch(() => undefined);
       }

@@ -17,6 +17,9 @@ import {
   createResultSpool,
   wipeStaleResultSpools,
 } from "../../src/adapters/result-spool.js";
+import { createResultPageStorageBridge } from "../../src/adapters/sdk-pages.js";
+import { createResultPageCollector } from "../../src/results/result-pages.js";
+import { resolvedContext, resolvedReviewer } from "../helpers/fixtures.js";
 
 const roots: string[] = [];
 
@@ -33,6 +36,50 @@ afterEach(async () => {
 });
 
 describe("result spool", () => {
+  it("exposes exact accepted pages and digests until persistence wipes them", async () => {
+    const page = JSON.stringify({
+      schema_version: "1",
+      kind: "review-mesh.result-page",
+      result_id: "stored-pages",
+      result_kind: "reviewer",
+      result_schema_version: "4",
+      page_index: 0,
+      page_count: 1,
+      page_kind: "header",
+      previous_page_digest: null,
+      payload: {
+        verdict: "pass",
+        summary: "clean",
+        informational_notes: [],
+        narrative_byte_count: 0,
+        narrative_fragment_count: 0,
+        actionable_finding_count: 0,
+        coverage_attestation: null,
+      },
+    });
+    const input = {
+      runId: "stored-run",
+      reviewer: resolvedReviewer(),
+      context: resolvedContext({ workspace: await root() }),
+    } as any;
+    const bridge = createResultPageStorageBridge(input);
+    const collector = createResultPageCollector({
+      resultId: "stored-pages",
+      resultKind: "reviewer",
+    });
+    await bridge.addPage(collector, page, 0);
+    const storage = bridge.resultStorage();
+    const stored = [];
+    for await (const entry of storage.pages()) stored.push(entry);
+    expect(stored).toEqual([
+      {
+        raw: page,
+        sha256:
+          "6a6a0f7d8e595719dcf72276df172bae17f4455b4397f1a584d0529917c88765",
+      },
+    ]);
+    await storage.persisted();
+  });
   it("appends and reads exact bytes, then durably wipes its owned file idempotently", async () => {
     const directory = await root();
     const spool = await createResultSpool({ directory, id: "exact" });

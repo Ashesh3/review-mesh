@@ -2391,6 +2391,8 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
       streaming: (this.registration.streaming ?? "disabled") !== "disabled",
       cancellation: true,
       maximumIsolation: "runtime_read_only",
+      observed_file_access: true,
+      progress_observable: true,
     };
     const configuration = this.configuration();
     if ("reason" in configuration) {
@@ -2721,18 +2723,33 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           }
         }
         const result = collector.assemble();
-        const storage = pageSpools.map((spool) => spool.lifecycle());
+        const storage = pageSpools;
         pageSpools = [];
         yield {
           type: "result",
           result,
           isolation: "runtime_read_only",
           resultStorage: {
+            async *pages() {
+              for (const spool of storage) {
+                const raw = await spool.readText();
+                yield {
+                  raw,
+                  sha256: createHash("sha256")
+                    .update(raw, "utf8")
+                    .digest("hex"),
+                };
+              }
+            },
             async persisted() {
-              await Promise.all(storage.map((entry) => entry.persisted()));
+              await Promise.all(
+                storage.map((spool) => spool.lifecycle().persisted()),
+              );
             },
             async abandoned() {
-              await Promise.all(storage.map((entry) => entry.abandoned()));
+              await Promise.all(
+                storage.map((spool) => spool.lifecycle().abandoned()),
+              );
             },
           },
         };
@@ -2878,7 +2895,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
       let inspectionBudgetReached = false;
       let initialRequestAdmitted = false;
       for (let turn = 0; turn < this.maxTurns; turn += 1) {
-        const chatResponse = await this.chat(
+        const exchange = this.observableChat(
           configuration,
           input.signal,
           sessionId,
@@ -2895,7 +2912,21 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
             tool_choice: turn === 0 ? "required" : "auto",
             max_tokens: 8_192,
           },
+          {},
         );
+        for await (const event of exchange.progress) {
+          yield {
+            type: "progress",
+            phase: event.byteCount === 0 ? "response" : "transport",
+            message:
+              event.byteCount === 0
+                ? "The provider admitted an inspection response boundary."
+                : "The provider streamed new inspection bytes.",
+            identity: event.identity,
+            byteCount: event.byteCount,
+          };
+        }
+        const chatResponse = await exchange.response;
         if (!initialRequestAdmitted) {
           initialRequestAdmitted = true;
           const git = input.context.git;
@@ -2995,6 +3026,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
             type: "activity",
             message:
               "The reviewer completed a bounded read-only inspection step.",
+            identity: `${sessionId}:tools:${turn}`,
           };
           if (!inspectionBudgetReached) continue;
           messages.push({

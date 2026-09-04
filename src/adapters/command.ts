@@ -12,6 +12,7 @@ import { coverageAttestationEntrySchema } from "../protocol/v9.js";
 import { MAX_REVIEWER_RESULT_BYTES } from "../results/sanitize.js";
 import { adapterFailure, sanitizeAdapterFailure } from "./errors.js";
 import {
+  createResultPageStorageBridge,
   nextPageAssignment,
   pageCollectorFor,
   pageFailure,
@@ -82,6 +83,8 @@ const progressEventSchema = z.strictObject({
   type: z.literal("progress"),
   phase: z.string().min(1),
   message: z.string().min(1).optional(),
+  identity: z.string().min(1).max(256).optional(),
+  byte_count: z.number().int().positive().optional(),
 });
 const activityEventSchema = z.strictObject({
   type: z.literal("activity"),
@@ -116,7 +119,8 @@ type ProtocolTerminal =
   | {
       type: "result";
       result: Extract<AdapterEvent, { type: "result" }>["result"];
-    };
+    }
+  | { type: "failure"; failure: ReturnType<typeof pageFailure> };
 
 interface ActiveChild {
   child: CommandProcess;
@@ -237,7 +241,8 @@ class CommandAdapter implements ReviewAdapter {
       cancellation: true,
       maximumIsolation: "unknown",
       observed_file_access: false,
-      progress_observable: true,
+      progress_observable:
+        this.registration.protocol === "review-mesh-command-v2",
     };
   }
 
@@ -336,6 +341,8 @@ class CommandAdapter implements ReviewAdapter {
       return;
     }
     const pages = pageCollectorFor(input);
+    const pageStorage =
+      pages === undefined ? undefined : createResultPageStorageBridge(input);
     child.stdin.write(`${JSON.stringify(request)}\n`);
     if (pages === undefined) child.stdin.end();
     else {
@@ -355,7 +362,9 @@ class CommandAdapter implements ReviewAdapter {
     let totalBytes = 0;
     let buffered = Buffer.alloc(0);
 
-    const acceptLine = (lineBuffer: Buffer): AdapterEvent | undefined => {
+    const acceptLine = async (
+      lineBuffer: Buffer,
+    ): Promise<AdapterEvent | undefined> => {
       eventCount += 1;
       if (eventCount > MAX_PROTOCOL_EVENTS) {
         protocolViolation = "The command exceeded the protocol event limit.";
@@ -390,16 +399,47 @@ class CommandAdapter implements ReviewAdapter {
       }
       const progress = progressEventSchema.safeParse(value);
       if (progress.success) {
+        if (
+          this.registration.protocol === "review-mesh-command-v2" &&
+          progress.data.identity === undefined
+        ) {
+          protocolViolation =
+            "Command protocol v2 progress requires an identity.";
+          return undefined;
+        }
+        if (
+          progress.data.identity !== undefined &&
+          identities.has(progress.data.identity)
+        ) {
+          protocolViolation = "The command repeated a progress identity.";
+          return undefined;
+        }
+        if (progress.data.identity !== undefined)
+          identities.add(progress.data.identity);
         return {
           type: "progress",
           phase: progress.data.phase,
           ...(progress.data.message === undefined
             ? {}
             : { message: sanitizedPublicMessage(progress.data.message) }),
+          ...(progress.data.identity === undefined
+            ? {}
+            : { identity: progress.data.identity }),
+          ...(progress.data.byte_count === undefined
+            ? {}
+            : { byteCount: progress.data.byte_count }),
         };
       }
       const activity = activityEventSchema.safeParse(value);
       if (activity.success) {
+        if (
+          this.registration.protocol === "review-mesh-command-v2" &&
+          activity.data.identity === undefined
+        ) {
+          protocolViolation =
+            "Command protocol v2 activity requires an identity.";
+          return undefined;
+        }
         if (
           activity.data.identity !== undefined &&
           identities.has(activity.data.identity)
@@ -434,7 +474,12 @@ class CommandAdapter implements ReviewAdapter {
       const resultPage = resultPageEventSchema.safeParse(value);
       if (resultPage.success && pages !== undefined) {
         try {
-          pages.collector.addPage(resultPage.data.page);
+          const pageIndex = pages.collector.nextRequest().pageIndex;
+          await pageStorage!.addPage(
+            pages.collector,
+            resultPage.data.page,
+            pageIndex,
+          );
           if (pages.collector.complete) {
             const result = pages.collector.assemble();
             if (
@@ -465,7 +510,11 @@ class CommandAdapter implements ReviewAdapter {
             );
           }
         } catch (error) {
-          protocolViolation = pageFailure(error, "The command").message;
+          terminal = {
+            type: "failure",
+            failure: pageFailure(error, "The command"),
+          };
+          void pageStorage!.abandon();
         }
         return undefined;
       }
@@ -508,6 +557,18 @@ class CommandAdapter implements ReviewAdapter {
           const rawChunk = outcome.result.value;
           const chunk = asBuffer(rawChunk);
           totalBytes += chunk.byteLength;
+          if (
+            this.registration.protocol === "review-mesh-command-v2" &&
+            chunk.byteLength > 0
+          ) {
+            yield {
+              type: "progress",
+              phase: "transport",
+              message: "The command emitted new protocol bytes.",
+              identity: `stdout:${totalBytes}`,
+              byteCount: chunk.byteLength,
+            };
+          }
           if (totalBytes > this.maxStdoutBytes) {
             protocolViolation =
               "The command exceeded the total stdout byte limit.";
@@ -528,7 +589,7 @@ class CommandAdapter implements ReviewAdapter {
             }
             const line = buffered.subarray(0, newline);
             buffered = buffered.subarray(newline + 1);
-            const event = acceptLine(line);
+            const event = await acceptLine(line);
             if (event !== undefined) yield event;
             if (protocolViolation !== undefined) {
               child.kill();
@@ -551,7 +612,7 @@ class CommandAdapter implements ReviewAdapter {
           protocolViolation =
             "The command exceeded the stdout line byte limit.";
         } else {
-          const event = acceptLine(buffered);
+          const event = await acceptLine(buffered);
           if (event !== undefined) yield event;
         }
       }
@@ -607,12 +668,17 @@ class CommandAdapter implements ReviewAdapter {
           isolation: actualIsolation,
         };
       } else if (terminal.type === "failure") {
+        const diagnostics =
+          "diagnostics" in terminal.failure
+            ? terminal.failure.diagnostics
+            : undefined;
         yield {
           type: "failure",
           failure: sanitizeAdapterFailure(
             terminal.failure.reason,
             terminal.failure.message,
             terminal.failure.retryable,
+            diagnostics === undefined ? {} : { diagnostics },
           ),
           isolation: actualIsolation,
         };
@@ -621,6 +687,9 @@ class CommandAdapter implements ReviewAdapter {
           type: "result",
           result: terminal.result,
           isolation: actualIsolation,
+          ...(pageStorage === undefined
+            ? {}
+            : { resultStorage: pageStorage.resultStorage() }),
         };
       }
     } catch (error) {
@@ -646,6 +715,9 @@ class CommandAdapter implements ReviewAdapter {
       }
     } finally {
       abort.dispose();
+      if (terminal?.type !== "result") {
+        await pageStorage?.abandon().catch(() => undefined);
+      }
     }
   }
 

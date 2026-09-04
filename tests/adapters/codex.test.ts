@@ -281,10 +281,15 @@ describe("Codex adapter", () => {
 
     const output = await collect(prepared.adapter.run(prepared.input));
 
-    expect(terminalResult(output).result).toMatchObject({
+    const terminal = terminalResult(output);
+    expect(terminal.result).toMatchObject({
       schema_version: "4",
       verdict: "pass",
     });
+    const stored = [];
+    for await (const entry of terminal.resultStorage!.pages!())
+      stored.push(entry);
+    expect(stored[0]?.raw).toBe(raw);
     expect(prepared.capture.starts).toHaveLength(1);
     expect(prepared.capture.starts[0]!.userPrompt).toContain("codex-pages");
     const capabilities = await prepared.adapter.probe(

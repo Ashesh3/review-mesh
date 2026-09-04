@@ -9,7 +9,10 @@ import { currentReviewerOutputSchema } from "../protocol/schemas.js";
 import { adapterFailure } from "./errors.js";
 import { createReadOnlyFileTools } from "./file-tools.js";
 import {
+  acknowledgeInitialDiffDelivery,
+  createResultPageStorageBridge,
   nextPageAssignment,
+  outputTruncatedFailure,
   pageCollectorFor,
   pageFailure,
 } from "./sdk-pages.js";
@@ -97,7 +100,14 @@ export type CopilotPermissionHandler = (
 
 export interface CopilotSessionEvent {
   type: string;
-  data?: { content?: string; [key: string]: unknown };
+  id?: string;
+  data?: {
+    content?: string;
+    deltaContent?: string;
+    toolCallId?: string;
+    result?: { content?: string };
+    [key: string]: unknown;
+  };
   [key: string]: unknown;
 }
 
@@ -124,7 +134,10 @@ export interface CopilotSessionConfig {
     name: string;
     description?: string;
     parameters?: Record<string, unknown>;
-    handler?: (args: unknown) => Promise<unknown> | unknown;
+    handler?: (
+      args: unknown,
+      invocation?: { toolCallId?: string },
+    ) => Promise<unknown> | unknown;
     overridesBuiltInTool?: boolean;
     skipPermission?: boolean;
     defer?: "auto" | "never";
@@ -237,6 +250,26 @@ interface CopilotSdkModule {
   CopilotClient: new (options: CopilotClientOptions) => NativeCopilotClient;
 }
 
+function nativeCopilotEvent(event: unknown): CopilotSessionEvent {
+  if (typeof event !== "object" || event === null || !("type" in event)) {
+    return { type: "unknown" };
+  }
+  const value = event as {
+    type: string;
+    id?: unknown;
+    data?: unknown;
+  };
+  const data =
+    typeof value.data === "object" && value.data !== null
+      ? (value.data as Exclude<CopilotSessionEvent["data"], undefined>)
+      : undefined;
+  return {
+    type: value.type,
+    ...(typeof value.id === "string" ? { id: value.id } : {}),
+    ...(data === undefined ? {} : { data }),
+  };
+}
+
 class CopilotClientSdkFacade implements CopilotClientFacade {
   constructor(private readonly client: NativeCopilotClient) {}
 
@@ -261,7 +294,8 @@ class CopilotClientSdkFacade implements CopilotClientFacade {
   ): Promise<CopilotSessionFacade> {
     const session = await this.client.createSession(config);
     return {
-      on: (handler) => session.on(handler),
+      on: (handler) =>
+        session.on((event) => handler(nativeCopilotEvent(event))),
       sendAndWait: (options, timeout) => session.sendAndWait(options, timeout),
       abort: () => session.abort(),
       close: () => session.disconnect(),
@@ -329,27 +363,43 @@ function permissionHandler(allowShell: boolean): CopilotPermissionHandler {
 }
 
 function eventSummary(event: CopilotSessionEvent): AdapterEvent | undefined {
+  const identity = typeof event.id === "string" ? event.id : undefined;
   switch (event.type) {
     case "assistant.turn_start":
       return {
         type: "progress",
         phase: "reviewing",
         message: "Copilot started the review turn.",
+        ...(identity === undefined ? {} : { identity }),
       };
     case "tool.execution_start":
       return {
         type: "activity",
         message: "Copilot started an inspection tool.",
+        ...(identity === undefined ? {} : { identity }),
       };
     case "tool.execution_complete":
       return {
         type: "activity",
         message: "Copilot completed an inspection tool.",
+        ...(identity === undefined ? {} : { identity }),
       };
+    case "assistant.message_delta":
+      return typeof event.data?.deltaContent !== "string" ||
+        event.data.deltaContent.length === 0
+        ? undefined
+        : {
+            type: "progress",
+            phase: "transport",
+            message: "Copilot streamed new response bytes.",
+            ...(identity === undefined ? {} : { identity }),
+            byteCount: Buffer.byteLength(event.data.deltaContent, "utf8"),
+          };
     case "assistant.message":
       return {
         type: "activity",
         message: "Copilot produced a response message.",
+        ...(identity === undefined ? {} : { identity }),
       };
     case "session.idle":
     case "assistant.turn_end":
@@ -357,6 +407,7 @@ function eventSummary(event: CopilotSessionEvent): AdapterEvent | undefined {
         type: "progress",
         phase: "validating",
         message: "Copilot completed the review turn.",
+        ...(identity === undefined ? {} : { identity }),
       };
     default:
       return undefined;
@@ -573,7 +624,10 @@ class CopilotAdapter implements ReviewAdapter {
         parameters: { type: "object", required: ["path"] },
         skipPermission: true,
         defer: "never" as const,
-        handler: async (args: unknown) => {
+        handler: async (
+          args: unknown,
+          invocation?: { toolCallId?: string },
+        ) => {
           if (coverageTools === undefined) return { error: "unavailable" };
           const value = args as {
             path: string;
@@ -588,7 +642,12 @@ class CopilotAdapter implements ReviewAdapter {
               : { byteCount: value.byte_count }),
           });
           const serialized = JSON.stringify(delivered.response);
-          delivered.acknowledgeDelivered(serialized);
+          if (typeof invocation?.toolCallId === "string") {
+            pendingDeliveries.set(invocation.toolCallId, {
+              text: serialized,
+              acknowledge: delivered.acknowledgeDelivered,
+            });
+          }
           return serialized;
         },
       },
@@ -613,7 +672,13 @@ class CopilotAdapter implements ReviewAdapter {
     const isolation = allowShell ? "prompt_only" : "runtime_read_only";
     const active = this.createRuntimeClient();
     const nativeEvents = new EventQueue<AdapterEvent>();
+    let pageEvents: EventQueue<AdapterEvent> | undefined;
+    const pendingDeliveries = new Map<
+      string,
+      { text: string; acknowledge(text: string): boolean }
+    >();
     let sessionFailure = false;
+    let outputTruncated = false;
     let deniedPermission = false;
     let abortPromise: Promise<void> | undefined;
     const onPermissionRequest = permissionHandler(allowShell);
@@ -627,13 +692,34 @@ class CopilotAdapter implements ReviewAdapter {
     };
     const onEvent = (event: CopilotSessionEvent): void => {
       if (event.type === "session.error") sessionFailure = true;
+      if (
+        event.type === "assistant.usage" &&
+        event.data?.finishReason === "length"
+      ) {
+        outputTruncated = true;
+      }
+      if (event.type === "tool.execution_complete") {
+        const toolCallId = event.data?.toolCallId;
+        const pending =
+          typeof toolCallId === "string"
+            ? pendingDeliveries.get(toolCallId)
+            : undefined;
+        const admitted = event.data?.result?.content;
+        if (pending !== undefined && admitted === pending.text) {
+          pending.acknowledge(admitted);
+          pendingDeliveries.delete(toolCallId!);
+        }
+      }
       const summary = eventSummary(event);
-      if (summary !== undefined) nativeEvents.push(summary);
+      if (summary !== undefined) (pageEvents ?? nativeEvents).push(summary);
     };
     const abort = (): void => {
       abortPromise ??= active.session?.abort().catch(() => undefined);
     };
     input.signal.addEventListener("abort", abort, { once: true });
+    let pageStorage:
+      ReturnType<typeof createResultPageStorageBridge> | undefined;
+    let resultStorageTransferred = false;
 
     try {
       await active.client.start();
@@ -686,7 +772,7 @@ class CopilotAdapter implements ReviewAdapter {
         instructionDirectories: [],
         remoteSession: "off",
         onPermissionRequest: guardedPermissionHandler,
-        onEvent,
+        onEvent: (event) => onEvent(nativeCopilotEvent(event)),
       });
       if (input.signal.aborted || active.forceCleanupRequested) {
         abort();
@@ -702,21 +788,33 @@ class CopilotAdapter implements ReviewAdapter {
         return;
       }
       if (pages !== undefined) {
+        pageStorage = createResultPageStorageBridge(input);
+        let initialRequestAdmitted = false;
         while (!pages.collector.complete) {
           const assignment = nextPageAssignment(
             pages.collector,
             pages.resultKind,
           );
-          const finalMessage = await active.session.sendAndWait(
-            {
-              prompt:
-                pages.collector.nextRequest().pageIndex === 0
-                  ? `${input.prompt.user}\n\n${assignment.prompt}`
-                  : assignment.prompt,
-              agentMode: "interactive",
-            },
-            input.reviewer.timeoutMs,
-          );
+          pageEvents = new EventQueue<AdapterEvent>();
+          const pendingMessage = active.session
+            .sendAndWait(
+              {
+                prompt:
+                  assignment.request.pageIndex === 0
+                    ? `${input.prompt.user}\n\n${assignment.prompt}`
+                    : assignment.prompt,
+                agentMode: "interactive",
+              },
+              input.reviewer.timeoutMs,
+            )
+            .finally(() => pageEvents?.close());
+          for (;;) {
+            const event = await pageEvents.next();
+            if (event === undefined) break;
+            yield event;
+          }
+          const finalMessage = await pendingMessage;
+          pageEvents = undefined;
           if (input.signal.aborted) {
             yield {
               type: "failure",
@@ -726,6 +824,7 @@ class CopilotAdapter implements ReviewAdapter {
             return;
           }
           if (sessionFailure) {
+            await pageStorage.abandon();
             yield {
               type: "failure",
               failure: adapterFailure.processCrashed(
@@ -735,7 +834,17 @@ class CopilotAdapter implements ReviewAdapter {
             };
             return;
           }
+          if (outputTruncated) {
+            await pageStorage.abandon();
+            yield {
+              type: "failure",
+              failure: outputTruncatedFailure("Copilot"),
+              isolation,
+            };
+            return;
+          }
           if (finalMessage === undefined) {
+            await pageStorage.abandon();
             yield {
               type: "failure",
               failure: adapterFailure.invalidResult(
@@ -745,9 +854,18 @@ class CopilotAdapter implements ReviewAdapter {
             };
             return;
           }
+          if (!initialRequestAdmitted) {
+            acknowledgeInitialDiffDelivery(input);
+            initialRequestAdmitted = true;
+          }
           try {
-            pages.collector.addPage(finalMessage.data.content);
+            await pageStorage.addPage(
+              pages.collector,
+              finalMessage.data.content,
+              assignment.request.pageIndex,
+            );
           } catch (error) {
+            await pageStorage.abandon();
             yield {
               type: "failure",
               failure: pageFailure(error, "Copilot"),
@@ -762,7 +880,13 @@ class CopilotAdapter implements ReviewAdapter {
             byteCount: Buffer.byteLength(finalMessage.data.content, "utf8"),
           };
         }
-        yield { type: "result", result: pages.collector.assemble(), isolation };
+        yield {
+          type: "result",
+          result: pages.collector.assemble(),
+          isolation,
+          resultStorage: pageStorage.resultStorage(),
+        };
+        resultStorageTransferred = true;
         return;
       }
       const terminal = active.session
@@ -816,6 +940,7 @@ class CopilotAdapter implements ReviewAdapter {
         };
         return;
       }
+      acknowledgeInitialDiffDelivery(input);
 
       let parsedJson: unknown;
       try {
@@ -859,6 +984,9 @@ class CopilotAdapter implements ReviewAdapter {
     } finally {
       input.signal.removeEventListener("abort", abort);
       await abortPromise;
+      if (!resultStorageTransferred) {
+        await pageStorage?.abandon().catch(() => undefined);
+      }
       await this.cleanup(active);
       active.resolveLifecycle();
     }

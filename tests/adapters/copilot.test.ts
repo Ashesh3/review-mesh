@@ -270,10 +270,15 @@ describe("Copilot adapter", () => {
 
     const output = await collect(prepared.adapter.run(prepared.input));
 
-    expect(terminalResult(output).result).toMatchObject({
+    const terminal = terminalResult(output);
+    expect(terminal.result).toMatchObject({
       schema_version: "4",
       verdict: "pass",
     });
+    const stored = [];
+    for await (const entry of terminal.resultStorage!.pages!())
+      stored.push(entry);
+    expect(stored[0]?.raw).toBe(page);
     const config = fake.capture.sessionConfigs[0]!;
     expect(config.availableTools).toEqual([
       "custom:list_files",
@@ -290,7 +295,7 @@ describe("Copilot adapter", () => {
       "copilot-pages",
     );
   });
-  it("returns the same serialized body that it credits to observed coverage", async () => {
+  it("credits a serialized body only after Copilot reports the same model-facing tool result", async () => {
     const acknowledgeDelivered = vi.fn(() => true);
     const fake = fakeFactory({
       response: finalMessage(
@@ -335,6 +340,7 @@ describe("Copilot adapter", () => {
         eof: true,
         acknowledgeDelivered,
       })),
+      observedFile: vi.fn(),
       recordDiffDelivery: vi.fn(),
       reconcileAttestation: vi.fn(),
       summary: vi.fn(),
@@ -342,18 +348,54 @@ describe("Copilot adapter", () => {
       snapshotFiles: vi.fn(() => []),
       close: vi.fn(async () => undefined),
     };
+    const diff = "diff --git a/src/a.ts b/src/a.ts\n+ok\n";
+    Object.assign(prepared.input.context.git, {
+      is_repository: true,
+      diff,
+      changed_files: ["src/a.ts"],
+      changed_paths: [{ path: "src/a.ts", status: "modified" }],
+      raw_diff: { byte_count: Buffer.byteLength(diff), sha256: "c".repeat(64) },
+      truncated: {
+        diff_stat: false,
+        diff: false,
+        changed_files: false,
+      },
+    });
+    prepared.input.prompt = {
+      ...prepared.input.prompt,
+      user: `${prepared.input.prompt.user}\n${diff}`,
+    };
 
     await collect(prepared.adapter.run(prepared.input));
+    expect(prepared.input.coverage.recordDiffDelivery).toHaveBeenCalledWith(
+      ["src/a.ts"],
+      { byteCount: Buffer.byteLength(diff), sha256: "c".repeat(64) },
+    );
     const tool = fake.capture.sessionConfigs[0]!.tools!.find(
       (entry) => entry.name === "read_file",
     )!;
-    const returned = await tool.handler!({ path: "src/a.ts" });
+    const returned = await tool.handler!(
+      { path: "src/a.ts" },
+      { toolCallId: "tool-call-1" },
+    );
 
     expect(typeof returned).toBe("string");
     expect(JSON.parse(returned as string)).toMatchObject({
       path: "src/a.ts",
       content: "b2s=",
     });
+    expect(acknowledgeDelivered).not.toHaveBeenCalled();
+    fake.emit(
+      sdkEvent({
+        type: "tool.execution_complete",
+        id: "tool-complete-1",
+        data: {
+          toolCallId: "tool-call-1",
+          success: true,
+          result: { content: returned },
+        },
+      }),
+    );
     expect(acknowledgeDelivered).toHaveBeenCalledOnce();
   });
   it("continues v9 pages on the same Copilot session", async () => {
@@ -413,6 +455,32 @@ describe("Copilot adapter", () => {
     });
     expect(fake.capture.sessionConfigs).toHaveLength(1);
     expect(fake.capture.sendCalls).toHaveLength(2);
+  });
+  it("classifies a Copilot length finish as output truncation before page parsing", async () => {
+    let fake!: ReturnType<typeof fakeFactory>;
+    fake = fakeFactory({
+      response: finalMessage('{"partial":'),
+      onSend: () =>
+        fake.emit(
+          sdkEvent({
+            type: "assistant.usage",
+            id: "usage-length",
+            data: { finishReason: "length" },
+          }),
+        ),
+    });
+    const prepared = setup({ createClient: fake.createClient });
+    prepared.input.resultPages = createResultPageCollector({
+      resultId: "copilot-truncated",
+      resultKind: "reviewer",
+    });
+    expect(
+      terminalFailure(await collect(prepared.adapter.run(prepared.input)))
+        .failure,
+    ).toMatchObject({
+      reason: "output_truncated",
+      retryable: true,
+    });
   });
   it("probes a fresh client and checks status, auth, and model membership concurrently", async () => {
     const status = deferred<{ version: string; protocolVersion: number }>();
@@ -695,12 +763,14 @@ describe("Copilot adapter", () => {
         fake.emit(
           sdkEvent({
             type: "assistant.turn_start",
+            id: "turn-start-1",
             data: { turnId: "turn-1", raw: "private prompt" },
           }),
         );
         fake.emit(
           sdkEvent({
             type: "tool.execution_start",
+            id: "tool-start-1",
             data: {
               toolCallId: "tool-1",
               toolName: "grep",
@@ -711,6 +781,7 @@ describe("Copilot adapter", () => {
         fake.emit(
           sdkEvent({
             type: "tool.execution_complete",
+            id: "tool-complete-1",
             data: {
               toolCallId: "tool-1",
               success: true,
@@ -721,10 +792,13 @@ describe("Copilot adapter", () => {
         fake.emit(
           sdkEvent({
             type: "assistant.message",
+            id: "assistant-message-1",
             data: { content: "private model text" },
           }),
         );
-        fake.emit(sdkEvent({ type: "session.idle", data: {} }));
+        fake.emit(
+          sdkEvent({ type: "session.idle", id: "session-idle-1", data: {} }),
+        );
       },
     });
     const prepared = setup({ createClient: fake.createClient });
@@ -736,14 +810,28 @@ describe("Copilot adapter", () => {
         type: "progress",
         phase: "reviewing",
         message: "Copilot started the review turn.",
+        identity: expect.any(String),
       },
-      { type: "activity", message: "Copilot started an inspection tool." },
-      { type: "activity", message: "Copilot completed an inspection tool." },
-      { type: "activity", message: "Copilot produced a response message." },
+      {
+        type: "activity",
+        message: "Copilot started an inspection tool.",
+        identity: expect.any(String),
+      },
+      {
+        type: "activity",
+        message: "Copilot completed an inspection tool.",
+        identity: expect.any(String),
+      },
+      {
+        type: "activity",
+        message: "Copilot produced a response message.",
+        identity: expect.any(String),
+      },
       {
         type: "progress",
         phase: "validating",
         message: "Copilot completed the review turn.",
+        identity: expect.any(String),
       },
     ]);
     expect(JSON.stringify(output)).not.toContain("private");

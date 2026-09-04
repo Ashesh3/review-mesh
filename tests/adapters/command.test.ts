@@ -220,7 +220,7 @@ function controlledProcess(pid: number) {
 }
 
 describe("generic command adapter", () => {
-  it("declares command evidence attested-only", async () => {
+  it("declares v1 command evidence attested-only without observable progress", async () => {
     const prepared = await setup("pass");
 
     await expect(
@@ -230,8 +230,17 @@ describe("generic command adapter", () => {
       ),
     ).resolves.toMatchObject({
       observed_file_access: false,
-      progress_observable: true,
+      progress_observable: false,
     });
+  });
+  it("advertises observable progress only for command protocol v2", async () => {
+    const prepared = await setup("v2-page");
+    await expect(
+      prepared.adapter.probe(
+        prepared.input.reviewer,
+        prepared.controller.signal,
+      ),
+    ).resolves.toMatchObject({ progress_observable: true });
   });
   it("keeps v2 stdin interactive and accepts only core-assigned result pages", async () => {
     const prepared = await setup("v2-page");
@@ -251,6 +260,12 @@ describe("generic command adapter", () => {
       type: "result",
       result: { schema_version: "4", verdict: "pass" },
     });
+    const terminal = output.at(-1);
+    if (terminal?.type !== "result") throw new Error("expected result");
+    const stored = [];
+    for await (const entry of terminal.resultStorage!.pages!())
+      stored.push(entry);
+    expect(stored).toHaveLength(1);
   });
   it("keeps v2 access claims attested and rejects repeated identities", async () => {
     const prepared = await setup("v2-duplicate-claim");
@@ -275,6 +290,7 @@ describe("generic command adapter", () => {
     prepared.input.coverage = {
       scopeDigest: "a".repeat(64),
       readFile: vi.fn(),
+      observedFile: vi.fn(),
       recordDiffDelivery: vi.fn(),
       reconcileAttestation: vi.fn(),
       summary: vi.fn(),

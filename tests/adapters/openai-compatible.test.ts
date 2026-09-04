@@ -712,9 +712,18 @@ describe("OpenAI-compatible adapter", () => {
     const iterator = prepared.adapter
       .run(prepared.input)
       [Symbol.asyncIterator]();
-    await iterator.next();
-    await iterator.next();
-    const boundaryPromise = iterator.next();
+    let boundaryPromise = iterator.next();
+    for (;;) {
+      const candidate = await boundaryPromise;
+      if (
+        candidate.value?.type === "progress" &&
+        candidate.value.phase === "response"
+      ) {
+        boundaryPromise = Promise.resolve(candidate);
+        break;
+      }
+      boundaryPromise = iterator.next();
+    }
     await new Promise((resolve) => setTimeout(resolve, 10));
     const boundary = await Promise.race([
       boundaryPromise,
