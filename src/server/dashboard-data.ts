@@ -68,6 +68,10 @@ export interface DashboardRunSummary {
   logical_lenses?: Record<string, unknown>;
   model_runs?: Record<string, unknown>;
   findings: number;
+  unique_findings?: number;
+  raw_findings?: number;
+  gate_findings?: number;
+  advisory_findings?: number;
   unreadable?: boolean;
   error?: string;
   legacy?: boolean;
@@ -902,20 +906,35 @@ function runSummaryFromParsed(parsed: ParsedRunFile): DashboardRunSummary {
     ) as readonly CanonicalRawFinding[],
     { gatePolicies: dashboardGatePolicies(reviewers) },
   );
-  const findings = integer(completion.unique_findings) ?? canonical.counts.unique;
+  const hasFullResults = reviewers.some(
+    (reviewer) => Array.isArray(reviewer.result?.actionable_findings),
+  );
+  const counts = hasFullResults
+    ? canonical.counts
+    : {
+        raw: integer(completion.raw_findings) ?? canonical.counts.raw,
+        unique: integer(completion.unique_findings) ?? canonical.counts.unique,
+        gate: integer(completion.gate_findings) ?? canonical.counts.gate,
+        advisory:
+          integer(completion.advisory_findings) ?? canonical.counts.advisory,
+      };
+  const findings = counts.unique;
   const hasIncomplete = reviewers.some(
     (reviewer) => reviewer.state === "incomplete",
   );
-  const hasFindings =
-    canonical.counts.raw > 0
-      ? canonical.counts.gate > 0
-      : text(completion.gate_outcome) === "findings";
+  const hasFindings = counts.gate > 0;
   const status = stale
     ? "stale"
     : active
       ? "running"
-      : (text(completion.status) ??
-        (hasIncomplete ? "incomplete" : hasFindings ? "findings" : "passed"));
+      : hasFullResults
+        ? hasIncomplete
+          ? "incomplete"
+          : hasFindings
+            ? "findings"
+            : "passed"
+        : (text(completion.status) ??
+          (hasIncomplete ? "incomplete" : hasFindings ? "findings" : "passed"));
   return {
     run_id: parsed.candidate.runId,
     active,
@@ -950,11 +969,14 @@ function runSummaryFromParsed(parsed: ParsedRunFile): DashboardRunSummary {
     ...(integer(completion.total_elapsed_ms) === undefined
       ? {}
       : { total_elapsed_ms: integer(completion.total_elapsed_ms)! }),
-    gate_outcome: hasFindings
-      ? "findings"
-      : activeFile
-        ? "pending"
-        : "passed",
+    gate_outcome: hasFullResults
+      ? hasFindings
+        ? "findings"
+        : activeFile
+          ? "pending"
+          : "passed"
+      : (text(completion.gate_outcome) ??
+        (hasFindings ? "findings" : activeFile ? "pending" : "passed")),
     coverage_outcome:
       text(completion.coverage_outcome) ??
       (activeFile ? "in_progress" : hasIncomplete ? "partial" : "complete"),
@@ -981,6 +1003,10 @@ function runSummaryFromParsed(parsed: ParsedRunFile): DashboardRunSummary {
         .length,
     },
     findings,
+    unique_findings: counts.unique,
+    raw_findings: counts.raw,
+    gate_findings: counts.gate,
+    advisory_findings: counts.advisory,
     stage: runStage(parsed, reviewers),
     reviewers: reviewers.map((reviewer) => ({
       reviewer_id: reviewer.reviewer_id,

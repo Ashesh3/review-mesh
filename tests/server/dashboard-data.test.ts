@@ -746,7 +746,26 @@ describe("dashboard data", () => {
           mode: "adjudication",
           adjudicates_reviewer_id: "lens::source",
           result: adjudicationResult,
-          adjudication_validation: adjudicationValidation,
+          adjudication_validation: {
+            ...adjudicationValidation,
+            context_head: "wrong-head",
+          },
+        },
+        {
+          schema_version: "5",
+          event: "run.completed",
+          run_id: runId,
+          seq: 1,
+          timestamp: new Date().toISOString(),
+          data: {
+            unique_findings: 0,
+            raw_findings: 1,
+            gate_findings: 0,
+            advisory_findings: 0,
+            status: "findings",
+            gate_outcome: "findings",
+            coverage_outcome: "complete",
+          },
         },
       ]
         .map((record) => JSON.stringify(record))
@@ -754,6 +773,14 @@ describe("dashboard data", () => {
     );
 
     const run = await readDashboardRun({ appPaths, runId });
+    const snapshot = await readDashboardSnapshot({
+      appPaths,
+      server: {
+        host: "127.0.0.1",
+        port: 0,
+        startedAt: new Date().toISOString(),
+      },
+    });
 
     expect(run).toMatchObject({
       findings: {
@@ -770,6 +797,59 @@ describe("dashboard data", () => {
         ],
         counts: { raw: 1, unique: 1, gate: 0, advisory: 1 },
       },
+    });
+    expect(snapshot.runs[0]).toMatchObject({
+      run_id: runId,
+      status: "passed",
+      gate_outcome: "passed",
+      findings: 1,
+      unique_findings: 1,
+      raw_findings: 1,
+      gate_findings: 0,
+      advisory_findings: 1,
+    });
+  });
+
+  it("uses persisted counts when a legacy compact artifact has no full results", async () => {
+    const { appPaths } = await fixture();
+    const runId = "run-legacy-count-fallback";
+    await writeFile(
+      join(appPaths.runsDirectory, `${runId}.jsonl`),
+      JSON.stringify({
+        schema_version: "5",
+        event: "run.completed",
+        run_id: runId,
+        seq: 1,
+        timestamp: new Date().toISOString(),
+        data: {
+          unique_findings: 7,
+          raw_findings: 8,
+          gate_findings: 3,
+          advisory_findings: 5,
+          status: "findings",
+          gate_outcome: "findings",
+          coverage_outcome: "complete",
+        },
+      }) + "\n",
+    );
+
+    const snapshot = await readDashboardSnapshot({
+      appPaths,
+      server: {
+        host: "127.0.0.1",
+        port: 0,
+        startedAt: new Date().toISOString(),
+      },
+    });
+    expect(snapshot.runs[0]).toMatchObject({
+      run_id: runId,
+      status: "findings",
+      gate_outcome: "findings",
+      findings: 7,
+      unique_findings: 7,
+      raw_findings: 8,
+      gate_findings: 3,
+      advisory_findings: 5,
     });
   });
 

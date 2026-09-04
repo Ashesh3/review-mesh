@@ -263,3 +263,47 @@ Observed:
 - Raw candidate and adjudicator results remain unchanged; only the derived adjudication outcome fails closed.
 - No workspace reread was added to report/dashboard consumers.
 - The 1 MiB bound rejects unprovable later line ranges as unverified instead of reading the full file or throwing.
+
+## Fix round 5
+
+### RED
+
+Command:
+
+```powershell
+npx vitest run tests/server/dashboard-data.test.ts
+```
+
+Observed:
+
+- Exit code 1.
+- With full persisted reviewer results, an invalid attestation correctly exposed one `needs_verification` candidate in the detailed run, but the dashboard summary still reported persisted `unique_findings: 0` and stale `status: findings`.
+- A legacy compact artifact exposed the inverse requirement: without full result data, persisted raw/unique/gate/advisory counts were the only authoritative fallback.
+
+### GREEN
+
+Command:
+
+```powershell
+npx vitest run tests/server/dashboard-data.test.ts tests/findings/canonical.test.ts tests/diagnostics/run-report.test.ts
+npm run typecheck
+git diff --check
+```
+
+Observed:
+
+- Exit code 0.
+- 3 test files passed; 46 tests passed.
+- Source and test TypeScript projects passed.
+- No whitespace errors.
+
+### Fixes
+
+- Dashboard summaries now use the derived canonical raw, unique, gate, and advisory counts whenever full reviewer results are present.
+- Derived canonical gate state now controls summary `status` and `gate_outcome`, preventing stale completion claims from overriding fail-closed attestation validation.
+- Persisted completion counts and status remain the fallback for legacy or compact artifacts without sufficient full reviewer results.
+
+### Self-review
+
+- Detailed dashboard findings and summary counts now share one canonical derivation.
+- The fallback branch is exercised by a no-results compact artifact and retains its persisted counts.
