@@ -554,6 +554,31 @@ const v6LensSummarySchema = z.strictObject({
   ]),
   message: utf8String(128).optional(),
 });
+export const selectedDeadlineSchema = z.strictObject({
+  mode: z.enum(["adaptive", "fixed"]),
+  tier: z.enum(["tiny", "small", "medium", "large", "fixed"]),
+  duration_ms: positiveInteger,
+  started_at: timestampSchema,
+  deadline_at: timestampSchema,
+  inputs: z.strictObject({
+    review_scope: z.enum(["changes", "full"]),
+    changed_file_count: nonNegativeInteger,
+    raw_diff_byte_count: nonNegativeInteger,
+    changed_files_truncated: z.boolean(),
+    diff_truncated: z.boolean(),
+  }),
+});
+const countDimension = z.strictObject({
+  status: z.enum(["complete", "partial"]),
+});
+const modelCounts = z.strictObject({
+  total: nonNegativeInteger,
+  completed: nonNegativeInteger,
+  incomplete: nonNegativeInteger,
+  skipped: nonNegativeInteger,
+  running: nonNegativeInteger,
+  queued: nonNegativeInteger,
+});
 const v6RunCompletedDataSchema = z
   .strictObject({
     run_outcome: v9RunOutcomeSchema,
@@ -572,8 +597,19 @@ const v6RunCompletedDataSchema = z
     non_gating_subfindings: nonNegativeInteger,
     incomplete_lenses: nonNegativeInteger,
     result_delivery: resultDeliverySchema,
+    execution_coverage: countDimension.optional(),
+    change_coverage: z
+      .strictObject({ status: v9CoverageStatusSchema })
+      .optional(),
+    deadline: selectedDeadlineSchema.optional(),
+    total_elapsed_ms: nonNegativeInteger.optional(),
+    model_runs: modelCounts.optional(),
     artifact: artifactReferenceSchema,
     lens_summaries: z.array(v6LensSummarySchema).max(8),
+    total_lens_summaries: nonNegativeInteger.optional(),
+    total_exclusions: nonNegativeInteger.optional(),
+    total_warnings: nonNegativeInteger.optional(),
+    total_deficit_samples: nonNegativeInteger.optional(),
     exclusions: z.array(boundedId).max(8),
     warnings: z.array(boundedId).max(8),
     deficit_samples: z.array(boundedId).max(8),
@@ -702,6 +738,17 @@ const v6GenericEventDataSchema = z.strictObject({
   detail_ref: boundedId.optional(),
   message: nonEmpty(1_000).optional(),
 });
+const reviewerLifecycleData = {
+  lens_id: boundedId,
+  mode: z.enum(["full_review", "adjudication"]),
+};
+const progressData = z.strictObject({
+  ...reviewerLifecycleData,
+  phase: v6ReviewerPhaseSchema,
+  attempt: positiveInteger.optional(),
+  maximum_attempts: positiveInteger.optional(),
+  message: utf8String(1000).optional(),
+});
 const publicEventV6BaseSchema = z.discriminatedUnion("event", [
   z.strictObject({
     ...v6EventEnvelope,
@@ -727,6 +774,9 @@ const publicEventV6BaseSchema = z.discriminatedUnion("event", [
       retryable: z.boolean(),
       fallback_eligible: z.boolean(),
       detail_ref: boundedId,
+      mode: z.enum(["full_review", "adjudication"]).optional(),
+      message: utf8String(1000).optional(),
+      elapsed_ms: nonNegativeInteger.optional(),
     }),
   }),
   z.strictObject({
@@ -739,6 +789,8 @@ const publicEventV6BaseSchema = z.discriminatedUnion("event", [
       result: z
         .union([reviewerResultV4Schema, adjudicationResultV2Schema])
         .optional(),
+      lens_id: boundedId.optional(),
+      mode: z.enum(["full_review", "adjudication"]).optional(),
     }),
   }),
   z.strictObject({
@@ -747,6 +799,11 @@ const publicEventV6BaseSchema = z.discriminatedUnion("event", [
     data: z.strictObject({
       elapsed_ms: nonNegativeInteger,
       active: z.array(v6ActiveHeartbeatEntrySchema).max(8),
+      active_count: nonNegativeInteger.optional(),
+      model_runs: modelCounts.optional(),
+      run_deadline_remaining_ms: nonNegativeInteger.optional(),
+      minimal: z.boolean().optional(),
+      detail_ref: boundedId.optional(),
       omitted_active_count: nonNegativeInteger.optional(),
       active_digest: digestSchema.optional(),
       artifact: artifactReferenceSchema.optional(),
@@ -755,43 +812,92 @@ const publicEventV6BaseSchema = z.discriminatedUnion("event", [
   z.strictObject({
     ...v6EventEnvelope,
     event: z.literal("context.resolved"),
-    data: v6GenericEventDataSchema,
+    data: z.strictObject({
+      project_name: nonEmpty(255),
+      review_scope: z.enum(["changes", "full"]),
+      changed_files_count: nonNegativeInteger,
+      diff_byte_count: nonNegativeInteger,
+      truncated: z.boolean(),
+      detail_ref: boundedId,
+    }),
   }),
   z.strictObject({
     ...v6EventEnvelope,
     event: z.literal("suite.resolved"),
-    data: v6GenericEventDataSchema,
+    data: z.strictObject({
+      logical_lenses: nonNegativeInteger,
+      model_runs: nonNegativeInteger,
+      deadline: selectedDeadlineSchema,
+      warnings: z.array(boundedId).max(8),
+      omitted_warnings_count: nonNegativeInteger.optional(),
+      warnings_digest: digestSchema.optional(),
+      detail_ref: boundedId,
+    }),
   }),
   z.strictObject({
     ...v6EventEnvelope,
     event: z.literal("reviewer.started"),
-    data: v6GenericEventDataSchema,
+    data: z.strictObject({
+      ...reviewerLifecycleData,
+      adapter: boundedId,
+      model: nonEmpty(256),
+      provider_group: boundedId,
+      attempt: positiveInteger,
+      maximum_attempts: positiveInteger,
+      timeout_ms: nonNegativeInteger,
+      run_deadline_remaining_ms: nonNegativeInteger,
+      lens_deadline_remaining_ms: nonNegativeInteger,
+      progress_observable: z.boolean(),
+      proof: v9CoverageProofKindSchema,
+    }),
   }),
   z.strictObject({
     ...v6EventEnvelope,
     event: z.literal("reviewer.progress"),
-    data: v6GenericEventDataSchema,
+    data: progressData,
   }),
   z.strictObject({
     ...v6EventEnvelope,
     event: z.literal("reviewer.heartbeat"),
-    data: v6GenericEventDataSchema,
+    data: progressData,
   }),
   z.strictObject({
     ...v6EventEnvelope,
     event: z.literal("reviewer.completed"),
-    data: v6GenericEventDataSchema,
+    data: z.strictObject({
+      ...reviewerLifecycleData,
+      verdict: z.enum(["pass", "fail"]),
+      elapsed_ms: nonNegativeInteger,
+      actionable_findings: nonNegativeInteger,
+      summary: utf8String(1024),
+      change_coverage: changeCoverageResultSchema.optional(),
+      detail_ref: boundedId,
+    }),
   }),
   z.strictObject({
     ...v6EventEnvelope,
     event: z.literal("reviewer.skipped"),
-    data: v6GenericEventDataSchema,
+    data: z.strictObject({
+      ...reviewerLifecycleData,
+      reason: boundedId,
+      missing_inputs: z
+        .array(
+          z.strictObject({
+            selector: nonEmpty(1024),
+            code: z.enum(["missing_required_input", "invalid_required_input"]),
+          }),
+        )
+        .max(8)
+        .optional(),
+      omitted_missing_inputs_count: nonNegativeInteger.optional(),
+      detail_ref: boundedId,
+    }),
   }),
 ]);
 export const publicEventV6Schema = publicEventV6BaseSchema.superRefine(
   (value, ctx) => {
     if (
-      value.event === "run.completed" &&
+      (value.event === "run.completed" || value.event === "suite.heartbeat") &&
       Buffer.byteLength(JSON.stringify(value), "utf8") >= 16 * 1_024
     ) {
       ctx.addIssue({
