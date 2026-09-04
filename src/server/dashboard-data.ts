@@ -16,6 +16,7 @@ import type {
 } from "../diagnostics/run-report.js";
 import {
   canonicalizeFindings,
+  type CanonicalGatePolicy,
   type CanonicalRawFinding,
 } from "../findings/canonical.js";
 import { validateAdjudication } from "../findings/adjudication.js";
@@ -876,6 +877,7 @@ function runSummaryFromParsed(parsed: ParsedRunFile): DashboardRunSummary {
         reviewers,
         scope?.mode === "changes" ? "changes" : "full",
       ) as readonly CanonicalRawFinding[],
+      { gatePolicies: dashboardGatePolicies(reviewers) },
     ).counts.unique;
   const hasIncomplete = reviewers.some(
     (reviewer) => reviewer.state === "incomplete",
@@ -1231,6 +1233,10 @@ function normalizeFinding(value: RawRunFinding | ConsolidatedRunFinding) {
 function rawFindings(
   reviewers: readonly ReviewerRuntime[],
   reviewScope: "changes" | "full" = "full",
+  gitContext: { changedFiles: readonly string[]; diff: string } = {
+    changedFiles: [],
+    diff: "",
+  },
 ): RawRunFinding[] {
   const values: RawRunFinding[] = [];
   const adjudicationDecisions = new Map<
@@ -1257,7 +1263,7 @@ function rawFindings(
     const outcome = validateAdjudication(
       candidateResult.data,
       adjudicationResult.data,
-      { reviewScope },
+      { reviewScope, git: gitContext },
     );
     const decisions = new Map(
       outcome.decisions.map((decision) => [
@@ -1408,6 +1414,36 @@ function rawFindings(
   return values;
 }
 
+function dashboardGatePolicies(
+  reviewers: readonly ReviewerRuntime[],
+): Record<string, CanonicalGatePolicy> {
+  return Object.fromEntries(
+    reviewers.map((reviewer) => {
+      const policy = reviewer.policy ?? {};
+      const minimumSeverity = text(policy.gateMinimumSeverity);
+      const minimumConfidence = text(policy.gateMinimumConfidence);
+      return [
+        reviewer.lens_id,
+        {
+          minimumSeverity: (
+            minimumSeverity === "critical" ||
+            minimumSeverity === "high" ||
+            minimumSeverity === "medium" ||
+            minimumSeverity === "low"
+              ? minimumSeverity
+              : "medium") as CanonicalGatePolicy["minimumSeverity"],
+          minimumConfidence: (
+            minimumConfidence === "high" ||
+            minimumConfidence === "medium" ||
+            minimumConfidence === "low"
+              ? minimumConfidence
+              : "medium") as CanonicalGatePolicy["minimumConfidence"],
+        },
+      ];
+    }),
+  );
+}
+
 export async function readDashboardRun(input: {
   appPaths: AppPaths;
   runId: string;
@@ -1428,9 +1464,19 @@ export async function readDashboardRun(input: {
     asRecord(parsed.request?.review_scope)?.mode === "changes"
       ? "changes"
       : "full";
-  const raw = rawFindings(reviewers, scope);
+  const context = parsed.context ?? {};
+  const git = asRecord(context.git);
+  const raw = rawFindings(reviewers, scope, {
+    changedFiles: Array.isArray(git?.changed_files)
+      ? git.changed_files
+          .map(text)
+          .filter((value): value is string => value !== undefined)
+      : [],
+    diff: text(git?.diff) ?? "",
+  });
   const canonical = canonicalizeFindings(
     raw as readonly CanonicalRawFinding[],
+    { gatePolicies: dashboardGatePolicies(reviewers) },
   );
   const findings = {
     raw: canonical.raw.map(normalizeFinding),

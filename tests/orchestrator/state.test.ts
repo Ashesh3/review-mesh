@@ -274,6 +274,41 @@ describe("suite state", () => {
     });
   });
 
+  it("uses non-default lens gate thresholds for live counts", () => {
+    const strict = completedFail("strict::primary");
+    if (strict.result.schema_version !== "3") throw new Error("v3 fixture required");
+    strict.lens_id = "strict";
+    strict.result.actionable_findings[0]!.severity = "medium";
+    strict.result.actionable_findings[0]!.confidence = "high";
+    const state = suiteState([strict]);
+    const internal = state.reviewer("strict::primary");
+    internal.reviewer.policy = {
+      passQuorum: 1,
+      minimumProviderGroups: 1,
+      adjudication: "off",
+      gateMinimumSeverity: "high",
+      gateMinimumConfidence: "high",
+    };
+
+    const configured = createSuiteState([internal.reviewer]);
+    configured.transition("strict::primary", "starting");
+    configured.transition("strict::primary", "reviewing");
+    configured.complete(
+      "strict::primary",
+      strict.result,
+      "enforced_read_only",
+    );
+    const aggregate = aggregateRun(configured);
+
+    expect(aggregate).toMatchObject({
+      rawFindings: 1,
+      uniqueFindings: 1,
+      gateFindings: 0,
+      advisoryFindings: 1,
+      gateOutcome: "no_findings",
+    });
+  });
+
   it("isolates caller-owned inputs and returned snapshots from stored state", () => {
     const reviewer = resolvedReviewer({ id: "a", purpose: "original" });
     const capabilities = {

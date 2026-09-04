@@ -6,6 +6,10 @@ import type {
 
 export interface AdjudicationValidationContext {
   reviewScope: "changes" | "full";
+  git?: {
+    changedFiles: readonly string[];
+    diff: string;
+  };
 }
 
 export type AdjudicationValidationIssue =
@@ -14,14 +18,18 @@ export type AdjudicationValidationIssue =
   | "unknown_source_finding_id"
   | "cited_evidence_required"
   | "cited_evidence_location_required"
+  | "cited_evidence_context_required"
   | "adjusted_finding_required"
   | "ordered_execution_proof_required"
   | "ordered_execution_steps_invalid"
   | "ordered_execution_citation_required"
+  | "ordered_execution_context_required"
   | "failure_point_invalid"
   | "failure_point_citation_required"
+  | "failure_point_context_required"
   | "base_head_comparison_required"
-  | "base_head_citation_required";
+  | "base_head_citation_required"
+  | "base_head_context_required";
 
 export interface EffectiveAdjudicationDecision {
   source_finding_id: string;
@@ -84,12 +92,20 @@ function concreteCitation(value: {
   end_line?: number | undefined;
 } | undefined): boolean {
   if (value === undefined) return false;
+  const path = value.path;
   return (
-    typeof value.path === "string" &&
-    value.path.length > 0 &&
-    !value.path.startsWith("/") &&
-    !/^[A-Za-z]:/u.test(value.path) &&
-    !value.path.includes("\\") &&
+    typeof path === "string" &&
+    path.length > 0 &&
+    path !== "." &&
+    path !== ".." &&
+    !/^[A-Za-z][A-Za-z0-9+.-]*:\/\//u.test(path) &&
+    !path.startsWith("/") &&
+    !path.startsWith(":") &&
+    !/^[A-Za-z]:/u.test(path) &&
+    !path.includes("\\") &&
+    !/[\u0000-\u001f]/u.test(path) &&
+    !/[*?[\]]/u.test(path) &&
+    !path.split("/").some((part) => part === "" || part === "." || part === "..") &&
     typeof value.start_line === "number" &&
     Number.isSafeInteger(value.start_line) &&
     value.start_line > 0 &&
@@ -97,6 +113,91 @@ function concreteCitation(value: {
       (Number.isSafeInteger(value.end_line) &&
         value.end_line >= value.start_line))
   );
+}
+
+interface DiffRanges {
+  old: Map<string, Array<{ start: number; end: number }>>;
+  head: Map<string, Array<{ start: number; end: number }>>;
+}
+
+function parseDiffRanges(diff: string): DiffRanges {
+  const ranges: DiffRanges = { old: new Map(), head: new Map() };
+  let path: string | undefined;
+  for (const line of diff.split(/\r?\n/u)) {
+    const file = /^diff --git a\/(.+) b\/(.+)$/u.exec(line);
+    if (file !== null) {
+      path = file[2];
+      continue;
+    }
+    const hunk = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/u.exec(line);
+    if (path === undefined || hunk === null) continue;
+    const oldStart = Number(hunk[1]);
+    const oldCount = Number(hunk[2] ?? "1");
+    const headStart = Number(hunk[3]);
+    const headCount = Number(hunk[4] ?? "1");
+    if (oldCount > 0) {
+      ranges.old.set(path, [
+        ...(ranges.old.get(path) ?? []),
+        { start: oldStart, end: oldStart + oldCount - 1 },
+      ]);
+    }
+    if (headCount > 0) {
+      ranges.head.set(path, [
+        ...(ranges.head.get(path) ?? []),
+        { start: headStart, end: headStart + headCount - 1 },
+      ]);
+    }
+  }
+  return ranges;
+}
+
+function withinRanges(
+  citation: {
+    path?: string | undefined;
+    start_line?: number | undefined;
+    end_line?: number | undefined;
+  },
+  ranges: Map<string, Array<{ start: number; end: number }>>,
+): boolean {
+  if (!concreteCitation(citation)) return false;
+  const end = citation.end_line ?? citation.start_line!;
+  return (ranges.get(citation.path!) ?? []).some(
+    (range) => citation.start_line! >= range.start && end <= range.end,
+  );
+}
+
+function withinCandidateEvidence(
+  citation: {
+    path?: string | undefined;
+    start_line?: number | undefined;
+    end_line?: number | undefined;
+  },
+  candidate: ReviewerResultV3["actionable_findings"][number],
+): boolean {
+  if (!concreteCitation(citation)) return false;
+  const end = citation.end_line ?? citation.start_line!;
+  return candidate.evidence.some((evidence) => {
+    if (!concreteCitation(evidence) || evidence.path !== citation.path) return false;
+    const evidenceEnd = evidence.end_line ?? evidence.start_line!;
+    return citation.start_line! >= evidence.start_line! && end <= evidenceEnd;
+  });
+}
+
+function contextBoundCitation(
+  citation: {
+    path?: string | undefined;
+    start_line?: number | undefined;
+    end_line?: number | undefined;
+  },
+  candidate: ReviewerResultV3["actionable_findings"][number],
+  context: AdjudicationValidationContext,
+): boolean {
+  if (!concreteCitation(citation)) return false;
+  if (withinCandidateEvidence(citation, candidate)) return true;
+  const git = context.git;
+  if (git === undefined || !git.changedFiles.includes(citation.path!)) return false;
+  const ranges = parseDiffRanges(git.diff);
+  return withinRanges(citation, ranges.old) || withinRanges(citation, ranges.head);
 }
 
 function adjustedFinding(
@@ -158,6 +259,14 @@ export function validateAdjudication(
         issues.push("cited_evidence_location_required");
       }
       if (
+        decision.decision !== "rejected" &&
+        !decision.cited_evidence.every((citation) =>
+          contextBoundCitation(citation, candidate, context),
+        )
+      ) {
+        issues.push("cited_evidence_context_required");
+      }
+      if (
         decision.decision === "adjusted" &&
         decision.adjusted_finding === undefined
       ) {
@@ -174,9 +283,23 @@ export function validateAdjudication(
           if (!proof.ordered) issues.push("ordered_execution_steps_invalid");
           if (!proof.citations)
             issues.push("ordered_execution_citation_required");
+          if (
+            !decision.ordered_execution_proof.steps.every((step) =>
+              contextBoundCitation(step.citation, candidate, context),
+            )
+          )
+            issues.push("ordered_execution_context_required");
           if (!proof.failurePoint) issues.push("failure_point_invalid");
           if (!proof.failurePointCitation)
             issues.push("failure_point_citation_required");
+          if (
+            !contextBoundCitation(
+              decision.ordered_execution_proof.failure_point.citation ?? {},
+              candidate,
+              context,
+            )
+          )
+            issues.push("failure_point_context_required");
         }
       }
       if (
@@ -193,6 +316,19 @@ export function validateAdjudication(
           !concreteCitation(decision.base_head_comparison.head.citation))
       ) {
         issues.push("base_head_citation_required");
+      }
+      if (
+        decision.decision !== "rejected" &&
+        context.reviewScope === "changes" &&
+        decision.base_head_comparison !== undefined
+      ) {
+        const ranges = parseDiffRanges(context.git?.diff ?? "");
+        if (
+          !withinRanges(decision.base_head_comparison.base.citation, ranges.old) ||
+          !withinRanges(decision.base_head_comparison.head.citation, ranges.head)
+        ) {
+          issues.push("base_head_context_required");
+        }
       }
       const effectiveFinding = adjustedFinding(candidate, decision);
       return {

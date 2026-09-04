@@ -190,4 +190,35 @@ describe("canonicalizeFindings", () => {
     ]);
     expect(forward.counts).toEqual({ raw: 3, unique: 3, gate: 1, advisory: 2 });
   });
+
+  it("applies resolved per-lens severity and confidence thresholds", () => {
+    const values = [
+      finding("strict::medium", "medium", {
+        lens_id: "strict",
+        severity: "medium",
+        confidence: "high",
+      }),
+      finding("strict::uncertain", "uncertain", {
+        lens_id: "strict",
+        severity: "high",
+        confidence: "medium",
+        title: "High but uncertain",
+      }),
+      finding("strict::gate", "gate", {
+        lens_id: "strict",
+        severity: "high",
+        confidence: "high",
+        title: "High confidence defect",
+      }),
+    ];
+
+    const result = canonicalizeFindings(values, {
+      gatePolicies: {
+        strict: { minimumSeverity: "high", minimumConfidence: "high" },
+      },
+    });
+
+    expect(result.gate_effective.map((item) => item.id)).toEqual(["gate"]);
+    expect(result.counts).toEqual({ raw: 3, unique: 3, gate: 1, advisory: 2 });
+  });
 });

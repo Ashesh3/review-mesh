@@ -89,6 +89,15 @@ export interface CanonicalFindingSet {
   };
 }
 
+export interface CanonicalGatePolicy {
+  minimumSeverity: CanonicalFindingSeverity;
+  minimumConfidence: CanonicalFindingConfidence;
+}
+
+export interface CanonicalizeFindingsOptions {
+  gatePolicies?: Readonly<Record<string, CanonicalGatePolicy>>;
+}
+
 const severityRank: Record<CanonicalFindingSeverity, number> = {
   low: 0,
   medium: 1,
@@ -277,9 +286,24 @@ function gateEligible(finding: CanonicalRawFinding): boolean {
   );
 }
 
+function thresholdEligible(
+  finding: CanonicalRawFinding,
+  policy: CanonicalGatePolicy | undefined,
+): boolean {
+  if (finding.adjudication === "needs_verification") return false;
+  if (finding.classification === "advisory") return false;
+  if (policy === undefined) return gateEligible(finding);
+  return (
+    severityRank[finding.severity] >= severityRank[policy.minimumSeverity] &&
+    confidenceRank[finding.confidence] >=
+      confidenceRank[policy.minimumConfidence]
+  );
+}
+
 /** Builds the one deterministic raw, unique, gate-effective, and advisory view. */
 export function canonicalizeFindings(
   values: readonly CanonicalRawFinding[],
+  options: CanonicalizeFindingsOptions = {},
 ): CanonicalFindingSet {
   const raw = values.map((value) => structuredClone(value)).sort(compareRaw);
   const findings = raw
@@ -300,11 +324,22 @@ export function canonicalizeFindings(
         lens_id: finding.lens_id,
         source_findings: finding.source_findings,
         duplicate_finding_ids: finding.duplicate_finding_ids,
-        gate_eligible:
-          finding.effective_finding.severity !== "low" &&
-          finding.effective_finding.classification === "confirmed_defect",
+        gate_eligible: thresholdEligible(
+          {
+            ...finding,
+            ...finding.effective_finding,
+          },
+          options.gatePolicies?.[finding.lens_id],
+        ),
       };
-    });
+    })
+    .map((finding) => ({
+      ...finding,
+      gate_eligible: thresholdEligible(
+        finding,
+        options.gatePolicies?.[finding.lens_id],
+      ),
+    }));
   const sets = new DisjointSet(findings.length);
   const explicitRoots = new Map<string, number>();
   const sourceRefs = new Map<string, number>();

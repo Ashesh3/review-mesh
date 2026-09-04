@@ -131,3 +131,41 @@ Observed:
 - Confirmation/adjustment proof requires concrete repository-relative path and positive line citations, including every ordered step, the failure point, and both base/head behaviors.
 - Adjusted decisions produce an effective finding used by live/report/dashboard canonical counts while the original candidate and full adjudicator review remain stored.
 - Report fallback derives `gate_outcome` from canonical gate-effective count, so advisory-only artifacts pass.
+
+## Fix round 2
+
+### RED
+
+Command:
+
+```powershell
+npx vitest run tests/findings/adjudication.test.ts tests/findings/canonical.test.ts tests/orchestrator/state.test.ts tests/diagnostics/run-report.test.ts tests/server/dashboard-data.test.ts
+```
+
+Observed:
+
+- Exit code 1.
+- Nine focused failures reproduced unsafe/unreviewed proof citations, fabricated base/head locations, canonical threshold drift, and report/dashboard ignoring persisted non-default thresholds.
+
+### GREEN
+
+Command:
+
+```powershell
+npx vitest run tests/findings/adjudication.test.ts tests/findings/canonical.test.ts tests/orchestrator/state.test.ts tests/orchestrator/review-feedback.test.ts tests/diagnostics/run-report.test.ts tests/server/dashboard-data.test.ts
+npm run typecheck
+```
+
+Observed:
+
+- Exit code 0.
+- 6 test files passed; 87 tests passed.
+- Source and test TypeScript projects passed.
+
+### Fixes
+
+- Adjudication citations now reject URLs, absolute paths, traversal, dot/empty paths, backslashes, control characters, pathspec magic, invalid ranges, and evidence not bound to inspected candidate locations or authoritative Git context.
+- Change-scoped base/head proof is parsed against old/new ranges in supplied diff hunks and must cite the corresponding side.
+- Full-scope ordered proof can use concrete locations already covered by candidate evidence without requiring a diff.
+- Canonicalization accepts resolved per-lens gate policies and applies severity/confidence thresholds deterministically.
+- Live state derives those policies from resolved reviewers; persisted report/dashboard recover them from resolution metadata and produce matching counts/outcomes.

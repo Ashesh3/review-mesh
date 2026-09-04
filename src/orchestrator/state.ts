@@ -625,7 +625,18 @@ export function analyzeLogicalLenses(state: SuiteState): LogicalLensAnalysis {
 export function aggregateRun(state: SuiteState): RunAggregate {
   const reviewers = state.reviewers;
   const rawFindings = rawFindingsForStates(reviewers);
-  const canonical = canonicalizeFindings(rawFindings);
+  const gatePolicies = Object.fromEntries(
+    reviewers.map((reviewer) => [
+      lensId(reviewer.reviewer),
+      {
+        minimumSeverity:
+          reviewer.reviewer.policy?.gateMinimumSeverity ?? "medium",
+        minimumConfidence:
+          reviewer.reviewer.policy?.gateMinimumConfidence ?? "medium",
+      },
+    ]),
+  );
+  const canonical = canonicalizeFindings(rawFindings, { gatePolicies });
   const groups = new Map<string, ReviewerState[]>();
   for (const reviewer of reviewers) {
     const id = lensId(reviewer.reviewer);
@@ -649,6 +660,7 @@ export function aggregateRun(state: SuiteState): RunAggregate {
     const completed = group.filter((item) => item.status === "completed");
     const lensCanonical = canonicalizeFindings(
       rawFindings.filter((finding) => finding.lens_id === id),
+      { gatePolicies },
     );
     const gateFindings = lensCanonical.counts.gate;
     const requiredSourceFindings = completed.filter(

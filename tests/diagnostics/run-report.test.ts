@@ -1145,4 +1145,55 @@ describe("finding consolidation and rendering", () => {
     expect(report.gate_outcome).toBe("passed");
     expect(report.status).toBe("passed");
   });
+
+  it("uses persisted non-default gate thresholds for report findings", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-strict-thresholds";
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [
+        line({
+          record: "resolution",
+          run_id: runId,
+          resolution: {
+            reviewers: [
+              {
+                id: "strict::primary",
+                agent_id: "strict",
+                policy: {
+                  passQuorum: 1,
+                  minimumProviderGroups: 1,
+                  adjudication: "off",
+                  gateMinimumSeverity: "high",
+                  gateMinimumConfidence: "high",
+                },
+              },
+            ],
+          },
+        }),
+        line({
+          record: "reviewer.result",
+          run_id: runId,
+          reviewer_id: "strict::primary",
+          result: resultV2([
+            findingV2({
+              id: "medium-only",
+              severity: "medium",
+              confidence: "high",
+            }),
+          ]),
+        }),
+      ].join(""),
+    );
+
+    const report = await readRunReport({ runsDirectory, runId });
+
+    expect(report.finding_counts).toEqual({
+      raw: 1,
+      unique: 1,
+      gate: 0,
+      advisory: 1,
+    });
+    expect(report.gate_outcome).toBe("passed");
+  });
 });

@@ -709,6 +709,70 @@ describe("dashboard data", () => {
     });
   });
 
+  it("uses persisted non-default gate thresholds for dashboard counts", async () => {
+    const { appPaths } = await fixture();
+    const runId = "run-dashboard-thresholds";
+    await writeFile(
+      join(appPaths.runsDirectory, `${runId}.jsonl`),
+      [
+        {
+          record: "resolution",
+          run_id: runId,
+          resolution: {
+            reviewers: [
+              {
+                id: "strict::primary",
+                agent_id: "strict",
+                policy: {
+                  passQuorum: 1,
+                  minimumProviderGroups: 1,
+                  adjudication: "off",
+                  gateMinimumSeverity: "high",
+                  gateMinimumConfidence: "high",
+                },
+              },
+            ],
+          },
+        },
+        {
+          record: "reviewer.result",
+          run_id: runId,
+          reviewer_id: "strict::primary",
+          result: {
+            schema_version: "2",
+            verdict: "fail",
+            summary: "Medium finding.",
+            actionable_findings: [
+              {
+                id: "medium-only",
+                severity: "medium",
+                title: "Medium only",
+                description: "Below the configured high threshold.",
+                evidence: [{ detail: "Evidence." }],
+                suggested_direction: "Consider later.",
+                confidence: "high",
+                classification: "confirmed_defect",
+                external_assumptions: [],
+              },
+            ],
+            informational_notes: [],
+          },
+        },
+      ]
+        .map((record) => JSON.stringify(record))
+        .join("\n") + "\n",
+    );
+
+    const run = await readDashboardRun({ appPaths, runId });
+
+    expect(run).toMatchObject({
+      findings: {
+        counts: { raw: 1, unique: 1, gate: 0, advisory: 1 },
+        gate_effective: [],
+      },
+    });
+  });
+
   it("isolates one malformed run and accepts a partial active tail", async () => {
     const { appPaths } = await fixture();
     await writeFile(join(appPaths.runsDirectory, "broken.jsonl"), "not json\n");

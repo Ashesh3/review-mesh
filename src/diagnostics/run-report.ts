@@ -816,6 +816,8 @@ interface ReviewerMetadata {
   lensId: string;
   mode?: "full_review" | "adjudication";
   adjudicatesReviewerId?: string;
+  gateMinimumSeverity?: FindingSeverity;
+  gateMinimumConfidence?: FindingConfidence;
 }
 
 interface ReviewerTerminal {
@@ -840,6 +842,7 @@ interface ParsedReportRecord {
   reviewers: Map<string, ReviewerMetadata>;
   terminals: Map<string, ReviewerTerminal>;
   request?: Record<string, unknown>;
+  context?: Record<string, unknown>;
   attempts: RunReport["attempts"];
   recordWarnings: RunRecordWarning[];
   omittedRecordWarnings: number;
@@ -1122,11 +1125,24 @@ function reviewerMetadata(
     inferredLensId(reviewerId);
   const mode = record?.mode === "adjudication" ? "adjudication" : undefined;
   const adjudicatesReviewerId = nonEmptyString(record?.adjudicates_reviewer_id);
+  const policy = asRecord(record?.policy);
+  const gateMinimumSeverity = findingSeveritySchema.safeParse(
+    policy?.gateMinimumSeverity,
+  );
+  const gateMinimumConfidence = z
+    .enum(["high", "medium", "low"])
+    .safeParse(policy?.gateMinimumConfidence);
   return {
     reviewerId,
     lensId,
     ...(mode === undefined ? {} : { mode }),
     ...(adjudicatesReviewerId === undefined ? {} : { adjudicatesReviewerId }),
+    ...(gateMinimumSeverity.success
+      ? { gateMinimumSeverity: gateMinimumSeverity.data }
+      : {}),
+    ...(gateMinimumConfidence.success
+      ? { gateMinimumConfidence: gateMinimumConfidence.data }
+      : {}),
   };
 }
 
@@ -1154,6 +1170,16 @@ function addReviewer(
         ? {}
         : { adjudicatesReviewerId: current.adjudicatesReviewerId }
       : { adjudicatesReviewerId: metadata.adjudicatesReviewerId }),
+    ...(metadata.gateMinimumSeverity === undefined
+      ? current?.gateMinimumSeverity === undefined
+        ? {}
+        : { gateMinimumSeverity: current.gateMinimumSeverity }
+      : { gateMinimumSeverity: metadata.gateMinimumSeverity }),
+    ...(metadata.gateMinimumConfidence === undefined
+      ? current?.gateMinimumConfidence === undefined
+        ? {}
+        : { gateMinimumConfidence: current.gateMinimumConfidence }
+      : { gateMinimumConfidence: metadata.gateMinimumConfidence }),
   });
 }
 
@@ -1356,7 +1382,13 @@ function parsePrivateRecord(
     >;
     return;
   }
-  if (value.record === "context") return;
+  if (value.record === "context") {
+    parsed.context = structuredClone(value.context) as unknown as Record<
+      string,
+      unknown
+    >;
+    return;
+  }
   if (value.record === "reviewer.activity") return;
   if (value.record === "reviewer.attempt") {
     const startedAt =
@@ -1642,7 +1674,14 @@ function parseRawFindings(parsed: ParsedReportRecord): ParsedFinding[] {
       asRecord(parsed.request?.review_scope)?.mode === "changes"
         ? "changes"
         : "full";
-    const outcome = validateAdjudication(sourceResult, result, { reviewScope });
+    const git = asRecord(parsed.context?.git);
+    const outcome = validateAdjudication(sourceResult, result, {
+      reviewScope,
+      git: {
+        changedFiles: stringArray(git?.changed_files),
+        diff: typeof git?.diff === "string" ? git.diff : "",
+      },
+    });
     adjudicationDecisions.set(
       metadata.adjudicatesReviewerId,
       new Map(
@@ -1946,10 +1985,20 @@ export async function readRunReport({
   const rawFindings = parseRawFindings(parsed).map<RawRunFinding>(
     ({ legacyDeduplicationKey: _legacyKey, ...finding }) => finding,
   );
-  const findings = consolidateFindings(rawFindings);
+  const gatePolicies = Object.fromEntries(
+    [...parsed.reviewers.values()].map((reviewer) => [
+      reviewer.lensId,
+      {
+        minimumSeverity: reviewer.gateMinimumSeverity ?? "medium",
+        minimumConfidence: reviewer.gateMinimumConfidence ?? "medium",
+      },
+    ]),
+  );
   const canonical = canonicalizeFindings(
     rawFindings as readonly CanonicalRawFinding[],
+    { gatePolicies },
   );
+  const findings = canonical.consolidated;
   const lensStates = logicalLensStates(parsed, rawFindings);
   const derivedIncompleteLenses = [...lensStates]
     .filter(([, state]) => state === "incomplete")

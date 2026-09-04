@@ -44,7 +44,19 @@ function candidate(): ReviewerResultV3 {
 function context(
   overrides: Partial<AdjudicationValidationContext> = {},
 ): AdjudicationValidationContext {
-  return { reviewScope: "changes", ...overrides };
+  return {
+    reviewScope: "changes",
+    git: {
+      changedFiles: ["src/ingest.ts"],
+      diff: [
+        "diff --git a/src/ingest.ts b/src/ingest.ts",
+        "--- a/src/ingest.ts",
+        "+++ b/src/ingest.ts",
+        "@@ -30,16 +30,16 @@",
+      ].join("\n"),
+    },
+    ...overrides,
+  };
 }
 
 function adjudication(
@@ -341,6 +353,189 @@ describe("validateAdjudication", () => {
         root_issue_id: "enum-fallback",
       },
     });
+  });
+
+  it.each([
+    "https://attacker.invalid/src/ingest.ts",
+    "C:/src/ingest.ts",
+    "/src/ingest.ts",
+    "../src/ingest.ts",
+    ".",
+    "",
+    "src\\ingest.ts",
+    "src/ingest.ts\u0000escape",
+    "src/not-reviewed.ts",
+  ])("rejects an unsafe or unreviewed citation path %j", (path) => {
+    const judge = adjudication({
+      source_finding_id: "enum-post-ingest",
+      decision: "confirmed",
+      rationale: "Claimed confirmation.",
+      cited_evidence: [
+        { path, start_line: 40, end_line: 45, detail: "Claimed evidence." },
+      ],
+      ordered_execution_proof: {
+        steps: [
+          {
+            order: 1,
+            description: "First.",
+            citation: { path, start_line: 40, detail: "First." },
+          },
+          {
+            order: 2,
+            description: "Second.",
+            citation: { path, start_line: 41, detail: "Second." },
+          },
+        ],
+        failure_point: {
+          step_order: 2,
+          citation: { path, start_line: 41, detail: "Failure." },
+          detail: "Failure.",
+        },
+      },
+      base_head_comparison: {
+        base: {
+          behavior: "Base.",
+          citation: { path, start_line: 40, detail: "Base." },
+        },
+        head: {
+          behavior: "Head.",
+          citation: { path, start_line: 41, detail: "Head." },
+        },
+        impact: "Impact.",
+      },
+      unverified_assumptions: [],
+    });
+
+    expect(validateAdjudication(candidate(), judge, context()).decisions[0]).toMatchObject({
+      effective_decision: "needs_verification",
+      gate_eligible: false,
+    });
+  });
+
+  it("rejects fabricated base/head locations outside supplied diff hunks", () => {
+    const judge = adjudication({
+      source_finding_id: "enum-post-ingest",
+      decision: "confirmed",
+      rationale: "Claimed confirmation.",
+      cited_evidence: [
+        {
+          path: "src/ingest.ts",
+          start_line: 40,
+          detail: "Candidate-bound evidence.",
+        },
+      ],
+      ordered_execution_proof: {
+        steps: [
+          {
+            order: 1,
+            description: "First.",
+            citation: {
+              path: "src/ingest.ts",
+              start_line: 40,
+              detail: "First.",
+            },
+          },
+          {
+            order: 2,
+            description: "Second.",
+            citation: {
+              path: "src/ingest.ts",
+              start_line: 41,
+              detail: "Second.",
+            },
+          },
+        ],
+        failure_point: {
+          step_order: 2,
+          citation: {
+            path: "src/ingest.ts",
+            start_line: 41,
+            detail: "Failure.",
+          },
+          detail: "Failure.",
+        },
+      },
+      base_head_comparison: {
+        base: {
+          behavior: "Fabricated base.",
+          citation: {
+            path: "src/ingest.ts",
+            start_line: 900,
+            detail: "Not in diff.",
+          },
+        },
+        head: {
+          behavior: "Fabricated head.",
+          citation: {
+            path: "src/ingest.ts",
+            start_line: 901,
+            detail: "Not in diff.",
+          },
+        },
+        impact: "Fabricated impact.",
+      },
+      unverified_assumptions: [],
+    });
+
+    expect(validateAdjudication(candidate(), judge, context()).decisions[0]).toMatchObject({
+      effective_decision: "needs_verification",
+      issues: expect.arrayContaining(["base_head_context_required"]),
+    });
+  });
+
+  it("allows full-scope ordered proof bound to inspected candidate evidence without a diff", () => {
+    const judge = adjudication({
+      source_finding_id: "enum-post-ingest",
+      decision: "confirmed",
+      rationale: "Candidate evidence establishes the ordered failure.",
+      cited_evidence: [
+        {
+          path: "src/ingest.ts",
+          start_line: 40,
+          end_line: 45,
+          detail: "Candidate-bound evidence.",
+        },
+      ],
+      ordered_execution_proof: {
+        steps: [
+          {
+            order: 1,
+            description: "Mapping starts.",
+            citation: {
+              path: "src/ingest.ts",
+              start_line: 40,
+              detail: "Within candidate evidence.",
+            },
+          },
+          {
+            order: 2,
+            description: "Exception escapes.",
+            citation: {
+              path: "src/ingest.ts",
+              start_line: 45,
+              detail: "Within candidate evidence.",
+            },
+          },
+        ],
+        failure_point: {
+          step_order: 2,
+          citation: {
+            path: "src/ingest.ts",
+            start_line: 45,
+            detail: "Candidate failure point.",
+          },
+          detail: "Exception escapes.",
+        },
+      },
+      unverified_assumptions: [],
+    });
+
+    expect(
+      validateAdjudication(candidate(), judge, {
+        reviewScope: "full",
+        git: { changedFiles: [], diff: "" },
+      }).decisions[0],
+    ).toMatchObject({ effective_decision: "confirmed", gate_eligible: true });
   });
 
   it("requires exactly one decision for each candidate source id", () => {

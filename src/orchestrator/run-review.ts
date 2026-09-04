@@ -807,6 +807,13 @@ export async function runReviewRound({
       "decisions" in accepted
         ? validateAdjudication(sourceResult, accepted, {
             reviewScope: context.review_scope.mode,
+            git:
+              context.git.is_repository
+                ? {
+                    changedFiles: context.git.changed_files,
+                    diff: context.git.diff,
+                  }
+                : { changedFiles: [], diff: "" },
           })
         : undefined;
     state.complete(reviewer.id, accepted, isolation, adjudicationOutcome);
