@@ -8,6 +8,7 @@ const READ_CHUNK_BYTES = 64 * 1024;
 
 export async function* readRunRecordLines(
   handle: FileHandle,
+  maximumBytes?: number,
 ): AsyncGenerator<{ line: number; encoded: string; terminated: boolean }> {
   const decoder = new TextDecoder("utf-8", { fatal: true });
   let carry = "";
@@ -15,7 +16,15 @@ export async function* readRunRecordLines(
   let position = 0;
   for (;;) {
     const chunk = Buffer.allocUnsafe(READ_CHUNK_BYTES);
-    const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+    const remaining =
+      maximumBytes === undefined ? chunk.length : maximumBytes - position;
+    if (remaining <= 0) break;
+    const { bytesRead } = await handle.read(
+      chunk,
+      0,
+      Math.min(chunk.length, remaining),
+      position,
+    );
     if (bytesRead === 0) break;
     position += bytesRead;
     carry += decoder.decode(chunk.subarray(0, bytesRead), { stream: true });

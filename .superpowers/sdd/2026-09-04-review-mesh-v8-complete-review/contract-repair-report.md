@@ -48,3 +48,45 @@ This report ships in the repair commit `Guarantee end-to-end full review deliver
 
 - This repair intentionally does not change the package version, README release notes, external machine configuration, or build/release assets.
 - Full standalone/release verification remains outside this repair task.
+
+## Independent review fix round 1
+
+### Findings addressed
+
+1. A permanently pending optional heartbeat could be awaited forever by required/final output.
+2. The mirror queue retained the full reviewer result object even though byte accounting used the compact reference.
+3. Dashboard readers did not reconcile persisted public result references against the authoritative private tuple.
+4. Active readers either skipped post-read identity validation or rejected legitimate append growth.
+5. Dashboard snapshots bypassed the aggregate quota for the first large artifact and retained full review payloads.
+6. Strict status did not reject records carrying a mismatched run id.
+7. Final required mirror append/publication could hang indefinitely.
+
+### RED evidence
+
+- Permanent optional heartbeat regression timed out instead of resolving or rejecting within shutdown grace.
+- EventWriter mirror callback received the full 1.1 MiB reviewer result rather than a compact reference.
+- Dashboard accepted orphaned and mismatched compact public result references.
+- Strict status accepted a private record with another run id.
+- Active path replacement tests for status/report initially resolved successfully instead of rejecting.
+- A bounded snapshot test showed the first oversized candidate bypassing the aggregate quota.
+- Final mirror-close reuse test showed the recorder close callback was invoked twice after a required persistence timeout.
+
+### Fixes
+
+- EventWriter now has a serialized optional-emission path that can be cancelled before physical write, plus an explicit output-failure hook for a started stuck write. Run orchestration bounds optional settlement by shutdown grace and fails explicitly rather than deadlocking or bypassing backpressure.
+- The mirror queue now stores `PersistedMirrorEvent`; public reviewer results are converted to digest/byte-count/reference objects before queueing, so the full result is retained only by stdout and the authoritative private record.
+- Required final mirror append/close is bounded by the configured mirror timeout, fails as persistence, and reuses one close promise after timeout.
+- Dashboard verifies compact public result references against the private authoritative result and rejects missing/mismatched tuples.
+- Status validates present run ids against the requested run.
+- Status/report/dashboard pin the initial active-file length, read only that stable prefix, tolerate append growth, and still reject pathname/inode replacement. Bigint file identities avoid Windows inode precision loss.
+- Dashboard snapshot selection never bypasses its aggregate byte quota. Omitted artifacts appear as explicit compact unreadable summaries in recency order; direct run/reviewer detail remains available and exact.
+
+### GREEN evidence
+
+- Final 17-file focused suite after this round: 17 files passed; 380 passed, 3 skipped.
+- Focused active-growth/replacement suite: 6 passed.
+- Focused critical heartbeat/compact-mirror suite: passed.
+- Focused final mirror append/close timeout suite: passed.
+- `npm run typecheck`: passed.
+- Targeted Prettier check: passed.
+- `git diff --check`: passed.

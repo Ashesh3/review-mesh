@@ -823,6 +823,7 @@ export interface ReadRunReportOptions {
   runId: string;
   /** Recover validated data around incompatible records without changing strict defaults. */
   bestEffort?: boolean;
+  afterOpen?: () => void | Promise<void>;
 }
 
 export interface RunRecordWarning {
@@ -873,7 +874,7 @@ interface RunRecordPath {
 }
 interface OpenRunRecord {
   handle: import("node:fs/promises").FileHandle;
-  initial: Awaited<ReturnType<import("node:fs/promises").FileHandle["stat"]>>;
+  initial: import("node:fs").BigIntStats;
   path: string;
   active: boolean;
   root?: string;
@@ -1130,11 +1131,17 @@ async function openRunRecordFile(
     );
   }
   try {
-    const metadata = await handle.stat();
+    const metadata = await handle.stat({ bigint: true });
     if (!metadata.isFile()) {
       throw new RunReportError(
         "invalid_run_record",
         "The persisted run record is unavailable or exceeds the report limit.",
+      );
+    }
+    if (metadata.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new RunReportError(
+        "invalid_run_record",
+        "The persisted run record exceeds the supported file size.",
       );
     }
     if (root !== undefined && expectedName !== undefined) {
@@ -1148,14 +1155,7 @@ async function openRunRecordFile(
         pathMetadata.isSymbolicLink() ||
         !isWithinDirectory(root, canonical) ||
         basename(canonical) !== expectedName ||
-        (process.platform !== "win32" &&
-          metadata.dev !== 0 &&
-          pathMetadata.dev !== 0n &&
-          BigInt(metadata.dev) !== pathMetadata.dev) ||
-        (process.platform !== "win32" &&
-          metadata.ino !== 0 &&
-          pathMetadata.ino !== 0n &&
-          BigInt(metadata.ino) !== pathMetadata.ino)
+        !sameFileIdentity(metadata, pathMetadata)
       ) {
         throw new RunReportError(
           "invalid_run_record",
@@ -1178,9 +1178,8 @@ async function openRunRecordFile(
 }
 
 async function verifyRunRecordFile(opened: OpenRunRecord): Promise<void> {
-  if (opened.active) return;
   const [current, canonical, pathMetadata] = await Promise.all([
-    opened.handle.stat(),
+    opened.handle.stat({ bigint: true }),
     realpath(opened.path).catch(() => undefined),
     lstat(opened.path, { bigint: true }).catch(() => undefined),
   ]);
@@ -1188,19 +1187,14 @@ async function verifyRunRecordFile(opened: OpenRunRecord): Promise<void> {
     canonical === undefined ||
     pathMetadata === undefined ||
     pathMetadata.isSymbolicLink() ||
+    !sameFileIdentity(current, pathMetadata) ||
     (opened.root !== undefined && !isWithinDirectory(opened.root, canonical)) ||
     (opened.expectedName !== undefined &&
       basename(canonical) !== opened.expectedName) ||
-    (process.platform !== "win32" &&
-      current.dev !== 0 &&
-      pathMetadata.dev !== 0n &&
-      BigInt(current.dev) !== pathMetadata.dev) ||
-    (process.platform !== "win32" &&
-      current.ino !== 0 &&
-      pathMetadata.ino !== 0n &&
-      BigInt(current.ino) !== pathMetadata.ino) ||
-    current.size !== opened.initial.size ||
-    current.mtimeMs !== opened.initial.mtimeMs ||
+    (opened.active
+      ? current.size < opened.initial.size
+      : current.size !== opened.initial.size) ||
+    (!opened.active && current.mtimeMs !== opened.initial.mtimeMs) ||
     current.dev !== opened.initial.dev ||
     current.ino !== opened.initial.ino
   ) {
@@ -1209,6 +1203,16 @@ async function verifyRunRecordFile(opened: OpenRunRecord): Promise<void> {
       "The completed run record changed while the report was being read.",
     );
   }
+}
+
+function sameFileIdentity(
+  handle: { dev: bigint; ino: bigint },
+  path: { dev: bigint; ino: bigint },
+): boolean {
+  return (
+    (handle.dev === 0n || path.dev === 0n || handle.dev === path.dev) &&
+    (handle.ino === 0n || path.ino === 0n || handle.ino === path.ino)
+  );
 }
 
 function reviewerMetadata(
@@ -1636,6 +1640,7 @@ function parsePrivateRecord(
 
 async function parseRunRecord(
   handle: import("node:fs/promises").FileHandle,
+  initialSize: number,
   expectedRunId: string,
   allowPartialTail: boolean,
   bestEffort = false,
@@ -1650,6 +1655,7 @@ async function parseRunRecord(
   };
   for await (const { line, encoded, terminated } of readRunRecordLines(
     handle,
+    initialSize,
   )) {
     if (encoded.trim().length === 0) continue;
     let value: unknown;
@@ -2148,6 +2154,7 @@ export async function readRunReport({
   runsDirectory,
   runId,
   bestEffort = false,
+  afterOpen,
 }: ReadRunReportOptions): Promise<RunReport> {
   requireSafeRunId(runId);
   const recordPath = await resolveRunRecordPath(runsDirectory, runId);
@@ -2157,10 +2164,12 @@ export async function readRunReport({
     recordPath.root,
     recordPath.name,
   );
+  await afterOpen?.();
   let parsed: ParsedReportRecord;
   try {
     parsed = await parseRunRecord(
       opened.handle,
+      Number(opened.initial.size),
       runId,
       recordPath.active,
       bestEffort,
@@ -2313,6 +2322,7 @@ export async function readRetryRunPlan(
   try {
     parsed = await parseRunRecord(
       opened.handle,
+      Number(opened.initial.size),
       options.runId,
       recordPath.active,
       false,

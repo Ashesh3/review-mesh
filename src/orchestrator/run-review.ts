@@ -496,6 +496,37 @@ export async function runReviewRound({
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   let optionalPending: Promise<void> | undefined;
 
+  const awaitOptional = async (): Promise<void> => {
+    const pending = optionalPending;
+    if (pending === undefined) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      pending.then(
+        () => ({ status: "complete" as const }),
+        (error: unknown) => ({ status: "failed" as const, error }),
+      ),
+      new Promise<{ status: "timeout" }>((resolve) => {
+        timer = clock.setTimeout(
+          () => resolve({ status: "timeout" }),
+          config.execution.shutdown_grace_period_ms,
+        );
+      }),
+    ]);
+    if (timer !== undefined) clock.clearTimeout(timer);
+    if (outcome.status === "complete") return;
+    const error =
+      outcome.status === "failed"
+        ? outcome.error
+        : new Error(
+            "Optional heartbeat output did not settle within shutdown grace.",
+          );
+    writerUsable = false;
+    writer.failOutput?.(
+      error instanceof Error ? error : new Error(String(error)),
+    );
+    throw new FinalOutputError(error);
+  };
+
   const circuitAdmission = (
     reviewer: ResolvedReviewer,
   ): { allowed: boolean; causedByReviewerId?: string } => {
@@ -561,7 +592,7 @@ export async function runReviewRound({
       );
     }
     try {
-      await optionalPending;
+      await awaitOptional();
       await writer.emit(draft);
     } catch (error) {
       writerUsable = false;
@@ -571,7 +602,9 @@ export async function runReviewRound({
 
   const emitOptional = (draft: EventDraft): void => {
     if (!writerUsable || optionalPending !== undefined) return;
-    const operation = Promise.resolve(writer.emit(draft)).then(
+    const operation = Promise.resolve(
+      writer.emitOptional?.(draft) ?? writer.emit(draft),
+    ).then(
       () => undefined,
       (error: unknown) => {
         writerUsable = false;
@@ -592,7 +625,7 @@ export async function runReviewRound({
       );
     }
     try {
-      await optionalPending;
+      await awaitOptional();
       await (writer.emitFinal ?? writer.emit)(draft);
     } catch (error) {
       writerUsable = false;

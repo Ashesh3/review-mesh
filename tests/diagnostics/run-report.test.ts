@@ -1,4 +1,12 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -635,6 +643,61 @@ describe("readRunReport", () => {
     ).rejects.toMatchObject({
       code: "invalid_run_record",
     });
+  });
+
+  it("reads a stable active prefix while the report file grows after open", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-report-active-growth";
+    const path = join(runsDirectory, `${runId}.jsonl.active.12.1.owner`);
+    await writeFile(
+      path,
+      line({
+        record: "resolution",
+        run_id: runId,
+        resolution: { reviewers: [] },
+      }),
+    );
+
+    await expect(
+      readRunReport({
+        runsDirectory,
+        runId,
+        afterOpen: async () => {
+          await appendFile(
+            path,
+            line({ record: "context", run_id: runId, context: {} }),
+          );
+        },
+      }),
+    ).resolves.toMatchObject({ active: true });
+  });
+
+  it("rejects an active report path replacement after open", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-report-active-replaced";
+    const path = join(runsDirectory, `${runId}.jsonl.active.12.1.owner`);
+    await writeFile(
+      path,
+      line({
+        record: "resolution",
+        run_id: runId,
+        resolution: { reviewers: [] },
+      }),
+    );
+
+    await expect(
+      readRunReport({
+        runsDirectory,
+        runId,
+        afterOpen: async () => {
+          await rename(path, `${path}.moved`);
+          await writeFile(
+            path,
+            `${line({ record: "resolution", run_id: runId, resolution: { reviewers: [] } })}replacement`,
+          );
+        },
+      }),
+    ).rejects.toMatchObject({ code: "invalid_run_record" });
   });
 
   it("reports the JSONL line, record type, and bounded schema paths", async () => {

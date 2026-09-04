@@ -1,5 +1,12 @@
 import { publicEventSchema, type PublicEvent } from "./schemas.js";
 
+type PublicResultEvent = Extract<PublicEvent, { event: "reviewer.result" }>;
+export type PersistedMirrorEvent =
+  | Exclude<PublicEvent, { event: "reviewer.result" }>
+  | (Omit<PublicResultEvent, "data"> & {
+      data: Omit<PublicResultEvent["data"], "result">;
+    });
+
 export interface EventSink {
   write(
     chunk: string | Uint8Array,
@@ -9,6 +16,7 @@ export interface EventSink {
   once(event: "drain", listener: () => void): unknown;
   removeListener(event: "error", listener: (error: Error) => void): unknown;
   removeListener(event: "drain", listener: () => void): unknown;
+  destroy?(error?: Error): unknown;
 }
 
 export type EventDraft = PublicEvent extends infer Event
@@ -22,10 +30,12 @@ export type EventDraft = PublicEvent extends infer Event
 
 export interface EventWriter {
   emit(draft: EventDraft): Promise<PublicEvent>;
+  emitOptional?(draft: EventDraft): Promise<PublicEvent | undefined>;
   emitFinal?(draft: EventDraft): Promise<PublicEvent>;
   record?(record: RunBoundRecordDraft): Promise<void>;
   close(): Promise<void>;
   outputFailed?(): boolean;
+  failOutput?(error: Error): void;
 }
 
 export type RunBoundRecordDraft = Record<string, unknown> & { run_id?: string };
@@ -35,7 +45,7 @@ export interface CreateEventWriterOptions {
   runId: string;
   requestId?: string;
   now?: () => Date;
-  onEvent?: (event: PublicEvent) => Promise<void>;
+  onEvent?: (event: PersistedMirrorEvent) => Promise<void>;
   onRecord?: (record: unknown) => Promise<void>;
   onMirrorClose?: () => Promise<void>;
   mirrorCloseRequired?: boolean;
@@ -46,17 +56,20 @@ export interface CreateEventWriterOptions {
 }
 
 interface PendingMirrorEvent {
-  event: PublicEvent;
+  event: PersistedMirrorEvent;
   bytes: number;
 }
 
-function mirrorEventBytes(event: PublicEvent, fallbackBytes: number): number {
-  if (event.event !== "reviewer.result") return fallbackBytes;
+interface OptionalWrite {
+  cancelled: boolean;
+  started: boolean;
+  promise: Promise<PublicEvent | undefined>;
+}
+
+function persistedMirrorEvent(event: PublicEvent): PersistedMirrorEvent {
+  if (event.event !== "reviewer.result") return event;
   const { result: _result, ...reference } = event.data;
-  return Buffer.byteLength(
-    JSON.stringify({ ...event, data: reference }) + "\n",
-    "utf8",
-  );
+  return { ...event, data: reference };
 }
 
 export function createEventWriter({
@@ -98,6 +111,8 @@ export function createEventWriter({
   let mirrorClose: Promise<void> | undefined;
   let mirrorFailure: Error | undefined;
   let mirrorFinalized = false;
+  let optionalWrite: OptionalWrite | undefined;
+  let rejectActiveWrite: ((error: Error) => void) | undefined;
 
   const rememberError = (error: Error) => {
     streamError ??= error;
@@ -115,6 +130,12 @@ export function createEventWriter({
       () => undefined,
     );
     return result;
+  };
+
+  const cancelQueuedOptional = () => {
+    if (optionalWrite !== undefined && !optionalWrite.started) {
+      optionalWrite.cancelled = true;
+    }
   };
 
   const disableMirror = (error: unknown) => {
@@ -164,7 +185,7 @@ export function createEventWriter({
     if (mirrorFailure !== undefined && mirrorCloseRequired) throw mirrorFailure;
   };
 
-  const enqueueMirror = (event: PublicEvent, bytes: number) => {
+  const enqueueMirror = (event: PersistedMirrorEvent, bytes: number) => {
     if (!mirrorEnabled || onEvent === undefined) return;
     const pendingEvents =
       mirrorQueue.length + (mirrorInFlightBytes > 0 ? 1 : 0);
@@ -226,6 +247,41 @@ export function createEventWriter({
       disableMirror(new Error("Run record persistence timed out."));
   };
 
+  const persistFinalWithinDeadline = async (
+    event: PersistedMirrorEvent,
+  ): Promise<void> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const persistence = (async () => {
+      await drainMirror();
+      if (onEvent !== undefined && mirrorEnabled) await onEvent(event);
+      if (onMirrorClose !== undefined) await onMirrorClose();
+    })();
+    mirrorClose ??= persistence;
+    const outcome = await Promise.race([
+      persistence.then(
+        () => ({ status: "complete" as const }),
+        (error: unknown) => ({ status: "failed" as const, error }),
+      ),
+      new Promise<{ status: "timeout" }>((resolve) => {
+        timer = globalThis.setTimeout(
+          () => resolve({ status: "timeout" }),
+          mirrorFlushTimeoutMs,
+        );
+      }),
+    ]);
+    if (timer !== undefined) globalThis.clearTimeout(timer);
+    if (outcome.status === "complete") return;
+    const error =
+      outcome.status === "failed"
+        ? outcome.error
+        : new Error("Required run record persistence timed out.");
+    disableMirror(error);
+    mirrorFinalized = true;
+    throw new Error("Immutable artifact persistence failed.", {
+      cause: error,
+    });
+  };
+
   const writeLine = (line: string): Promise<void> =>
     new Promise((resolve, reject) => {
       let callbackSettled = false;
@@ -234,6 +290,7 @@ export function createEventWriter({
       let settled = false;
 
       const cleanup = () => {
+        if (rejectActiveWrite === rejectOnce) rejectActiveWrite = undefined;
         output.removeListener("error", onError);
         output.removeListener("drain", onDrain);
       };
@@ -271,6 +328,7 @@ export function createEventWriter({
       };
 
       output.once("error", onError);
+      rejectActiveWrite = rejectOnce;
       try {
         const accepted = output.write(line, onWrite);
         writeReturned = true;
@@ -296,6 +354,7 @@ export function createEventWriter({
         return Promise.reject(streamError);
       }
 
+      cancelQueuedOptional();
       return enqueue(async () => {
         if (streamError !== undefined) {
           throw streamError;
@@ -306,11 +365,43 @@ export function createEventWriter({
 
         await writeLine(line);
 
-        const lineBytes = Buffer.byteLength(line, "utf8");
-        enqueueMirror(event, mirrorEventBytes(event, lineBytes));
+        const mirrorEvent = persistedMirrorEvent(event);
+        enqueueMirror(
+          mirrorEvent,
+          Buffer.byteLength(JSON.stringify(mirrorEvent) + "\n", "utf8"),
+        );
 
         return event;
       });
+    },
+
+    emitOptional(draft) {
+      if (closed || streamError !== undefined || optionalWrite !== undefined) {
+        return Promise.resolve(undefined);
+      }
+      const pending = {
+        cancelled: false,
+        started: false,
+        promise: Promise.resolve(undefined) as Promise<PublicEvent | undefined>,
+      };
+      const result = enqueue(async () => {
+        if (pending.cancelled || streamError !== undefined) return undefined;
+        pending.started = true;
+        const event = materialize(draft);
+        const line = JSON.stringify(event) + "\n";
+        await writeLine(line);
+        const mirrorEvent = persistedMirrorEvent(event);
+        enqueueMirror(
+          mirrorEvent,
+          Buffer.byteLength(JSON.stringify(mirrorEvent) + "\n", "utf8"),
+        );
+        return event;
+      });
+      pending.promise = result.finally(() => {
+        if (optionalWrite === pending) optionalWrite = undefined;
+      });
+      optionalWrite = pending;
+      return pending.promise;
     },
 
     emitFinal(draft) {
@@ -318,20 +409,11 @@ export function createEventWriter({
         return Promise.reject(new Error("Event writer is closed"));
       }
       if (streamError !== undefined) return Promise.reject(streamError);
+      cancelQueuedOptional();
       return enqueue(async () => {
         const event = materialize(draft);
         const line = JSON.stringify(event) + "\n";
-        await drainMirror();
-        if (onEvent !== undefined && mirrorEnabled) await onEvent(event);
-        if (onMirrorClose !== undefined) {
-          try {
-            await onMirrorClose();
-          } catch (error) {
-            throw new Error("Immutable artifact publication failed.", {
-              cause: error,
-            });
-          }
-        }
+        await persistFinalWithinDeadline(persistedMirrorEvent(event));
         mirrorFinalized = true;
         mirrorEnabled = false;
         mirrorClose = Promise.resolve();
@@ -351,6 +433,7 @@ export function createEventWriter({
     },
 
     close() {
+      cancelQueuedOptional();
       closed = true;
       return tail.then(async () => {
         try {
@@ -362,6 +445,15 @@ export function createEventWriter({
     },
     outputFailed() {
       return streamError !== undefined;
+    },
+    failOutput(error) {
+      rememberError(error);
+      rejectActiveWrite?.(error);
+      try {
+        output.destroy?.(error);
+      } catch {
+        // The sticky stream error still makes every queued operation fail.
+      }
     },
   };
 }

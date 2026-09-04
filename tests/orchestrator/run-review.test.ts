@@ -74,6 +74,30 @@ function writerWithStuckSuiteHeartbeat() {
   };
 }
 
+function writerWithPermanentHeartbeat() {
+  const emitted: Array<{ event: string; reviewer_id?: string }> = [];
+  let resolveHeartbeatStarted!: () => void;
+  const heartbeatStarted = new Promise<void>((resolve) => {
+    resolveHeartbeatStarted = resolve;
+  });
+  return {
+    emitted,
+    heartbeatStarted,
+    writer: {
+      emit: vi.fn((draft: { event: string; reviewer_id?: string }) => {
+        emitted.push(draft);
+        if (draft.event === "suite.heartbeat") {
+          resolveHeartbeatStarted();
+          return new Promise<never>(() => undefined);
+        }
+        return Promise.resolve({});
+      }),
+      outputFailed: vi.fn(() => false),
+      close: vi.fn(async () => undefined),
+    },
+  };
+}
+
 describe("runReviewRound", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -930,6 +954,31 @@ describe("runReviewRound", () => {
     expect(
       emitted.filter((event) => event.event === "run.completed"),
     ).toHaveLength(0);
+  });
+
+  it("rejects within shutdown grace when a started optional heartbeat never settles", async () => {
+    const { heartbeatStarted, writer } = writerWithPermanentHeartbeat();
+    const completion = runReviewRound(
+      roundInput({
+        adapters: { clean: fakeAdapterReturning(passResult(), 30) },
+        writer,
+        config: {
+          execution: {
+            heartbeat_interval_ms: 10,
+            shutdown_grace_period_ms: 20,
+          },
+        },
+      }),
+    );
+    const asserted = expect(completion).rejects.toThrow(
+      "The final public event could not be written.",
+    );
+
+    await vi.advanceTimersByTimeAsync(10);
+    await heartbeatStarted;
+    await vi.advanceTimersByTimeAsync(100);
+
+    await asserted;
   });
 
   it("bounds a stuck heartbeat writer during caller cancellation", async () => {

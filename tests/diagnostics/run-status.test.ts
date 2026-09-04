@@ -1,4 +1,4 @@
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mkdtemp } from "node:fs/promises";
@@ -33,6 +33,27 @@ afterEach(async () => {
 });
 
 describe("readRunStatus", () => {
+  it("rejects every record whose run_id does not match the requested run", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-expected";
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      line({
+        record: "resolution",
+        run_id: "run-other",
+        resolution: { reviewers: [] },
+      }),
+    );
+
+    await expect(readRunStatus({ runsDirectory, runId })).rejects.toMatchObject(
+      {
+        code: "invalid_run_record",
+        line: 1,
+        schemaPaths: ["run_id"],
+      },
+    );
+  });
+
   it("loads and verifies a complete adjudication result", async () => {
     const { runsDirectory } = await fixture();
     const runId = "run-adjudication-result";
@@ -399,6 +420,67 @@ describe("readRunStatus", () => {
         },
       ],
     });
+  });
+
+  it("reads a stable active prefix while the file grows after open", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-active-growth";
+    const path = join(runsDirectory, `${runId}.jsonl.active.12.1.owner`);
+    await writeFile(
+      path,
+      line({
+        record: "resolution",
+        run_id: runId,
+        resolution: { reviewers: [] },
+      }),
+    );
+
+    const status = await readRunStatus({
+      runsDirectory,
+      runId,
+      afterOpen: async () => {
+        await appendFile(
+          path,
+          line({
+            schema_version: "5",
+            event: "run.started",
+            run_id: runId,
+            seq: 1,
+            timestamp: new Date().toISOString(),
+            data: { consistency_mode: "live_worktree" },
+          }),
+        );
+      },
+    });
+    expect(status).toMatchObject({ active: true, last_seq: 0 });
+  });
+
+  it("rejects an active path replacement after open", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-active-replaced";
+    const path = join(runsDirectory, `${runId}.jsonl.active.12.1.owner`);
+    await writeFile(
+      path,
+      line({
+        record: "resolution",
+        run_id: runId,
+        resolution: { reviewers: [] },
+      }),
+    );
+
+    await expect(
+      readRunStatus({
+        runsDirectory,
+        runId,
+        afterOpen: async () => {
+          await rename(path, `${path}.moved`);
+          await writeFile(
+            path,
+            `${line({ record: "resolution", run_id: runId, resolution: { reviewers: [] } })}replacement`,
+          );
+        },
+      }),
+    ).rejects.toMatchObject({ code: "invalid_run_record" });
   });
 
   it("prefers the final record and returns terminal failures", async () => {

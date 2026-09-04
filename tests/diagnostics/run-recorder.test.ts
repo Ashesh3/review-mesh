@@ -208,7 +208,7 @@ describe("RunRecorder", () => {
       seq: 1,
       timestamp: "2026-09-04T00:00:00.000Z",
       reviewer_id: "reviewer-1",
-      data: { digest, byte_count: byteCount, result },
+      data: { digest, byte_count: byteCount },
     });
     await recorder.close();
 

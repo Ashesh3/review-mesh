@@ -308,9 +308,10 @@ function processIsLikelyAlive(owner: {
 
 async function listRunFiles(
   runsDirectory: string,
-): Promise<RunFileCandidate[]> {
+  maximumTotalBytes = MAX_DASHBOARD_TOTAL_BYTES,
+): Promise<{ selected: RunFileCandidate[]; omitted: RunFileCandidate[] }> {
   const root = await realpath(resolve(runsDirectory)).catch(() => undefined);
-  if (root === undefined) return [];
+  if (root === undefined) return { selected: [], omitted: [] };
   const entries = await readdir(root, { withFileTypes: true });
   const candidates = await Promise.all(
     entries.map(async (entry): Promise<RunFileCandidate | undefined> => {
@@ -356,18 +357,18 @@ async function listRunFiles(
     right.modifiedAt.localeCompare(left.modifiedAt),
   );
   const selected: RunFileCandidate[] = [];
+  const omitted: RunFileCandidate[] = [];
   let totalBytes = 0;
   for (const candidate of ordered) {
     if (selected.length >= MAX_DASHBOARD_RUNS) break;
-    if (
-      selected.length > 0 &&
-      candidate.size > MAX_DASHBOARD_TOTAL_BYTES - totalBytes
-    )
+    if (candidate.size > maximumTotalBytes - totalBytes) {
+      omitted.push(candidate);
       continue;
+    }
     selected.push(candidate);
     totalBytes += candidate.size;
   }
-  return selected;
+  return { selected, omitted };
 }
 
 async function mapWithConcurrency<T, R>(
@@ -393,6 +394,7 @@ async function mapWithConcurrency<T, R>(
 
 async function parseCandidate(
   candidate: RunFileCandidate,
+  afterOpen?: () => void | Promise<void>,
 ): Promise<ParsedRunFile> {
   const handle = await open(
     candidate.path,
@@ -416,6 +418,7 @@ async function parseCandidate(
     ) {
       throw new Error("Run record exceeds the dashboard limit.");
     }
+    await afterOpen?.();
     const records: Record<string, unknown>[] = [];
     const events: Record<string, unknown>[] = [];
     let resolution: Record<string, unknown> | undefined;
@@ -427,7 +430,10 @@ async function parseCandidate(
     let completed: Record<string, unknown> | undefined;
     let latestTimestamp: string | undefined;
     let legacy = false;
-    for await (const { encoded, terminated } of readRunRecordLines(handle)) {
+    for await (const { encoded, terminated } of readRunRecordLines(
+      handle,
+      metadata.size,
+    )) {
       if (encoded.trim().length === 0) continue;
       let value: unknown;
       try {
@@ -479,8 +485,10 @@ async function parseCandidate(
       afterHandle.ino !== metadata.ino ||
       afterTarget.dev !== metadata.dev ||
       afterTarget.ino !== metadata.ino ||
-      afterHandle.size !== metadata.size ||
-      afterTarget.size !== metadata.size
+      (candidate.active
+        ? afterHandle.size < metadata.size || afterTarget.size < metadata.size
+        : afterHandle.size !== metadata.size ||
+          afterTarget.size !== metadata.size)
     ) {
       throw new Error("Run record identity changed while reading.");
     }
@@ -508,9 +516,9 @@ async function loadParsedRun(
   runId: string,
 ): Promise<ParsedRunFile> {
   requireSafeRunId(runId);
-  const candidate = (await listRunFiles(runsDirectory)).find(
-    (item) => item.runId === runId,
-  );
+  const candidate = (
+    await listRunFiles(runsDirectory, Number.MAX_SAFE_INTEGER)
+  ).selected.find((item) => item.runId === runId);
   if (candidate === undefined) throw new Error(`Run ${runId} was not found.`);
   return await parseCandidate(candidate);
 }
@@ -743,6 +751,22 @@ function buildReviewerRuntime(parsed: ParsedRunFile): ReviewerRuntime[] {
     if (event === undefined || id === undefined) continue;
     const data = eventData(record);
     const reviewer = reviewerFor(id);
+    if (event === "reviewer.result") {
+      const digest = text(data.digest);
+      const byteCount = integer(data.byte_count);
+      if (
+        reviewer.result === undefined ||
+        digest === undefined ||
+        byteCount === undefined ||
+        reviewer.result_digest !== digest ||
+        reviewer.result_byte_count !== byteCount
+      ) {
+        throw new Error(
+          "The persisted public reviewer result reference is invalid.",
+        );
+      }
+      continue;
+    }
     reviewer.lens_id = text(data.lens_id) ?? reviewer.lens_id;
     const mode = text(data.mode);
     const adapter = text(data.adapter);
@@ -1305,16 +1329,32 @@ async function configurationCatalog(appPaths: AppPaths): Promise<{
 export async function readDashboardSnapshot(input: {
   appPaths: AppPaths;
   server: DashboardServerInfo;
+  maximumTotalBytes?: number;
 }): Promise<DashboardSnapshot> {
   const [catalog, candidates] = await Promise.all([
     configurationCatalog(input.appPaths),
-    listRunFiles(input.appPaths.runsDirectory),
+    listRunFiles(
+      input.appPaths.runsDirectory,
+      input.maximumTotalBytes ?? MAX_DASHBOARD_TOTAL_BYTES,
+    ),
   ]);
   const runs = await mapWithConcurrency(
-    candidates,
+    candidates.selected,
     DASHBOARD_READ_CONCURRENCY,
     readRunSummary,
   );
+  runs.push(
+    ...candidates.omitted.map((candidate) => ({
+      run_id: candidate.runId,
+      active: candidate.active,
+      status: "unreadable",
+      updated_at: candidate.modifiedAt,
+      findings: 0,
+      unreadable: true,
+      error: "Run omitted from the bounded dashboard snapshot.",
+    })),
+  );
+  runs.sort((left, right) => right.updated_at.localeCompare(left.updated_at));
   const active = runs.filter((run) => run.active && !run.unreadable);
   return {
     schema_version: "1",
@@ -1585,8 +1625,15 @@ function dashboardGatePolicies(
 export async function readDashboardRun(input: {
   appPaths: AppPaths;
   runId: string;
+  afterOpen?: () => void | Promise<void>;
 }): Promise<Record<string, unknown>> {
-  const parsed = await loadParsedRun(input.appPaths.runsDirectory, input.runId);
+  requireSafeRunId(input.runId);
+  const candidate = (
+    await listRunFiles(input.appPaths.runsDirectory, Number.MAX_SAFE_INTEGER)
+  ).selected.find((item) => item.runId === input.runId);
+  if (candidate === undefined)
+    throw new Error(`Run ${input.runId} was not found.`);
+  const parsed = await parseCandidate(candidate, input.afterOpen);
   const summary = runSummaryFromParsed(parsed);
   const reviewers = buildReviewerRuntime(parsed);
   const publicEvents = parsed.events.map((event) => ({
@@ -1700,7 +1747,9 @@ export async function dashboardFingerprint(
   appPaths: AppPaths,
 ): Promise<string> {
   const [runs, config] = await Promise.all([
-    listRunFiles(appPaths.runsDirectory),
+    listRunFiles(appPaths.runsDirectory, Number.MAX_SAFE_INTEGER).then(
+      (result) => result.selected,
+    ),
     stat(appPaths.configFile)
       .then((metadata) => `${metadata.size}:${metadata.mtimeMs}`)
       .catch(() => "missing"),

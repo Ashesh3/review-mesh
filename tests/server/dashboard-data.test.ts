@@ -1,4 +1,12 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -683,6 +691,66 @@ describe("dashboard data", () => {
     });
   });
 
+  it.each([
+    {
+      name: "missing authoritative result",
+      includePrivate: false,
+      mismatch: false,
+    },
+    { name: "mismatched tuple", includePrivate: true, mismatch: true },
+  ])(
+    "rejects a compact public result reference with $name",
+    async ({ includePrivate, mismatch }) => {
+      const { appPaths } = await fixture();
+      const runId = `run-dashboard-reference-${mismatch ? "mismatch" : "missing"}`;
+      const result: ReviewerResultV3 = {
+        schema_version: "3",
+        verdict: "pass",
+        review_markdown: "# Complete review",
+        summary: "No findings.",
+        actionable_findings: [],
+        informational_notes: [],
+      };
+      const digest = reviewerResultDigest(result);
+      const byteCount = Buffer.byteLength(JSON.stringify(result), "utf8");
+      await writeFile(
+        join(appPaths.runsDirectory, `${runId}.jsonl`),
+        [
+          ...(includePrivate
+            ? [
+                {
+                  record: "reviewer.result",
+                  run_id: runId,
+                  reviewer_id: "reviewer-1",
+                  digest,
+                  byte_count: byteCount,
+                  result,
+                },
+              ]
+            : []),
+          {
+            schema_version: "5",
+            event: "reviewer.result",
+            run_id: runId,
+            seq: 1,
+            timestamp: new Date().toISOString(),
+            reviewer_id: "reviewer-1",
+            data: {
+              digest: mismatch ? "0".repeat(64) : digest,
+              byte_count: byteCount,
+            },
+          },
+        ]
+          .map((record) => JSON.stringify(record))
+          .join("\n") + "\n",
+      );
+
+      await expect(readDashboardRun({ appPaths, runId })).rejects.toThrow(
+        /result reference/i,
+      );
+    },
+  );
+
   it("downgrades invalid adjudication proof with the same canonical classification and counts as reports", async () => {
     const { appPaths } = await fixture();
     const runId = "run-invalid-proof";
@@ -1028,6 +1096,59 @@ describe("dashboard data", () => {
     );
   });
 
+  it("reads a stable active dashboard prefix while the file grows after open", async () => {
+    const { appPaths } = await fixture();
+    const runId = "dashboard-active-growth";
+    const path = join(
+      appPaths.runsDirectory,
+      `${runId}.jsonl.active.${process.pid}.${Math.floor(Date.now() - process.uptime() * 1000)}.owner`,
+    );
+    await writeFile(
+      path,
+      `${JSON.stringify({ record: "resolution", run_id: runId, resolution: { reviewers: [] } })}\n`,
+    );
+
+    await expect(
+      readDashboardRun({
+        appPaths,
+        runId,
+        afterOpen: async () => {
+          await appendFile(
+            path,
+            `${JSON.stringify({ record: "context", run_id: runId, context: {} })}\n`,
+          );
+        },
+      }),
+    ).resolves.toMatchObject({ run_id: runId });
+  });
+
+  it("rejects an active dashboard path replacement after open", async () => {
+    const { appPaths } = await fixture();
+    const runId = "dashboard-active-replaced";
+    const path = join(
+      appPaths.runsDirectory,
+      `${runId}.jsonl.active.${process.pid}.${Math.floor(Date.now() - process.uptime() * 1000)}.owner`,
+    );
+    await writeFile(
+      path,
+      `${JSON.stringify({ record: "resolution", run_id: runId, resolution: { reviewers: [] } })}\n`,
+    );
+
+    await expect(
+      readDashboardRun({
+        appPaths,
+        runId,
+        afterOpen: async () => {
+          await rename(path, `${path}.moved`);
+          await writeFile(
+            path,
+            `${JSON.stringify({ record: "resolution", run_id: runId, resolution: { reviewers: [] } })}\nreplacement`,
+          );
+        },
+      }),
+    ).rejects.toThrow(/identity changed/i);
+  });
+
   it("marks an orphaned active record stale instead of live", async () => {
     const { appPaths } = await fixture();
     await writeFile(
@@ -1059,5 +1180,35 @@ describe("dashboard data", () => {
       status: "stale",
     });
     expect(snapshot.counts.active_runs).toBe(0);
+  });
+
+  it("reports an oversized newest snapshot candidate explicitly and still loads the next run", async () => {
+    const { appPaths } = await fixture();
+    await writeFile(
+      join(appPaths.runsDirectory, "older.jsonl"),
+      `${JSON.stringify({ record: "resolution", run_id: "older", resolution: { reviewers: [] } })}\n`,
+    );
+    await writeFile(
+      join(appPaths.runsDirectory, "newer.jsonl"),
+      `${JSON.stringify({ record: "resolution", run_id: "newer", resolution: { reviewers: [] }, padding: "x".repeat(2_000) })}\n`,
+    );
+
+    const snapshot = await readDashboardSnapshot({
+      appPaths,
+      maximumTotalBytes: 1_000,
+      server: {
+        host: "127.0.0.1",
+        port: 1,
+        startedAt: new Date().toISOString(),
+      },
+    });
+
+    expect(snapshot.runs[0]).toMatchObject({
+      run_id: "newer",
+      unreadable: true,
+    });
+    expect(
+      snapshot.runs.find((run) => run.run_id === "older")?.unreadable,
+    ).toBeUndefined();
   });
 });

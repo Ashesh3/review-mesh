@@ -38,6 +38,7 @@ export interface ReadRunStatusOptions {
   runsDirectory: string;
   runId: string;
   reviewerId?: string;
+  afterOpen?: () => void | Promise<void>;
 }
 
 interface ReviewerSnapshot {
@@ -157,12 +158,19 @@ async function openRunRecord(path: string) {
     path,
     constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
   );
-  const metadata = await handle.stat();
+  const metadata = await handle.stat({ bigint: true });
   if (!metadata.isFile()) {
     await handle.close();
     throw new RunStatusError(
       "invalid_run_record",
       "The run record is unavailable or exceeds the status limit.",
+    );
+  }
+  if (metadata.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+    await handle.close();
+    throw new RunStatusError(
+      "invalid_run_record",
+      "The run record exceeds the supported file size.",
     );
   }
   return { handle, initial: metadata };
@@ -449,10 +457,12 @@ export async function readRunStatus({
   runsDirectory,
   runId,
   reviewerId,
+  afterOpen,
 }: ReadRunStatusOptions): Promise<Record<string, unknown>> {
   requireSafeRunId(runId);
   const location = await resolveRunRecord(runsDirectory, runId);
   const opened = await openRunRecord(location.path);
+  await afterOpen?.();
   const reviewers = new Map<string, ReviewerSnapshot>();
   let completed: Record<string, unknown> | undefined;
   let lastSeq = 0;
@@ -461,6 +471,7 @@ export async function readRunStatus({
   try {
     for await (const { line, encoded, terminated } of readRunRecordLines(
       opened.handle,
+      Number(opened.initial.size),
     )) {
       if (encoded.trim().length === 0) continue;
       let value: unknown;
@@ -477,6 +488,16 @@ export async function readRunStatus({
       }
       const event = asRecord(value);
       if (event === undefined) continue;
+      const recordRunId = text(event.run_id);
+      if (recordRunId !== undefined && recordRunId !== runId) {
+        throw new RunStatusError(
+          "invalid_run_record",
+          `The persisted run record has a mismatched run_id at JSONL line ${line}.`,
+          line,
+          text(event.record) ?? text(event.event) ?? "unknown",
+          ["run_id"],
+        );
+      }
       if (event.record === "resolution") {
         const resolution = asRecord(event.resolution);
         const roster = Array.isArray(resolution?.reviewers)
@@ -635,9 +656,9 @@ export async function readRunStatus({
         };
       }
     }
-    if (!location.active) {
+    {
       const [current, canonical, pathMetadata] = await Promise.all([
-        opened.handle.stat(),
+        opened.handle.stat({ bigint: true }),
         realpath(location.path).catch(() => undefined),
         lstat(location.path, { bigint: true }).catch(() => undefined),
       ]);
@@ -645,18 +666,13 @@ export async function readRunStatus({
         canonical === undefined ||
         pathMetadata === undefined ||
         pathMetadata.isSymbolicLink() ||
+        !sameFileIdentity(current, pathMetadata) ||
         !isWithinDirectory(location.root, canonical) ||
         basename(canonical) !== location.name ||
-        (process.platform !== "win32" &&
-          current.dev !== 0 &&
-          pathMetadata.dev !== 0n &&
-          BigInt(current.dev) !== pathMetadata.dev) ||
-        (process.platform !== "win32" &&
-          current.ino !== 0 &&
-          pathMetadata.ino !== 0n &&
-          BigInt(current.ino) !== pathMetadata.ino) ||
-        current.size !== opened.initial.size ||
-        current.mtimeMs !== opened.initial.mtimeMs ||
+        (location.active
+          ? current.size < opened.initial.size
+          : current.size !== opened.initial.size) ||
+        (!location.active && current.mtimeMs !== opened.initial.mtimeMs) ||
         current.dev !== opened.initial.dev ||
         current.ino !== opened.initial.ino
       ) {
@@ -735,4 +751,14 @@ export async function readRunStatus({
     ...(reviewerId === undefined ? {} : { reviewer_id: reviewerId }),
     last_seq: lastSeq,
   };
+}
+
+function sameFileIdentity(
+  handle: { dev: bigint; ino: bigint },
+  path: { dev: bigint; ino: bigint },
+): boolean {
+  return (
+    (handle.dev === 0n || path.dev === 0n || handle.dev === path.dev) &&
+    (handle.ino === 0n || path.ino === 0n || handle.ino === path.ino)
+  );
 }

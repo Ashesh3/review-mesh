@@ -12,7 +12,7 @@ import {
   type FileHandle,
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import type { PublicEvent } from "../protocol/schemas.js";
+import type { PersistedMirrorEvent } from "../protocol/event-writer.js";
 
 const REDACTED = "[redacted]";
 const TRUNCATED = "[truncated]";
@@ -46,7 +46,7 @@ export interface RunRecorderFileSystem {
 
 export interface RunRecorder {
   ready(): Promise<void>;
-  onEvent(event: PublicEvent): Promise<void>;
+  onEvent(event: PersistedMirrorEvent): Promise<void>;
   onRecord(record: unknown): Promise<void>;
   close(): Promise<void>;
 }
@@ -358,10 +358,8 @@ function recordLine(value: unknown): string {
   return line(value);
 }
 
-function eventLine(event: PublicEvent): string {
-  if (event.event !== "reviewer.result") return line(event);
-  const { result: _result, ...reference } = event.data;
-  return `${JSON.stringify({ ...event, data: reference })}\n`;
+function eventLine(event: PersistedMirrorEvent): string {
+  return line(event);
 }
 
 async function lstatIfPresent(path: string) {

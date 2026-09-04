@@ -1,7 +1,10 @@
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
-import { createEventWriter } from "../../src/protocol/event-writer.js";
+import {
+  createEventWriter,
+  type PersistedMirrorEvent,
+} from "../../src/protocol/event-writer.js";
 import type { PublicEvent } from "../../src/protocol/schemas.js";
 
 class ControlledSink extends EventEmitter {
@@ -115,7 +118,7 @@ describe("EventWriter", () => {
   it("accounts for the recorder's compact persisted form when queuing a full result", async () => {
     const output = new PassThrough();
     output.resume();
-    const mirrored: PublicEvent[] = [];
+    const mirrored: unknown[] = [];
     const writer = createEventWriter({
       output,
       runId: "run-required-large-result",
@@ -150,7 +153,7 @@ describe("EventWriter", () => {
     expect(mirrored).toContainEqual(
       expect.objectContaining({
         event: "reviewer.result",
-        data: expect.objectContaining({ result: expect.any(Object) }),
+        data: expect.not.objectContaining({ result: expect.anything() }),
       }),
     );
   });
@@ -173,6 +176,84 @@ describe("EventWriter", () => {
     });
 
     await expect(writer.close()).rejects.toBe(publicationFailure);
+  });
+
+  it("bounds a required final mirror append that never settles", async () => {
+    const writer = createEventWriter({
+      output: new PassThrough(),
+      runId: "run-final-mirror-stuck",
+      onEvent: async () => new Promise<void>(() => undefined),
+      onMirrorClose: async () => undefined,
+      mirrorCloseRequired: true,
+      mirrorFlushTimeoutMs: 10,
+    });
+
+    await writer.emit({
+      event: "run.started",
+      data: { consistency_mode: "live_worktree" },
+    });
+    await expect(
+      writer.emitFinal?.({
+        event: "run.completed",
+        data: {
+          exit_code: 0,
+          consistency_mode: "live_worktree",
+          total_elapsed_ms: 1,
+          results_complete: true,
+          suite: {
+            total: 0,
+            deferred: 0,
+            queued: 0,
+            running: 0,
+            completed: 0,
+            incomplete: 0,
+            skipped: 0,
+          },
+        },
+      }),
+    ).rejects.toThrow(/persistence/i);
+  });
+
+  it("bounds a required final mirror close that never settles", async () => {
+    let closes = 0;
+    const writer = createEventWriter({
+      output: new PassThrough(),
+      runId: "run-final-close-stuck",
+      onEvent: async () => undefined,
+      onMirrorClose: async () => {
+        closes += 1;
+        return new Promise<void>(() => undefined);
+      },
+      mirrorCloseRequired: true,
+      mirrorFlushTimeoutMs: 10,
+    });
+
+    await writer.emit({
+      event: "run.started",
+      data: { consistency_mode: "live_worktree" },
+    });
+    await expect(
+      writer.emitFinal?.({
+        event: "run.completed",
+        data: {
+          exit_code: 0,
+          consistency_mode: "live_worktree",
+          total_elapsed_ms: 1,
+          results_complete: true,
+          suite: {
+            total: 0,
+            deferred: 0,
+            queued: 0,
+            running: 0,
+            completed: 0,
+            incomplete: 0,
+            skipped: 0,
+          },
+        },
+      }),
+    ).rejects.toThrow(/persistence/i);
+    await expect(writer.close()).resolves.toBeUndefined();
+    expect(closes).toBe(1);
   });
 
   it("injects the current run_id into every private record", async () => {
@@ -554,7 +635,7 @@ describe("EventWriter", () => {
 
   it("preserves mirror event order when the mirror is healthy", async () => {
     const output = new PassThrough();
-    const mirrored: PublicEvent[] = [];
+    const mirrored: PersistedMirrorEvent[] = [];
     const writer = createEventWriter({
       output,
       runId: "run-mirror-order",
