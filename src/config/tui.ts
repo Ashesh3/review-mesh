@@ -32,6 +32,7 @@ export interface ConfigPrompter {
 export interface ConfigMenuOptions {
   configFile: string;
   config: ManagedConfig;
+  pendingMigrationConfirmation?: boolean;
   snapshot: ConfigSnapshot;
   prompt: ConfigPrompter;
   output: NodeJS.WritableStream;
@@ -620,7 +621,21 @@ async function addAgent(options: ConfigMenuOptions): Promise<void> {
       : "prefer_enforced",
     timeout_ms: timeout,
     applicability: { mode: "always" },
-    required_context: [],
+    kind: "generic",
+    required_input: [],
+    change_coverage: {
+      relevant_paths: ["**"],
+      minimum_inspection: "full_file",
+      proof: ("model_runs" in selection
+        ? selection.model_runs.map((run) => run.adapter ?? adapter)
+        : [adapter]
+      ).some((adapterId) => {
+        const type = config.adapters[adapterId]?.type;
+        return type === "codex" || type === "command";
+      })
+        ? "attested"
+        : "observed",
+    },
   };
   if (agent.model_runs !== undefined) {
     agent.pass_quorum = defaultAgentPassQuorum(agent);
@@ -703,9 +718,16 @@ async function editAgent(options: ConfigMenuOptions): Promise<void> {
     ...(current.applicability === undefined
       ? { applicability: { mode: "always" } as const }
       : { applicability: current.applicability }),
-    ...(current.required_context === undefined
-      ? { required_context: [] }
-      : { required_context: current.required_context }),
+    kind: current.kind ?? "generic",
+    required_input: [...(current.required_input ?? [])],
+    ...(current.lens_deadline_ms === undefined
+      ? {}
+      : { lens_deadline_ms: current.lens_deadline_ms }),
+    change_coverage: current.change_coverage ?? {
+      relevant_paths: ["**"],
+      minimum_inspection: "full_file",
+      proof: "attested",
+    },
     ...(current.pass_quorum === undefined
       ? {}
       : { pass_quorum: current.pass_quorum }),
@@ -818,11 +840,11 @@ async function editAgentPolicy(options: ConfigMenuOptions): Promise<void> {
       case_sensitive: caseSensitive,
     };
   }
-  agent.required_context = commaSeparatedValues(
+  agent.required_input = commaSeparatedValues(
     await answer(
       options.prompt,
-      `Required caller-context selectors [${(agent.required_context ?? []).join(",")}]: `,
-      (agent.required_context ?? []).join(","),
+      `Required input selectors [${(agent.required_input ?? []).join(",")}]: `,
+      (agent.required_input ?? []).join(","),
     ),
     "caller-context selector",
     validateCallerContextRequirement,
@@ -1185,6 +1207,26 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
 
         if (changed) {
           const normalized = normalizeManagedConfig(options.config);
+          const derivedAttested = Object.entries(normalized.agents)
+            .filter(
+              ([id, agent]) =>
+                agent.change_coverage?.proof === "attested" &&
+                (options.pendingMigrationConfirmation === true ||
+                  before.agents[id]?.change_coverage?.proof !== "attested"),
+            )
+            .map(([id]) => id);
+          if (
+            derivedAttested.length > 0 &&
+            !yes(
+              await answer(
+                options.prompt,
+                `Save weaker attested coverage for ${derivedAttested.join(", ")}? [y/N]: `,
+                "n",
+              ),
+            )
+          ) {
+            throw new Error("attested coverage save was not confirmed");
+          }
           for (const key of Object.keys(options.config) as Array<
             keyof ManagedConfig
           >) {
@@ -1196,6 +1238,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
             options.config,
             snapshot,
           );
+          options.pendingMigrationConfirmation = false;
           await write(options.output, "Configuration saved.\n");
         }
       } catch (error) {

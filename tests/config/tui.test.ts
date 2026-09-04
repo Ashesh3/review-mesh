@@ -103,7 +103,7 @@ describe("config menu", () => {
       model: "gpt-test",
       effort: "high",
       applicability: { mode: "always" },
-      required_context: [],
+      required_input: [],
     });
   });
 
@@ -171,7 +171,9 @@ describe("config menu", () => {
       copilotAccount,
     });
 
-    expect((await loadManagedConfig(file)).config.agents.architecture).toEqual({
+    expect(
+      (await loadManagedConfig(file)).config.agents.architecture,
+    ).toMatchObject({
       adapter: "gateway",
       model_runs: [
         { id: "opus", model: "claude-opus-test", effort: "max" },
@@ -189,7 +191,9 @@ describe("config menu", () => {
       pass_quorum: 2,
       minimum_provider_groups: 2,
       applicability: { mode: "always" },
-      required_context: [],
+      required_input: [],
+      kind: "generic",
+      change_coverage: { proof: "observed" },
       allow_zero_outage_tolerance: true,
     });
   });
@@ -246,6 +250,8 @@ describe("config menu", () => {
         "900000",
         "n",
         "y",
+        "y",
+        "q",
         "q",
       ]),
       output: new PassThrough(),
@@ -258,7 +264,7 @@ describe("config menu", () => {
       minimum_provider_groups: 2,
       allow_zero_outage_tolerance: true,
       applicability: { mode: "always" },
-      required_context: [],
+      required_input: [],
     });
   });
 
@@ -306,7 +312,7 @@ describe("config menu", () => {
     expect(saved.config.agents.gemini?.effort).toBe("high");
     expect(saved.config.agents.gemini).toMatchObject({
       applicability: { mode: "always" },
-      required_context: [],
+      required_input: [],
     });
     expect(saved.config.adapters.gateway).toMatchObject({
       type: "openai_compatible",
@@ -331,7 +337,7 @@ describe("config menu", () => {
       schema_version: "5",
       execution: {
         max_concurrency: 1,
-        heartbeat_interval_ms: 100,
+        heartbeat_interval_ms: 1_000,
         shutdown_grace_period_ms: 100,
       },
       diagnostics: { persist_runs: true, max_runs: 2 },
@@ -396,7 +402,7 @@ describe("config menu", () => {
       '{"tier":2}',
       "s",
       "3",
-      "200",
+      "2000",
       "300",
       "n",
       "y",
@@ -436,11 +442,13 @@ describe("config menu", () => {
     ]);
     expect(saved.execution).toEqual({
       max_concurrency: 3,
-      heartbeat_interval_ms: 200,
+      heartbeat_interval_ms: 2000,
       shutdown_grace_period_ms: 300,
       distribute_primaries: false,
       allow_provider_concentration: true,
       continuation_attempts: 4,
+      deadline_mode: "adaptive",
+      no_progress_timeout_ms: 300000,
     });
     expect(saved.diagnostics).toEqual({ persist_runs: false, max_runs: 7 });
   });
@@ -450,10 +458,10 @@ describe("config menu", () => {
     roots.push(directory);
     const file = join(directory, "config.toml");
     const initial: ManagedConfig = {
-      schema_version: "6",
+      schema_version: "5",
       execution: {
         max_concurrency: 2,
-        heartbeat_interval_ms: 100,
+        heartbeat_interval_ms: 1_000,
         shutdown_grace_period_ms: 100,
       },
       diagnostics: { persist_runs: false, max_runs: 2 },
@@ -553,7 +561,7 @@ describe("config menu", () => {
       schema_version: "5",
       execution: {
         max_concurrency: 2,
-        heartbeat_interval_ms: 100,
+        heartbeat_interval_ms: 1_000,
         shutdown_grace_period_ms: 100,
       },
       diagnostics: { persist_runs: false, max_runs: 2 },
@@ -680,10 +688,10 @@ describe("config menu", () => {
       output,
     });
     expect(loaded.config).toEqual<ManagedConfig>({
-      schema_version: "6",
+      schema_version: "7",
       execution: {
         max_concurrency: 2,
-        heartbeat_interval_ms: 15000,
+        heartbeat_interval_ms: 30000,
         shutdown_grace_period_ms: 5000,
         distribute_primaries: true,
         allow_provider_concentration: false,
@@ -694,6 +702,8 @@ describe("config menu", () => {
         retry_attempts: 2,
         continuation_attempts: 2,
         retry_backoff_ms: 1000,
+        deadline_mode: "adaptive",
+        no_progress_timeout_ms: 300000,
       },
       diagnostics: { persist_runs: true, max_runs: 50 },
       adapters: {},
@@ -743,7 +753,7 @@ describe("config menu", () => {
       schema_version: "5",
       execution: {
         max_concurrency: 1,
-        heartbeat_interval_ms: 100,
+        heartbeat_interval_ms: 1_000,
         shutdown_grace_period_ms: 100,
       },
       diagnostics: { persist_runs: false, max_runs: 1 },

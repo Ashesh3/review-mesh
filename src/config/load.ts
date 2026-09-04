@@ -10,6 +10,7 @@ import {
   trustedConfigV4Schema,
   trustedConfigV5Schema,
   trustedConfigV6Schema,
+  trustedConfigV7Schema,
   type AgentProfile,
   type ProjectConfig,
   type ReviewerProfile,
@@ -276,7 +277,9 @@ async function resolveInstructionFiles(
   if (trusted.schema_version === "5") {
     return trustedConfigV5Schema.parse(resolved);
   }
-  return trustedConfigV6Schema.parse(resolved);
+  if (trusted.schema_version === "6")
+    return trustedConfigV6Schema.parse(resolved);
+  return trustedConfigV7Schema.parse(resolved);
 }
 
 export async function loadConfigFiles(
@@ -309,8 +312,9 @@ export async function loadConfigFiles(
     instructionsResolved.schema_version === "2" ||
     instructionsResolved.schema_version === "3" ||
     instructionsResolved.schema_version === "4" ||
-    instructionsResolved.schema_version === "5"
-      ? trustedConfigV6Schema.parse(
+    instructionsResolved.schema_version === "5" ||
+    instructionsResolved.schema_version === "6"
+      ? trustedConfigV7Schema.parse(
           await migrateLegacyConfig(instructionsResolved),
         )
       : instructionsResolved;

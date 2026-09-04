@@ -18,7 +18,7 @@ function config(): ManagedConfig {
     schema_version: "5",
     execution: {
       max_concurrency: 1,
-      heartbeat_interval_ms: 100,
+      heartbeat_interval_ms: 1_000,
       shutdown_grace_period_ms: 100,
     },
     diagnostics: { persist_runs: false, max_runs: 1 },
@@ -120,7 +120,7 @@ describe("config command", () => {
     expect(
       await runConfigCommand({ args: ["show"], configFile: file, ...shown }),
     ).toBe(0);
-    expect(shown.stdout()).toContain('schema_version = "6"');
+    expect(shown.stdout()).toContain('schema_version = "7"');
 
     const validated = streams();
     expect(
@@ -144,7 +144,7 @@ describe("config command", () => {
       }),
     ).toBe(0);
     expect(JSON.parse(io.stdout())).toMatchObject({
-      schema_version: "6",
+      schema_version: "7",
       agents: [{ id: "gemini", default: true }],
       projects: [],
     });
@@ -235,11 +235,11 @@ describe("config command", () => {
     const exported = JSON.parse(io.stdout());
     expect(exported).toMatchObject({
       schema_version: "1",
-      config_schema_version: "6",
+      config_schema_version: "7",
       path: file,
       exists: true,
       migrated: false,
-      config: { schema_version: "6" },
+      config: { schema_version: "7" },
     });
     expect(exported.revision).toMatch(/^[a-f0-9]{64}$/);
     expect(exported.config.agents.gemini.instructions).toBe("review");
@@ -382,7 +382,7 @@ describe("config command", () => {
       }),
     ).toBe(0);
     const saved = (await loadManagedConfig(file)).config;
-    expect(saved.schema_version).toBe("6");
+    expect(saved.schema_version).toBe("7");
     expect(saved.execution.max_concurrency).toBe(4);
   });
 
@@ -402,6 +402,23 @@ describe("config command", () => {
       }),
     ).toBe(2);
     expect(JSON.parse(stale.stderr())).toMatchObject({
+      error: "config_conflict",
+    });
+
+    const staleInvalid = streams();
+    inputJson(staleInvalid, {
+      schema_version: "1",
+      expected_revision: "0".repeat(64),
+      config: { schema_version: "invalid" },
+    });
+    expect(
+      await runConfigCommand({
+        args: ["apply", "--json"],
+        configFile: file,
+        ...staleInvalid,
+      }),
+    ).toBe(2);
+    expect(JSON.parse(staleInvalid.stderr())).toMatchObject({
       error: "config_conflict",
     });
 

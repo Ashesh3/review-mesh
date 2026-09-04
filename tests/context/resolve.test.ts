@@ -238,6 +238,80 @@ describe("resolveContext", () => {
     ).rejects.toThrow(/could not resolve requested review base missing-ref/i);
   });
 
+  it("classifies shallow and complete-history base failures with structured codes", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "review-mesh-history-"));
+    directories.push(workspace);
+    const createRunner = (shallow: boolean): GitRunner => ({
+      async run(args) {
+        if (args.includes("--is-inside-work-tree"))
+          return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args.includes("--is-shallow-repository"))
+          return { stdout: `${shallow}\n`, stderr: "", exitCode: 0 };
+        if (args.includes("--show-toplevel"))
+          return { stdout: `${workspace}\n`, stderr: "", exitCode: 0 };
+        if (args.includes("--abbrev-ref"))
+          return { stdout: "feature\n", stderr: "", exitCode: 0 };
+        if (args[0] === "rev-parse" && args[1] === "HEAD")
+          return { stdout: `${"a".repeat(40)}\n`, stderr: "", exitCode: 0 };
+        if (args.includes("--verify")) {
+          const requested = args.at(-1);
+          return requested === "HEAD^{commit}"
+            ? { stdout: `${"a".repeat(40)}\n`, stderr: "", exitCode: 0 }
+            : { stdout: "", stderr: "sensitive git details", exitCode: 1 };
+        }
+        return { stdout: "", stderr: "", exitCode: 0 };
+      },
+    });
+
+    await expect(
+      resolveContext({
+        request: request({
+          workspace,
+          review_scope: { mode: "changes", base: "missing-ref" },
+        }),
+        git: createRunner(true),
+      }),
+    ).rejects.toMatchObject({
+      code: "git_history_incomplete",
+      subtype: "base_ref_unavailable",
+      diagnostics: expect.objectContaining({ shallow: true }),
+    });
+    await expect(
+      resolveContext({
+        request: request({
+          workspace,
+          review_scope: { mode: "changes", base: "missing-ref" },
+        }),
+        git: createRunner(false),
+      }),
+    ).rejects.toMatchObject({ code: "review_base_unresolvable" });
+  });
+
+  it("preserves raw diff identity and explicit changed path kinds", async () => {
+    const repo = await createGitFixture();
+    fixtures.push(repo);
+    await repo.write("tracked.ts", "changed\n");
+    await repo.stage("tracked.ts");
+    await repo.write("untracked.ts", "new\n");
+    const context = await resolveContext({
+      request: request({ workspace: repo.path }),
+      git: createGitRunner(),
+    });
+    if (!context.git.is_repository) throw new Error("expected Git");
+    if (context.git.raw_diff === undefined)
+      throw new Error("expected raw diff");
+    expect(context.git.raw_diff.byte_count).toBe(
+      Buffer.byteLength(context.git.diff, "utf8"),
+    );
+    expect(context.git.raw_diff.sha256).toMatch(/^[a-f0-9]{64}$/u);
+    expect(context.git.changed_paths).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: "tracked.ts", kind: "tracked" }),
+        { path: "untracked.ts", kind: "untracked" },
+      ]),
+    );
+  });
+
   it("fails closed when Git cannot produce a complete change scope", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "review-mesh-scope-fail-"));
     directories.push(workspace);

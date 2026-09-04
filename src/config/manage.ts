@@ -20,12 +20,14 @@ import type {
   TrustedConfigV3,
   TrustedConfigV4,
   TrustedConfigV5,
+  TrustedConfigV6,
+  TrustedConfigV7,
 } from "./schemas.js";
 import type { JsonValue } from "../protocol/schemas.js";
 import {
   trustedConfigSchema,
   trustedConfigV4Schema,
-  trustedConfigV6Schema,
+  trustedConfigV7Schema,
   validateAdapterEffort,
 } from "./schemas.js";
 import { validateProjectKeys } from "./project-paths.js";
@@ -58,7 +60,15 @@ interface ManagedAgentBase {
         case_sensitive?: boolean | undefined;
       }
     | undefined;
+  kind?: "generic" | "change_readiness" | undefined;
+  required_input?: string[] | undefined;
   required_context?: string[] | undefined;
+  lens_deadline_ms?: number | undefined;
+  change_coverage?: {
+    relevant_paths: string[];
+    minimum_inspection: "full_file" | "diff";
+    proof: "observed" | "attested";
+  };
   pass_quorum?: number | undefined;
   minimum_provider_groups?: number | undefined;
   allow_zero_outage_tolerance?: boolean | undefined;
@@ -99,7 +109,7 @@ export interface ManagedProject {
 }
 
 export interface ManagedConfig {
-  schema_version: "5" | "6";
+  schema_version: "5" | "6" | "7";
   execution: {
     max_concurrency: number;
     heartbeat_interval_ms: number;
@@ -113,8 +123,15 @@ export interface ManagedConfig {
     retry_attempts?: number | undefined;
     continuation_attempts?: number | undefined;
     retry_backoff_ms?: number | undefined;
+    deadline_mode?: "adaptive" | "fixed" | undefined;
+    run_deadline_ms?: number | undefined;
+    no_progress_timeout_ms?: number | undefined;
   };
-  diagnostics: { persist_runs: boolean; max_runs: number };
+  diagnostics: {
+    persist_runs: boolean;
+    max_runs: number;
+    activity_detail?: "condensed" | "full" | undefined;
+  };
   adapters: Record<string, AdapterRegistration>;
   agents: Record<string, ManagedAgent>;
   defaults?: { agents: string[] } | undefined;
@@ -193,6 +210,16 @@ export interface LoadedManagedConfig {
   snapshot: ConfigSnapshot;
   sourceText?: string;
   migrated: boolean;
+  warnings: ConfigMigrationWarning[];
+}
+
+export interface ConfigMigrationWarning {
+  code:
+    | "implicit_v9_deadline"
+    | "implicit_v9_change_coverage"
+    | "attested_coverage_requires_adapter_upgrade";
+  message: string;
+  lens_ids: string[];
 }
 
 interface ReadSnapshot {
@@ -235,16 +262,16 @@ function preserveLegacyPrimaryOrder<T extends { execution: object }>(
 function requireManagedConfig(value: unknown): ManagedConfig {
   const record = asRecord(value);
   if (
-    record?.schema_version !== "6" ||
+    record?.schema_version !== "7" ||
     asRecord(record.execution) === undefined ||
     asRecord(record.diagnostics) === undefined ||
     asRecord(record.adapters) === undefined ||
     asRecord(record.agents) === undefined
   ) {
-    throw new Error("configuration is not a Review Mesh v6 configuration");
+    throw new Error("configuration is not a Review Mesh v7 configuration");
   }
   const config = clone(
-    trustedConfigV6Schema.parse(value) as unknown as ManagedConfig,
+    trustedConfigV7Schema.parse(value) as unknown as ManagedConfig,
   );
   config.execution.allow_provider_concentration ??= false;
   config.execution.continuation_attempts ??= 2;
@@ -307,7 +334,8 @@ function requireManagedConfig(value: unknown): ManagedConfig {
   return config;
 }
 
-type LegacyAgent = TrustedConfigV5["agents"][string];
+type LegacyAgent =
+  TrustedConfigV5["agents"][string] | TrustedConfigV6["agents"][string];
 
 function legacyProviderGroups(agent: LegacyAgent): string[] {
   if (!("model_runs" in agent)) {
@@ -338,27 +366,70 @@ function toleratesOneProviderOutage(
   return true;
 }
 
-function migrateLegacyAgent(agent: LegacyAgent): ManagedAgent {
+function observedAdapter(adapter: AdapterRegistration | undefined): boolean {
+  return (
+    adapter?.type === "openai_compatible" ||
+    adapter?.type === "claude" ||
+    adapter?.type === "copilot"
+  );
+}
+
+function migrateLegacyAgent(
+  agent: LegacyAgent,
+  adapters: ManagedConfig["adapters"],
+  sourceVersion: "5" | "6",
+): { agent: ManagedAgent; attested: boolean } {
   const legacyApplicability = agent.applicability;
-  const migrated = clone(agent) as unknown as ManagedAgent;
+  const migrated = clone(agent) as unknown as ManagedAgent & {
+    required_context?: string[];
+  };
   migrated.applicability =
-    legacyApplicability !== undefined
-      ? {
-          mode: "changed_paths",
-          any_changed_paths: [...legacyApplicability.any_changed_paths],
-          ...(legacyApplicability.case_sensitive === undefined
-            ? {}
-            : { case_sensitive: legacyApplicability.case_sensitive }),
-        }
-      : { mode: "always" };
-  migrated.required_context = [...(migrated.required_context ?? [])];
+    legacyApplicability === undefined
+      ? { mode: "always" }
+      : "mode" in legacyApplicability
+        ? clone(legacyApplicability)
+        : {
+            mode: "changed_paths",
+            any_changed_paths: [...legacyApplicability.any_changed_paths],
+            ...(legacyApplicability.case_sensitive === undefined
+              ? {}
+              : { case_sensitive: legacyApplicability.case_sensitive }),
+          };
+  const requiredContext = [...(migrated.required_context ?? [])];
+  delete migrated.required_context;
+  migrated.kind = "generic";
+  migrated.required_input = requiredContext.map(
+    (selector) =>
+      `/context${selector.startsWith("/") ? selector : `/${selector}`}`,
+  );
+  const relevantPaths =
+    migrated.applicability.mode === "changed_paths"
+      ? [...migrated.applicability.any_changed_paths]
+      : ["**"];
+  const adapterIds =
+    "model_runs" in migrated
+      ? migrated.model_runs.map((run) => run.adapter ?? migrated.adapter)
+      : [migrated.adapter];
+  const attested = adapterIds.some(
+    (adapterId) => !observedAdapter(adapters[adapterId]),
+  );
+  migrated.change_coverage = {
+    relevant_paths: relevantPaths,
+    minimum_inspection: "full_file",
+    proof: attested ? "attested" : "observed",
+  };
   if ("model_runs" in migrated) {
     const providerGroups = legacyProviderGroups(agent);
     const passQuorum =
-      migrated.pass_quorum ?? Math.min(2, migrated.model_runs.length);
+      migrated.pass_quorum ??
+      (sourceVersion === "6" && migrated.model_runs.length === 5
+        ? 3
+        : Math.min(2, migrated.model_runs.length));
     const minimumProviderGroups =
       migrated.minimum_provider_groups ??
-      Math.min(2, new Set(providerGroups).size);
+      (sourceVersion === "6" && migrated.model_runs.length === 5
+        ? 3
+        : Math.min(2, new Set(providerGroups).size));
     migrated.pass_quorum = passQuorum;
     migrated.minimum_provider_groups = minimumProviderGroups;
     if (
@@ -371,7 +442,7 @@ function migrateLegacyAgent(agent: LegacyAgent): ManagedAgent {
       migrated.allow_zero_outage_tolerance = true;
     }
   }
-  return migrated;
+  return { agent: migrated, attested };
 }
 
 function migrateLegacyAdapters(
@@ -439,24 +510,53 @@ function legacyNeedsProviderConcentrationAcknowledgement(
 }
 
 function migrateLegacyShape(
-  config: Omit<TrustedConfigV5, "schema_version">,
-): ManagedConfig {
+  config: Omit<TrustedConfigV5 | TrustedConfigV6, "schema_version">,
+  sourceVersion: "5" | "6" = "5",
+): { config: ManagedConfig; warnings: ConfigMigrationWarning[] } {
+  const adapters = migrateLegacyAdapters(config.adapters);
+  const migratedAgents = Object.entries(config.agents).map(
+    ([id, agent]) =>
+      [id, migrateLegacyAgent(agent, adapters, sourceVersion)] as const,
+  );
   const migrated: Omit<ManagedConfig, "schema_version"> = {
     ...clone(config),
     execution: { ...clone(config.execution) },
-    adapters: migrateLegacyAdapters(config.adapters),
+    adapters,
     agents: Object.fromEntries(
-      Object.entries(config.agents).map(([id, agent]) => [
-        id,
-        migrateLegacyAgent(agent),
-      ]),
+      migratedAgents.map(([id, migrated]) => [id, migrated.agent]),
     ),
   };
-  migrated.execution.continuation_attempts = 2;
+  migrated.execution.deadline_mode = "adaptive";
+  migrated.execution.no_progress_timeout_ms = 300_000;
+  migrated.execution.continuation_attempts ??= 2;
   if (legacyNeedsProviderConcentrationAcknowledgement(migrated)) {
     migrated.execution.allow_provider_concentration = true;
   }
-  return requireManagedConfig({ ...migrated, schema_version: "6" });
+  return {
+    config: requireManagedConfig({ ...migrated, schema_version: "7" }),
+    warnings: [
+      {
+        code: "implicit_v9_deadline",
+        message:
+          "Schema v7 derives an adaptive run deadline and five-minute no-progress timeout.",
+        lens_ids: Object.keys(migrated.agents),
+      },
+      {
+        code: "implicit_v9_change_coverage",
+        message:
+          "Schema v7 derives full-file change coverage for every migrated lens.",
+        lens_ids: Object.keys(migrated.agents),
+      },
+      ...migratedAgents
+        .filter(([, migrated]) => migrated.attested)
+        .map(([id]) => ({
+          code: "attested_coverage_requires_adapter_upgrade" as const,
+          message:
+            "One or more configured candidates cannot provide Review Mesh-mediated reads; coverage proof is attested.",
+          lens_ids: [id],
+        })),
+    ],
+  };
 }
 
 function requireAssignments(config: ManagedConfig): void {
@@ -533,7 +633,7 @@ export function migrateV1Config(value: unknown): ManagedConfig {
     agents: agents as unknown as TrustedConfigV5["agents"],
     defaults: { agents: defaults },
     projects: {},
-  });
+  }).config;
 }
 
 /** Promotes a scalar-agent v2 document to the current managed shape. */
@@ -547,7 +647,7 @@ export function migrateV2Config(value: unknown): ManagedConfig {
       clone(parsed) as TrustedConfigV2,
     ) as unknown as Omit<TrustedConfigV5, "schema_version">),
     projects: migrateLegacyProjects(parsed.projects),
-  });
+  }).config;
 }
 
 function migrateLegacyProjects(
@@ -607,7 +707,7 @@ export function migrateV3Config(value: unknown): ManagedConfig {
       clone(parsed) as TrustedConfigV3,
     ) as unknown as Omit<TrustedConfigV5, "schema_version">),
     projects: migrateLegacyProjects(parsed.projects),
-  });
+  }).config;
 }
 
 /** Migrates legacy path keys using repository identity for paths that still exist. */
@@ -623,7 +723,7 @@ export async function migrateLegacyConfig(
         clone(parsed) as TrustedConfigV2,
       ) as unknown as Omit<TrustedConfigV5, "schema_version">),
       projects: await migrateLegacyProjectsByIdentity(parsed.projects),
-    });
+    }).config;
   }
   if (parsed.schema_version === "3") {
     validateProjectKeys(parsed.projects);
@@ -632,18 +732,22 @@ export async function migrateLegacyConfig(
         clone(parsed) as TrustedConfigV3,
       ) as unknown as Omit<TrustedConfigV5, "schema_version">),
       projects: await migrateLegacyProjectsByIdentity(parsed.projects),
-    });
+    }).config;
   }
   if (parsed.schema_version === "4") {
     return migrateLegacyShape(
       preserveLegacyPrimaryOrder(
         clone(parsed) as TrustedConfigV4,
       ) as unknown as Omit<TrustedConfigV5, "schema_version">,
-    );
+    ).config;
   }
   if (parsed.schema_version === "5") {
     const { schema_version: _schemaVersion, ...legacy } = clone(parsed);
-    return migrateLegacyShape(legacy);
+    return migrateLegacyShape(legacy, "5").config;
+  }
+  if (parsed.schema_version === "6") {
+    const { schema_version: _schemaVersion, ...legacy } = clone(parsed);
+    return migrateLegacyShape(legacy, "6").config;
   }
   return requireManagedConfig(parsed);
 }
@@ -651,15 +755,16 @@ export async function migrateLegacyConfig(
 export function parseManagedConfig(text: string): {
   config: ManagedConfig;
   migrated: boolean;
+  warnings: ConfigMigrationWarning[];
 } {
   const parsed = parse(text);
   const version = asRecord(parsed)?.schema_version;
   if (version === "1")
-    return { config: migrateV1Config(parsed), migrated: true };
+    return { config: migrateV1Config(parsed), migrated: true, warnings: [] };
   if (version === "2")
-    return { config: migrateV2Config(parsed), migrated: true };
+    return { config: migrateV2Config(parsed), migrated: true, warnings: [] };
   if (version === "3")
-    return { config: migrateV3Config(parsed), migrated: true };
+    return { config: migrateV3Config(parsed), migrated: true, warnings: [] };
   if (version === "4") {
     const legacy = trustedConfigV4Schema.parse(parsed);
     return {
@@ -667,17 +772,30 @@ export function parseManagedConfig(text: string): {
         preserveLegacyPrimaryOrder(
           clone(legacy) as TrustedConfigV4,
         ) as unknown as Omit<TrustedConfigV5, "schema_version">,
-      ),
+      ).config,
       migrated: true,
+      warnings: [],
     };
   }
   if (version === "5") {
     const legacy = trustedConfigSchema.parse(parsed);
     if (legacy.schema_version !== "5") throw new Error("invalid v5 config");
     const { schema_version: _schemaVersion, ...shape } = clone(legacy);
-    return { config: migrateLegacyShape(shape), migrated: true };
+    const migrated = migrateLegacyShape(shape, "5");
+    return { ...migrated, migrated: true };
   }
-  return { config: requireManagedConfig(parsed), migrated: false };
+  if (version === "6") {
+    const legacy = trustedConfigSchema.parse(parsed);
+    if (legacy.schema_version !== "6") throw new Error("invalid v6 config");
+    const { schema_version: _schemaVersion, ...shape } = clone(legacy);
+    const migrated = migrateLegacyShape(shape, "6");
+    return { ...migrated, migrated: true };
+  }
+  return {
+    config: requireManagedConfig(parsed),
+    migrated: false,
+    warnings: [],
+  };
 }
 
 export function serializeManagedConfig(config: ManagedConfig): string {
@@ -692,31 +810,28 @@ export function serializeManagedConfig(config: ManagedConfig): string {
   return text;
 }
 
-/** Normalizes an in-memory legacy managed shape before a v6-only save. */
+/** Normalizes an in-memory managed shape before a v7-only save. */
 export function normalizeManagedConfig(config: ManagedConfig): ManagedConfig {
-  if (config.schema_version === "6") {
+  if (config.schema_version === "7") {
     const normalized = clone(config);
     normalized.execution.allow_provider_concentration ??= false;
-    for (const agent of Object.values(normalized.agents)) {
-      agent.applicability ??= { mode: "always" };
-      agent.required_context ??= [];
-    }
     return normalized;
   }
   const parsed = trustedConfigSchema.parse(config);
-  if (parsed.schema_version !== "5") {
-    throw new Error("configuration is not a Review Mesh v5 configuration");
+  if (parsed.schema_version !== "5" && parsed.schema_version !== "6") {
+    throw new Error("configuration is not a Review Mesh legacy configuration");
   }
   const { schema_version: _schemaVersion, ...legacy } = clone(parsed);
-  return migrateLegacyShape(legacy);
+  return migrateLegacyShape(legacy, parsed.schema_version === "6" ? "6" : "5")
+    .config;
 }
 
 export function emptyManagedConfig(): ManagedConfig {
   return {
-    schema_version: "6",
+    schema_version: "7",
     execution: {
       max_concurrency: 2,
-      heartbeat_interval_ms: 15_000,
+      heartbeat_interval_ms: 30_000,
       shutdown_grace_period_ms: 5_000,
       distribute_primaries: true,
       allow_provider_concentration: false,
@@ -727,6 +842,8 @@ export function emptyManagedConfig(): ManagedConfig {
       retry_attempts: 2,
       continuation_attempts: 2,
       retry_backoff_ms: 1_000,
+      deadline_mode: "adaptive",
+      no_progress_timeout_ms: 300_000,
     },
     diagnostics: { persist_runs: true, max_runs: 50 },
     adapters: {},
@@ -839,6 +956,7 @@ export async function loadManagedConfig(
       config: emptyManagedConfig(),
       snapshot: current.snapshot,
       migrated: false,
+      warnings: [],
     };
   }
   const sourceText = current.text!;
@@ -846,7 +964,11 @@ export async function loadManagedConfig(
   const version = asRecord(source)?.schema_version;
   const parsed =
     version === "2" || version === "3"
-      ? { config: await migrateLegacyConfig(source), migrated: true }
+      ? {
+          config: await migrateLegacyConfig(source),
+          migrated: true,
+          warnings: [],
+        }
       : parseManagedConfig(sourceText);
   return { ...parsed, snapshot: current.snapshot, sourceText };
 }

@@ -13,6 +13,7 @@ import {
   type TrustedConfigV4,
   type TrustedConfigV5,
   type TrustedConfigV6,
+  type TrustedConfigV7,
 } from "./schemas.js";
 import {
   DEFAULT_GATE_THRESHOLDS,
@@ -64,7 +65,8 @@ function adaptersForResolution(
     | TrustedConfigV3
     | TrustedConfigV4
     | TrustedConfigV5
-    | TrustedConfigV6,
+    | TrustedConfigV6
+    | TrustedConfigV7,
 ): TrustedConfigV2["adapters"] {
   return Object.fromEntries(
     Object.entries(config.adapters).map(([id, adapter]) => [
@@ -72,7 +74,10 @@ function adaptersForResolution(
       adapter.type === "openai_compatible" && adapter.streaming === undefined
         ? {
             ...adapter,
-            streaming: config.schema_version === "6" ? "auto" : "disabled",
+            streaming:
+              config.schema_version === "6" || config.schema_version === "7"
+                ? "auto"
+                : "disabled",
           }
         : adapter,
     ]),
@@ -148,6 +153,14 @@ function resolvedPolicy(profile: AgentProfile): ResolvedReviewer["policy"] {
           case_sensitive?: boolean;
         };
     required_context?: string[];
+    kind?: "generic" | "change_readiness";
+    required_input?: string[];
+    lens_deadline_ms?: number;
+    change_coverage?: {
+      relevant_paths: string[];
+      minimum_inspection: "full_file" | "diff";
+      proof: "observed" | "attested";
+    };
     pass_quorum?: number;
     minimum_provider_groups?: number;
     adjudication?: "off" | "required";
@@ -155,7 +168,7 @@ function resolvedPolicy(profile: AgentProfile): ResolvedReviewer["policy"] {
     gate_minimum_confidence?: "high" | "medium" | "low";
     allow_zero_outage_tolerance?: boolean;
   };
-  const isV6 =
+  const isV6OrV7 =
     candidate.applicability !== undefined && "mode" in candidate.applicability;
   if (
     !("model_runs" in profile) &&
@@ -170,10 +183,10 @@ function resolvedPolicy(profile: AgentProfile): ResolvedReviewer["policy"] {
   const passQuorum =
     candidate.pass_quorum ??
     ("model_runs" in profile
-      ? isV6 && profile.model_runs.length === 5
+      ? isV6OrV7 && profile.model_runs.length === 5
         ? 3
         : Math.min(2, profile.model_runs.length)
-      : isV6
+      : isV6OrV7
         ? 1
         : DEFAULT_PASS_QUORUM_POLICY.passQuorum);
   const distinctProviderGroups =
@@ -186,7 +199,7 @@ function resolvedPolicy(profile: AgentProfile): ResolvedReviewer["policy"] {
       : 1;
   const minimumProviderGroups =
     candidate.minimum_provider_groups ??
-    (isV6 && "model_runs" in profile && profile.model_runs.length === 5
+    (isV6OrV7 && "model_runs" in profile && profile.model_runs.length === 5
       ? 3
       : Math.min(2, distinctProviderGroups));
   const applicability =
@@ -212,6 +225,22 @@ function resolvedPolicy(profile: AgentProfile): ResolvedReviewer["policy"] {
               : { caseSensitive: candidate.applicability.case_sensitive }),
           };
   const policy: NonNullable<ResolvedReviewer["policy"]> = {
+    ...(candidate.kind === undefined ? {} : { kind: candidate.kind }),
+    ...(candidate.lens_deadline_ms === undefined
+      ? {}
+      : { lensDeadlineMs: candidate.lens_deadline_ms }),
+    ...(candidate.required_input === undefined
+      ? {}
+      : { requiredInput: [...candidate.required_input] }),
+    ...(candidate.change_coverage === undefined
+      ? {}
+      : {
+          changeCoverage: {
+            relevantPaths: [...candidate.change_coverage.relevant_paths],
+            minimumInspection: candidate.change_coverage.minimum_inspection,
+            proof: candidate.change_coverage.proof,
+          },
+        }),
     applicability,
     requiredCallerContext: [...(candidate.required_context ?? [])],
     passQuorum,
@@ -324,7 +353,12 @@ function requireUniqueResolvedIds(
 }
 
 function requireUniqueExpandedAgentIds(
-  config: TrustedConfigV3 | TrustedConfigV4 | TrustedConfigV5 | TrustedConfigV6,
+  config:
+    | TrustedConfigV3
+    | TrustedConfigV4
+    | TrustedConfigV5
+    | TrustedConfigV6
+    | TrustedConfigV7,
 ): void {
   const ids = new Set<string>();
   for (const [agentId, profile] of Object.entries(config.agents)) {
@@ -389,6 +423,8 @@ function resolveV1(
       retry_attempts: 2,
       continuation_attempts: 2,
       retry_backoff_ms: 1_000,
+      deadline_mode: "adaptive",
+      no_progress_timeout_ms: 300_000,
     },
     diagnostics: config.diagnostics,
     selection: {
@@ -406,7 +442,8 @@ function resolveV2(
     | TrustedConfigV3
     | TrustedConfigV4
     | TrustedConfigV5
-    | TrustedConfigV6,
+    | TrustedConfigV6
+    | TrustedConfigV7,
   workspace: string | undefined,
   projectName: string | undefined,
   projectNameSource: ResolveConfigInput["projectNameSource"],
@@ -415,20 +452,23 @@ function resolveV2(
     config.schema_version === "3" ||
     config.schema_version === "4" ||
     config.schema_version === "5" ||
-    config.schema_version === "6"
+    config.schema_version === "6" ||
+    config.schema_version === "7"
   ) {
     requireUniqueExpandedAgentIds(config);
   }
   const selectedByName =
     config.schema_version === "4" ||
     config.schema_version === "5" ||
-    config.schema_version === "6"
+    config.schema_version === "6" ||
+    config.schema_version === "7"
       ? selectProjectByName(config.projects, projectName)
       : undefined;
   const selectedByPath =
     config.schema_version === "4" ||
     config.schema_version === "5" ||
-    config.schema_version === "6"
+    config.schema_version === "6" ||
+    config.schema_version === "7"
       ? undefined
       : selectProject(config.projects, workspace);
   const project = (selectedByName ?? selectedByPath)?.project;
@@ -438,7 +478,9 @@ function resolveV2(
     throw new Error("no agents are configured for the requested project");
   }
   const distributePrimaries =
-    config.schema_version === "5" || config.schema_version === "6"
+    config.schema_version === "5" ||
+    config.schema_version === "6" ||
+    config.schema_version === "7"
       ? (config.execution.distribute_primaries ?? true)
       : false;
   let rotatableLensIndex = 0;
@@ -494,6 +536,18 @@ function resolveV2(
         "retry_backoff_ms" in config.execution
           ? (config.execution.retry_backoff_ms ?? 1_000)
           : 1_000,
+      deadline_mode:
+        config.schema_version === "7"
+          ? config.execution.deadline_mode
+          : "adaptive",
+      ...(config.schema_version === "7" &&
+      config.execution.run_deadline_ms !== undefined
+        ? { run_deadline_ms: config.execution.run_deadline_ms }
+        : {}),
+      no_progress_timeout_ms:
+        config.schema_version === "7"
+          ? config.execution.no_progress_timeout_ms
+          : 300_000,
     },
     diagnostics: config.diagnostics,
     selection: {

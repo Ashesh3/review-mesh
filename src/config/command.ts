@@ -11,7 +11,7 @@ import {
   serializeManagedConfig,
 } from "./manage.js";
 import { describeEffectiveConfig } from "./effective.js";
-import { configApplyRequestSchema } from "./schemas.js";
+import { configApplyEnvelopeSchema, trustedConfigSchema } from "./schemas.js";
 import { createReadlinePrompter, runConfigMenu } from "./tui.js";
 import {
   createCopilotAccountService,
@@ -470,9 +470,9 @@ export async function runConfigCommand(
         );
         return 2;
       }
-      let request: ReturnType<typeof configApplyRequestSchema.parse>;
+      let request: ReturnType<typeof configApplyEnvelopeSchema.parse>;
       try {
-        request = configApplyRequestSchema.parse(JSON.parse(text));
+        request = configApplyEnvelopeSchema.parse(JSON.parse(text));
       } catch {
         await diagnostic(
           options.error,
@@ -498,10 +498,37 @@ export async function runConfigCommand(
         );
         return 2;
       }
+      let strictConfig;
+      try {
+        strictConfig = trustedConfigSchema.parse(request.config);
+      } catch {
+        await diagnostic(
+          options.error,
+          "invalid_request",
+          "Stdin must contain one strict Review Mesh configuration apply request.",
+        );
+        return 2;
+      }
       const desired =
-        request.config.schema_version === "6"
-          ? request.config
-          : await migrateLegacyConfig(request.config);
+        strictConfig.schema_version === "7"
+          ? strictConfig
+          : await migrateLegacyConfig(strictConfig);
+      const attestedLensIds = Object.entries(desired.agents)
+        .filter(([, agent]) => agent.change_coverage?.proof === "attested")
+        .map(([id]) => id);
+      if (
+        strictConfig.schema_version !== "7" &&
+        attestedLensIds.length > 0 &&
+        request.confirm_attested_coverage !== true
+      ) {
+        await diagnostic(
+          options.error,
+          "attested_coverage_confirmation_required",
+          "Applying this migration requires confirmation of derived attested coverage.",
+          { lens_ids: attestedLensIds },
+        );
+        return 2;
+      }
       const desiredText = serializeManagedConfig(desired);
       if (
         !loaded.migrated &&
@@ -652,6 +679,7 @@ export async function runConfigCommand(
     await runConfigMenu({
       configFile,
       config: loaded.config,
+      pendingMigrationConfirmation: loaded.migrated,
       snapshot: loaded.snapshot,
       prompt: createReadlinePrompter(options.input, options.output),
       output: options.output,

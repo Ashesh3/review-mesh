@@ -148,8 +148,8 @@ export async function describeTool(options: DescribeToolOptions = {}) {
         "Configuration and workspace selection are valid; adapters, credentials, models, and isolation are probed when review starts.",
     },
     protocol: {
-      version: "5" as const,
-      request_version: "2" as const,
+      version: "6" as const,
+      request_version: "3" as const,
       consistency_mode: "live_worktree" as const,
       maximum_request_bytes: 8 * 1024 * 1024,
       outcomes: ["gate_outcome", "coverage_outcome"] as const,
@@ -187,6 +187,14 @@ export async function describeTool(options: DescribeToolOptions = {}) {
             : undefined,
         },
       },
+      deadlines: configuration.valid
+        ? {
+            mode: configuration.execution.deadline_mode,
+            run_deadline_ms: configuration.execution.run_deadline_ms,
+            no_progress_timeout_ms:
+              configuration.execution.no_progress_timeout_ms,
+          }
+        : undefined,
       provider_transport: {
         openai_compatible_streaming_modes: [
           "auto",

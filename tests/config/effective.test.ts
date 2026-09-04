@@ -134,7 +134,7 @@ describe("effective configuration description", () => {
     });
     expect(effective).toMatchObject({
       valid: true,
-      config_schema_version: "6",
+      config_schema_version: "7",
       execution: { allow_provider_concentration: false },
       reviewers: [
         {
@@ -231,7 +231,7 @@ describe("effective configuration description", () => {
     expect(result.warnings).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          code: "zero_outage_tolerance_quorum",
+          code: "zero_outage_tolerance",
           lens_ids: ["reviewer"],
         }),
       ]),

@@ -156,3 +156,73 @@ describe("trusted configuration schema v6", () => {
     expect(trustedConfigSchema.safeParse(scalar).success).toBe(false);
   });
 });
+
+describe("trusted configuration schema v7", () => {
+  function v7Config() {
+    const legacy = v6Config();
+    const profile = fiveModelProfile();
+    delete profile.required_context;
+    return {
+      ...legacy,
+      schema_version: "7" as const,
+      execution: {
+        ...legacy.execution,
+        heartbeat_interval_ms: 30_000,
+        deadline_mode: "adaptive" as const,
+        no_progress_timeout_ms: 300_000,
+      },
+      agents: {
+        readiness: {
+          ...profile,
+          kind: "change_readiness" as const,
+          applicability: { mode: "always" as const },
+          required_input: [
+            "/request/pull_request/id",
+            "/request/pull_request/url",
+            "/request/pull_request/title",
+            "/request/pull_request/description",
+            "/request/pull_request/work_items",
+            "/request/pull_request/validation",
+            "/request/pull_request/contract_impact",
+          ],
+          lens_deadline_ms: 900_000,
+          change_coverage: {
+            relevant_paths: ["src/**"],
+            minimum_inspection: "full_file" as const,
+            proof: "observed" as const,
+          },
+        },
+      },
+      defaults: { agents: ["readiness"] },
+    };
+  }
+
+  it("accepts fixed and adaptive deadline policy within exact bounds", () => {
+    expect(trustedConfigSchema.safeParse(v7Config()).success).toBe(true);
+    const fixed: any = v7Config();
+    fixed.execution.deadline_mode = "fixed";
+    Object.assign(fixed.execution, { run_deadline_ms: 14_400_000 });
+    expect(trustedConfigSchema.safeParse(fixed).success).toBe(true);
+    Object.assign(fixed.execution, { run_deadline_ms: 59_999 });
+    expect(trustedConfigSchema.safeParse(fixed).success).toBe(false);
+  });
+
+  it("requires every standard readiness selector", () => {
+    const incomplete = v7Config();
+    incomplete.agents.readiness.required_input.pop();
+    expect(trustedConfigSchema.safeParse(incomplete).success).toBe(false);
+  });
+
+  it("rejects explicit observed proof when any candidate adapter is opaque", () => {
+    const config: any = v7Config();
+    config.adapters.opaque = {
+      type: "command",
+      command: "reviewer",
+      protocol: "review-mesh-command-v1",
+    };
+    config.agents.readiness.model_runs[4]!.adapter = "opaque";
+    expect(trustedConfigSchema.safeParse(config).success).toBe(false);
+    config.agents.readiness.change_coverage.proof = "attested";
+    expect(trustedConfigSchema.safeParse(config).success).toBe(true);
+  });
+});
