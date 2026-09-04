@@ -124,11 +124,14 @@ describe("v6 public writer", () => {
       const finalizing = new Promise<void>((resolve) => {
         releaseFinalize = resolve;
       });
+      const recorded: string[] = [];
       const writer = createV9EventWriter({
         output,
         runId: "run-1",
         now: () => new Date(Date.now()),
-        recordEvent: async () => undefined,
+        recordEvent: async (event) => {
+          recorded.push(event.event);
+        },
         finalize: async () => {
           await finalizing;
           return {
@@ -165,6 +168,18 @@ describe("v6 public writer", () => {
       ).resolves.toBeUndefined();
       expect(text).toContain("suite.heartbeat");
       expect(text).not.toContain("run.completed");
+      expect(recorded).toEqual([]);
+      await expect(
+        writer.emit({
+          event: "reviewer.progress",
+          reviewer_id: "reviewer-1",
+          data: {
+            lens_id: "lens-1",
+            mode: "full_review",
+            phase: "finalizing",
+          },
+        }),
+      ).rejects.toThrow(/Only suite heartbeat/);
 
       releaseFinalize();
       await finish;

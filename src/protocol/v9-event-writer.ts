@@ -119,11 +119,21 @@ export function createV9EventWriter(options: V9EventWriterOptions) {
         return Promise.reject(
           new Error("No public event is allowed after the terminal event."),
         );
+      if (finalizing && draft.event !== "suite.heartbeat")
+        return Promise.reject(
+          new Error(
+            "Only suite heartbeat events are allowed during finalization.",
+          ),
+        );
+      const publicOnlyHeartbeat = finalizing;
       return enqueue(async () => {
         const event = materialize(draft);
         if (event.event === "run.completed")
           throw new Error("Use finish for the terminal event.");
-        await options.recordEvent(event);
+        // The artifact is already sealed once finalization begins. Continued
+        // suite liveness is public-only and must never append after the private
+        // terminal summary or participate in the artifact digest.
+        if (!publicOnlyHeartbeat) await options.recordEvent(event);
         await write(event);
       });
     },

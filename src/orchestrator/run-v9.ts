@@ -139,7 +139,11 @@ export async function runV9Review(input: V9RunInput) {
   });
   const heartbeatBudget = createHeartbeatBudget({ intervalMs: interval });
   const controller = new AbortController();
-  const onCallerAbort = () => controller.abort(input.signal.reason);
+  let callerCancelled = input.signal.aborted;
+  const onCallerAbort = () => {
+    callerCancelled = true;
+    controller.abort(input.signal.reason);
+  };
   if (input.signal.aborted) controller.abort(input.signal.reason);
   else input.signal.addEventListener("abort", onCallerAbort, { once: true });
   const timeout = setTimeout(
@@ -797,12 +801,7 @@ export async function runV9Review(input: V9RunInput) {
               );
               const evidence =
                 evidencePaths.length > 0 &&
-                evidencePaths.every((path) =>
-                  entries.some(
-                    (entry) =>
-                      entry.path === path && entry.disposition === "satisfied",
-                  ),
-                );
+                evidencePaths.every((path) => job.ledger!.observedFile(path));
               const related =
                 input.context.review_scope.mode === "full" ||
                 evidencePaths.some((path) =>
@@ -813,6 +812,10 @@ export async function runV9Review(input: V9RunInput) {
               proofBySourceRef[finding.source_ref] = {
                 evidence_verified: evidence,
                 source_coverage_verified: evidence,
+                change_impact_required:
+                  input.context.review_scope.mode === "changes",
+                change_impact_verified:
+                  input.context.review_scope.mode === "full" || related,
                 out_of_scope: !related,
                 adjudication_required:
                   reviewer.policy?.adjudication === "required",
@@ -1312,7 +1315,8 @@ export async function runV9Review(input: V9RunInput) {
             ? ("complete" as const)
             : ("not_applicable" as const);
     const outcome = runOutcome({
-      cancelled: input.signal.aborted,
+      cancelled:
+        callerCancelled || jobs.some((job) => job.reason === "cancelled"),
       coverage,
       gateFindings: canonical.counts.gate_eligible_subfindings,
     });
@@ -1333,7 +1337,9 @@ export async function runV9Review(input: V9RunInput) {
       advisory: _advisory,
       ...counts
     } = canonical.counts;
-    const exitCode = input.signal.aborted
+    const cancelled =
+      callerCancelled || jobs.some((job) => job.reason === "cancelled");
+    const exitCode = cancelled
       ? 4
       : executionPartial
         ? 3
