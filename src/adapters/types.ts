@@ -7,6 +7,8 @@ import type {
   IsolationLevel,
   IsolationPolicy,
   ReviewerOutput,
+  ProviderReviewerResultV4,
+  AdjudicationResultV2,
 } from "../protocol/schemas.js";
 import type { ReviewerPromptBundle } from "../protocol/prompt.js";
 import type { ChangeCoverageLedger } from "../context/change-coverage.js";
@@ -55,7 +57,7 @@ export type AdapterEvent =
   | { type: "activity"; message: string; identity?: string; byteCount?: number }
   | {
       type: "result";
-      result: ReviewerOutput;
+      result: ReviewerOutput | ProviderReviewerResultV4 | AdjudicationResultV2;
       isolation: IsolationLevel;
       /** Adapter-owned exact-result storage lifecycle. */
       resultStorage?: {
