@@ -1,5 +1,13 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -45,6 +53,106 @@ const complete = {
 };
 
 describe("immutable artifact format two", () => {
+  it("rejects redirected ancestors for creation and replay", async () => {
+    const { root } = await fixture();
+    const outside = join(root, "outside");
+    const redirected = join(root, "redirected");
+    await mkdir(outside);
+    await symlink(
+      outside,
+      redirected,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    await expect(
+      createRunArtifact({
+        path: join(redirected, "run.jsonl"),
+        runId: "run-1",
+        toolVersion: "9.0.0",
+      }),
+    ).rejects.toMatchObject({ code: "artifact_identity_changed" });
+
+    const writer = await createRunArtifact({
+      path: join(outside, "existing.jsonl"),
+      runId: "run-1",
+      toolVersion: "9.0.0",
+    });
+    await writer.finalize({
+      ...complete,
+      result_delivery: { ...complete.result_delivery, completed_results: 0 },
+    });
+    await expect(
+      readRunArtifact(join(redirected, "existing.jsonl")),
+    ).rejects.toMatchObject({ code: "artifact_identity_changed" });
+  });
+
+  it("rejects parent replacement during finalization", async () => {
+    const { root } = await fixture();
+    const parent = join(root, "artifact-parent");
+    await mkdir(parent);
+    const writer = await createRunArtifact({
+      path: join(parent, "run.jsonl"),
+      runId: "run-1",
+      toolVersion: "9.0.0",
+      beforeFinalVerify: async () => {
+        await rename(parent, join(root, "artifact-parent-old"));
+        await mkdir(parent);
+      },
+    });
+    await expect(
+      writer.finalize({
+        ...complete,
+        result_delivery: {
+          ...complete.result_delivery,
+          completed_results: 0,
+        },
+      }),
+    ).rejects.toMatchObject({ code: "artifact_identity_changed" });
+  });
+
+  it("does not return a stale reference when the open file is modified during finalization", async () => {
+    const { path } = await fixture();
+    const writer = await createRunArtifact({
+      path,
+      runId: "run-1",
+      toolVersion: "9.0.0",
+      beforeFinalVerify: () => writeFile(path, "foreign bytes\n"),
+    });
+    await expect(
+      writer.finalize({
+        ...complete,
+        result_delivery: {
+          ...complete.result_delivery,
+          completed_results: 0,
+        },
+      }),
+    ).rejects.toMatchObject({ code: "artifact_digest_mismatch" });
+  });
+
+  it("rejects parent replacement before completing replay", async () => {
+    const { root } = await fixture();
+    const parent = join(root, "read-parent");
+    const path = join(parent, "run.jsonl");
+    await mkdir(parent);
+    const writer = await createRunArtifact({
+      path,
+      runId: "run-1",
+      toolVersion: "9.0.0",
+    });
+    const reference = await writer.finalize({
+      ...complete,
+      result_delivery: { ...complete.result_delivery, completed_results: 0 },
+    });
+    await expect(
+      readRunArtifact(path, {
+        expectedSha256: reference.sha256,
+        beforeFinalVerify: async () => {
+          await rename(parent, join(root, "read-parent-old"));
+          await mkdir(parent);
+        },
+      }),
+    ).rejects.toMatchObject({ code: "artifact_identity_changed" });
+  });
+
   it("finalizes private summary and content digest without mirroring the public terminal", async () => {
     const { path } = await fixture();
     const writer = await createRunArtifact({
@@ -178,6 +286,86 @@ describe("immutable artifact format two", () => {
     await writeFile(path, prefix + JSON.stringify(records.at(-1)) + "\n");
     await expect(readRunArtifact(path)).rejects.toMatchObject({
       code: "unsupported_schema_version",
+    });
+  });
+
+  it("classifies future header manifests and malformed known records", async () => {
+    const { path } = await fixture();
+    const writer = await createRunArtifact({
+      path,
+      runId: "run-1",
+      toolVersion: "9.0.0",
+    });
+    await writer.record({ record: "context", context: {} });
+    await writer.finalize({
+      ...complete,
+      result_delivery: { ...complete.result_delivery, completed_results: 0 },
+    });
+    const original = await readFile(path, "utf8");
+    await writeFile(path, original.replace('"request":"3"', '"request":"999"'));
+    await expect(readRunArtifact(path)).rejects.toMatchObject({
+      code: "unsupported_schema_version",
+    });
+
+    await writeFile(
+      path,
+      original.replace('"context":{}', '"context":"invalid"'),
+    );
+    await expect(readRunArtifact(path)).rejects.toMatchObject({
+      code: "invalid_artifact_record",
+    });
+  });
+
+  it("rejects aggregate orphan narrative chunks before consuming a later record", async () => {
+    const { path } = await fixture();
+    const versions = {
+      resolution: "1",
+      request: "3",
+      context: "1",
+      "reviewer.attempt": "1",
+      "reviewer.activity": "1",
+      "reviewer.activity_summary": "1",
+      "reviewer.coverage": "1",
+      "reviewer.result_page": "1",
+      "reviewer.narrative": "1",
+      "reviewer.result": "1",
+      "reviewer.terminal": "1",
+      "run.terminal_summary": "1",
+      "run.artifact_terminal": "1",
+    };
+    const chunk = "x".repeat(24 * 1024);
+    const chunkHash = createHash("sha256").update(chunk).digest("hex");
+    const lines = [
+      JSON.stringify({
+        record: "run.artifact",
+        artifact_format_version: "2",
+        tool_version: "9.0.0",
+        run_id: "run-1",
+        created_at: "2026-09-05T00:00:00.000Z",
+        private_record_versions: versions,
+      }),
+    ];
+    for (
+      let index = 0;
+      index <= Math.floor((16 * 1024 * 1024) / chunk.length);
+      index++
+    )
+      lines.push(
+        JSON.stringify({
+          record: "reviewer.narrative",
+          schema_version: "1",
+          run_id: "run-1",
+          reviewer_id: index % 2 === 0 ? "reviewer-1" : "reviewer-2",
+          index: Math.floor(index / 2),
+          text: chunk,
+          sha256: chunkHash,
+        }),
+      );
+    lines.push("this is deliberately not JSON");
+    await writeFile(path, lines.join("\n") + "\n");
+    await expect(readRunArtifact(path)).rejects.toMatchObject({
+      code: "invalid_artifact_record",
+      message: expect.stringMatching(/narrative.*limit/i),
     });
   });
 

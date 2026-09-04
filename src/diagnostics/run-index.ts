@@ -27,6 +27,10 @@ const identitySchema = z.strictObject({
   dev: z.string().regex(/^\d+$/u),
   ino: z.string().regex(/^\d+$/u),
 });
+export type ArtifactIdentity = z.infer<typeof identitySchema>;
+export interface ArtifactParentIdentity extends ArtifactIdentity {
+  path: string;
+}
 const indexSchema = z.strictObject({
   schema_version: z.literal("1"),
   kind: z.literal("review-mesh.run-index"),
@@ -46,6 +50,7 @@ export class RunArtifactError extends Error {
       | "artifact_unavailable"
       | "artifact_identity_changed"
       | "artifact_digest_mismatch"
+      | "invalid_artifact_record"
       | "invalid_run_index"
       | "unsupported_schema_version"
       | "index_conflict",
@@ -62,20 +67,23 @@ function runId(value: string): void {
     throw new RunArtifactError("invalid_run_id", "The run ID is invalid.");
 }
 
-function identity(metadata: { dev: bigint; ino: bigint }) {
+export function artifactIdentity(metadata: {
+  dev: bigint;
+  ino: bigint;
+}): ArtifactIdentity {
   return { dev: String(metadata.dev), ino: String(metadata.ino) };
 }
 
-function sameIdentity(
-  a: { dev: string; ino: string },
-  b: { dev: string; ino: string },
+export function sameArtifactIdentity(
+  a: ArtifactIdentity,
+  b: ArtifactIdentity,
 ): boolean {
   return a.dev === b.dev && a.ino === b.ino;
 }
 
-async function safeParent(
+export async function safeArtifactParent(
   path: string,
-): Promise<{ path: string; dev: string; ino: string }> {
+): Promise<ArtifactParentIdentity> {
   const parent = resolve(dirname(path));
   for (let ancestor = parent; ; ancestor = dirname(ancestor)) {
     const metadata = await lstat(ancestor, { bigint: true });
@@ -92,18 +100,27 @@ async function safeParent(
   if (
     !metadata.isDirectory() ||
     metadata.isSymbolicLink() ||
-    !sameIdentity(identity(metadata), identity(canonicalMetadata))
+    !sameArtifactIdentity(
+      artifactIdentity(metadata),
+      artifactIdentity(canonicalMetadata),
+    )
   )
     throw new RunArtifactError(
       "artifact_identity_changed",
       "The artifact directory identity is unsafe.",
     );
-  return { path: canonical, ...identity(metadata) };
+  return { path: canonical, ...artifactIdentity(metadata) };
 }
 
-async function verifiedFile(
+export async function verifyArtifactFile(
   path: string,
-  expected?: IndexDocument["identity"],
+  expectedIdentity?: ArtifactIdentity,
+  expectedParent?: ArtifactParentIdentity,
+  expectedMetadata?: {
+    size: bigint;
+    mtimeNs: bigint;
+    ctimeNs: bigint;
+  },
 ) {
   if (!isAbsolute(path))
     throw new RunArtifactError(
@@ -112,21 +129,36 @@ async function verifiedFile(
     );
   let handle: FileHandle | undefined;
   try {
-    const parent = await safeParent(path);
+    const parent = await safeArtifactParent(path);
+    if (
+      expectedParent !== undefined &&
+      (parent.path !== expectedParent.path ||
+        !sameArtifactIdentity(parent, expectedParent))
+    )
+      throw new RunArtifactError(
+        "artifact_identity_changed",
+        "The artifact directory identity changed.",
+      );
     const before = await lstat(path, { bigint: true });
     if (!before.isFile() || before.isSymbolicLink())
       throw new RunArtifactError(
         "artifact_identity_changed",
         "The artifact is no longer a regular file.",
       );
-    if (expected !== undefined && !sameIdentity(identity(before), expected))
+    if (
+      expectedIdentity !== undefined &&
+      !sameArtifactIdentity(artifactIdentity(before), expectedIdentity)
+    )
       throw new RunArtifactError(
         "artifact_identity_changed",
         "The artifact file identity changed.",
       );
     handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     const opened = await handle.stat({ bigint: true });
-    if (!opened.isFile() || !sameIdentity(identity(opened), identity(before)))
+    if (
+      !opened.isFile() ||
+      !sameArtifactIdentity(artifactIdentity(opened), artifactIdentity(before))
+    )
       throw new RunArtifactError(
         "artifact_identity_changed",
         "The artifact changed while opening.",
@@ -147,12 +179,18 @@ async function verifiedFile(
     }
     const after = await handle.stat({ bigint: true });
     const current = await lstat(path, { bigint: true });
-    const afterParent = await safeParent(path);
+    const afterParent = await safeArtifactParent(path);
     if (
-      !sameIdentity(identity(current), identity(opened)) ||
+      !sameArtifactIdentity(
+        artifactIdentity(current),
+        artifactIdentity(opened),
+      ) ||
       current.isSymbolicLink() ||
       afterParent.path !== parent.path ||
-      !sameIdentity(afterParent, parent)
+      !sameArtifactIdentity(afterParent, parent) ||
+      (expectedParent !== undefined &&
+        (afterParent.path !== expectedParent.path ||
+          !sameArtifactIdentity(afterParent, expectedParent)))
     )
       throw new RunArtifactError(
         "artifact_identity_changed",
@@ -161,7 +199,14 @@ async function verifiedFile(
     if (
       after.size !== opened.size ||
       after.mtimeNs !== opened.mtimeNs ||
-      after.ctimeNs !== opened.ctimeNs
+      after.ctimeNs !== opened.ctimeNs ||
+      current.size !== opened.size ||
+      current.mtimeNs !== opened.mtimeNs ||
+      current.ctimeNs !== opened.ctimeNs ||
+      (expectedMetadata !== undefined &&
+        (opened.size !== expectedMetadata.size ||
+          opened.mtimeNs !== expectedMetadata.mtimeNs ||
+          opened.ctimeNs !== expectedMetadata.ctimeNs))
     )
       throw new RunArtifactError(
         "artifact_digest_mismatch",
@@ -170,7 +215,7 @@ async function verifiedFile(
     return {
       sha256: hash.digest("hex"),
       byte_count: position,
-      identity: identity(opened),
+      identity: artifactIdentity(opened),
     };
   } catch (error) {
     if (error instanceof RunArtifactError) throw error;
@@ -195,7 +240,7 @@ async function readIndex(
 ): Promise<IndexDocument | undefined> {
   let handle: FileHandle | undefined;
   try {
-    await safeParent(path);
+    await safeArtifactParent(path);
     const before = await lstat(path, { bigint: true });
     if (!before.isFile() || before.isSymbolicLink() || before.size > 32_768n)
       throw new RunArtifactError(
@@ -204,7 +249,9 @@ async function readIndex(
       );
     handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     const opened = await handle.stat({ bigint: true });
-    if (!sameIdentity(identity(before), identity(opened)))
+    if (
+      !sameArtifactIdentity(artifactIdentity(before), artifactIdentity(opened))
+    )
       throw new RunArtifactError(
         "invalid_run_index",
         "The run index changed while opening.",
@@ -234,7 +281,10 @@ async function readIndex(
     const after = await handle.stat({ bigint: true });
     const current = await lstat(path, { bigint: true });
     if (
-      !sameIdentity(identity(opened), identity(current)) ||
+      !sameArtifactIdentity(
+        artifactIdentity(opened),
+        artifactIdentity(current),
+      ) ||
       after.mtimeNs !== opened.mtimeNs ||
       after.size !== opened.size
     )
@@ -284,7 +334,7 @@ async function writeIndex(
   exclusive: boolean,
 ): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
-  const parent = await safeParent(path);
+  const parent = await safeArtifactParent(path);
   const target = exclusive ? path : `${path}.${randomUUID()}.tmp`;
   const handle = await open(
     target,
@@ -306,8 +356,11 @@ async function writeIndex(
       "utf8",
     );
     await handle.sync();
-    const afterParent = await safeParent(path);
-    if (afterParent.path !== parent.path || !sameIdentity(afterParent, parent))
+    const afterParent = await safeArtifactParent(path);
+    if (
+      afterParent.path !== parent.path ||
+      !sameArtifactIdentity(afterParent, parent)
+    )
       throw new RunArtifactError(
         "invalid_run_index",
         "The run index directory changed.",
@@ -335,7 +388,7 @@ export async function indexRunArtifact(input: {
     ...input.artifact,
     path: resolve(input.artifact.path),
   });
-  const verified = await verifiedFile(reference.path);
+  const verified = await verifyArtifactFile(reference.path);
   if (
     reference.sha256 !== verified.sha256 ||
     reference.byte_count !== verified.byte_count
@@ -363,12 +416,13 @@ export async function resolveRunArtifact(
 ): Promise<{
   artifact: ArtifactReference;
   observed_public_stream?: PublicStreamOutcome;
+  expected_identity: ArtifactIdentity;
   digest_status: "verified" | "final_digest_unavailable";
 }> {
   const index = await readIndex(indexPath(options.runsDirectory, id), id);
   if (index === undefined) {
     const path = join(resolve(options.runsDirectory), `${id}.jsonl`);
-    const verified = await verifiedFile(path);
+    const verified = await verifyArtifactFile(path);
     return {
       artifact: {
         path,
@@ -376,10 +430,14 @@ export async function resolveRunArtifact(
         byte_count: verified.byte_count,
         completed_results: 0,
       },
+      expected_identity: verified.identity,
       digest_status: "final_digest_unavailable",
     };
   }
-  const verified = await verifiedFile(index.artifact.path, index.identity);
+  const verified = await verifyArtifactFile(
+    index.artifact.path,
+    index.identity,
+  );
   if (
     verified.sha256 !== index.artifact.sha256 ||
     verified.byte_count !== index.artifact.byte_count
@@ -390,6 +448,7 @@ export async function resolveRunArtifact(
     );
   return {
     artifact: index.artifact,
+    expected_identity: index.identity,
     ...(index.observed_public_stream === undefined
       ? {}
       : { observed_public_stream: index.observed_public_stream }),

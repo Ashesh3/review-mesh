@@ -1,12 +1,6 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import {
-  lstat,
-  mkdir,
-  open,
-  realpath,
-  type FileHandle,
-} from "node:fs/promises";
+import { lstat, mkdir, open, type FileHandle } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { z } from "zod";
 import {
@@ -18,7 +12,15 @@ import {
 } from "../protocol/v9.js";
 import { reviewerResultDigest } from "../results/digest.js";
 import { MAX_REVIEWER_RESULT_BYTES } from "../results/sanitize.js";
-import { RunArtifactError, type ArtifactReference } from "./run-index.js";
+import {
+  artifactIdentity,
+  RunArtifactError,
+  safeArtifactParent,
+  sameArtifactIdentity,
+  verifyArtifactFile,
+  type ArtifactIdentity,
+  type ArtifactReference,
+} from "./run-index.js";
 
 const CURRENT_RESULT = z.union([
   reviewerResultV4Schema,
@@ -28,6 +30,10 @@ type CurrentResult = ReviewerResultV4 | AdjudicationResultV2;
 const id = z.string().min(1).max(128);
 const hash = z.string().regex(/^[a-f0-9]{64}$/u);
 const count = z.number().int().nonnegative();
+const NARRATIVE_CHUNK_BYTES = 24 * 1024;
+const MAX_NARRATIVE_CHUNKS = Math.ceil(
+  MAX_REVIEWER_RESULT_BYTES / NARRATIVE_CHUNK_BYTES,
+);
 const PRIVATE_VERSIONS = {
   resolution: "1",
   request: "3",
@@ -81,7 +87,9 @@ const narrativeSchema = z.strictObject({
   index: count,
   text: z
     .string()
-    .refine((value) => Buffer.byteLength(value, "utf8") <= 24 * 1024),
+    .refine(
+      (value) => Buffer.byteLength(value, "utf8") <= NARRATIVE_CHUNK_BYTES,
+    ),
   sha256: hash,
 });
 const resultSchema = z.strictObject({
@@ -137,7 +145,37 @@ function digest(value: Uint8Array | string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 function fail(message: string): never {
-  throw new RunArtifactError("invalid_run_index", message);
+  throw new RunArtifactError("invalid_artifact_record", message);
+}
+function identityFail(message: string): never {
+  throw new RunArtifactError("artifact_identity_changed", message);
+}
+function parseRecord<T>(schema: z.ZodType<T>, value: unknown): T {
+  const parsed = schema.safeParse(value);
+  if (!parsed.success)
+    throw new RunArtifactError(
+      "invalid_artifact_record",
+      "Artifact record does not match its declared schema.",
+      { cause: parsed.error },
+    );
+  return parsed.data;
+}
+function validateHeaderManifest(record: Record<string, unknown>): void {
+  const manifest = record.private_record_versions;
+  if (
+    typeof manifest !== "object" ||
+    manifest === null ||
+    Array.isArray(manifest)
+  )
+    fail("Artifact header manifest is invalid.");
+  for (const [kind, expected] of Object.entries(PRIVATE_VERSIONS)) {
+    const declared = (manifest as Record<string, unknown>)[kind];
+    if (typeof declared === "string" && declared !== expected)
+      throw new RunArtifactError(
+        "unsupported_schema_version",
+        `Private artifact record ${kind} schema version is unsupported.`,
+      );
+  }
 }
 function validateTerminalSummary(
   summary: Record<string, unknown>,
@@ -166,7 +204,7 @@ function chunks(text: string): string[] {
   const bytes = Buffer.from(text, "utf8");
   const result: string[] = [];
   for (let offset = 0; offset < bytes.length;) {
-    let end = Math.min(offset + 24 * 1024, bytes.length);
+    let end = Math.min(offset + NARRATIVE_CHUNK_BYTES, bytes.length);
     while (end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end--;
     result.push(bytes.subarray(offset, end).toString("utf8"));
     offset = end;
@@ -179,13 +217,11 @@ export async function createRunArtifact(options: {
   runId: string;
   toolVersion: string;
   createdAt?: string;
+  beforeFinalVerify?: () => void | Promise<void>;
 }) {
   const path = resolve(options.path);
   await mkdir(dirname(path), { recursive: true });
-  const parent = await realpath(dirname(path));
-  const parentBefore = await lstat(parent, { bigint: true });
-  if (parentBefore.isSymbolicLink() || !parentBefore.isDirectory())
-    fail("Artifact directory is unsafe.");
+  const parent = await safeArtifactParent(path);
   const handle = await open(
     path,
     constants.O_WRONLY |
@@ -333,25 +369,30 @@ export async function createRunArtifact(options: {
         });
         await append(terminal);
         await handle.sync();
-        const current = await lstat(path, { bigint: true });
-        const parentAfter = await lstat(parent, { bigint: true });
-        if (
-          !current.isFile() ||
-          current.isSymbolicLink() ||
-          current.dev !== opened.dev ||
-          current.ino !== opened.ino ||
-          parentAfter.dev !== parentBefore.dev ||
-          parentAfter.ino !== parentBefore.ino
-        )
-          fail("Artifact identity changed during finalization.");
+        const completedResults = resultIds.size;
+        const expectedMetadata = await handle.stat({ bigint: true });
+        await handle.close();
+        await options.beforeFinalVerify?.();
+        const verified = await verifyArtifactFile(
+          path,
+          artifactIdentity(opened),
+          parent,
+          expectedMetadata,
+        );
+        const attemptedHash = contentHash.digest("hex");
+        if (verified.sha256 !== attemptedHash || verified.byte_count !== bytes)
+          throw new RunArtifactError(
+            "artifact_digest_mismatch",
+            "Final artifact bytes do not match the serialized records.",
+          );
         return {
           path,
-          sha256: contentHash.digest("hex"),
-          byte_count: bytes,
-          completed_results: resultIds.size,
+          sha256: verified.sha256,
+          byte_count: verified.byte_count,
+          completed_results: completedResults,
         };
       } finally {
-        await handle.close();
+        await handle.close().catch(() => undefined);
       }
     },
     async close(): Promise<void> {
@@ -380,17 +421,32 @@ export interface ArtifactReadResult {
 
 export async function readRunArtifact(
   path: string,
-  options: { expectedSha256?: string } = {},
+  options: {
+    expectedSha256?: string;
+    expectedIdentity?: ArtifactIdentity;
+    beforeFinalVerify?: () => void | Promise<void>;
+  } = {},
 ): Promise<ArtifactReadResult> {
   let handle: FileHandle | undefined;
   try {
+    const parent = await safeArtifactParent(path);
     const before = await lstat(path, { bigint: true });
     if (!before.isFile() || before.isSymbolicLink())
-      fail("Artifact is not a regular file.");
+      identityFail("Artifact is not a regular file.");
     handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     const opened = await handle.stat({ bigint: true });
-    if (before.dev !== opened.dev || before.ino !== opened.ino)
-      fail("Artifact identity changed while opening.");
+    if (
+      !sameArtifactIdentity(
+        artifactIdentity(before),
+        artifactIdentity(opened),
+      ) ||
+      (options.expectedIdentity !== undefined &&
+        !sameArtifactIdentity(
+          artifactIdentity(opened),
+          options.expectedIdentity,
+        ))
+    )
+      identityFail("Artifact identity changed while opening.");
     const hashAll = createHash("sha256");
     const hashContent = createHash("sha256");
     let byteCount = 0,
@@ -402,14 +458,31 @@ export async function readRunArtifact(
     let terminalSeen = false;
     const records: Record<string, unknown>[] = [];
     const results: ArtifactReadResult["results"] = [];
-    const narratives = new Map<string, string[]>();
+    const narratives = new Map<
+      string,
+      { fragments: string[]; byteCount: number }
+    >();
+    let narrativeBytes = 0;
+    let narrativeChunks = 0;
     const consume = (line: Buffer) => {
-      if (++lineNumber > 1_000_000)
-        fail("Artifact record count limit exceeded.");
-      if (terminalSeen) fail("Artifact has a post-terminal record.");
-      const raw: unknown = JSON.parse(
-        new TextDecoder("utf-8", { fatal: true }).decode(line.subarray(0, -1)),
-      );
+      let raw: unknown;
+      try {
+        if (++lineNumber > 1_000_000)
+          fail("Artifact record count limit exceeded.");
+        if (terminalSeen) fail("Artifact has a post-terminal record.");
+        raw = JSON.parse(
+          new TextDecoder("utf-8", { fatal: true }).decode(
+            line.subarray(0, -1),
+          ),
+        );
+      } catch (error) {
+        if (error instanceof RunArtifactError) throw error;
+        throw new RunArtifactError(
+          "invalid_artifact_record",
+          "Artifact record is not valid UTF-8 JSON.",
+          { cause: error },
+        );
+      }
       if (typeof raw !== "object" || raw === null || Array.isArray(raw))
         fail("Artifact record must be an object.");
       const record = raw as Record<string, unknown>;
@@ -419,7 +492,8 @@ export async function readRunArtifact(
             "unsupported_schema_version",
             "Artifact format version is unsupported.",
           );
-        header = headerSchema.parse(record);
+        validateHeaderManifest(record);
+        header = parseRecord(headerSchema, record);
       } else {
         if (header === undefined || record.run_id !== header.run_id)
           fail("Artifact run identity mismatch.");
@@ -438,7 +512,7 @@ export async function readRunArtifact(
           );
         }
         if (record.record === "run.artifact_terminal") {
-          const terminal = terminalSchema.parse(record);
+          const terminal = parseRecord(terminalSchema, record);
           if (
             summary === undefined ||
             terminal.content_sha256 !== hashContent.copy().digest("hex") ||
@@ -454,23 +528,46 @@ export async function readRunArtifact(
             "Artifact terminal summary must immediately precede its digest record.",
           );
         else if (record.record === "run.terminal_summary") {
-          summary = summarySchema.parse(record).summary;
-          validateTerminalSummary(summary, header.run_id);
+          summary = parseRecord(summarySchema, record).summary;
+          try {
+            validateTerminalSummary(summary, header.run_id);
+          } catch (error) {
+            throw new RunArtifactError(
+              "invalid_artifact_record",
+              "Artifact terminal summary is invalid.",
+              { cause: error },
+            );
+          }
         } else if (record.record === "reviewer.narrative") {
-          const chunk = narrativeSchema.parse(record);
-          const previous = narratives.get(chunk.reviewer_id) ?? [];
+          const chunk = parseRecord(narrativeSchema, record);
+          const previous = narratives.get(chunk.reviewer_id) ?? {
+            fragments: [],
+            byteCount: 0,
+          };
           if (
-            chunk.index !== previous.length ||
+            chunk.index !== previous.fragments.length ||
             chunk.sha256 !== digest(chunk.text)
           )
             fail("Artifact narrative chunk is invalid.");
-          previous.push(chunk.text);
+          const chunkBytes = Buffer.byteLength(chunk.text, "utf8");
+          if (
+            previous.byteCount + chunkBytes > MAX_REVIEWER_RESULT_BYTES ||
+            previous.fragments.length + 1 > MAX_NARRATIVE_CHUNKS ||
+            narrativeBytes + chunkBytes > MAX_REVIEWER_RESULT_BYTES ||
+            narrativeChunks + 1 > MAX_NARRATIVE_CHUNKS
+          )
+            fail("Artifact narrative chunk limit exceeded.");
+          previous.fragments.push(chunk.text);
+          previous.byteCount += chunkBytes;
+          narrativeBytes += chunkBytes;
+          narrativeChunks++;
           narratives.set(chunk.reviewer_id, previous);
         } else if (record.record === "reviewer.result") {
-          const item = resultSchema.parse(record);
+          const item = parseRecord(resultSchema, record);
           if (results.some((result) => result.reviewer_id === item.reviewer_id))
             fail("Artifact repeats a reviewer result.");
-          const fragments = narratives.get(item.reviewer_id) ?? [];
+          const pending = narratives.get(item.reviewer_id);
+          const fragments = pending?.fragments ?? [];
           let reconstructed = item.result;
           if (item.narrative !== undefined) {
             const narrative = fragments.join("");
@@ -484,7 +581,7 @@ export async function readRunArtifact(
             reconstructed = { ...reconstructed, review_markdown: narrative };
           } else if (fragments.length > 0)
             fail("Unreferenced artifact narrative chunks.");
-          const result = CURRENT_RESULT.parse(reconstructed);
+          const result = parseRecord(CURRENT_RESULT, reconstructed);
           if (
             reviewerResultDigest(result) !== item.digest ||
             Buffer.byteLength(JSON.stringify(result), "utf8") !==
@@ -498,9 +595,11 @@ export async function readRunArtifact(
             byte_count: item.byte_count,
             result,
           });
+          narrativeBytes -= pending?.byteCount ?? 0;
+          narrativeChunks -= fragments.length;
           narratives.delete(item.reviewer_id);
         } else if (typeof record.event === "string") {
-          const event = publicEventV6Schema.parse(record);
+          const event = parseRecord(publicEventV6Schema, record);
           if (event.event === "run.completed")
             fail("Public terminal cannot be mirrored into format two.");
           records.push(event);
@@ -508,7 +607,7 @@ export async function readRunArtifact(
           const schema = genericRecords[String(record.record)];
           if (schema === undefined)
             fail("Unknown private artifact record type.");
-          records.push(schema.parse(record) as Record<string, unknown>);
+          records.push(parseRecord(schema, record) as Record<string, unknown>);
         }
       }
       hashAll.update(line);
@@ -551,16 +650,41 @@ export async function readRunArtifact(
         "Final artifact digest does not match the published digest.",
       );
     const after = await handle.stat({ bigint: true });
-    const current = await lstat(path, { bigint: true });
+    await handle.close();
+    handle = undefined;
+    await options.beforeFinalVerify?.();
+    let current: Awaited<ReturnType<typeof lstat>>;
+    let parentAfter: Awaited<ReturnType<typeof safeArtifactParent>>;
+    try {
+      current = await lstat(path, { bigint: true });
+      parentAfter = await safeArtifactParent(path);
+    } catch (error) {
+      if (error instanceof RunArtifactError) throw error;
+      throw new RunArtifactError(
+        "artifact_identity_changed",
+        "Artifact identity changed while reading.",
+        { cause: error },
+      );
+    }
     if (
       after.size !== opened.size ||
       after.mtimeNs !== opened.mtimeNs ||
       after.ctimeNs !== opened.ctimeNs ||
+      current.size !== opened.size ||
+      current.mtimeNs !== opened.mtimeNs ||
+      current.ctimeNs !== opened.ctimeNs ||
       current.ino !== opened.ino ||
       current.dev !== opened.dev ||
-      current.isSymbolicLink()
+      current.isSymbolicLink() ||
+      parentAfter.path !== parent.path ||
+      !sameArtifactIdentity(parentAfter, parent) ||
+      (options.expectedIdentity !== undefined &&
+        !sameArtifactIdentity(
+          artifactIdentity(current),
+          options.expectedIdentity,
+        ))
     )
-      fail("Artifact identity changed while reading.");
+      identityFail("Artifact identity changed while reading.");
     const delivery = summary.result_delivery as
       { completed_results?: unknown } | undefined;
     if (delivery?.completed_results !== results.length)
