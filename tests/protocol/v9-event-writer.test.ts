@@ -1,5 +1,5 @@
 import { PassThrough } from "node:stream";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createV9EventWriter } from "../../src/protocol/v9-event-writer.js";
 
 const terminal = {
@@ -110,5 +110,74 @@ describe("v6 public writer", () => {
     ).rejects.toThrow();
     await expect(writer.finish(terminal)).rejects.toThrow();
     expect(order).toEqual(["finalized", "failed"]);
+  });
+
+  it("keeps accepting liveness events while artifact finalization is in progress", async () => {
+    vi.useFakeTimers();
+    try {
+      const output = new PassThrough();
+      let text = "";
+      output.on("data", (chunk) => {
+        text += chunk.toString();
+      });
+      let releaseFinalize!: () => void;
+      const finalizing = new Promise<void>((resolve) => {
+        releaseFinalize = resolve;
+      });
+      const writer = createV9EventWriter({
+        output,
+        runId: "run-1",
+        now: () => new Date(Date.now()),
+        recordEvent: async () => undefined,
+        finalize: async () => {
+          await finalizing;
+          return {
+            path: "/artifact",
+            sha256: "a".repeat(64),
+            byte_count: 100,
+            completed_results: 0,
+          };
+        },
+        observe: async () => undefined,
+      });
+
+      const finish = writer.finish(terminal);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await expect(
+        writer.emit({
+          event: "suite.heartbeat",
+          data: {
+            elapsed_ms: 1_000,
+            model_runs: {
+              total: 1,
+              completed: 1,
+              incomplete: 0,
+              skipped: 0,
+              running: 0,
+              queued: 0,
+            },
+            run_deadline_remaining_ms: 1_000,
+            active: [],
+            minimal: true,
+            detail_ref: "run.terminal_summary",
+          },
+        }),
+      ).resolves.toBeUndefined();
+      expect(text).toContain("suite.heartbeat");
+      expect(text).not.toContain("run.completed");
+
+      releaseFinalize();
+      await finish;
+      const events = text
+        .trimEnd()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      expect(events.map((event) => event.event)).toEqual([
+        "suite.heartbeat",
+        "run.completed",
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

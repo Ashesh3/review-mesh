@@ -30,6 +30,7 @@ export function createV9EventWriter(options: V9EventWriterOptions) {
   let seq = 0;
   let tail = Promise.resolve();
   let terminal = false;
+  let finalizing = false;
   let failure: Error | undefined;
   const grace = options.shutdownGraceMs ?? 5000;
   const remember = (error: Error) => {
@@ -127,11 +128,20 @@ export function createV9EventWriter(options: V9EventWriterOptions) {
       });
     },
     async finish(summary: Record<string, unknown>): Promise<ArtifactReference> {
-      if (terminal)
+      if (terminal || finalizing)
         throw new Error("The terminal event has already been finalized.");
-      terminal = true;
+      finalizing = true;
       await tail;
-      const artifact = await options.finalize(summary);
+      let artifact: ArtifactReference;
+      try {
+        artifact = await options.finalize(summary);
+        // Optional liveness writes remain admissible while durable artifact
+        // finalization is in progress, but must settle before the terminal line.
+        await tail;
+      } finally {
+        terminal = true;
+        finalizing = false;
+      }
       const event = materialize({
         event: "run.completed",
         data: { ...summary, artifact },
