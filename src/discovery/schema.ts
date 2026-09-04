@@ -1,5 +1,12 @@
 import { z } from "zod";
 import {
+  reviewRequestV3Schema,
+  publicEventV6Schema,
+  reviewerResultV4Schema,
+  adjudicationResultV2Schema,
+  resultPageSchema,
+} from "../protocol/v9.js";
+import {
   configApplyRequestSchema,
   trustedConfigSchema,
 } from "../config/schemas.js";
@@ -174,10 +181,10 @@ export const schemaNames = [
 export type SchemaName = (typeof schemaNames)[number];
 
 const schemas = {
-  request: reviewRequestV2Schema,
-  events: publicEventSchema,
+  request: z.union([reviewRequestV3Schema, reviewRequestV2Schema]),
+  events: publicEventV6Schema,
   "run-status": runStatusSchema,
-  result: reviewerResultSchema,
+  result: z.union([reviewerResultV4Schema, adjudicationResultV2Schema]),
   config: trustedConfigSchema,
   "config-apply": configApplyRequestSchema,
   diagnostic: diagnosticSchema,

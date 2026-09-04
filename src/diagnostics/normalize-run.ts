@@ -18,6 +18,9 @@ import { readRunArtifact } from "./run-artifact.js";
 import {
   type ArtifactReference,
   type PublicStreamOutcome,
+  type ArtifactIdentity,
+  verifyArtifactFile,
+  RunArtifactError,
 } from "./run-index.js";
 
 export interface NormalizedReviewer {
@@ -133,8 +136,10 @@ export async function readNormalizedRun(
   path: string,
   options: {
     expectedSha256?: string;
+    expectedIdentity?: ArtifactIdentity;
     observedPublicStream?: PublicStreamOutcome;
     bestEffort?: boolean;
+    allowActive?: boolean;
   } = {},
 ): Promise<NormalizedRun> {
   const handle = await open(path, "r");
@@ -153,9 +158,9 @@ export async function readNormalizedRun(
   }
   if (first?.record !== "run.artifact") {
     // Historical parsing stays owned by the existing strict v4/v5 dispatcher.
-    const { readRunReport } = await import("./run-report.js");
+    const { readLegacyRunReport } = await import("./run-report.js");
     const id = basename(path).replace(/\.jsonl(?:\.active.*)?$/u, "");
-    const legacy = await readRunReport({
+    const legacy = await readLegacyRunReport({
       runsDirectory: dirname(path),
       runId: id,
       ...(options.bestEffort === undefined
@@ -170,6 +175,15 @@ export async function readNormalizedRun(
       ]),
     );
     const canonical = canonicalizeFindings(raw, { proofBySourceRef: proofs });
+    const verified = await verifyArtifactFile(path, options.expectedIdentity);
+    if (
+      options.expectedSha256 !== undefined &&
+      options.expectedSha256 !== verified.sha256
+    )
+      throw new RunArtifactError(
+        "artifact_digest_mismatch",
+        "The historical artifact digest does not match its published digest.",
+      );
     return {
       run_id: legacy.run_id,
       active: legacy.active,
@@ -193,13 +207,16 @@ export async function readNormalizedRun(
       })),
       artifact: {
         path,
-        sha256: options.expectedSha256 ?? "0".repeat(64),
-        byte_count: 0,
+        sha256: verified.sha256,
+        byte_count: verified.byte_count,
         completed_results: legacy.reviewers.filter(
           (reviewer) => reviewer.result !== undefined,
         ).length,
       },
-      digest_status: "final_digest_unavailable",
+      digest_status:
+        options.expectedSha256 === undefined
+          ? "final_digest_unavailable"
+          : "verified",
       reported_outcome: {
         gate_outcome: legacy.gate_outcome,
         coverage_outcome: legacy.coverage_outcome,
@@ -211,12 +228,15 @@ export async function readNormalizedRun(
       warnings: [{ code: "legacy_unknown_change_coverage" }],
     };
   }
-  const artifact = await readRunArtifact(
-    path,
-    options.expectedSha256 === undefined
+  const artifact = await readRunArtifact(path, {
+    ...(options.expectedSha256 === undefined
       ? {}
-      : { expectedSha256: options.expectedSha256 },
-  );
+      : { expectedSha256: options.expectedSha256 }),
+    ...(options.expectedIdentity === undefined
+      ? {}
+      : { expectedIdentity: options.expectedIdentity }),
+    ...(options.allowActive ? { allowActive: true } : {}),
+  });
   const resolution = object(
     artifact.records.find((record) => record.record === "resolution")
       ?.resolution,
@@ -277,7 +297,7 @@ export async function readNormalizedRun(
   reviewers.sort((a, b) =>
     a.reviewer_id < b.reviewer_id ? -1 : a.reviewer_id > b.reviewer_id ? 1 : 0,
   );
-  const raw = reviewers.flatMap((reviewer) =>
+  const sourceRaw = reviewers.flatMap((reviewer) =>
     reviewer.result?.schema_version === "4"
       ? buildCanonicalRawFindings({
           reviewer_id: reviewer.reviewer_id,
@@ -286,34 +306,73 @@ export async function readNormalizedRun(
         })
       : [],
   );
-  const proofs = explicitProofs(artifact.records);
+  const findingsRecord = object(
+    artifact.records.find((record) => record.record === "run.findings")?.data,
+  );
+  const raw = Array.isArray(findingsRecord?.raw)
+    ? (findingsRecord.raw as CanonicalRawFinding[])
+    : sourceRaw;
+  const proofs =
+    (object(findingsRecord?.proof_by_source_ref) as
+      Record<string, CanonicalFindingCoreProof> | undefined) ??
+    explicitProofs(artifact.records);
   for (const finding of raw)
     proofs[finding.source_ref] ??= {
       evidence_verified: false,
       source_coverage_verified: false,
     };
   const canonical = canonicalizeFindings(raw, {
-    gatePolicies: gatePolicies(resolution),
+    gatePolicies:
+      (object(findingsRecord?.gate_policies) as
+        Record<string, CanonicalGatePolicy> | undefined) ??
+      gatePolicies(resolution),
     proofBySourceRef: proofs,
   });
   const full = object(context?.review_scope)?.mode === "full";
+  const contributing = reviewers.filter(
+    (reviewer) =>
+      reviewer.status === "completed" &&
+      reviewer.result?.schema_version === "4",
+  );
   const coverageComplete =
     full ||
-    reviewers
-      .filter((reviewer) => reviewer.result?.schema_version === "4")
-      .every(
+    (contributing.length > 0 &&
+      contributing.every(
         (reviewer) =>
           reviewer.result?.schema_version === "4" &&
-          reviewer.result.change_coverage.status === "complete",
-      );
-  const executionComplete = artifact.summary.coverage_outcome === "complete";
-  const coverage =
-    coverageComplete && executionComplete ? "complete" : "partial";
+          (reviewer.result.change_coverage.status === "complete" ||
+            reviewer.result.change_coverage.status === "not_applicable"),
+      ));
+  const executionComplete =
+    (object(artifact.summary.execution_coverage)?.status ??
+      artifact.summary.coverage_outcome) === "complete";
+  const reportedChange = object(artifact.summary.change_coverage)?.status;
+  const changeComplete =
+    reportedChange === "not_applicable" || reportedChange === "complete"
+      ? coverageComplete || contributing.length === 0
+      : coverageComplete;
+  const coverage = changeComplete && executionComplete ? "complete" : "partial";
   const gateCount = canonical.counts.gate_eligible_subfindings;
   const cancelled = artifact.summary.run_outcome === "cancelled";
+  for (const key of [
+    "raw_source_findings",
+    "atomic_subfindings",
+    "canonical_roots",
+    "gate_eligible_subfindings",
+    "advisory_subfindings",
+    "rejected_subfindings",
+    "needs_verification_subfindings",
+    "non_gating_subfindings",
+  ] as const) {
+    if (!artifact.active && artifact.summary[key] !== canonical.counts[key])
+      throw new RunArtifactError(
+        "invalid_artifact_record",
+        "Terminal finding counts do not match the preserved source evidence.",
+      );
+  }
   return {
     run_id: artifact.run_id,
-    active: false,
+    active: artifact.active,
     artifact_format_version: "2",
     run_outcome: runOutcome({ cancelled, coverage, gateFindings: gateCount }),
     gate_outcome: gateCount > 0 ? "gate_findings" : "no_gate_findings",
@@ -322,7 +381,7 @@ export async function readNormalizedRun(
     change_coverage: {
       status: full
         ? "not_applicable"
-        : coverageComplete
+        : changeComplete
           ? "complete"
           : "incomplete",
     },
@@ -350,6 +409,12 @@ export async function readNormalizedRun(
     ...(context === undefined ? {} : { context }),
     ...(resolution === undefined ? {} : { resolution }),
     records: artifact.records,
-    warnings: [],
+    warnings: Array.isArray(resolution?.warnings)
+      ? resolution.warnings
+          .map(object)
+          .filter(
+            (value): value is Record<string, unknown> => value !== undefined,
+          )
+      : [],
   };
 }

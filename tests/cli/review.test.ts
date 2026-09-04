@@ -18,7 +18,7 @@ import { PassThrough, Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { execa } from "execa";
-import { runReviewApplication } from "../../src/app.js";
+import { runLegacyReviewApplication as runReviewApplication } from "../../src/app.js";
 import {
   publicEventSchema,
   type PublicEvent,
@@ -31,7 +31,7 @@ import { installAbortHandlers, runCli as runCliEntry } from "../../src/cli.js";
 const projectRoot = resolve(import.meta.dirname, "../..");
 const require = createRequire(import.meta.url);
 const tscCli = require.resolve("typescript/bin/tsc");
-const cliEntry = join(projectRoot, "src", "cli.ts");
+const cliEntry = join(projectRoot, "tests", "helpers", "legacy-cli.ts");
 const compiledCliEntry = join(projectRoot, "dist", "cli.js");
 const commandFixtureUrl = pathToFileURL(
   join(projectRoot, "tests", "fixtures", "command-adapter.mjs"),
@@ -228,12 +228,17 @@ function startCompiledCli(
   args: readonly string[] = ["review"],
   input = fixture.request,
 ): ChildProcessWithoutNullStreams {
-  const child = spawn(process.execPath, [compiledCliEntry, ...args], {
-    cwd: projectRoot,
-    env: fixture.env,
-    stdio: "pipe",
-    windowsHide: true,
-  });
+  const script = `import {runCli} from ${JSON.stringify(pathToFileURL(compiledCliEntry).href)}; import {runLegacyReviewApplication} from ${JSON.stringify(pathToFileURL(join(projectRoot, "dist", "app.js")).href)}; await runCli(process,{argv:process.argv.slice(1),runReview:runLegacyReviewApplication});`;
+  const child = spawn(
+    process.execPath,
+    ["--input-type=module", "-e", script, ...args],
+    {
+      cwd: projectRoot,
+      env: fixture.env,
+      stdio: "pipe",
+      windowsHide: true,
+    },
+  );
   child.stdin.on("error", () => undefined);
   child.stdin.end(input);
   return child;
@@ -563,14 +568,14 @@ describe("review-mesh review", () => {
       },
       streams: {
         review: {
-          stdin: "empty-or-review-request-json-v2",
-          stdout: "public-events-jsonl-v5",
+          stdin: "empty-or-review-request-json-v2-or-v3",
+          stdout: "public-events-jsonl-v6",
           final_event: "run.completed",
         },
       },
       protocol: {
-        version: "5",
-        request_version: "2",
+        version: "6",
+        request_version: "3",
         review_scope: {
           default_mode: "changes",
           full_review_requires_explicit_mode: true,

@@ -205,6 +205,9 @@ export const dashboardHtml = String.raw`<!doctype html>
     .badge.passed, .badge.pass, .badge.completed, .badge.complete, .badge.no_findings { color: var(--green); border-color: #35523d; background: var(--green-dim); }
     .badge.findings, .badge.fail, .badge.failed { color: var(--amber); border-color: #5a4828; background: var(--amber-dim); }
     .badge.incomplete, .badge.error { color: var(--red); border-color: #643736; background: var(--red-dim); }
+    .badge.inconclusive, .badge.cancelled { color: var(--warning); border-color: #5a4828; background: var(--warning-soft); }
+    .badge.clear, .badge.no_gate_findings { color: var(--positive); border-color: #35523d; background: var(--positive-soft); }
+    .badge.gate_findings { color: var(--negative); border-color: #643736; background: var(--negative-soft); }
     .badge.skipped, .badge.deferred, .badge.queued, .badge.pending, .badge.unknown { color: var(--muted); }
     .badge.adjudication { color: var(--violet); border-color: #514571; background: var(--violet-soft); }
 
@@ -709,7 +712,7 @@ export const dashboardHtml = String.raw`<!doctype html>
     function runStatus(run) {
       if (!isObject(run)) return "unknown";
       if (run.active === true) return text(firstDefined(run.stage, run.phase, run.status), "running").toLowerCase();
-      return text(firstDefined(run.status, run.outcome, run.state, run.gate_outcome), "unknown").toLowerCase();
+      return text(firstDefined(run.run_outcome, run.status, run.outcome, run.state, run.gate_outcome), "unknown").toLowerCase();
     }
 
     function isActiveRun(run) {
@@ -1058,6 +1061,7 @@ export const dashboardHtml = String.raw`<!doctype html>
 
     function findingsOf(detail) {
       if (!isObject(detail)) return [];
+      if (Array.isArray(get(detail, ["canonical", "atomics"]))) return detail.canonical.atomics;
       var direct = firstDefined(get(detail, ["findings", "consolidated"]), get(detail, ["findings", "raw"]), Array.isArray(detail.findings) ? detail.findings : undefined, detail.actionable_findings, get(detail, ["result", "actionable_findings"]));
       var collected = array(direct).filter(isObject);
       reviewersOf(detail).forEach(function (reviewer) {
@@ -1080,7 +1084,7 @@ export const dashboardHtml = String.raw`<!doctype html>
         var path = text(item.path, "Location not recorded");
         var range = number(item.start_line) !== undefined ? ":" + item.start_line + (number(item.end_line) !== undefined && item.end_line !== item.start_line ? "–" + item.end_line : "") : "";
         return '<div class="evidence"><div class="evidence-path">' + escapeHtml(path + range) + '</div><p>' + escapeHtml(text(item.detail, "No evidence detail recorded.")) + "</p></div>";
-      }).join("") + (finding.suggested_direction ? '<p><strong>Suggested direction:</strong> ' + escapeHtml(finding.suggested_direction) + "</p>" : "") + "</article>";
+      }).join("") + (finding.gate_eligibility ? '<p><strong>Gate eligibility:</strong> ' + (finding.gate_eligibility.eligible ? "Eligible" : escapeHtml(array(finding.gate_eligibility.reasons).join(", ").replace(/_/g, " "))) + "</p>" : "") + (finding.suggested_direction ? '<p><strong>Suggested direction:</strong> ' + escapeHtml(finding.suggested_direction) + "</p>" : "") + "</article>";
     }
 
     function renderFindings(detail) {
@@ -1090,7 +1094,11 @@ export const dashboardHtml = String.raw`<!doctype html>
         if (count !== undefined && count > 0) return renderEmpty(count + " finding" + (count === 1 ? "" : "s") + " reported", "Structured finding details were not included in this API response.");
         return renderEmpty("No structured findings", "No actionable finding records are available for this run.");
       }
-      return '<div class="finding-list">' + findings.map(renderFinding).join("") + "</div>";
+      var roots = array(get(detail, ["canonical", "roots"]));
+      var grouped = new Set();
+      var groups = roots.map(function (root) { array(root.subfindings).forEach(function (finding) { grouped.add(finding.id); }); return '<section class="section"><h2 class="section-title">' + escapeHtml(root.id) + '</h2><div class="finding-list">' + array(root.subfindings).map(renderFinding).join("") + '</div></section>'; }).join("");
+      var related = array(get(detail, ["canonical", "semantic_proposals"]));
+      return groups + '<div class="finding-list">' + findings.filter(function (finding) { return !grouped.has(finding.id); }).map(renderFinding).join("") + "</div>" + (related.length ? '<div class="notice"><strong>Related findings</strong><p>' + related.length + ' related pairs retain their separate evidence and gate decisions.</p></div>' : "");
     }
 
     function renderEvents(detail) {
@@ -1121,7 +1129,13 @@ export const dashboardHtml = String.raw`<!doctype html>
         ["Scope", firstDefined(get(detail, ["review_scope", "mode"]), get(context, ["review_scope", "mode"]), get(request, ["review_scope", "mode"]))],
         ["Branch", get(git, ["branch"])],
         ["Head", get(git, ["head"])],
-        ["Changed files", get(git, ["changed_files_count"])]
+        ["Changed files", get(git, ["changed_files_count"])],
+        ["Execution coverage", get(detail, ["execution_coverage", "status"])],
+        ["File coverage", get(detail, ["change_coverage", "status"])],
+        ["Deadline tier", get(detail, ["summary", "deadline", "tier"])],
+        ["Execution deadline", get(detail, ["summary", "deadline", "deadline_at"])],
+        ["Artifact verification", detail.digest_status],
+        ["Artifact SHA256", get(detail, ["artifact", "sha256"])]
       ]) + '</div><div class="panel side-card"><h3>Execution counts</h3>' + renderDefinitionList(isObject(counts) ? Object.keys(counts).filter(function (key) { return !isObject(counts[key]) && !Array.isArray(counts[key]); }).map(function (key) { return [key.replace(/_/g, " "), counts[key]]; }) : []) + '</div><div class="notice"><strong>Activity, not chat.</strong> Review Mesh persists sanitized phase and activity summaries plus structured terminal results. These views are not full provider conversations or hidden reasoning.</div></aside>';
     }
 
@@ -1140,6 +1154,7 @@ export const dashboardHtml = String.raw`<!doctype html>
       var coverageLabel = isActiveRun(detail) ? "In progress" : text(detail.coverage_outcome, "Not recorded");
       var stages = renderStageRail(detail);
       var html = '<div class="detail-head"><a class="back-link" href="#/reviews">' + icon("arrowLeft") + '<span>All reviews</span></a><div class="detail-title"><h1>' + escapeHtml(runProject(detail)) + "</h1>" + badge(status) + '</div><div class="detail-id">' + escapeHtml(id) + "</div></div>";
+      if (detail.headline) html += '<div class="notice" role="status">' + escapeHtml(detail.headline) + '</div>';
       if (state.runLoading) html += '<div class="sr-only" role="status">Refreshing run detail</div>';
       html += '<div class="panel" style="padding:13px 14px">' + stages + "</div>";
       html += '<dl class="fact-grid"><div class="fact"><dt>Started</dt><dd>' + escapeHtml(formatDate(runStartedAt(detail), true)) + '</dd></div><div class="fact"><dt>Elapsed</dt><dd>' + escapeHtml(formatDuration(runElapsed(detail))) + '</dd></div><div class="fact"><dt>Reviewers</dt><dd>' + reviewers.length + '</dd></div><div class="fact"><dt>Findings</dt><dd>' + (findings === undefined ? "Not recorded" : findings) + '</dd></div><div class="fact"><dt>Gate</dt><dd>' + escapeHtml(gateLabel) + '</dd></div><div class="fact"><dt>Coverage</dt><dd>' + escapeHtml(coverageLabel) + "</dd></div></dl>";
@@ -1479,6 +1494,7 @@ export const dashboardHtml = String.raw`<!doctype html>
       var notes = array(result.informational_notes).filter(isObject);
       var reviewMarkdown = text(result.review_markdown);
       var html = '<section class="drawer-section"><h3>Terminal result</h3><div class="panel side-card"><div style="margin-bottom:10px">' + badge(firstDefined(result.verdict, status)) + '</div><div class="summary-copy">' + escapeHtml(summary) + "</div></div></section>";
+      if (result.change_coverage) html += '<section class="drawer-section"><h3>Changed-file evidence</h3>' + renderDefinitionList([["Status", result.change_coverage.status], ["Proof", result.change_coverage.proof_kind], ["Inspected", result.change_coverage.inspected_count], ["Deficits", result.change_coverage.deficit_count]]) + '<div class="finding-list">' + array(detail.coverage).filter(function (entry) { return entry.relevant; }).map(function (entry) { return '<div class="panel side-card"><strong>' + escapeHtml(entry.path) + '</strong><p>' + escapeHtml(entry.snapshot_read + ' · ' + entry.diff_delivery + (entry.reason ? ' · ' + entry.reason : '')) + '</p></div>'; }).join("") + '</div></section>';
       if (reviewMarkdown) html += '<section class="drawer-section"><h3>Complete review</h3><div class="panel side-card review-markdown">' + escapeHtml(reviewMarkdown) + "</div></section>";
       html += '<section class="drawer-section"><h3>Actionable findings · ' + findings.length + "</h3>" + (findings.length ? '<div class="finding-list">' + findings.map(renderFinding).join("") + "</div>" : renderEmpty("No structured findings", "No actionable finding details were returned for this reviewer.")) + "</section>";
       if (notes.length) html += '<section class="drawer-section"><h3>Informational notes · ' + notes.length + '</h3><div class="stack">' + notes.map(function (note) { return '<div class="panel side-card"><strong style="font-size:11px">' + escapeHtml(text(note.title, "Note")) + '</strong><div class="summary-copy" style="margin-top:5px">' + escapeHtml(text(note.description)) + "</div></div>"; }).join("") + "</div></section>";

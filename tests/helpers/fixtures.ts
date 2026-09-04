@@ -356,7 +356,7 @@ export function incomplete(
     adapter: "claude-main",
     model: "test-model",
     elapsed_ms: 0,
-    reason: failure.reason,
+    reason,
     message: failure.message,
     retryable: failure.retryable,
   };

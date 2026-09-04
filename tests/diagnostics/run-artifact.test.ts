@@ -54,6 +54,26 @@ const complete = {
 };
 
 describe("immutable artifact format two", () => {
+  it("reads an active prefix without pretending its terminal digest is finalized", async () => {
+    const { path } = await fixture();
+    const writer = await createRunArtifact({
+      path,
+      runId: "run-active",
+      toolVersion: "9.0.0",
+    });
+    await writer.record({
+      record: "context",
+      context: { review_scope: { mode: "full" } },
+    });
+    const active = await readRunArtifact(path, { allowActive: true });
+    expect(active.active).toBe(true);
+    expect(active.digest_status).toBe("final_digest_unavailable");
+    expect(active.records).toHaveLength(1);
+    await writer.close();
+    await expect(readRunArtifact(path)).rejects.toMatchObject({
+      code: "invalid_artifact_record",
+    });
+  });
   it("rejects redirected ancestors for creation and replay", async () => {
     const { root } = await fixture();
     const outside = join(root, "outside");
@@ -354,6 +374,7 @@ describe("immutable artifact format two", () => {
       "reviewer.narrative": "1",
       "reviewer.result": "1",
       "reviewer.terminal": "1",
+      "run.findings": "1",
       "run.terminal_summary": "1",
       "run.artifact_terminal": "1",
     };

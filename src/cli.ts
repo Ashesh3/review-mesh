@@ -568,7 +568,15 @@ export async function runCli(
             },
           );
           const result = structuredOutput
-            ? await runDoctorReview(adapter, reviewer, controller.signal)
+            ? await (
+                await import("./diagnostics/doctor-v9.js")
+              ).runDoctorV9(
+                adapter,
+                reviewer,
+                controller.signal,
+                config,
+                (runtime.appPaths ?? getAppPaths()).runsDirectory,
+              )
             : (() => undefined)();
           const capabilities =
             result === undefined
@@ -990,7 +998,8 @@ export async function runCli(
       positional.length > 1 ||
       (outputMode !== undefined &&
         outputMode !== "full-jsonl" &&
-        outputMode !== "compact-jsonl") ||
+        outputMode !== "compact-jsonl" &&
+        outputMode !== "concise-jsonl") ||
       (heartbeatMode !== undefined && heartbeatMode !== "aggregate")
     ) {
       await writeUsageDiagnostic(
@@ -1085,7 +1094,11 @@ export async function runCli(
             ? {}
             : { detailsFile: resolve(cwd, detailsFile) }),
           outputMode:
-            outputMode === "compact-jsonl" ? "compact-jsonl" : "full-jsonl",
+            outputMode === "full-jsonl"
+              ? "full-jsonl"
+              : outputMode === "compact-jsonl"
+                ? "compact-jsonl"
+                : "concise-jsonl",
         });
       } catch (error) {
         await writeDiagnostic(

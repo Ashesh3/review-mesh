@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { lstat, open, type FileHandle } from "node:fs/promises";
 import { resolve } from "node:path";
 import { z } from "zod";
+import { privatePayloadSchemas } from "./artifact-payloads.js";
 import {
   adjudicationResultV2Schema,
   reviewerResultV4Schema,
@@ -47,6 +48,7 @@ const PRIVATE_VERSIONS = {
   "reviewer.narrative": "1",
   "reviewer.result": "1",
   "reviewer.terminal": "1",
+  "run.findings": "1",
   "run.terminal_summary": "1",
   "run.artifact_terminal": "1",
 } as const;
@@ -106,6 +108,29 @@ const resultSchema = z.strictObject({
     .optional(),
 });
 const genericRecords: Record<string, z.ZodType> = {
+  "run.findings": z.strictObject({
+    record: z.literal("run.findings"),
+    schema_version: z.literal("1"),
+    run_id: id,
+    data: z.strictObject({
+      raw: z.array(z.record(z.string(), z.unknown())).max(16384),
+      proof_by_source_ref: z.record(
+        z.string(),
+        z.record(z.string(), z.unknown()),
+      ),
+      adjudication_outcomes: z
+        .array(z.unknown())
+        .or(z.record(z.string(), z.unknown())),
+      gate_policies: z.record(
+        z.string(),
+        z.strictObject({
+          minimumSeverity: z.enum(["critical", "high", "medium", "low"]),
+          minimumConfidence: z.enum(["high", "medium", "low"]),
+        }),
+      ),
+      canonical_counts: z.record(z.string(), count),
+    }),
+  }),
   resolution: z.strictObject({
     record: z.literal("resolution"),
     schema_version: z.literal("1"),
@@ -160,6 +185,19 @@ function parseRecord<T>(schema: z.ZodType<T>, value: unknown): T {
       { cause: parsed.error },
     );
   return parsed.data;
+}
+function validatePayload(record: Record<string, unknown>): void {
+  const kind = String(record.record);
+  const schema = privatePayloadSchemas[kind];
+  if (schema)
+    parseRecord(
+      schema,
+      record[
+        kind === "request" || kind === "resolution" || kind === "context"
+          ? kind
+          : "data"
+      ],
+    );
 }
 function validateHeaderManifest(record: Record<string, unknown>): void {
   const manifest = record.private_record_versions;
@@ -279,14 +317,14 @@ export async function createRunArtifact(options: {
         const kind = String(value.record);
         const schema = genericRecords[kind];
         if (schema === undefined) fail("Unknown private artifact record type.");
-        await append(
-          schema.parse({
-            ...value,
-            run_id: options.runId,
-            schema_version:
-              PRIVATE_VERSIONS[kind as keyof typeof PRIVATE_VERSIONS],
-          }),
-        );
+        const parsed = schema.parse({
+          ...value,
+          run_id: options.runId,
+          schema_version:
+            PRIVATE_VERSIONS[kind as keyof typeof PRIVATE_VERSIONS],
+        }) as Record<string, unknown>;
+        validatePayload(parsed);
+        await append(parsed);
       });
     },
     result(reviewerId: string, input: CurrentResult): Promise<void> {
@@ -406,6 +444,7 @@ export async function createRunArtifact(options: {
 
 export interface ArtifactReadResult {
   run_id: string;
+  active: boolean;
   results: Array<{
     reviewer_id: string;
     digest: string;
@@ -425,6 +464,7 @@ export async function readRunArtifact(
     expectedSha256?: string;
     expectedIdentity?: ArtifactIdentity;
     beforeFinalVerify?: () => void | Promise<void>;
+    allowActive?: boolean;
   } = {},
 ): Promise<ArtifactReadResult> {
   let handle: FileHandle | undefined;
@@ -607,7 +647,9 @@ export async function readRunArtifact(
           const schema = genericRecords[String(record.record)];
           if (schema === undefined)
             fail("Unknown private artifact record type.");
-          records.push(parseRecord(schema, record) as Record<string, unknown>);
+          const parsed = parseRecord(schema, record) as Record<string, unknown>;
+          validatePayload(parsed);
+          records.push(parsed);
         }
       }
       hashAll.update(line);
@@ -637,6 +679,24 @@ export async function readRunArtifact(
       }
       if (carry.length > MAX_REVIEWER_RESULT_BYTES + 1024 * 1024)
         fail("Artifact record exceeds the line limit.");
+    }
+    const active = !terminalSeen;
+    if (
+      active &&
+      options.allowActive &&
+      header !== undefined &&
+      options.expectedSha256 === undefined
+    ) {
+      return {
+        run_id: header.run_id,
+        active: true,
+        results,
+        records,
+        summary: summary ?? {},
+        sha256: hashAll.digest("hex"),
+        byte_count: byteCount,
+        digest_status: "final_digest_unavailable",
+      };
     }
     if (carry.length || !terminalSeen || !header || !summary || narratives.size)
       fail("Artifact is incomplete.");
@@ -691,6 +751,7 @@ export async function readRunArtifact(
       fail("Artifact terminal result delivery count mismatch.");
     return {
       run_id: header.run_id,
+      active,
       results,
       records,
       summary,

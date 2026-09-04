@@ -341,7 +341,7 @@ describe("report and findings commands", () => {
     process.exitCode = undefined;
   });
 
-  it("uses the real adapter run path, selected effort, tools, and v3 schema for doctor", async () => {
+  it("uses the v9 adapter run path, selected effort, mediated tools, and page contract for doctor", async () => {
     const root = await mkdtemp(join(tmpdir(), "review-mesh-doctor-cli-"));
     roots.push(root);
     const workspace = join(root, "demo");
@@ -399,6 +399,10 @@ describe("report and findings commands", () => {
           join(input.context.workspace, "review-mesh-doctor.txt"),
           "utf8",
         );
+        const read = await input.coverage!.readFile({
+          path: "review-mesh-doctor.txt",
+        });
+        if (!read.ok) throw new Error("doctor fixture unavailable");
         yield { type: "progress", phase: "reviewing" };
         yield {
           type: "activity",
@@ -407,7 +411,24 @@ describe("report and findings commands", () => {
         yield { type: "progress", phase: "validating" };
         yield {
           type: "result",
-          result: passResult("Doctor parity."),
+          result: {
+            schema_version: "4",
+            verdict: "pass",
+            summary: "Doctor parity.",
+            review_markdown: "Doctor parity.",
+            actionable_findings: [],
+            informational_notes: [],
+            coverage_attestation: {
+              scope_digest: input.coverage!.scopeDigest,
+              entries: [
+                {
+                  path: "review-mesh-doctor.txt",
+                  method: "full_file",
+                  snapshot_digest: read.snapshotDigest,
+                },
+              ],
+            },
+          },
           isolation: "prompt_only",
         };
       },
@@ -424,17 +445,14 @@ describe("report and findings commands", () => {
     });
 
     expect(runInput?.reviewer).toMatchObject({
-      id: "security",
+      id: "doctor",
       model: "review-model",
       effort: "high",
     });
     expect(runInput?.context.workspace).not.toBe(await realpath(workspace));
-    expect(sentinel).toContain("Review Mesh doctor synthetic workspace");
-    expect(
-      (runInput?.resultJsonSchema.properties as Record<string, any>)
-        .schema_version.const,
-    ).toBe("3");
-    expect(JSON.parse(await output(stdout))).toEqual({
+    expect(sentinel).toContain("Review Mesh doctor.");
+    expect(runInput?.resultPages).toMatchObject({ resultKind: "reviewer" });
+    expect(JSON.parse(await output(stdout))).toMatchObject({
       schema_version: "1",
       kind: "review-mesh.doctor",
       workspace: await realpath(workspace),
@@ -446,14 +464,15 @@ describe("report and findings commands", () => {
           model: "review-model",
           provider_group: "fake",
           ready: true,
-          checks: [
+          checks: expect.arrayContaining([
             { name: "authentication", passed: true },
             { name: "model", passed: true },
             { name: "streaming_negotiation", passed: true },
-            { name: "read_tool_execution", passed: true },
-            { name: "complete_result_production", passed: true },
+            { name: "changed_file_access", passed: true },
+            { name: "result_page_assembly", passed: true },
+            { name: "coverage_reconciliation", passed: true },
             { name: "schema_validation", passed: true },
-          ],
+          ]),
         },
       ],
     });
@@ -551,7 +570,7 @@ describe("report and findings commands", () => {
     const result = JSON.parse(await output(stdout));
     expect(result.ready).toBe(false);
     expect(result.reviewers[0].checks).toContainEqual({
-      name: "read_tool_execution",
+      name: "changed_file_access",
       passed: false,
       message: "Synthetic read failed.",
       failure: expect.objectContaining({
@@ -624,6 +643,8 @@ describe("report and findings commands", () => {
           streaming: true,
           cancellation: true,
           maximumIsolation: "runtime_read_only",
+          observed_file_access: true,
+          progress_observable: true,
         };
       },
       async *run() {

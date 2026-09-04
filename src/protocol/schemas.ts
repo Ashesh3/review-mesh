@@ -5,7 +5,11 @@ export type JsonValue =
 
 export const protocolVersionSchema = z.enum(["1", "2"]);
 export const publicEventVersionSchema = z.enum(["4", "5"]);
-export const reviewOutputModeSchema = z.enum(["full-jsonl", "compact-jsonl"]);
+export const reviewOutputModeSchema = z.enum([
+  "full-jsonl",
+  "compact-jsonl",
+  "concise-jsonl",
+]);
 export const runStatusSchema = z.enum(["passed", "findings", "incomplete"]);
 export const gateOutcomeSchema = z.enum(["no_findings", "findings"]);
 export const coverageOutcomeSchema = z.enum(["complete", "partial"]);

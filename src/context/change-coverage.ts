@@ -115,6 +115,7 @@ export type ChangeCoverageNotApplicable =
 export interface ChangeCoverageLedger {
   readonly scopeDigest: string;
   readonly notApplicable?: ChangeCoverageNotApplicable;
+  observedFile(path: string): boolean;
   readFile(input: {
     path: string;
     offset?: number;
@@ -617,6 +618,15 @@ export async function createChangeCoverageLedger(input: {
 
   return {
     scopeDigest,
+    observedFile(path) {
+      const entry = entries.get(canonicalPath(path));
+      return (
+        entry !== undefined &&
+        entry.snapshot !== undefined &&
+        entry.stickyFailure === undefined &&
+        intervalsCover(entry.intervals, entry.snapshot.bytes.length)
+      );
+    },
     ...(notApplicable === undefined ? {} : { notApplicable }),
     async readFile(request) {
       if (closed) return { ok: false, path: request.path, reason: "closed" };

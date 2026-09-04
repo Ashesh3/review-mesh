@@ -119,10 +119,10 @@ export async function describeTool(options: DescribeToolOptions = {}) {
     },
     streams: {
       review: {
-        stdin: "empty-or-review-request-json-v2" as const,
-        stdout: "public-events-jsonl-v5" as const,
-        default_output_mode: "full-jsonl" as const,
-        output_modes: ["full-jsonl", "compact-jsonl"] as const,
+        stdin: "empty-or-review-request-json-v2-or-v3" as const,
+        stdout: "public-events-jsonl-v6" as const,
+        default_output_mode: "concise-jsonl" as const,
+        output_modes: ["concise-jsonl", "full-jsonl", "compact-jsonl"] as const,
         stderr: "diagnostic-jsonl-v1" as const,
         final_event: "run.completed" as const,
         status_query: "review-mesh status RUN_ID [REVIEWER_ID] --json" as const,
@@ -152,7 +152,7 @@ export async function describeTool(options: DescribeToolOptions = {}) {
       request_version: "3" as const,
       consistency_mode: "live_worktree" as const,
       maximum_request_bytes: 8 * 1024 * 1024,
-      outcomes: ["gate_outcome", "coverage_outcome"] as const,
+      outcomes: ["run_outcome", "gate_outcome", "coverage_outcome"] as const,
       model_fallback: {
         parallelism: "across_agents" as const,
         order: "effective_cyclic_model_runs" as const,

@@ -75,7 +75,7 @@ export const adapterRegistrationSchema = z.discriminatedUnion("type", [
     command: nonEmptyString,
     args: z.array(z.string()).optional(),
     env_allowlist: z.array(nonEmptyString).optional(),
-    protocol: z.literal("review-mesh-command-v1"),
+    protocol: z.enum(["review-mesh-command-v1", "review-mesh-command-v2"]),
   }),
 ]);
 

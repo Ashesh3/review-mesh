@@ -61,6 +61,8 @@ export type AdapterEvent =
       isolation: IsolationLevel;
       /** Adapter-owned exact-result storage lifecycle. */
       resultStorage?: {
+        serializationBoundary?: "provider_raw" | "sdk_canonical_json";
+        pages?(): AsyncIterable<{ raw: string; sha256: string }>;
         persisted(): void | Promise<void>;
         abandoned(): void | Promise<void>;
       };

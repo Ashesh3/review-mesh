@@ -533,6 +533,10 @@ function migrateLegacyShape(
   };
   migrated.execution.deadline_mode = "adaptive";
   migrated.execution.no_progress_timeout_ms = 300_000;
+  migrated.execution.heartbeat_interval_ms = Math.max(
+    1000,
+    Math.min(300000, migrated.execution.heartbeat_interval_ms),
+  );
   migrated.execution.continuation_attempts ??= 2;
   if (legacyNeedsProviderConcentrationAcknowledgement(migrated)) {
     migrated.execution.allow_provider_concentration = true;
