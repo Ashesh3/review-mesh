@@ -21,6 +21,10 @@ import {
 } from "../findings/canonical.js";
 import { validateAdjudication } from "../findings/adjudication.js";
 import {
+  verifyAdjudicationValidationAttestation,
+  type AdjudicationValidationAttestation,
+} from "../findings/attestation.js";
+import {
   adjudicationResultSchema,
   reviewerResultV3Schema,
 } from "../protocol/schemas.js";
@@ -111,6 +115,7 @@ interface ReviewerRuntime {
   mode?: string;
   adjudicates_reviewer_id?: string;
   policy?: Record<string, unknown>;
+  adjudication_validation?: AdjudicationValidationAttestation;
   state: string;
   started_at?: string;
   finished_at?: string;
@@ -675,6 +680,12 @@ function buildReviewerRuntime(parsed: ParsedRunFile): ReviewerRuntime[] {
       if (mode !== undefined) reviewer.mode = mode;
       if (adjudicatesReviewerId !== undefined) {
         reviewer.adjudicates_reviewer_id = adjudicatesReviewerId;
+      }
+      const adjudicationValidation = asRecord(record.adjudication_validation);
+      if (adjudicationValidation !== undefined) {
+        reviewer.adjudication_validation = structuredClone(
+          adjudicationValidation,
+        ) as unknown as AdjudicationValidationAttestation;
       }
       reviewer.result = bounded(
         record.result ?? asRecord(record.data)?.result,
@@ -1260,11 +1271,15 @@ function rawFindings(
       reviewer.result,
     );
     if (!candidateResult.success || !adjudicationResult.success) continue;
-    const outcome = validateAdjudication(
-      candidateResult.data,
-      adjudicationResult.data,
-      { reviewScope, git: gitContext },
-    );
+    const attestation = reviewer.adjudication_validation;
+    if (attestation === undefined) continue;
+    const outcome = verifyAdjudicationValidationAttestation({
+      attestation,
+      candidateResult: candidateResult.data,
+      adjudicationResult: adjudicationResult.data,
+      contextHead: null,
+    });
+    if (outcome === undefined) continue;
     const decisions = new Map(
       outcome.decisions.map((decision) => [
         decision.source_finding_id,

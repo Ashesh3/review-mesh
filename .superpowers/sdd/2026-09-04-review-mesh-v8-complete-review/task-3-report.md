@@ -169,3 +169,41 @@ Observed:
 - Full-scope ordered proof can use concrete locations already covered by candidate evidence without requiring a diff.
 - Canonicalization accepts resolved per-lens gate policies and applies severity/confidence thresholds deterministically.
 - Live state derives those policies from resolved reviewers; persisted report/dashboard recover them from resolution metadata and produce matching counts/outcomes.
+
+## Fix round 3
+
+### RED
+
+Command:
+
+```powershell
+npx vitest run tests/findings/evidence-verifier.test.ts tests/findings/adjudication.test.ts
+```
+
+Observed:
+
+- Exit code 1.
+- The core evidence verifier module was missing and full-scope candidate repetition still gated without authoritative verification.
+
+### GREEN
+
+Command:
+
+```powershell
+npm run typecheck
+npx vitest run tests/findings/adjudication.test.ts tests/findings/evidence-verifier.test.ts tests/findings/canonical.test.ts tests/orchestrator/state.test.ts tests/orchestrator/review-feedback.test.ts tests/diagnostics/run-report.test.ts tests/server/dashboard-data.test.ts
+```
+
+Observed:
+
+- Exit code 0.
+- Source and test TypeScript projects passed.
+- 7 test files passed; 96 tests passed.
+
+### Fixes
+
+- Added a bounded core-side evidence verifier using canonical workspace resolution, no-follow opens, regular-file checks, bounded line validation, and stable handle/path identity checks.
+- Nonexistent paths, symlink escapes, out-of-range lines, and file replacement races fail closed as non-gating `needs_verification`.
+- Pure adjudication validation now requires an authoritative core verification map; candidate evidence cannot self-authenticate.
+- The orchestrator verifies evidence before gate evaluation and persists a validation attestation bound to candidate/adjudicator digests, context head, evidence-verification digest, and exact effective outcome.
+- Strict reports and dashboard data consume and verify the persisted attestation, never rereading the workspace or re-trusting raw model proof after the run.

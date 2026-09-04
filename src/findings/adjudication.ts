@@ -3,6 +3,7 @@ import type {
   AdjudicationResult,
   ReviewerResultV3,
 } from "../protocol/schemas.js";
+import type { AdjudicationEvidenceVerification } from "./evidence-verifier.js";
 
 export interface AdjudicationValidationContext {
   reviewScope: "changes" | "full";
@@ -10,6 +11,7 @@ export interface AdjudicationValidationContext {
     changedFiles: readonly string[];
     diff: string;
   };
+  evidenceVerification?: AdjudicationEvidenceVerification;
 }
 
 export type AdjudicationValidationIssue =
@@ -29,7 +31,8 @@ export type AdjudicationValidationIssue =
   | "failure_point_context_required"
   | "base_head_comparison_required"
   | "base_head_citation_required"
-  | "base_head_context_required";
+  | "base_head_context_required"
+  | "core_evidence_verification_required";
 
 export interface EffectiveAdjudicationDecision {
   source_finding_id: string;
@@ -329,6 +332,13 @@ export function validateAdjudication(
         ) {
           issues.push("base_head_context_required");
         }
+      }
+      if (
+        decision.decision !== "rejected" &&
+        context.evidenceVerification?.by_source_finding_id[candidate.id]
+          ?.verified !== true
+      ) {
+        issues.push("core_evidence_verification_required");
       }
       const effectiveFinding = adjustedFinding(candidate, decision);
       return {

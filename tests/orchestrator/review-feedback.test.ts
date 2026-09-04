@@ -635,6 +635,88 @@ describe("v6 review feedback semantics", () => {
     });
   });
 
+  it("persists a digest-bound core adjudication validation attestation", async () => {
+    const source = fakeAdapterReturning(failResult("candidate"));
+    const adjudicator = fakeAdapterReturning({
+      schema_version: "1",
+      kind: "review-mesh.adjudication-result",
+      verdict: "pass",
+      review_markdown: "# Adjudication\n\nCandidate rejected.",
+      summary: "Candidate rejected.",
+      actionable_findings: [],
+      decisions: [
+        {
+          source_finding_id: "candidate",
+          decision: "rejected",
+          rationale: "Rejected.",
+          cited_evidence: [],
+          unverified_assumptions: [],
+        },
+      ],
+      informational_notes: [],
+    });
+    const records: Array<Record<string, unknown>> = [];
+    const input = roundInput({
+      adapters: { source, adjudicator },
+      writer: {
+        emit: async () => ({}) as never,
+        emitFinal: async () => ({}) as never,
+        record: async (record: Record<string, unknown>) => {
+          records.push(record);
+        },
+        close: async () => undefined,
+      },
+      config: {
+        reviewers: [
+          {
+            agentId: "security",
+            modelIndex: 0,
+            modelCount: 2,
+            providerGroup: "provider-a",
+            policy: {
+              passQuorum: 2,
+              minimumProviderGroups: 2,
+              adjudication: "required",
+              gateMinimumSeverity: "medium",
+              gateMinimumConfidence: "medium",
+            },
+          },
+          {
+            agentId: "security",
+            modelIndex: 1,
+            modelCount: 2,
+            providerGroup: "provider-b",
+            policy: {
+              passQuorum: 2,
+              minimumProviderGroups: 2,
+              adjudication: "required",
+              gateMinimumSeverity: "medium",
+              gateMinimumConfidence: "medium",
+            },
+          },
+        ],
+      },
+    });
+
+    await runReviewRound(input);
+
+    expect(
+      records.find(
+        (record) =>
+          record.record === "reviewer.result" &&
+          record.mode === "adjudication",
+      ),
+    ).toMatchObject({
+      adjudication_validation: {
+        candidate_digest: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        adjudication_digest: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        verification_digest: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        attestation_digest: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        outcome: { decisions: [expect.objectContaining({ source_finding_id: "candidate" })] },
+      },
+    });
+  });
+
   it("marks required findings as partial when no adjudicator can complete", async () => {
     const source = fakeAdapterReturning(failResult("candidate"));
     const unavailable = new FakeAdapter({

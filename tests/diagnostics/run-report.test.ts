@@ -14,6 +14,7 @@ import {
 } from "../../src/diagnostics/run-report.js";
 import type { ReviewerResultV3 } from "../../src/protocol/schemas.js";
 import { reviewerResultDigest } from "../../src/results/digest.js";
+import { createAdjudicationValidationAttestation } from "../../src/findings/attestation.js";
 
 const temporaryRoots: string[] = [];
 
@@ -1195,5 +1196,115 @@ describe("finding consolidation and rendering", () => {
       advisory: 1,
     });
     expect(report.gate_outcome).toBe("passed");
+  });
+
+  it("uses persisted validated adjudication after the workspace changes", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-persisted-adjudication";
+    const candidate = resultV3("# Review\n\nCandidate.");
+    candidate.verdict = "fail";
+    candidate.summary = "Candidate.";
+    candidate.actionable_findings = [
+      {
+        id: "candidate",
+        severity: "high",
+        title: "Candidate",
+        description: "Candidate description.",
+        evidence: [
+          { path: "src/item.ts", start_line: 1, end_line: 1, detail: "Evidence." },
+        ],
+        suggested_direction: "Fix.",
+        confidence: "high",
+        classification: "confirmed_defect",
+        external_assumptions: [],
+        category: "correctness",
+        verification: "Verified.",
+      },
+    ];
+    const adjudication = {
+      schema_version: "1" as const,
+      kind: "review-mesh.adjudication-result" as const,
+      verdict: "pass" as const,
+      review_markdown: "# Adjudication\n\nRejected.",
+      summary: "Rejected.",
+      actionable_findings: [] as [],
+      decisions: [
+        {
+          source_finding_id: "candidate",
+          decision: "rejected" as const,
+          rationale: "Rejected by core validation.",
+          cited_evidence: [],
+          unverified_assumptions: [],
+        },
+      ],
+      informational_notes: [],
+    };
+    const validationContext = {
+      reviewScope: "full" as const,
+      git: { changedFiles: [] as string[], diff: "" },
+      evidenceVerification: {
+        by_source_finding_id: { candidate: { verified: true, failures: [] } },
+      },
+    };
+    const attestation = createAdjudicationValidationAttestation({
+      candidateResult: candidate,
+      adjudicationResult: adjudication,
+      contextHead: null,
+      validationContext,
+    });
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [
+        line({
+          record: "resolution",
+          run_id: runId,
+          resolution: {
+            reviewers: [
+              { id: "lens::source", agent_id: "lens" },
+              {
+                id: "lens::judge",
+                agent_id: "lens",
+                policy: {
+                  passQuorum: 1,
+                  minimumProviderGroups: 1,
+                  adjudication: "required",
+                  gateMinimumSeverity: "medium",
+                  gateMinimumConfidence: "medium",
+                  mode: "adjudication",
+                  adjudicatesReviewerId: "lens::source",
+                },
+              },
+            ],
+          },
+        }),
+        line({
+          record: "reviewer.result",
+          run_id: runId,
+          reviewer_id: "lens::source",
+          digest: reviewerResultDigest(candidate),
+          byte_count: Buffer.byteLength(JSON.stringify(candidate)),
+          result: candidate,
+        }),
+        line({
+          record: "reviewer.result",
+          run_id: runId,
+          reviewer_id: "lens::judge",
+          mode: "adjudication",
+          adjudicates_reviewer_id: "lens::source",
+          digest: reviewerResultDigest(adjudication),
+          byte_count: Buffer.byteLength(JSON.stringify(adjudication)),
+          result: adjudication,
+          adjudication_validation: attestation,
+        }),
+      ].join(""),
+    );
+
+    const report = await readRunReport({ runsDirectory, runId });
+    expect(report.finding_counts).toEqual({
+      raw: 1,
+      unique: 0,
+      gate: 0,
+      advisory: 0,
+    });
   });
 });

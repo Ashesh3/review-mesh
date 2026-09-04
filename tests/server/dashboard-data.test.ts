@@ -7,6 +7,11 @@ import {
   readDashboardRun,
   readDashboardSnapshot,
 } from "../../src/server/dashboard-data.js";
+import { createAdjudicationValidationAttestation } from "../../src/findings/attestation.js";
+import type {
+  AdjudicationResult,
+  ReviewerResultV3,
+} from "../../src/protocol/schemas.js";
 
 const roots: string[] = [];
 
@@ -457,7 +462,7 @@ describe("dashboard data", () => {
 
   it("retains source findings rejected by an adjudicator while excluding them from canonical counts", async () => {
     const { appPaths } = await fixture();
-    const finding = {
+    const finding: ReviewerResultV3["actionable_findings"][number] = {
       id: "candidate",
       severity: "high",
       title: "Rejected candidate",
@@ -470,6 +475,53 @@ describe("dashboard data", () => {
       category: "correctness",
       verification: "Candidate verification.",
     };
+    const candidateResult: ReviewerResultV3 = {
+      schema_version: "3" as const,
+      verdict: "fail" as const,
+      review_markdown: "# Review\n\nCandidate.",
+      summary: "Candidate",
+      actionable_findings: [finding],
+      informational_notes: [],
+    };
+    const adjudicationResult: AdjudicationResult = {
+      schema_version: "1" as const,
+      kind: "review-mesh.adjudication-result" as const,
+      verdict: "pass" as const,
+      review_markdown: "# Adjudication\n\nRejected.",
+      summary: "Rejected",
+      actionable_findings: [] as [],
+      decisions: [
+        {
+          source_finding_id: "candidate",
+          decision: "rejected" as const,
+          rationale: "The candidate is not supported by the code.",
+          cited_evidence: [
+            {
+              path: "src/candidate.ts",
+              start_line: 1,
+              end_line: 1,
+              detail: "Contradictory code evidence.",
+            },
+          ],
+          unverified_assumptions: [],
+        },
+      ],
+      informational_notes: [],
+    };
+    const adjudicationValidation = createAdjudicationValidationAttestation({
+      candidateResult,
+      adjudicationResult,
+      contextHead: null,
+      validationContext: {
+        reviewScope: "full",
+        git: { changedFiles: [], diff: "" },
+        evidenceVerification: {
+          by_source_finding_id: {
+            candidate: { verified: true, failures: [] },
+          },
+        },
+      },
+    });
     await writeFile(
       join(appPaths.runsDirectory, "run-adjudicated.jsonl"),
       [
@@ -500,14 +552,7 @@ describe("dashboard data", () => {
           record: "reviewer.result",
           run_id: "run-adjudicated",
           reviewer_id: "lens::source",
-          result: {
-            schema_version: "3",
-            verdict: "fail",
-            review_markdown: "# Review\n\nCandidate.",
-            summary: "Candidate",
-            actionable_findings: [finding],
-            informational_notes: [],
-          },
+          result: candidateResult,
         },
         {
           record: "reviewer.result",
@@ -515,31 +560,8 @@ describe("dashboard data", () => {
           reviewer_id: "lens::judge",
           mode: "adjudication",
           adjudicates_reviewer_id: "lens::source",
-          result: {
-            schema_version: "1",
-            kind: "review-mesh.adjudication-result",
-            verdict: "pass",
-            review_markdown: "# Adjudication\n\nRejected.",
-            summary: "Rejected",
-            actionable_findings: [],
-            decisions: [
-              {
-                source_finding_id: "candidate",
-                decision: "rejected",
-                rationale: "The candidate is not supported by the code.",
-                cited_evidence: [
-                  {
-                    path: "src/candidate.ts",
-                    start_line: 1,
-                    end_line: 1,
-                    detail: "Contradictory code evidence.",
-                  },
-                ],
-                unverified_assumptions: [],
-              },
-            ],
-            informational_notes: [],
-          },
+          result: adjudicationResult,
+          adjudication_validation: adjudicationValidation,
         },
         {
           schema_version: "5",
@@ -587,7 +609,7 @@ describe("dashboard data", () => {
   it("downgrades invalid adjudication proof with the same canonical classification and counts as reports", async () => {
     const { appPaths } = await fixture();
     const runId = "run-invalid-proof";
-    const candidate = {
+    const candidate: ReviewerResultV3 = {
       schema_version: "3",
       verdict: "fail",
       review_markdown: "# Review\n\nCandidate reliability defect.",
@@ -617,6 +639,38 @@ describe("dashboard data", () => {
       ],
       informational_notes: [],
     };
+    const adjudicationResult: AdjudicationResult = {
+      schema_version: "1" as const,
+      kind: "review-mesh.adjudication-result" as const,
+      verdict: "fail" as const,
+      review_markdown: "# Adjudication\n\nRepeated without proof.",
+      summary: "Repeated candidate.",
+      actionable_findings: [] as [],
+      decisions: [
+        {
+          source_finding_id: "candidate",
+          decision: "confirmed" as const,
+          rationale: "Confirmed by prose only.",
+          cited_evidence: [{ detail: "No repository location." }],
+          unverified_assumptions: [],
+        },
+      ],
+      informational_notes: [],
+    };
+    const adjudicationValidation = createAdjudicationValidationAttestation({
+      candidateResult: candidate,
+      adjudicationResult,
+      contextHead: null,
+      validationContext: {
+        reviewScope: "changes",
+        git: { changedFiles: [], diff: "" },
+        evidenceVerification: {
+          by_source_finding_id: {
+            candidate: { verified: false, failures: ["read_failed"] },
+          },
+        },
+      },
+    });
     await writeFile(
       join(appPaths.runsDirectory, `${runId}.jsonl`),
       [
@@ -665,24 +719,8 @@ describe("dashboard data", () => {
           reviewer_id: "lens::judge",
           mode: "adjudication",
           adjudicates_reviewer_id: "lens::source",
-          result: {
-            schema_version: "1",
-            kind: "review-mesh.adjudication-result",
-            verdict: "fail",
-            review_markdown: "# Adjudication\n\nRepeated without proof.",
-            summary: "Repeated candidate.",
-            actionable_findings: [],
-            decisions: [
-              {
-                source_finding_id: "candidate",
-                decision: "confirmed",
-                rationale: "Confirmed by prose only.",
-                cited_evidence: [{ detail: "No repository location." }],
-                unverified_assumptions: [],
-              },
-            ],
-            informational_notes: [],
-          },
+          result: adjudicationResult,
+          adjudication_validation: adjudicationValidation,
         },
       ]
         .map((record) => JSON.stringify(record))

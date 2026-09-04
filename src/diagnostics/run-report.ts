@@ -21,6 +21,14 @@ import {
   type CanonicalRawFinding,
 } from "../findings/canonical.js";
 import { validateAdjudication } from "../findings/adjudication.js";
+import type {
+  AdjudicationOutcome,
+  AdjudicationValidationContext,
+} from "../findings/adjudication.js";
+import {
+  verifyAdjudicationValidationAttestation,
+  type AdjudicationValidationAttestation,
+} from "../findings/attestation.js";
 import { reviewerResultDigest } from "../results/digest.js";
 
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
@@ -105,6 +113,15 @@ const legacyResultRecordFields = {
   byte_count: nonNegativeIntegerSchema.optional(),
   result: persistedReviewerResultSchema,
 };
+const adjudicationValidationSchema = z.looseObject({
+  candidate_digest: digestSchema,
+  adjudication_digest: digestSchema,
+  context_head: z.string().nullable(),
+  verification_digest: digestSchema,
+  evidence_verification: z.unknown(),
+  outcome: z.unknown(),
+  attestation_digest: digestSchema,
+});
 
 const legacySuiteCountsSchema = z.strictObject({
   total: nonNegativeIntegerSchema,
@@ -511,6 +528,7 @@ const privateRecordSchema = z.union([
       agent_id: persistedString.optional(),
       mode: reviewerModeSchema.optional(),
       adjudicates_reviewer_id: persistedString.optional(),
+      adjudication_validation: adjudicationValidationSchema.optional(),
       ...legacyResultRecordFields,
     })
     .superRefine((value, ctx) => {
@@ -818,6 +836,7 @@ interface ReviewerMetadata {
   adjudicatesReviewerId?: string;
   gateMinimumSeverity?: FindingSeverity;
   gateMinimumConfidence?: FindingConfidence;
+  adjudicationValidation?: AdjudicationValidationAttestation;
 }
 
 interface ReviewerTerminal {
@@ -1143,6 +1162,12 @@ function reviewerMetadata(
     ...(gateMinimumConfidence.success
       ? { gateMinimumConfidence: gateMinimumConfidence.data }
       : {}),
+    ...(record?.adjudication_validation === undefined
+      ? {}
+      : {
+          adjudicationValidation:
+            record.adjudication_validation as AdjudicationValidationAttestation,
+        }),
   };
 }
 
@@ -1180,6 +1205,11 @@ function addReviewer(
         ? {}
         : { gateMinimumConfidence: current.gateMinimumConfidence }
       : { gateMinimumConfidence: metadata.gateMinimumConfidence }),
+    ...(metadata.adjudicationValidation === undefined
+      ? current?.adjudicationValidation === undefined
+        ? {}
+        : { adjudicationValidation: current.adjudicationValidation }
+      : { adjudicationValidation: metadata.adjudicationValidation }),
   });
 }
 
@@ -1670,18 +1700,21 @@ function parseRawFindings(parsed: ParsedReportRecord): ParsedFinding[] {
       !("actionable_findings" in sourceResult)
     )
       continue;
+    const attestation = metadata.adjudicationValidation;
+    if (attestation === undefined) continue;
     const reviewScope =
       asRecord(parsed.request?.review_scope)?.mode === "changes"
         ? "changes"
         : "full";
     const git = asRecord(parsed.context?.git);
-    const outcome = validateAdjudication(sourceResult, result, {
-      reviewScope,
-      git: {
-        changedFiles: stringArray(git?.changed_files),
-        diff: typeof git?.diff === "string" ? git.diff : "",
-      },
+    const outcome = verifyAdjudicationValidationAttestation({
+      attestation,
+      candidateResult: sourceResult,
+      adjudicationResult: result,
+      contextHead:
+        typeof git?.head === "string" ? git.head : null,
     });
+    if (outcome === undefined) continue;
     adjudicationDecisions.set(
       metadata.adjudicatesReviewerId,
       new Map(

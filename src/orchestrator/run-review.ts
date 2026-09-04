@@ -42,6 +42,8 @@ import {
   sanitizeCurrentReviewerOutput,
 } from "../results/sanitize.js";
 import { validateAdjudication } from "../findings/adjudication.js";
+import { verifyAdjudicationEvidence } from "../findings/evidence-verifier.js";
+import { createAdjudicationValidationAttestation } from "../findings/attestation.js";
 import {
   aggregateRun,
   createSuiteState,
@@ -769,6 +771,60 @@ export async function runReviewRound({
     }
     const digest = reviewerResultDigest(accepted);
     const byteCount = Buffer.byteLength(JSON.stringify(accepted), "utf8");
+    const sourceReviewerId = reviewer.policy?.adjudicatesReviewerId;
+    const sourceResult =
+      sourceReviewerId === undefined
+        ? undefined
+        : state.reviewer(sourceReviewerId).result;
+    const adjudicationResult =
+      mode === "adjudication" && "decisions" in accepted
+        ? accepted
+        : undefined;
+    const evidenceVerification =
+      adjudicationResult === undefined
+        ? undefined
+        : await verifyAdjudicationEvidence({
+            workspace: context.workspace,
+            adjudicationResult,
+          }).catch(() => ({ by_source_finding_id: {} }));
+    const validationContext =
+      evidenceVerification === undefined
+        ? undefined
+        : {
+            reviewScope: context.review_scope.mode,
+            git:
+              context.git.is_repository
+                ? {
+                    changedFiles: context.git.changed_files,
+                    diff: context.git.diff,
+                  }
+                : { changedFiles: [], diff: "" },
+            evidenceVerification,
+          };
+    const adjudicationOutcome =
+      adjudicationResult !== undefined &&
+      validationContext !== undefined &&
+      sourceResult !== undefined &&
+      sourceResult.schema_version === "3" &&
+      "actionable_findings" in sourceResult
+        ? validateAdjudication(sourceResult, adjudicationResult, validationContext)
+        : undefined;
+    const adjudicationValidation =
+      adjudicationOutcome === undefined ||
+      sourceResult === undefined ||
+      sourceResult.schema_version !== "3" ||
+      adjudicationResult === undefined ||
+      validationContext === undefined
+        ? undefined
+        : createAdjudicationValidationAttestation({
+            candidateResult: sourceResult,
+            adjudicationResult,
+            contextHead:
+              context.git.is_repository && context.git.head !== null
+                ? context.git.head
+                : null,
+            validationContext,
+          });
     try {
       await recordRequired({
         record: "reviewer.result",
@@ -783,6 +839,9 @@ export async function runReviewRound({
         digest,
         byte_count: byteCount,
         result: accepted,
+        ...(adjudicationValidation === undefined
+          ? {}
+          : { adjudication_validation: adjudicationValidation }),
       });
     } catch (error) {
       const failure = sanitizeAdapterFailure(
@@ -794,28 +853,6 @@ export async function runReviewRound({
       await finalizeIncomplete(reviewer, failure, isolation);
       return { outcome: "incomplete", failure };
     }
-    const sourceReviewerId = reviewer.policy?.adjudicatesReviewerId;
-    const sourceResult =
-      sourceReviewerId === undefined
-        ? undefined
-        : state.reviewer(sourceReviewerId).result;
-    const adjudicationOutcome =
-      mode === "adjudication" &&
-      sourceResult !== undefined &&
-      sourceResult.schema_version === "3" &&
-      "actionable_findings" in sourceResult &&
-      "decisions" in accepted
-        ? validateAdjudication(sourceResult, accepted, {
-            reviewScope: context.review_scope.mode,
-            git:
-              context.git.is_repository
-                ? {
-                    changedFiles: context.git.changed_files,
-                    diff: context.git.diff,
-                  }
-                : { changedFiles: [], diff: "" },
-          })
-        : undefined;
     state.complete(reviewer.id, accepted, isolation, adjudicationOutcome);
     const terminal = reviewerTerminalRecord(state, reviewer.id);
     resultManifest.push({

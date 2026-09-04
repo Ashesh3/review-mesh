@@ -7,6 +7,10 @@ import type {
   AdjudicationResult,
   ReviewerResultV3,
 } from "../../src/protocol/schemas.js";
+import {
+  createAdjudicationValidationAttestation,
+  verifyAdjudicationValidationAttestation,
+} from "../../src/findings/attestation.js";
 
 function candidate(): ReviewerResultV3 {
   return {
@@ -54,6 +58,9 @@ function context(
         "+++ b/src/ingest.ts",
         "@@ -30,16 +30,16 @@",
       ].join("\n"),
+    },
+    evidenceVerification: {
+      by_source_finding_id: { "enum-post-ingest": { verified: true, failures: [] } },
     },
     ...overrides,
   };
@@ -534,8 +541,107 @@ describe("validateAdjudication", () => {
       validateAdjudication(candidate(), judge, {
         reviewScope: "full",
         git: { changedFiles: [], diff: "" },
+        evidenceVerification: {
+          by_source_finding_id: {
+            "enum-post-ingest": { verified: true, failures: [] },
+          },
+        },
       }).decisions[0],
     ).toMatchObject({ effective_decision: "confirmed", gate_eligible: true });
+  });
+
+  it("cannot gate without authoritative core evidence verification", () => {
+    const judge = adjudication({
+      source_finding_id: "enum-post-ingest",
+      decision: "confirmed",
+      rationale: "Candidate repetition only.",
+      cited_evidence: [
+        {
+          path: "src/ingest.ts",
+          start_line: 40,
+          end_line: 45,
+          detail: "Repeated candidate evidence.",
+        },
+      ],
+      ordered_execution_proof: {
+        steps: [
+          {
+            order: 1,
+            description: "First.",
+            citation: {
+              path: "src/ingest.ts",
+              start_line: 40,
+              detail: "First.",
+            },
+          },
+          {
+            order: 2,
+            description: "Second.",
+            citation: {
+              path: "src/ingest.ts",
+              start_line: 45,
+              detail: "Second.",
+            },
+          },
+        ],
+        failure_point: {
+          step_order: 2,
+          citation: {
+            path: "src/ingest.ts",
+            start_line: 45,
+            detail: "Failure.",
+          },
+          detail: "Failure.",
+        },
+      },
+      unverified_assumptions: [],
+    });
+
+    expect(
+      validateAdjudication(candidate(), judge, {
+        reviewScope: "full",
+        git: { changedFiles: [], diff: "" },
+      }).decisions[0],
+    ).toMatchObject({
+      effective_decision: "needs_verification",
+      gate_eligible: false,
+      issues: expect.arrayContaining(["core_evidence_verification_required"]),
+    });
+  });
+
+  it("binds persisted validation to both results and the context head", () => {
+    const candidateResult = candidate();
+    const adjudicationResult = adjudication({
+      source_finding_id: "enum-post-ingest",
+      decision: "rejected",
+      rationale: "Rejected.",
+      cited_evidence: [],
+      unverified_assumptions: [],
+    });
+    const validationContext = context();
+    const attestation = createAdjudicationValidationAttestation({
+      candidateResult,
+      adjudicationResult,
+      contextHead: "abc123",
+      validationContext,
+    });
+
+    expect(
+      verifyAdjudicationValidationAttestation({
+        attestation,
+        candidateResult,
+        adjudicationResult,
+        contextHead: "abc123",
+      }),
+    ).toEqual(attestation.outcome);
+    expect(
+      verifyAdjudicationValidationAttestation({
+        attestation,
+        candidateResult,
+        adjudicationResult,
+        contextHead: "different",
+      }),
+    ).toBeUndefined();
   });
 
   it("requires exactly one decision for each candidate source id", () => {
