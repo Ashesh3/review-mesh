@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -86,8 +86,38 @@ describe("createReadOnlyFileTools", () => {
       eof: false,
     });
     expect(ledger.summary().status).toBe("incomplete");
-    result.acknowledgeDelivered();
+    expect(result.acknowledgeDelivered(JSON.stringify(result.response))).toBe(
+      true,
+    );
     expect(ledger.summary().status).toBe("incomplete");
+  });
+
+  it("credits only the exact serialized response admitted to the provider", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-mesh-tools-"));
+    directories.push(root);
+    await writeFile(join(root, "worker.ts"), "abcdef", "utf8");
+    const ledger = await createChangeCoverageLedger({
+      context: context(root),
+      policy: {
+        relevantPaths: ["**"],
+        minimumInspection: "full_file",
+        proof: "observed",
+      },
+    });
+    const tools = createReadOnlyFileTools({ ledger });
+
+    const altered = await tools.readFile({ path: "worker.ts" });
+    if (!altered.response.ok) throw new Error(altered.response.reason);
+    altered.response.content = "";
+    expect(altered.acknowledgeDelivered(JSON.stringify(altered.response))).toBe(
+      false,
+    );
+    expect(ledger.summary().status).toBe("incomplete");
+
+    const admitted = await tools.readFile({ path: "worker.ts" });
+    const serialized = JSON.stringify(admitted.response);
+    expect(admitted.acknowledgeDelivered(serialized)).toBe(true);
+    expect(ledger.summary().status).toBe("complete");
   });
 
   it("lists and searches pinned text without crediting full-file inspection", async () => {
@@ -150,5 +180,47 @@ describe("createReadOnlyFileTools", () => {
       files: [{ path: "worker.ts", byte_count: 16 }],
     });
     expect(ledger.summary().status).toBe("not_applicable");
+  });
+
+  it("keeps full-review reads, listings, and searches inside the path filter", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-mesh-tools-"));
+    directories.push(root);
+    await mkdir(join(root, "allowed"));
+    await mkdir(join(root, "outside"));
+    await writeFile(join(root, "allowed", "worker.ts"), "needle allowed\n");
+    await writeFile(join(root, "outside", "secret.ts"), "needle secret\n");
+    const full = context(root, []);
+    full.review_scope = {
+      mode: "full",
+      source: "request",
+      paths: ["allowed"],
+    };
+    const ledger = await createChangeCoverageLedger({
+      context: full,
+      policy: {
+        relevantPaths: ["**"],
+        minimumInspection: "full_file",
+        proof: "observed",
+      },
+    });
+    const tools = createReadOnlyFileTools({ ledger });
+
+    await expect(tools.listFiles()).resolves.toEqual({
+      files: [{ path: "allowed/worker.ts", byte_count: 15 }],
+      truncated: false,
+    });
+    await expect(tools.searchText({ query: "needle" })).resolves.toEqual({
+      matches: [{ path: "allowed/worker.ts", line: 1, text: "needle allowed" }],
+      truncated: false,
+    });
+    await expect(
+      tools.readFile({ path: "outside/secret.ts" }),
+    ).resolves.toMatchObject({
+      response: {
+        ok: false,
+        path: "outside/secret.ts",
+        reason: "unavailable",
+      },
+    });
   });
 });

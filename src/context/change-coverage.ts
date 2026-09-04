@@ -101,13 +101,20 @@ interface MutableEntry extends ChangeCoverageEntry {
 
 interface SharedSnapshot {
   files: Map<string, SnapshotFile>;
-  references: number;
 }
 
 const sharedSnapshots = new WeakMap<ResolvedContext, Promise<SharedSnapshot>>();
 
+export type ChangeCoverageNotApplicable =
+  | { reason: "full_review" }
+  | {
+      reason: "policy_excluded";
+      policy_reference: { relevant_paths: string[] };
+    };
+
 export interface ChangeCoverageLedger {
   readonly scopeDigest: string;
+  readonly notApplicable?: ChangeCoverageNotApplicable;
   readFile(input: {
     path: string;
     offset?: number;
@@ -126,6 +133,10 @@ export interface ChangeCoverageLedger {
     byteCount: number;
   }>;
   close(): Promise<void>;
+}
+
+export function releaseRunSnapshot(context: ResolvedContext): void {
+  sharedSnapshots.delete(context);
 }
 
 function digest(bytes: Uint8Array | string): string {
@@ -276,11 +287,29 @@ async function capture(
 
 async function captureWorkspace(
   root: string,
+  includedPaths: readonly string[] | undefined,
   signal?: AbortSignal,
 ): Promise<Map<string, SnapshotFile>> {
   const snapshots = new Map<string, SnapshotFile>();
   let entries = 0;
   let bytes = 0;
+  const included = (path: string): boolean =>
+    includedPaths === undefined ||
+    includedPaths.some(
+      (scopePath) =>
+        scopePath === "" ||
+        path === scopePath ||
+        path.startsWith(`${scopePath}/`),
+    );
+  const canContainIncludedPath = (path: string): boolean =>
+    includedPaths === undefined ||
+    includedPaths.some(
+      (scopePath) =>
+        scopePath === "" ||
+        path === scopePath ||
+        path.startsWith(`${scopePath}/`) ||
+        scopePath.startsWith(`${path}/`),
+    );
   const walk = async (directory: string): Promise<void> => {
     const stream = await opendir(directory);
     try {
@@ -298,12 +327,14 @@ async function captureWorkspace(
           continue;
         }
         if (metadata.isSymbolicLink()) continue;
-        if (metadata.isDirectory()) await walk(absolute);
-        else if (metadata.isFile()) {
-          const path = relative(root, absolute)
-            .split(sep)
-            .join("/")
-            .normalize("NFC");
+        const path = relative(root, absolute)
+          .split(sep)
+          .join("/")
+          .normalize("NFC");
+        if (metadata.isDirectory()) {
+          if (canContainIncludedPath(path)) await walk(absolute);
+        } else if (metadata.isFile()) {
+          if (!included(path)) continue;
           let snapshot: SnapshotFile | CoverageReadFailureReason;
           try {
             snapshot = await capture(root, canonicalPath(path));
@@ -389,20 +420,27 @@ export async function createChangeCoverageLedger(input: {
   const normalized = paths
     .map((entry) => ({ path: canonicalPath(entry.path), kind: entry.kind }))
     .sort((left, right) => compareCodePoints(left.path, right.path));
+  const fullReview = input.context.review_scope.mode === "full";
+  const fullScopePaths =
+    fullReview && input.context.review_scope.paths !== undefined
+      ? input.context.review_scope.paths.map((path) =>
+          path === "." ? "" : canonicalPath(path.replace(/\/+$/u, "")),
+        )
+      : undefined;
   let snapshotPromise = sharedSnapshots.get(input.context);
   if (snapshotPromise === undefined) {
-    snapshotPromise = captureWorkspace(root, input.signal).then((files) => ({
-      files,
-      references: 0,
-    }));
+    snapshotPromise = captureWorkspace(root, fullScopePaths, input.signal).then(
+      (files) => ({ files }),
+    );
     sharedSnapshots.set(input.context, snapshotPromise);
   }
   const sharedSnapshot = await snapshotPromise;
-  sharedSnapshot.references += 1;
   const snapshots = sharedSnapshot.files;
   const entries = new Map<string, MutableEntry>();
   const authoritativePaths = new Set(normalized.map((entry) => entry.path));
-  const fullReview = input.context.review_scope.mode === "full";
+  const changedFilesTruncated =
+    input.context.git.is_repository &&
+    input.context.git.truncated.changed_files;
 
   for (const changed of normalized) {
     const relevant =
@@ -483,6 +521,7 @@ export async function createChangeCoverageLedger(input: {
     canonicalJson({
       schema_version: "1",
       diff_sha256: rawDiffDigest,
+      changed_files_truncated: changedFilesTruncated,
       paths: [...entries.values()]
         .filter((entry) => authoritativePaths.has(entry.path))
         .map((entry) => ({
@@ -504,6 +543,16 @@ export async function createChangeCoverageLedger(input: {
     for (const entry of relevantEntries)
       entry.stickyFailure = "attestation_path_limit";
   }
+  const notApplicable: ChangeCoverageNotApplicable | undefined = fullReview
+    ? { reason: "full_review" }
+    : relevantEntries.length === 0 && !changedFilesTruncated
+      ? {
+          reason: "policy_excluded",
+          policy_reference: {
+            relevant_paths: [...input.policy.relevantPaths],
+          },
+        }
+      : undefined;
 
   function refresh(entry: MutableEntry): void {
     if (!entry.relevant) {
@@ -534,7 +583,7 @@ export async function createChangeCoverageLedger(input: {
 
   function summary(): ChangeCoverageResult {
     const relevant = [...entries.values()].filter((entry) => entry.relevant);
-    if (fullReview || relevant.length === 0) {
+    if (notApplicable !== undefined) {
       return {
         status: "not_applicable",
         inspected_count: 0,
@@ -546,21 +595,29 @@ export async function createChangeCoverageLedger(input: {
     const deficits = relevant.filter(
       (entry) => entry.disposition === "deficit",
     );
+    const scopeDeficit = changedFilesTruncated
+      ? [{ path: "<change_scope>", reason: "changed_files_truncated" }]
+      : [];
+    const deficitCount = deficits.length + scopeDeficit.length;
     return {
-      status: deficits.length === 0 ? "complete" : "incomplete",
+      status: deficitCount === 0 ? "complete" : "incomplete",
       proof_kind: input.policy.proof,
       scope_digest: scopeDigest,
       inspected_count: relevant.length - deficits.length,
-      deficit_count: deficits.length,
-      deficit_sample: deficits.slice(0, 8).map((entry) => ({
-        path: entry.path,
-        reason: entry.reason ?? "not_inspected",
-      })),
+      deficit_count: deficitCount,
+      deficit_sample: [
+        ...scopeDeficit,
+        ...deficits.map((entry) => ({
+          path: entry.path,
+          reason: entry.reason ?? "not_inspected",
+        })),
+      ].slice(0, 8),
     };
   }
 
   return {
     scopeDigest,
+    ...(notApplicable === undefined ? {} : { notApplicable }),
     async readFile(request) {
       if (closed) return { ok: false, path: request.path, reason: "closed" };
       let path: string;
@@ -713,10 +770,6 @@ export async function createChangeCoverageLedger(input: {
       closed = true;
       for (const entry of entries.values()) {
         delete entry.snapshot;
-      }
-      sharedSnapshot.references -= 1;
-      if (sharedSnapshot.references === 0) {
-        sharedSnapshots.delete(input.context);
       }
     },
   };

@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createChangeCoverageLedger,
+  releaseRunSnapshot,
   type ChangeCoveragePolicy,
 } from "../../src/context/change-coverage.js";
 import type { ResolvedContext } from "../../src/context/resolve.js";
@@ -26,7 +27,12 @@ function context(
     path: string;
     kind: "tracked" | "deleted" | "untracked";
   }>,
-  options: { diffTruncated?: boolean; mode?: "changes" | "full" } = {},
+  options: {
+    diffTruncated?: boolean;
+    changedFilesTruncated?: boolean;
+    mode?: "changes" | "full";
+    scopePaths?: string[];
+  } = {},
 ): ResolvedContext {
   const diff = changedPaths
     .filter((entry) => entry.kind !== "untracked")
@@ -37,7 +43,13 @@ function context(
     workspace,
     project_name: "coverage-test",
     instructions: "Review the changes.",
-    review_scope: { mode: options.mode ?? "changes", source: "request" },
+    review_scope: {
+      mode: options.mode ?? "changes",
+      source: "request",
+      ...(options.scopePaths === undefined
+        ? {}
+        : { paths: options.scopePaths }),
+    },
     git: {
       is_repository: true,
       root: workspace,
@@ -52,7 +64,7 @@ function context(
       raw_diff: { byte_count: Buffer.byteLength(diff), sha256: sha256(diff) },
       truncated: {
         status_entries: false,
-        changed_files: false,
+        changed_files: options.changedFilesTruncated ?? false,
         diff_stat: false,
         diff: options.diffTruncated ?? false,
       },
@@ -184,6 +196,36 @@ describe("createChangeCoverageLedger", () => {
     expect(secondRead.snapshotDigest).toBe(firstRead.snapshotDigest);
   });
 
+  it("keeps the run snapshot after a reviewer closes until explicit teardown", async () => {
+    const root = await workspace();
+    await writeFile(join(root, "worker.ts"), "first", "utf8");
+    const resolved = context(root, [{ path: "worker.ts", kind: "untracked" }]);
+    const first = await createChangeCoverageLedger({
+      context: resolved,
+      policy: observedFullFile,
+    });
+    await first.close();
+    await writeFile(join(root, "worker.ts"), "second", "utf8");
+
+    const fallback = await createChangeCoverageLedger({
+      context: resolved,
+      policy: observedFullFile,
+    });
+    const pinned = await fallback.readFile({ path: "worker.ts" });
+    if (!pinned.ok) throw new Error(pinned.reason);
+    expect(Buffer.from(pinned.bytes).toString("utf8")).toBe("first");
+
+    await fallback.close();
+    releaseRunSnapshot(resolved);
+    const nextRun = await createChangeCoverageLedger({
+      context: resolved,
+      policy: observedFullFile,
+    });
+    const recaptured = await nextRun.readFile({ path: "worker.ts" });
+    if (!recaptured.ok) throw new Error(recaptured.reason);
+    expect(Buffer.from(recaptured.bytes).toString("utf8")).toBe("second");
+  });
+
   it("fails closed for symlink escapes without leaking filesystem errors", async () => {
     const root = await workspace();
     const outside = await workspace();
@@ -265,7 +307,41 @@ describe("createChangeCoverageLedger", () => {
     });
   });
 
-  it("marks a lens with no relevant changed paths and a full review not applicable", async () => {
+  it("keeps a truncated changed-file manifest as a scope deficit", async () => {
+    const root = await workspace();
+    await writeFile(join(root, "worker.ts"), "abcdef", "utf8");
+    const truncated = context(root, [{ path: "worker.ts", kind: "tracked" }], {
+      changedFilesTruncated: true,
+    });
+    const ledger = await createChangeCoverageLedger({
+      context: truncated,
+      policy: observedFullFile,
+    });
+    ledger.recordDiffDelivery(["worker.ts"], diffProof(truncated));
+    const read = await ledger.readFile({ path: "worker.ts" });
+    if (!read.ok) throw new Error(read.reason);
+    read.acknowledgeDelivered();
+
+    expect(ledger.summary()).toMatchObject({
+      status: "incomplete",
+      inspected_count: 1,
+      deficit_count: 1,
+      deficit_sample: [
+        { path: "<change_scope>", reason: "changed_files_truncated" },
+      ],
+    });
+
+    const completeManifest = context(root, [
+      { path: "worker.ts", kind: "tracked" },
+    ]);
+    const completeLedger = await createChangeCoverageLedger({
+      context: completeManifest,
+      policy: observedFullFile,
+    });
+    expect(ledger.scopeDigest).not.toBe(completeLedger.scopeDigest);
+  });
+
+  it("distinguishes policy exclusion from full-review non-applicability", async () => {
     const root = await workspace();
     await mkdir(join(root, "docs"));
     await writeFile(join(root, "docs/readme.md"), "docs", "utf8");
@@ -279,12 +355,17 @@ describe("createChangeCoverageLedger", () => {
       deficit_count: 0,
       deficit_sample: [],
     });
+    expect(excluded.notApplicable).toEqual({
+      reason: "policy_excluded",
+      policy_reference: { relevant_paths: ["src/**"] },
+    });
 
     const full = await createChangeCoverageLedger({
       context: context(root, [], { mode: "full" }),
       policy: observedFullFile,
     });
     expect(full.summary().status).toBe("not_applicable");
+    expect(full.notApplicable).toEqual({ reason: "full_review" });
   });
 
   it("requires the exact attested scope, methods, and snapshot digests", async () => {

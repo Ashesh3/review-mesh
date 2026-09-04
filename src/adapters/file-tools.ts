@@ -14,7 +14,13 @@ export function createReadOnlyFileTools(options: {
       byteCount?: number;
     }) {
       const read = await options.ledger.readFile(input);
-      if (!read.ok) return { response: read, acknowledgeDelivered() {} };
+      if (!read.ok)
+        return {
+          response: read,
+          acknowledgeDelivered(_admittedSerializedResponse: string) {
+            return false;
+          },
+        };
       const response = {
         ok: true as const,
         path: read.path,
@@ -27,7 +33,19 @@ export function createReadOnlyFileTools(options: {
         snapshot_digest: read.snapshotDigest,
         eof: read.eof,
       };
-      return { response, acknowledgeDelivered: read.acknowledgeDelivered };
+      const expectedSerializedResponse = JSON.stringify(response);
+      let credited = false;
+      return {
+        response,
+        acknowledgeDelivered(admittedSerializedResponse: string): boolean {
+          if (admittedSerializedResponse !== expectedSerializedResponse)
+            return false;
+          if (credited) return true;
+          read.acknowledgeDelivered();
+          credited = true;
+          return true;
+        },
+      };
     },
     async listFiles(input: { path?: string } = {}) {
       const prefix = normalizedPrefix(input.path);
