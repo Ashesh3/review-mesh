@@ -203,6 +203,37 @@ describe("effective configuration description", () => {
     });
   });
 
+  it("warns whenever the reported topology has zero provider-outage tolerance", async () => {
+    const { file, workspace } = await fixture();
+    const source = await readFile(file, "utf8");
+    await writeFile(
+      file,
+      source
+        .replace('model = "private-model"\n', "")
+        .replace(
+          'purpose = "Correctness"',
+          'model_runs = [{ id = "a1", model = "a1", provider_group = "a" }, { id = "a2", model = "a2", provider_group = "a" }, { id = "a3", model = "a3", provider_group = "a" }, { id = "b", model = "b", provider_group = "b" }, { id = "c", model = "c", provider_group = "c" }]\npass_quorum = 3\nminimum_provider_groups = 2\nallow_zero_outage_tolerance = true\npurpose = "Correctness"',
+        ),
+    );
+
+    const result = await describeEffectiveConfig({
+      configFile: file,
+      workspace,
+      environment: {},
+    });
+    expect(result.valid).toBe(true);
+    if (!result.valid) throw new Error("expected valid effective config");
+    expect(result.reviewers[0]?.provider_topology.outage_tolerance).toBe(0);
+    expect(result.warnings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "zero_outage_tolerance_quorum",
+          lens_ids: ["reviewer"],
+        }),
+      ]),
+    );
+  });
+
   it("reports missing and invalid configuration without throwing", async () => {
     const root = await mkdtemp(join(tmpdir(), "review-mesh-effective-"));
     roots.push(root);

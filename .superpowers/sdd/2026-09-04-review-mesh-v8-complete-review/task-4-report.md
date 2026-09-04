@@ -114,4 +114,56 @@ Observed: both commands exited 0; all matched files use Prettier style and no wh
 
 ## Commit
 
+`e10ec73` — `Require resilient explicit lens policy`
+
+## Fix round 1
+
+### RED
+
+Command:
+
+```powershell
+npx vitest run tests/config/resolve.test.ts tests/config/effective.test.ts tests/config/tui.test.ts
+```
+
+Observed:
+
+- Exit code 1.
+- 3 test files failed; 3 new regressions failed while 37 existing assertions passed.
+- V1 loading returned schema 1 instead of migrated schema 6 with explicit always/empty policy.
+- TUI could not save a five-model roster split across two providers before the policy editor was reachable.
+- Effective topology reported outage tolerance 0 for a 3+1+1 provider distribution at quorum 3/2, but emitted no zero-outage warning.
+
+### GREEN
+
+Focused command:
+
+```powershell
+npx vitest run tests/config/resolve.test.ts tests/config/effective.test.ts tests/config/tui.test.ts
+```
+
+Observed: exit code 0; 3 files and 40 tests passed.
+
+Exact Task 4 command:
+
+```powershell
+npx vitest run tests/config/schemas.test.ts tests/config/manage.test.ts tests/config/resolve.test.ts tests/config/effective.test.ts tests/config/tui.test.ts tests/orchestrator/lens-policy.test.ts tests/orchestrator/review-feedback.test.ts
+```
+
+Observed: exit code 0; 7 files and 139 tests passed.
+
+Additional verification:
+
+- `npm run typecheck`: exit code 0.
+- Targeted `npx prettier --check`: exit code 0.
+- `git diff --check`: exit code 0.
+
+### Fixes
+
+- Active loading now migrates v1 through the same v6 managed migration as v2-v5, preserving reviewer order and legacy disabled streaming while adding explicit always applicability and empty required context.
+- TUI materializes quorum policy before validation: five-model lenses default to pass quorum 3 and up to 3 distinct provider groups, so a two-provider roster is directly created as acknowledged 3/2 while three-or-more-provider rosters retain 3/3.
+- Zero-outage warnings now use the same `providerOutageTolerance(...) === 0` calculation shown in effective topology, eliminating heuristic drift.
+
+### Commit
+
 Pending.

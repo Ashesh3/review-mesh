@@ -186,9 +186,79 @@ describe("config menu", () => {
       instructions: "Review architecture and trust boundaries.",
       isolation: "prefer_enforced",
       timeout_ms: 900000,
+      pass_quorum: 2,
+      minimum_provider_groups: 2,
       applicability: { mode: "always" },
       required_context: [],
       allow_zero_outage_tolerance: true,
+    });
+  });
+
+  it("creates a five-model two-provider lens directly with a three-by-two acknowledged policy", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "review-mesh-config-tui-"));
+    roots.push(directory);
+    const file = join(directory, "config.toml");
+    const loaded = await loadManagedConfig(file, true);
+    loaded.config.adapters.gateway = {
+      type: "openai_compatible",
+      base_url_env: "BASE",
+      api_key_env: "KEY",
+    };
+    loaded.config.adapters.secondary = {
+      type: "command",
+      command: "secondary-reviewer",
+      protocol: "review-mesh-command-v1",
+    };
+    await runConfigMenu({
+      configFile: file,
+      config: loaded.config,
+      snapshot: loaded.snapshot,
+      prompt: new Answers([
+        "a",
+        "resilience",
+        "gateway",
+        "multi",
+        "5",
+        "one",
+        "inherit",
+        "one",
+        "high",
+        "two",
+        "inherit",
+        "two",
+        "high",
+        "three",
+        "inherit",
+        "three",
+        "high",
+        "four",
+        "existing",
+        "secondary",
+        "four",
+        "high",
+        "five",
+        "existing",
+        "secondary",
+        "five",
+        "high",
+        "Resilience",
+        "Review resilience.",
+        "900000",
+        "n",
+        "y",
+        "q",
+      ]),
+      output: new PassThrough(),
+    });
+
+    expect(
+      (await loadManagedConfig(file)).config.agents.resilience,
+    ).toMatchObject({
+      pass_quorum: 3,
+      minimum_provider_groups: 2,
+      allow_zero_outage_tolerance: true,
+      applicability: { mode: "always" },
+      required_context: [],
     });
   });
 

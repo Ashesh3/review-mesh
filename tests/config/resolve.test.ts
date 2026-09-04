@@ -706,6 +706,74 @@ describe("global configuration", () => {
 });
 
 describe("loadConfigFiles", () => {
+  it("migrates v1 into explicit v6 policy without changing legacy order or streaming", async () => {
+    const root = await mkdtemp(
+      join(process.env.TEMP ?? "C:\\Temp", "mesh-config-v1-"),
+    );
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    await writeFile(
+      join(root, "config.toml"),
+      `schema_version = "1"
+[execution]
+max_concurrency = 1
+heartbeat_interval_ms = 1000
+shutdown_grace_period_ms = 1000
+[diagnostics]
+persist_runs = false
+max_runs = 1
+[adapters.gateway]
+type = "openai_compatible"
+base_url_env = "BASE"
+api_key_env = "KEY"
+[reviewer_profiles.first]
+adapter = "gateway"
+model = "one"
+purpose = "First"
+instructions = "Review first."
+isolation = "prefer_enforced"
+timeout_ms = 1000
+[reviewer_profiles.second]
+adapter = "gateway"
+model = "two"
+purpose = "Second"
+instructions = "Review second."
+isolation = "prefer_enforced"
+timeout_ms = 1000
+[[reviewers]]
+id = "first"
+profile = "first"
+[[reviewers]]
+id = "second"
+profile = "second"
+`,
+    );
+    try {
+      const loaded = await loadConfigFiles({
+        configFile: join(root, "config.toml"),
+        workspace,
+      });
+      expect(loaded.trusted.schema_version).toBe("6");
+      const resolved = resolveConfig(loaded);
+      expect(resolved.execution.distribute_primaries).toBe(false);
+      expect(resolved.reviewers.map(({ id }) => id)).toEqual([
+        "first",
+        "second",
+      ]);
+      expect(resolved.reviewers[0]).toMatchObject({
+        adapter: { type: "openai_compatible", streaming: "disabled" },
+        policy: {
+          applicability: { mode: "always" },
+          requiredCallerContext: [],
+          passQuorum: 1,
+          minimumProviderGroups: 1,
+        },
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("loads v2 global/project instruction files and ignores workspace policy", async () => {
     const root = await mkdtemp(
       join(process.env.TEMP ?? "C:\\Temp", "mesh-config-"),

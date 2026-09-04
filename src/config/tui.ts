@@ -228,7 +228,9 @@ function defaultAgentProviderGroups(agent: ManagedAgent): number {
           (run) => run.provider_group ?? run.adapter ?? agent.adapter,
         ),
   ).size;
-  return agent.model_runs?.length === 5 ? 3 : Math.min(2, distinct);
+  return agent.model_runs?.length === 5
+    ? Math.min(3, distinct)
+    : Math.min(2, distinct);
 }
 
 async function zeroOutageAcknowledgement(
@@ -620,6 +622,13 @@ async function addAgent(options: ConfigMenuOptions): Promise<void> {
     applicability: { mode: "always" },
     required_context: [],
   };
+  if (agent.model_runs !== undefined) {
+    agent.pass_quorum = defaultAgentPassQuorum(agent);
+    agent.minimum_provider_groups = defaultAgentProviderGroups(agent);
+  } else {
+    agent.pass_quorum = 1;
+    agent.minimum_provider_groups = 1;
+  }
   agent.allow_zero_outage_tolerance = await zeroOutageAcknowledgement(
     options,
     agent,

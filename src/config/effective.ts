@@ -172,12 +172,18 @@ export function describeResolvedConfig(
     .filter(([, members]) => {
       if (members.length < 2) return false;
       const policy = members[0]?.policy;
-      const groups = new Set(
-        members.map((reviewer) => reviewer.providerGroup ?? reviewer.adapterId),
+      const providerGroups = members.map(
+        (reviewer) => reviewer.providerGroup ?? reviewer.adapterId,
       );
       return (
-        (policy?.passQuorum ?? members.length) >= members.length ||
-        (policy?.minimumProviderGroups ?? 1) >= groups.size
+        new Set(providerGroups).size > 1 &&
+        providerOutageTolerance(
+          {
+            passQuorum: policy?.passQuorum ?? members.length,
+            minimumProviderGroups: policy?.minimumProviderGroups ?? 1,
+          },
+          providerGroups,
+        ) === 0
       );
     })
     .map(([id]) => id);
@@ -185,7 +191,7 @@ export function describeResolvedConfig(
     warnings.push({
       code: "zero_outage_tolerance_quorum",
       message:
-        "One or more multi-model lenses require every configured model or provider group to pass, so one outage makes clean coverage impossible.",
+        "One or more multi-model lenses cannot tolerate one provider-group outage while still satisfying clean-pass quorum.",
       lens_ids: zeroToleranceLenses,
       provider_groups: [
         ...new Set(

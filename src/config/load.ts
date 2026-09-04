@@ -305,6 +305,7 @@ export async function loadConfigFiles(
     readTimeoutMs,
   );
   const resolvedTrusted =
+    instructionsResolved.schema_version === "1" ||
     instructionsResolved.schema_version === "2" ||
     instructionsResolved.schema_version === "3" ||
     instructionsResolved.schema_version === "4" ||
