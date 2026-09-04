@@ -113,7 +113,7 @@ const lensDeadlineAt = Math.min(runDeadlineAt,
 
 ```ts
 await ledger.readFile({ path: "worker.ts", offset: 0, byteCount: 3 });
-expect(ledger.summary()).toMatchObject({ status: "partial", deficit_count: 1 });
+expect(ledger.summary()).toMatchObject({ status: "incomplete", deficit_count: 1 });
 await ledger.readFile({ path: "worker.ts", offset: 3 });
 expect(ledger.summary()).toMatchObject({ status: "complete", deficit_count: 0 });
 ```
@@ -188,8 +188,8 @@ expect(canonical.atomics.every(f => f.gate_eligibility.eligible
 - [ ] Add tests proving exact final ordering, no digest recursion, a 13 MiB narrative reconstructed from 24 KiB private chunks, strict unknown-version/type rejection, legacy result preservation, index-bound digest verification, orphan digest-unavailable labels, and no event after terminal.
 
 ```ts
-expect(records.at(-2)?.type).toBe("run.terminal_summary");
-expect(records.at(-1)?.type).toBe("run.artifact_terminal");
+expect(records.at(-2)?.record).toBe("run.terminal_summary");
+expect(records.at(-1)?.record).toBe("run.artifact_terminal");
 expect(records.some(r => r.event === "run.completed")).toBe(false);
 expect(createHash("sha256").update(finalBytes).digest("hex"))
   .toBe(artifact.sha256);
