@@ -103,4 +103,16 @@ describe("concise public output", () => {
       minimal: false,
     });
   });
+
+  it("does not inspect unused detailed payloads after switching to minimal liveness", () => {
+    const budget = createHeartbeatBudget({ intervalMs: 1000, maximumBytes: 1 });
+    expect(budget.select(0, {}, { elapsed_ms: 0 })?.minimal).toBe(true);
+    expect(
+      budget.select(
+        1000,
+        { text: "x".repeat(16 * 1024) },
+        { elapsed_ms: 1000 },
+      ),
+    ).toEqual({ data: { elapsed_ms: 1000 }, minimal: true });
+  });
 });
