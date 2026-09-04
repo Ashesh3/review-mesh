@@ -86,14 +86,16 @@ async function runDoctorReview(
     {
       name: "authentication",
       passed: capabilities.authenticated === true,
-      ...(capabilities.authenticated === true || capabilities.message === undefined
+      ...(capabilities.authenticated === true ||
+      capabilities.message === undefined
         ? {}
         : { message: capabilities.message }),
     },
     {
       name: "model",
       passed: capabilities.model_available === true,
-      ...(capabilities.model_available === true || capabilities.message === undefined
+      ...(capabilities.model_available === true ||
+      capabilities.message === undefined
         ? {}
         : { message: capabilities.message }),
     },
@@ -127,7 +129,8 @@ async function runDoctorReview(
       resultJsonSchema: reviewerResultJsonSchema,
     });
     let readToolObserved = false;
-    let terminal: Extract<AdapterEvent, { type: "result" | "failure" }> | undefined;
+    let terminal:
+      Extract<AdapterEvent, { type: "result" | "failure" }> | undefined;
     for await (const event of adapter.run({
       runId: `doctor-${Date.now()}`,
       reviewer,
@@ -557,11 +560,16 @@ export async function runCli(
         const registry = runtime.adapterRegistry ?? createDefaultRegistry();
         const results = [];
         for (const reviewer of reviewers) {
-          const adapter = registry.create(reviewer.adapterId, reviewer.adapter);
-          const result =
-            structuredOutput
-              ? await runDoctorReview(adapter, reviewer, controller.signal)
-              : (() => undefined)();
+          const adapter = registry.create(
+            reviewer.adapterId,
+            reviewer.adapter,
+            {
+              continuationAttempts: config.execution.continuation_attempts,
+            },
+          );
+          const result = structuredOutput
+            ? await runDoctorReview(adapter, reviewer, controller.signal)
+            : (() => undefined)();
           const capabilities =
             result === undefined
               ? await adapter.probe(reviewer, controller.signal)

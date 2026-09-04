@@ -393,6 +393,7 @@ export const dashboardHtml = String.raw`<!doctype html>
     .drawer-section { margin-top: 15px; }
     .drawer-section h3 { margin: 0 0 10px; color: var(--muted); font-size: 11px; letter-spacing: .07em; text-transform: uppercase; }
     .summary-copy { color: var(--muted); font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
+    .review-markdown { overflow-wrap: anywhere; color: var(--muted); font-family: inherit; font-size: 13px; line-height: 1.65; white-space: pre-wrap; }
 
     .toast { position: fixed; right: 20px; bottom: 20px; z-index: 80; max-width: 380px; padding: 12px 14px; border: 1px solid var(--line-strong); border-radius: var(--radius-md); color: var(--text); background: var(--panel-3); box-shadow: var(--shadow); font-size: 13px; transform: translateY(20px); visibility: hidden; opacity: 0; transition: transform var(--motion-fast), opacity var(--motion-fast), visibility var(--motion-fast); }
     .toast.show { visibility: visible; opacity: 1; transform: translateY(0); }
@@ -1476,7 +1477,9 @@ export const dashboardHtml = String.raw`<!doctype html>
       var summary = text(firstDefined(result.summary, detail.summary, get(detail, ["failure", "message"]), get(detail, ["skipped", "reason"])), "No terminal summary recorded.");
       var findings = array(firstDefined(result.actionable_findings, detail.findings)).filter(isObject);
       var notes = array(result.informational_notes).filter(isObject);
+      var reviewMarkdown = text(result.review_markdown);
       var html = '<section class="drawer-section"><h3>Terminal result</h3><div class="panel side-card"><div style="margin-bottom:10px">' + badge(firstDefined(result.verdict, status)) + '</div><div class="summary-copy">' + escapeHtml(summary) + "</div></div></section>";
+      if (reviewMarkdown) html += '<section class="drawer-section"><h3>Complete review</h3><div class="panel side-card review-markdown">' + escapeHtml(reviewMarkdown) + "</div></section>";
       html += '<section class="drawer-section"><h3>Actionable findings · ' + findings.length + "</h3>" + (findings.length ? '<div class="finding-list">' + findings.map(renderFinding).join("") + "</div>" : renderEmpty("No structured findings", "No actionable finding details were returned for this reviewer.")) + "</section>";
       if (notes.length) html += '<section class="drawer-section"><h3>Informational notes · ' + notes.length + '</h3><div class="stack">' + notes.map(function (note) { return '<div class="panel side-card"><strong style="font-size:11px">' + escapeHtml(text(note.title, "Note")) + '</strong><div class="summary-copy" style="margin-top:5px">' + escapeHtml(text(note.description)) + "</div></div>"; }).join("") + "</div></section>";
       return html;

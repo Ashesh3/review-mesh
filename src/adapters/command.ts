@@ -8,6 +8,7 @@ import {
   currentReviewerOutputSchema,
   type IsolationLevel,
 } from "../protocol/schemas.js";
+import { MAX_REVIEWER_RESULT_BYTES } from "../results/sanitize.js";
 import { adapterFailure, sanitizeAdapterFailure } from "./errors.js";
 import {
   buildAllowlistedEnvironment,
@@ -17,8 +18,11 @@ import {
   type ReviewAdapter,
 } from "./types.js";
 
-const MAX_STDOUT_BYTES = 8 * 1024 * 1024;
-const MAX_STDOUT_LINE_BYTES = 1024 * 1024;
+// A legal 16 MiB result can expand under JSON escaping. Six bytes per input
+// byte covers JSON's longest supported escape plus a bounded protocol envelope.
+const MAX_RESULT_EVENT_BYTES = MAX_REVIEWER_RESULT_BYTES * 6 + 64 * 1024;
+const MAX_STDOUT_BYTES = MAX_RESULT_EVENT_BYTES + 8 * 1024 * 1024;
+const MAX_STDOUT_LINE_BYTES = MAX_RESULT_EVENT_BYTES;
 const MAX_STDERR_BYTES = 64 * 1024;
 const PROTOCOL = "review-mesh-command-v1";
 const LAUNCH_ENVIRONMENT_NAMES = [
@@ -39,6 +43,8 @@ export interface CommandAdapterDependencies {
   environment?: NodeJS.ProcessEnv;
   launch?: CommandLauncher;
   platform?: NodeJS.Platform;
+  maxStdoutBytes?: number;
+  maxStdoutLineBytes?: number;
 }
 
 export type CommandLauncher = (
@@ -170,6 +176,8 @@ class CommandAdapter implements ReviewAdapter {
   private readonly environment: NodeJS.ProcessEnv;
   private readonly launch: CommandLauncher;
   private readonly platform: NodeJS.Platform;
+  private readonly maxStdoutBytes: number;
+  private readonly maxStdoutLineBytes: number;
 
   constructor(
     private readonly registration: CommandRegistration,
@@ -182,6 +190,20 @@ class CommandAdapter implements ReviewAdapter {
       ((command, args, options) =>
         execa(command, args, options) as unknown as CommandProcess);
     this.platform = dependencies.platform ?? process.platform;
+    this.maxStdoutBytes = dependencies.maxStdoutBytes ?? MAX_STDOUT_BYTES;
+    this.maxStdoutLineBytes =
+      dependencies.maxStdoutLineBytes ?? MAX_STDOUT_LINE_BYTES;
+    if (
+      !Number.isSafeInteger(this.maxStdoutBytes) ||
+      this.maxStdoutBytes < 1 ||
+      !Number.isSafeInteger(this.maxStdoutLineBytes) ||
+      this.maxStdoutLineBytes < 1 ||
+      this.maxStdoutLineBytes > this.maxStdoutBytes
+    ) {
+      throw new Error(
+        "command stdout limits must be positive safe integers with line <= total",
+      );
+    }
   }
 
   async probe(): Promise<AdapterCapabilities> {
@@ -383,7 +405,7 @@ class CommandAdapter implements ReviewAdapter {
           const rawChunk = outcome.result.value;
           const chunk = asBuffer(rawChunk);
           totalBytes += chunk.byteLength;
-          if (totalBytes > MAX_STDOUT_BYTES) {
+          if (totalBytes > this.maxStdoutBytes) {
             protocolViolation =
               "The command exceeded the total stdout byte limit.";
             child.kill();
@@ -394,7 +416,7 @@ class CommandAdapter implements ReviewAdapter {
           for (;;) {
             const newline = buffered.indexOf(0x0a);
             if (newline < 0) break;
-            if (newline > MAX_STDOUT_LINE_BYTES) {
+            if (newline > this.maxStdoutLineBytes) {
               protocolViolation =
                 "The command exceeded the stdout line byte limit.";
               child.kill();
@@ -412,7 +434,7 @@ class CommandAdapter implements ReviewAdapter {
             }
           }
           if (protocolViolation !== undefined) break;
-          if (buffered.byteLength > MAX_STDOUT_LINE_BYTES) {
+          if (buffered.byteLength > this.maxStdoutLineBytes) {
             protocolViolation =
               "The command exceeded the stdout line byte limit.";
             child.kill();
@@ -422,7 +444,7 @@ class CommandAdapter implements ReviewAdapter {
         }
       }
       if (protocolViolation === undefined && buffered.byteLength > 0) {
-        if (buffered.byteLength > MAX_STDOUT_LINE_BYTES) {
+        if (buffered.byteLength > this.maxStdoutLineBytes) {
           protocolViolation =
             "The command exceeded the stdout line byte limit.";
         } else {

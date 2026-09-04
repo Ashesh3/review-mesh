@@ -121,6 +121,76 @@ afterEach(async () => {
 });
 
 describe("readRunReport", () => {
+  it("joins a compact mirrored public result reference to the authoritative private result", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-public-reference";
+    const result = resultV3(
+      `# Complete review\n\n${"Evidence. ".repeat(2_000)}`,
+    );
+    const digest = reviewerResultDigest(result);
+    const byteCount = Buffer.byteLength(JSON.stringify(result), "utf8");
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      [
+        line(persistedResultV3(runId, result)),
+        line({
+          schema_version: "5",
+          event: "reviewer.result",
+          run_id: runId,
+          seq: 1,
+          timestamp: "2026-09-04T00:00:00.000Z",
+          reviewer_id: "security",
+          data: { digest, byte_count: byteCount },
+        }),
+      ].join(""),
+    );
+
+    await expect(
+      readRunReport({ runsDirectory, runId }),
+    ).resolves.toMatchObject({
+      reviewers: [{ reviewer_id: "security", result }],
+    });
+  });
+
+  it.each([
+    {
+      name: "missing private result",
+      includePrivate: false,
+      digest: "a".repeat(64),
+    },
+    { name: "mismatched tuple", includePrivate: true, digest: "0".repeat(64) },
+  ])(
+    "rejects a compact public result reference with $name",
+    async ({ includePrivate, digest }) => {
+      const { runsDirectory } = await fixture();
+      const runId = "run-invalid-public-reference";
+      const result = resultV3("# Complete review");
+      const byteCount = Buffer.byteLength(JSON.stringify(result), "utf8");
+      await writeFile(
+        join(runsDirectory, `${runId}.jsonl`),
+        [
+          ...(includePrivate ? [line(persistedResultV3(runId, result))] : []),
+          line({
+            schema_version: "5",
+            event: "reviewer.result",
+            run_id: runId,
+            seq: 1,
+            timestamp: "2026-09-04T00:00:00.000Z",
+            reviewer_id: "security",
+            data: { digest, byte_count: byteCount },
+          }),
+        ].join(""),
+      );
+
+      await expect(
+        readRunReport({ runsDirectory, runId }),
+      ).rejects.toMatchObject({
+        code: "invalid_run_record",
+        recordType: "reviewer.result",
+      });
+    },
+  );
+
   it("keeps the authoritative full result when a later terminal contains a truncated copy", async () => {
     const { runsDirectory } = await fixture();
     const runId = "run-authoritative-result";
@@ -148,6 +218,20 @@ describe("readRunReport", () => {
 
     const report = await readRunReport({ runsDirectory, runId });
     expect(report.reviewers[0]?.result).toEqual(full);
+  });
+
+  it("renders every complete reviewer review in Markdown", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-markdown-full-review";
+    const reviewMarkdown = "# Reviewer review\n\nExact complete evidence.";
+    const result = resultV3(reviewMarkdown);
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      line(persistedResultV3(runId, result)),
+    );
+
+    const report = await readRunReport({ runsDirectory, runId });
+    expect(renderRunReportMarkdown(report)).toContain(reviewMarkdown);
   });
 
   it.each([
@@ -1211,7 +1295,12 @@ describe("finding consolidation and rendering", () => {
         title: "Candidate",
         description: "Candidate description.",
         evidence: [
-          { path: "src/item.ts", start_line: 1, end_line: 1, detail: "Evidence." },
+          {
+            path: "src/item.ts",
+            start_line: 1,
+            end_line: 1,
+            detail: "Evidence.",
+          },
         ],
         suggested_direction: "Fix.",
         confidence: "high",
@@ -1334,7 +1423,14 @@ describe("finding consolidation and rendering", () => {
           severity: "high",
           title: "Candidate",
           description: "Candidate description.",
-          evidence: [{ path: "src/item.ts", start_line: 1, end_line: 1, detail: "Evidence." }],
+          evidence: [
+            {
+              path: "src/item.ts",
+              start_line: 1,
+              end_line: 1,
+              detail: "Evidence.",
+            },
+          ],
           suggested_direction: "Fix.",
           confidence: "high",
           classification: "confirmed_defect",
@@ -1350,13 +1446,22 @@ describe("finding consolidation and rendering", () => {
         review_markdown: "# Adjudication\n\nConfirmed.",
         summary: "Confirmed.",
         actionable_findings: [] as [],
-        decisions: [{
-          source_finding_id: "candidate",
-          decision: "confirmed" as const,
-          rationale: "Confirmed.",
-          cited_evidence: [{ path: "src/item.ts", start_line: 1, end_line: 1, detail: "Evidence." }],
-          unverified_assumptions: [],
-        }],
+        decisions: [
+          {
+            source_finding_id: "candidate",
+            decision: "confirmed" as const,
+            rationale: "Confirmed.",
+            cited_evidence: [
+              {
+                path: "src/item.ts",
+                start_line: 1,
+                end_line: 1,
+                detail: "Evidence.",
+              },
+            ],
+            unverified_assumptions: [],
+          },
+        ],
         informational_notes: [],
       };
       const valid = createAdjudicationValidationAttestation({
@@ -1367,33 +1472,53 @@ describe("finding consolidation and rendering", () => {
           reviewScope: "full",
           git: { changedFiles: [], diff: "" },
           evidenceVerification: {
-            by_source_finding_id: { candidate: { verified: true, failures: [] } },
+            by_source_finding_id: {
+              candidate: { verified: true, failures: [] },
+            },
           },
         },
       });
       await writeFile(
         join(runsDirectory, `${runId}.jsonl`),
         [
-          line({ record: "request", run_id: runId, request: {
-            schema_version: "2",
-            project_name: "demo",
-            workspace: "C:/demo",
-            instructions: "Review.",
-            review_scope: { mode: "full" },
-          } }),
-          line({ record: "context", run_id: runId, context: { git: { head: "head", changed_files: [], diff: "" } } }),
-          line({ record: "resolution", run_id: runId, resolution: { reviewers: [
-            { id: "lens::source", agent_id: "lens" },
-            { id: "lens::judge", agent_id: "lens", policy: {
-              passQuorum: 1,
-              minimumProviderGroups: 1,
-              adjudication: "required",
-              gateMinimumSeverity: "medium",
-              gateMinimumConfidence: "medium",
-              mode: "adjudication",
-              adjudicatesReviewerId: "lens::source",
-            } },
-          ] } }),
+          line({
+            record: "request",
+            run_id: runId,
+            request: {
+              schema_version: "2",
+              project_name: "demo",
+              workspace: "C:/demo",
+              instructions: "Review.",
+              review_scope: { mode: "full" },
+            },
+          }),
+          line({
+            record: "context",
+            run_id: runId,
+            context: { git: { head: "head", changed_files: [], diff: "" } },
+          }),
+          line({
+            record: "resolution",
+            run_id: runId,
+            resolution: {
+              reviewers: [
+                { id: "lens::source", agent_id: "lens" },
+                {
+                  id: "lens::judge",
+                  agent_id: "lens",
+                  policy: {
+                    passQuorum: 1,
+                    minimumProviderGroups: 1,
+                    adjudication: "required",
+                    gateMinimumSeverity: "medium",
+                    gateMinimumConfidence: "medium",
+                    mode: "adjudication",
+                    adjudicatesReviewerId: "lens::source",
+                  },
+                },
+              ],
+            },
+          }),
           line({
             record: "reviewer.result",
             run_id: runId,
@@ -1413,7 +1538,9 @@ describe("finding consolidation and rendering", () => {
             result: adjudication,
             ...(attestationState === "missing"
               ? {}
-              : { adjudication_validation: { ...valid, context_head: "wrong" } }),
+              : {
+                  adjudication_validation: { ...valid, context_head: "wrong" },
+                }),
           }),
         ].join(""),
       );
@@ -1426,7 +1553,12 @@ describe("finding consolidation and rendering", () => {
           gate_eligible: false,
         }),
       ]);
-      expect(report.finding_counts).toEqual({ raw: 1, unique: 1, gate: 0, advisory: 1 });
+      expect(report.finding_counts).toEqual({
+        raw: 1,
+        unique: 1,
+        gate: 0,
+        advisory: 1,
+      });
       expect(report.gate_outcome).toBe("passed");
     },
   );

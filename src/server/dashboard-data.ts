@@ -29,13 +29,16 @@ import {
 } from "../findings/attestation.js";
 import {
   adjudicationResultSchema,
+  currentReviewerOutputSchema,
+  reviewerResultSchema,
   reviewerResultV3Schema,
 } from "../protocol/schemas.js";
+import { reviewerResultDigest } from "../results/digest.js";
+import { readRunRecordLines } from "../diagnostics/run-record-reader.js";
 
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 const ACTIVE_RUN_FILE =
   /^(?<runId>[A-Za-z0-9][A-Za-z0-9._-]*)\.jsonl\.active(?:\..+)?$/u;
-const MAX_DASHBOARD_RUN_BYTES = 64 * 1024 * 1024;
 const MAX_DASHBOARD_RUNS = 256;
 const MAX_DASHBOARD_TOTAL_BYTES = 128 * 1024 * 1024;
 const DASHBOARD_READ_CONCURRENCY = 4;
@@ -130,6 +133,8 @@ interface ReviewerRuntime {
   isolation?: string;
   activity: Array<Record<string, unknown>>;
   result?: Record<string, unknown>;
+  result_digest?: string;
+  result_byte_count?: number;
   failure?: Record<string, unknown>;
   skipped?: Record<string, unknown>;
   attempts: Array<Record<string, unknown>>;
@@ -321,7 +326,7 @@ async function listRunFiles(
         return undefined;
       }
       const metadata = await stat(path);
-      if (!metadata.isFile() || metadata.size > MAX_DASHBOARD_RUN_BYTES) {
+      if (!metadata.isFile()) {
         return undefined;
       }
       return {
@@ -354,7 +359,11 @@ async function listRunFiles(
   let totalBytes = 0;
   for (const candidate of ordered) {
     if (selected.length >= MAX_DASHBOARD_RUNS) break;
-    if (candidate.size > MAX_DASHBOARD_TOTAL_BYTES - totalBytes) continue;
+    if (
+      selected.length > 0 &&
+      candidate.size > MAX_DASHBOARD_TOTAL_BYTES - totalBytes
+    )
+      continue;
     selected.push(candidate);
     totalBytes += candidate.size;
   }
@@ -382,7 +391,9 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
-async function readCandidate(candidate: RunFileCandidate): Promise<string> {
+async function parseCandidate(
+  candidate: RunFileCandidate,
+): Promise<ParsedRunFile> {
   const handle = await open(
     candidate.path,
     constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
@@ -398,7 +409,6 @@ async function readCandidate(candidate: RunFileCandidate): Promise<string> {
       !target.isFile() ||
       target.isSymbolicLink() ||
       canonical !== candidate.path ||
-      metadata.size > MAX_DASHBOARD_RUN_BYTES ||
       metadata.size !== candidate.size ||
       target.size !== metadata.size ||
       metadata.dev !== target.dev ||
@@ -406,7 +416,56 @@ async function readCandidate(candidate: RunFileCandidate): Promise<string> {
     ) {
       throw new Error("Run record exceeds the dashboard limit.");
     }
-    const source = await handle.readFile("utf8");
+    const records: Record<string, unknown>[] = [];
+    const events: Record<string, unknown>[] = [];
+    let resolution: Record<string, unknown> | undefined;
+    let request: Record<string, unknown> | undefined;
+    let context: Record<string, unknown> | undefined;
+    let started: Record<string, unknown> | undefined;
+    let contextEvent: Record<string, unknown> | undefined;
+    let suiteEvent: Record<string, unknown> | undefined;
+    let completed: Record<string, unknown> | undefined;
+    let latestTimestamp: string | undefined;
+    let legacy = false;
+    for await (const { encoded, terminated } of readRunRecordLines(handle)) {
+      if (encoded.trim().length === 0) continue;
+      let value: unknown;
+      try {
+        value = JSON.parse(encoded);
+      } catch {
+        if (candidate.active && !terminated) break;
+        throw new Error("The persisted run record contains invalid JSON.");
+      }
+      const record = asRecord(value);
+      if (record === undefined) throw new Error("Invalid run record entry.");
+      const recordRunId = text(record.run_id);
+      if (recordRunId !== undefined && recordRunId !== candidate.runId)
+        throw new Error("Run record id mismatch.");
+      if (record.schema_version !== undefined && record.schema_version !== "5")
+        legacy = true;
+      records.push(record);
+      const at = timestamp(record.timestamp);
+      if (at !== undefined) latestTimestamp = at;
+      const event = text(record.event);
+      if (event !== undefined) {
+        events.push(record);
+        if (event === "run.started") started = record;
+        if (event === "context.resolved") contextEvent = record;
+        if (event === "suite.resolved") suiteEvent = record;
+        if (event === "run.completed") completed = record;
+      } else if (record.record === "resolution") {
+        resolution = asRecord(record.resolution);
+      } else if (record.record === "request") {
+        request = asRecord(record.request);
+      } else if (record.record === "context") {
+        context = asRecord(record.context);
+      } else if (record.record === "run.summary") {
+        completed = {
+          timestamp: latestTimestamp ?? candidate.modifiedAt,
+          data: asRecord(record.data) ?? asRecord(record.summary) ?? {},
+        };
+      }
+    }
     const [afterHandle, afterTarget, afterCanonical] = await Promise.all([
       handle.stat(),
       lstat(candidate.path),
@@ -425,85 +484,23 @@ async function readCandidate(candidate: RunFileCandidate): Promise<string> {
     ) {
       throw new Error("Run record identity changed while reading.");
     }
-    return source;
+    return {
+      candidate,
+      records,
+      events,
+      ...(resolution === undefined ? {} : { resolution }),
+      ...(request === undefined ? {} : { request }),
+      ...(context === undefined ? {} : { context }),
+      ...(started === undefined ? {} : { started }),
+      ...(contextEvent === undefined ? {} : { contextEvent }),
+      ...(suiteEvent === undefined ? {} : { suiteEvent }),
+      ...(completed === undefined ? {} : { completed }),
+      ...(latestTimestamp === undefined ? {} : { latestTimestamp }),
+      legacy,
+    };
   } finally {
     await handle.close();
   }
-}
-
-function parseCandidate(
-  candidate: RunFileCandidate,
-  source: string,
-): ParsedRunFile {
-  const records: Record<string, unknown>[] = [];
-  const events: Record<string, unknown>[] = [];
-  let resolution: Record<string, unknown> | undefined;
-  let request: Record<string, unknown> | undefined;
-  let context: Record<string, unknown> | undefined;
-  let started: Record<string, unknown> | undefined;
-  let contextEvent: Record<string, unknown> | undefined;
-  let suiteEvent: Record<string, unknown> | undefined;
-  let completed: Record<string, unknown> | undefined;
-  let latestTimestamp: string | undefined;
-  let legacy = false;
-  const lines = source.split(/\r?\n/u);
-  for (const [index, encoded] of lines.entries()) {
-    if (encoded.trim().length === 0) continue;
-    let value: unknown;
-    try {
-      value = JSON.parse(encoded);
-    } catch {
-      if (candidate.active && index === lines.length - 1) break;
-      throw new Error("The persisted run record contains invalid JSON.");
-    }
-    const record = asRecord(value);
-    if (record === undefined) throw new Error("Invalid run record entry.");
-    const recordRunId = text(record.run_id);
-    if (recordRunId !== undefined && recordRunId !== candidate.runId) {
-      throw new Error("Run record id mismatch.");
-    }
-    if (record.schema_version !== undefined && record.schema_version !== "5") {
-      legacy = true;
-    }
-    records.push(record);
-    const at = timestamp(record.timestamp);
-    if (at !== undefined) latestTimestamp = at;
-    const event = text(record.event);
-    if (event !== undefined) {
-      events.push(record);
-      if (event === "run.started") started = record;
-      if (event === "context.resolved") contextEvent = record;
-      if (event === "suite.resolved") suiteEvent = record;
-      if (event === "run.completed") completed = record;
-      continue;
-    }
-    if (record.record === "resolution") {
-      resolution = asRecord(record.resolution);
-    } else if (record.record === "request") {
-      request = asRecord(record.request);
-    } else if (record.record === "context") {
-      context = asRecord(record.context);
-    } else if (record.record === "run.summary") {
-      completed = {
-        timestamp: latestTimestamp ?? candidate.modifiedAt,
-        data: asRecord(record.data) ?? asRecord(record.summary) ?? {},
-      };
-    }
-  }
-  return {
-    candidate,
-    records,
-    events,
-    ...(resolution === undefined ? {} : { resolution }),
-    ...(request === undefined ? {} : { request }),
-    ...(context === undefined ? {} : { context }),
-    ...(started === undefined ? {} : { started }),
-    ...(contextEvent === undefined ? {} : { contextEvent }),
-    ...(suiteEvent === undefined ? {} : { suiteEvent }),
-    ...(completed === undefined ? {} : { completed }),
-    ...(latestTimestamp === undefined ? {} : { latestTimestamp }),
-    legacy,
-  };
 }
 
 async function loadParsedRun(
@@ -515,7 +512,7 @@ async function loadParsedRun(
     (item) => item.runId === runId,
   );
   if (candidate === undefined) throw new Error(`Run ${runId} was not found.`);
-  return parseCandidate(candidate, await readCandidate(candidate));
+  return await parseCandidate(candidate);
 }
 
 function eventData(event: Record<string, unknown> | undefined) {
@@ -694,9 +691,44 @@ function buildReviewerRuntime(parsed: ParsedRunFile): ReviewerRuntime[] {
           adjudicationValidation,
         ) as unknown as AdjudicationValidationAttestation;
       }
-      reviewer.result = bounded(
-        record.result ?? asRecord(record.data)?.result,
-      ) as Record<string, unknown>;
+      const container = asRecord(record.data) ?? record;
+      const candidate = container.result;
+      const result = currentReviewerOutputSchema.safeParse(candidate);
+      const digest = text(container.digest);
+      const byteCount = integer(container.byte_count);
+      if (!result.success) {
+        const legacy = reviewerResultSchema.safeParse(candidate);
+        if (
+          legacy.success &&
+          (legacy.data.schema_version === "1" ||
+            legacy.data.schema_version === "2")
+        ) {
+          reviewer.result = bounded(legacy.data) as Record<string, unknown>;
+          continue;
+        }
+        throw new Error("The persisted reviewer result is invalid.");
+      }
+      const requiresTuple =
+        result.data.schema_version === "3" || "kind" in result.data;
+      if (requiresTuple || digest !== undefined || byteCount !== undefined) {
+        if (digest === undefined || byteCount === undefined)
+          throw new Error("The persisted reviewer result is invalid.");
+        const expectedBytes = Buffer.byteLength(
+          JSON.stringify(result.data),
+          "utf8",
+        );
+        if (
+          digest !== reviewerResultDigest(result.data) ||
+          byteCount !== expectedBytes
+        ) {
+          throw new Error(
+            "The persisted reviewer result integrity tuple is invalid.",
+          );
+        }
+      }
+      reviewer.result = structuredClone(result.data) as Record<string, unknown>;
+      if (digest !== undefined) reviewer.result_digest = digest;
+      if (byteCount !== undefined) reviewer.result_byte_count = byteCount;
       continue;
     }
     if (record.record === "reviewer.terminal") {
@@ -791,7 +823,16 @@ function buildReviewerRuntime(parsed: ParsedRunFile): ReviewerRuntime[] {
     .map((reviewer) => ({
       ...reviewer,
       activity: reviewer.activity.slice(-MAX_ACTIVITY_ITEMS),
-      ...(reviewer.result === undefined ? {} : { result: reviewer.result }),
+      ...(reviewer.result === undefined
+        ? {}
+        : {
+            verdict: reviewer.result.verdict,
+            actionable_findings: Array.isArray(
+              reviewer.result.actionable_findings,
+            )
+              ? reviewer.result.actionable_findings.length
+              : 0,
+          }),
     }))
     .sort(
       (left, right) =>
@@ -828,8 +869,24 @@ function applyTerminal(
     reviewer.finished_at = fallbackTimestamp;
   }
   const result = asRecord(terminal.result);
-  if (result !== undefined)
-    reviewer.result = bounded(result) as Record<string, unknown>;
+  const digest = text(terminal.result_digest);
+  const byteCount = integer(terminal.result_byte_count);
+  if (
+    result === undefined &&
+    (digest !== undefined || byteCount !== undefined)
+  ) {
+    if (
+      reviewer.result === undefined ||
+      digest === undefined ||
+      byteCount === undefined ||
+      reviewer.result_digest !== digest ||
+      reviewer.result_byte_count !== byteCount
+    ) {
+      throw new Error("The completed terminal result reference is invalid.");
+    }
+  }
+  if (result !== undefined && reviewer.result === undefined)
+    reviewer.result = structuredClone(result) as Record<string, unknown>;
   if (reviewer.state === "incomplete") {
     reviewer.failure = bounded(terminal) as Record<string, unknown>;
   }
@@ -906,8 +963,8 @@ function runSummaryFromParsed(parsed: ParsedRunFile): DashboardRunSummary {
     ) as readonly CanonicalRawFinding[],
     { gatePolicies: dashboardGatePolicies(reviewers) },
   );
-  const hasFullResults = reviewers.some(
-    (reviewer) => Array.isArray(reviewer.result?.actionable_findings),
+  const hasFullResults = reviewers.some((reviewer) =>
+    Array.isArray(reviewer.result?.actionable_findings),
   );
   const counts = hasFullResults
     ? canonical.counts
@@ -1024,7 +1081,16 @@ function runSummaryFromParsed(parsed: ParsedRunFile): DashboardRunSummary {
       ...(reviewer.activity.at(-1)?.message === undefined
         ? {}
         : { last_activity_message: reviewer.activity.at(-1)!.message }),
-      ...(reviewer.result === undefined ? {} : { result: reviewer.result }),
+      ...(reviewer.result === undefined
+        ? {}
+        : {
+            verdict: reviewer.result.verdict,
+            actionable_findings: Array.isArray(
+              reviewer.result.actionable_findings,
+            )
+              ? reviewer.result.actionable_findings.length
+              : 0,
+          }),
     })),
     ...(stale ? { stale: true } : {}),
     ...(parsed.legacy ? { legacy: true } : {}),
@@ -1035,9 +1101,11 @@ async function readRunSummary(
   candidate: RunFileCandidate,
 ): Promise<DashboardRunSummary> {
   try {
-    return runSummaryFromParsed(
-      parseCandidate(candidate, await readCandidate(candidate)),
-    );
+    const parsed = await parseCandidate(candidate);
+    const summary = runSummaryFromParsed(parsed);
+    parsed.records.length = 0;
+    parsed.events.length = 0;
+    return summary;
   } catch (error) {
     return {
       run_id: candidate.runId,
@@ -1308,8 +1376,7 @@ function rawFindings(
       continue;
     }
     const source = reviewers.find(
-      (candidate) =>
-        candidate.reviewer_id === reviewer.adjudicates_reviewer_id,
+      (candidate) => candidate.reviewer_id === reviewer.adjudicates_reviewer_id,
     );
     const candidateResult = reviewerResultV3Schema.safeParse(source?.result);
     const adjudicationResult = adjudicationResultSchema.safeParse(
@@ -1421,12 +1488,15 @@ function rawFindings(
           text(finding.suggested_direction) ??
           "Investigate and correct the defect.",
         confidence: effectiveConfidence as RawRunFinding["confidence"],
-        classification: effectiveClassification as RawRunFinding["classification"],
-        external_assumptions: adjusted?.external_assumptions ?? (Array.isArray(finding.external_assumptions)
-          ? finding.external_assumptions
-              .map(text)
-              .filter((entry): entry is string => entry !== undefined)
-          : []),
+        classification:
+          effectiveClassification as RawRunFinding["classification"],
+        external_assumptions:
+          adjusted?.external_assumptions ??
+          (Array.isArray(finding.external_assumptions)
+            ? finding.external_assumptions
+                .map(text)
+                .filter((entry): entry is string => entry !== undefined)
+            : []),
         source_findings: [
           { reviewer_id: reviewer.reviewer_id, finding_id: findingId },
         ],
@@ -1435,7 +1505,8 @@ function rawFindings(
               .map(text)
               .filter((entry): entry is string => entry !== undefined)
           : [],
-        ...((adjusted?.root_issue_id ?? text(finding.root_issue_id)) === undefined
+        ...((adjusted?.root_issue_id ?? text(finding.root_issue_id)) ===
+        undefined
           ? {}
           : {
               deduplication_key:
@@ -1450,8 +1521,7 @@ function rawFindings(
           adjudicationDecision?.effective_decision !== "rejected" &&
           adjudicationDecision?.effective_decision !== "needs_verification",
         adjudication:
-          adjudicationDecision?.effective_decision ??
-          "unadjudicated",
+          adjudicationDecision?.effective_decision ?? "unadjudicated",
         ...(adjusted === undefined
           ? {}
           : {
@@ -1495,19 +1565,17 @@ function dashboardGatePolicies(
       return [
         reviewer.lens_id,
         {
-          minimumSeverity: (
-            minimumSeverity === "critical" ||
-            minimumSeverity === "high" ||
-            minimumSeverity === "medium" ||
-            minimumSeverity === "low"
-              ? minimumSeverity
-              : "medium") as CanonicalGatePolicy["minimumSeverity"],
-          minimumConfidence: (
-            minimumConfidence === "high" ||
-            minimumConfidence === "medium" ||
-            minimumConfidence === "low"
-              ? minimumConfidence
-              : "medium") as CanonicalGatePolicy["minimumConfidence"],
+          minimumSeverity: (minimumSeverity === "critical" ||
+          minimumSeverity === "high" ||
+          minimumSeverity === "medium" ||
+          minimumSeverity === "low"
+            ? minimumSeverity
+            : "medium") as CanonicalGatePolicy["minimumSeverity"],
+          minimumConfidence: (minimumConfidence === "high" ||
+          minimumConfidence === "medium" ||
+          minimumConfidence === "low"
+            ? minimumConfidence
+            : "medium") as CanonicalGatePolicy["minimumConfidence"],
         },
       ];
     }),
@@ -1536,14 +1604,19 @@ export async function readDashboardRun(input: {
       : "full";
   const context = parsed.context ?? {};
   const git = asRecord(context.git);
-  const raw = rawFindings(reviewers, scope, {
-    changedFiles: Array.isArray(git?.changed_files)
-      ? git.changed_files
-          .map(text)
-          .filter((value): value is string => value !== undefined)
-      : [],
-    diff: text(git?.diff) ?? "",
-  }, typeof git?.head === "string" ? git.head : null);
+  const raw = rawFindings(
+    reviewers,
+    scope,
+    {
+      changedFiles: Array.isArray(git?.changed_files)
+        ? git.changed_files
+            .map(text)
+            .filter((value): value is string => value !== undefined)
+        : [],
+      diff: text(git?.diff) ?? "",
+    },
+    typeof git?.head === "string" ? git.head : null,
+  );
   const canonical = canonicalizeFindings(
     raw as readonly CanonicalRawFinding[],
     { gatePolicies: dashboardGatePolicies(reviewers) },
@@ -1559,7 +1632,7 @@ export async function readDashboardRun(input: {
   const completedAt = timestamp(parsed.completed?.timestamp);
   const stage = runStage(parsed, reviewers);
   const retry = eventData(parsed.started);
-  return bounded({
+  const response = {
     ...summary,
     stage,
     ...(text(retry.parent_run_id) === undefined
@@ -1570,12 +1643,34 @@ export async function readDashboardRun(input: {
     context: bounded(contextData(parsed)),
     suite: bounded(eventData(parsed.suiteEvent)),
     lenses: groupLenses(reviewers),
-    reviewers,
+    reviewers: reviewers.map((reviewer) => ({
+      ...reviewer,
+      ...(reviewer.result === undefined
+        ? {}
+        : { result: structuredClone(reviewer.result) }),
+    })),
     findings,
     events: publicEvents,
     activity_notice:
       "Review Mesh stores sanitized phase and activity summaries, not the provider's full chat transcript.",
-  }) as Record<string, unknown>;
+  };
+  const sanitized = bounded(response) as Record<string, unknown>;
+  const sanitizedReviewers = Array.isArray(sanitized.reviewers)
+    ? sanitized.reviewers.map(asRecord)
+    : [];
+  sanitized.reviewers = response.reviewers.map((reviewer, index) => ({
+    ...(sanitizedReviewers[index] ?? {}),
+    ...(reviewer.result === undefined
+      ? {}
+      : { result: structuredClone(reviewer.result) }),
+    ...(reviewer.result_digest === undefined
+      ? {}
+      : { result_digest: reviewer.result_digest }),
+    ...(reviewer.result_byte_count === undefined
+      ? {}
+      : { result_byte_count: reviewer.result_byte_count }),
+  }));
+  return sanitized;
 }
 
 export async function readDashboardReviewer(input: {
@@ -1594,11 +1689,11 @@ export async function readDashboardReviewer(input: {
   if (reviewer === undefined) {
     throw new Error(`Reviewer ${input.reviewerId} was not found.`);
   }
-  return bounded({
+  return {
     run_id: input.runId,
     ...reviewer,
     activity_notice: run.activity_notice,
-  }) as Record<string, unknown>;
+  } as Record<string, unknown>;
 }
 
 export async function dashboardFingerprint(

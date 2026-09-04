@@ -84,6 +84,35 @@ function v5(projectName: string): TrustedConfigV5 {
 }
 
 describe("global configuration", () => {
+  it("resolves explicit continuation attempts and preserves the legacy default of two", () => {
+    const legacyBase = v5("demo");
+    const legacyAgent = Object.values(legacyBase.agents)[0]!;
+    const configured = {
+      ...legacyBase,
+      schema_version: "6" as const,
+      execution: { ...legacyBase.execution, continuation_attempts: 4 },
+      agents: {
+        reviewer: {
+          ...legacyAgent,
+          applicability: { mode: "always" as const },
+          required_context: [],
+        },
+      },
+      defaults: { agents: ["reviewer"] },
+      projects: {},
+    };
+    expect(
+      resolveConfig({ trusted: configured, projectName: "demo" }).execution
+        .continuation_attempts,
+    ).toBe(4);
+
+    const legacy = v5("demo");
+    expect(
+      resolveConfig({ trusted: legacy, projectName: "demo" }).execution
+        .continuation_attempts,
+    ).toBe(2);
+  });
+
   it("defaults a five-model v6 lens to a resilient three-by-three quorum", () => {
     const config = {
       schema_version: "6",

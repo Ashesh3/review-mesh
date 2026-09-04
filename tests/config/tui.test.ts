@@ -400,6 +400,7 @@ describe("config menu", () => {
       "300",
       "n",
       "y",
+      "4",
       "n",
       "7",
       "g",
@@ -439,6 +440,7 @@ describe("config menu", () => {
       shutdown_grace_period_ms: 300,
       distribute_primaries: false,
       allow_provider_concentration: true,
+      continuation_attempts: 4,
     });
     expect(saved.diagnostics).toEqual({ persist_runs: false, max_runs: 7 });
   });
@@ -690,6 +692,7 @@ describe("config menu", () => {
         circuit_breaker_threshold: 2,
         circuit_breaker_cooldown_ms: 30000,
         retry_attempts: 2,
+        continuation_attempts: 2,
         retry_backoff_ms: 1000,
       },
       diagnostics: { persist_runs: true, max_runs: 50 },

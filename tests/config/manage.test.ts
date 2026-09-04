@@ -36,6 +36,7 @@ function config(): ManagedConfig {
       heartbeat_interval_ms: 15_000,
       shutdown_grace_period_ms: 5_000,
       allow_provider_concentration: false,
+      continuation_attempts: 2,
     },
     diagnostics: { persist_runs: true, max_runs: 50 },
     adapters: {
@@ -78,6 +79,7 @@ function legacyConfig(version: "2" | "4" | "5"): Record<string, unknown> {
   );
   const {
     allow_provider_concentration: _allowProviderConcentration,
+    continuation_attempts: _continuationAttempts,
     ...v5Execution
   } = current.execution;
   const {

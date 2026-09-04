@@ -15,6 +15,7 @@ import {
   currentReviewerOutputSchema,
   type CurrentReviewerOutput,
 } from "../protocol/schemas.js";
+import { MAX_REVIEWER_RESULT_BYTES } from "../results/sanitize.js";
 import {
   adapterFailure,
   type AdapterFailure,
@@ -22,10 +23,7 @@ import {
   type AdapterResponseStructure,
   type AdapterValidationIssue,
 } from "./errors.js";
-import {
-  OpenAIStreamError,
-  parseOpenAIChatStream,
-} from "./openai-stream.js";
+import { OpenAIStreamError, parseOpenAIChatStream } from "./openai-stream.js";
 import {
   createResultSpool,
   ResultSpoolError,
@@ -45,7 +43,10 @@ const MAX_FILE_BYTES = 512 * 1_024;
 const MAX_SNAPSHOT_BYTES = 32 * 1_024 * 1_024;
 const MAX_LIST_ENTRIES = 2_000;
 const MAX_SEARCH_RESULTS = 200;
-const MAX_PROVIDER_RESPONSE_BYTES = 8 * 1_024 * 1_024;
+// A 16 MiB decoded JSON string may use six-byte Unicode escapes, with bounded
+// response/SSE framing overhead. Keep transport bounded without rejecting it.
+const MAX_PROVIDER_RESPONSE_BYTES =
+  MAX_REVIEWER_RESULT_BYTES * 6 + 1_024 * 1_024;
 const MAX_TOOL_RESULT_BYTES = 128 * 1_024;
 const MAX_CONVERSATION_BYTES = 6 * 1_024 * 1_024;
 const FINALIZATION_RESERVE_BYTES = 256 * 1_024;
@@ -85,6 +86,7 @@ export interface OpenAICompatibleAdapterDependencies {
   requestTimeoutMs?: number;
   maxTurns?: number;
   finalizationAttempts?: number;
+  continuationAttempts?: number;
   now?: () => number;
   workspaceHooks?: ReadOnlyWorkspaceHooks;
   fileSystemIdentity?: FileSystemIdentityFacade;
@@ -1471,6 +1473,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
   private readonly requestTimeoutMs: number;
   private readonly maxTurns: number;
   private readonly finalizationAttempts: number;
+  private readonly continuationAttempts: number;
   private readonly now: () => number;
   private readonly workspaceHooks: ReadOnlyWorkspaceHooks;
   private readonly fileSystemIdentity: FileSystemIdentityFacade;
@@ -1493,12 +1496,21 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     this.maxTurns = dependencies.maxTurns ?? DEFAULT_MAX_TURNS;
     this.finalizationAttempts =
       dependencies.finalizationAttempts ?? DEFAULT_FINALIZATION_ATTEMPTS;
+    this.continuationAttempts =
+      dependencies.continuationAttempts ?? DEFAULT_FINALIZATION_ATTEMPTS;
     if (
       !Number.isSafeInteger(this.finalizationAttempts) ||
       this.finalizationAttempts < 1 ||
       this.finalizationAttempts > 10
     ) {
       throw new Error("finalizationAttempts must be an integer from 1 to 10");
+    }
+    if (
+      !Number.isSafeInteger(this.continuationAttempts) ||
+      this.continuationAttempts < 1 ||
+      this.continuationAttempts > 10
+    ) {
+      throw new Error("continuationAttempts must be an integer from 1 to 10");
     }
     this.now = dependencies.now ?? Date.now;
     this.workspaceHooks = dependencies.workspaceHooks ?? {};
@@ -1963,13 +1975,10 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               "The streaming response had no body.",
             );
           } else {
-            const parsed = await parseOpenAIChatStream(
-              streamed.response.body,
-              {
-                signal: streamed.controller.signal,
-                maximumBytes: MAX_PROVIDER_RESPONSE_BYTES,
-              },
-            );
+            const parsed = await parseOpenAIChatStream(streamed.response.body, {
+              signal: streamed.controller.signal,
+              maximumBytes: MAX_PROVIDER_RESPONSE_BYTES,
+            });
             const value = {
               choices: [
                 {
@@ -2553,15 +2562,15 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         // repeating any repository tool calls or inspection turns.
         const finalizationCheckpoint = structuredClone(messages);
         const finalizationDeadline =
-          this.now() + this.requestTimeoutMs * this.finalizationAttempts * 2;
+          this.now() +
+          this.requestTimeoutMs *
+            (this.finalizationAttempts + this.continuationAttempts);
         let lastFinalizationFailure: AdapterFailure | undefined;
         let continuationSpool: ResultSpool | undefined;
         let continuationFragments: string[] = [];
-        for (
-          let finalizationAttempt = 1;
-          finalizationAttempt <= this.finalizationAttempts;
-          finalizationAttempt += 1
-        ) {
+        let continuationRequests = 0;
+        let finalizationAttempt = 1;
+        while (finalizationAttempt <= this.finalizationAttempts) {
           throwIfAborted(input.signal);
           if (this.now() >= finalizationDeadline) {
             lastFinalizationFailure = adapterFailure.timeout(
@@ -2647,11 +2656,12 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
                 finalResponse.diagnostics,
                 false,
               );
-              if (finalizationAttempt < this.finalizationAttempts) {
+              if (continuationRequests < this.continuationAttempts) {
+                continuationRequests += 1;
                 yield {
                   type: "progress",
                   phase: "validating",
-                  message: `Continuing the exact structured result from its stopping point (fragment ${finalizationAttempt + 1} of ${this.finalizationAttempts}).`,
+                  message: `Continuing the exact structured result from its stopping point (fragment ${continuationRequests} of ${this.continuationAttempts}).`,
                 };
                 continue;
               }
@@ -2733,11 +2743,12 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
                   repairedResponse.diagnostics,
                   true,
                 );
-                if (finalizationAttempt < this.finalizationAttempts) {
+                if (continuationRequests < this.continuationAttempts) {
+                  continuationRequests += 1;
                   yield {
                     type: "progress",
                     phase: "validating",
-                    message: `Continuing the exact structured result from its stopping point (fragment ${finalizationAttempt + 1} of ${this.finalizationAttempts}).`,
+                    message: `Continuing the exact structured result from its stopping point (fragment ${continuationRequests} of ${this.continuationAttempts}).`,
                   };
                   continue;
                 }
@@ -2807,11 +2818,16 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
             lastFinalizationFailure !== undefined &&
             retryableResultProductionFailure(lastFinalizationFailure)
           ) {
+            await continuationSpool?.cleanup();
+            continuationSpool = undefined;
+            continuationFragments = [];
             yield {
               type: "progress",
               phase: "validating",
               message: `Retrying structured result production from the retained inspection checkpoint (attempt ${finalizationAttempt + 1} of ${this.finalizationAttempts}).`,
             };
+            finalizationAttempt += 1;
+            continuationRequests = 0;
             continue;
           }
           break;

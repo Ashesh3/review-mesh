@@ -93,6 +93,14 @@ describe("embedded dashboard UI", () => {
     expect(reducedMotion).toMatch(/scroll-behavior:\s*auto\s*!important/u);
   });
 
+  it("renders the complete review markdown as escaped pre-wrapped text", () => {
+    expect(dashboardHtml).toContain("result.review_markdown");
+    expect(dashboardHtml).toMatch(/escapeHtml\(reviewMarkdown\)/u);
+    expect(style).toMatch(
+      /\.review-markdown\s*\{[^}]*white-space:\s*pre-wrap/u,
+    );
+  });
+
   it("stays self-contained without a React, StyleX, or Astryx runtime", async () => {
     expect(dashboardHtml).not.toMatch(/<link\b[^>]*rel=["']stylesheet["']/iu);
     expect(dashboardHtml).not.toMatch(/<script\b[^>]*\bsrc\s*=/iu);

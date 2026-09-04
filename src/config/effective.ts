@@ -62,6 +62,7 @@ export interface EffectiveConfigDescription {
     circuit_breaker_threshold: number;
     circuit_breaker_cooldown_ms: number;
     retry_attempts: number;
+    continuation_attempts: number;
     retry_backoff_ms: number;
   };
   diagnostics: { persist_runs: boolean; max_runs: number };

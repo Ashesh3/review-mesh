@@ -540,6 +540,7 @@ const executionSchema = z.strictObject({
   circuit_breaker_threshold: positiveInteger.optional(),
   circuit_breaker_cooldown_ms: positiveInteger.optional(),
   retry_attempts: positiveInteger.optional(),
+  continuation_attempts: positiveInteger.optional(),
   retry_backoff_ms: nonNegativeInteger.optional(),
 });
 

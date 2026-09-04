@@ -33,10 +33,10 @@ import {
   type AdjudicationValidationAttestation,
 } from "../findings/attestation.js";
 import { reviewerResultDigest } from "../results/digest.js";
+import { readRunRecordLines } from "./run-record-reader.js";
 
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 const ACTIVE_SUFFIX = /^\.jsonl\.active(?:\..+)?$/u;
-const MAX_REPORT_RECORD_BYTES = 64 * 1024 * 1024;
 const MAX_RECORD_WARNINGS = 100;
 const persistedString = z
   .string()
@@ -107,10 +107,26 @@ const persistedReviewerResultSchema = z.union([
   reviewerResultSchema,
   legacyReviewerResultSchema,
 ]);
+const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
+const persistedPublicResultReferenceSchema = z.strictObject({
+  schema_version: z.literal("5"),
+  event: z.literal("reviewer.result"),
+  run_id: persistedString,
+  request_id: persistedString.optional(),
+  seq: positiveIntegerSchema,
+  timestamp: timestampSchema,
+  reviewer_id: persistedString,
+  data: z.strictObject({
+    lens_id: persistedString.optional(),
+    mode: reviewerModeSchema.optional(),
+    digest: digestSchema,
+    byte_count: nonNegativeIntegerSchema,
+    artifact_path: persistedString.optional(),
+  }),
+});
 export type PersistedReviewerResult = z.infer<
   typeof persistedReviewerResultSchema
 >;
-const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
 const legacyResultRecordFields = {
   digest: digestSchema.optional(),
   byte_count: nonNegativeIntegerSchema.optional(),
@@ -335,19 +351,29 @@ const persistedExecutionSchema = z.looseObject({
   provider_limits: z.record(persistedString, positiveIntegerSchema).optional(),
   circuit_breaker_threshold: positiveIntegerSchema.optional(),
   retry_attempts: positiveIntegerSchema.optional(),
+  continuation_attempts: positiveIntegerSchema.optional(),
   retry_backoff_ms: nonNegativeIntegerSchema.optional(),
 });
 
 const persistedReviewerPolicySchema = z.looseObject({
   applicability: z
-    .looseObject({
-      anyChangedPaths: z.array(persistedString).min(1).max(256),
-      caseSensitive: z.boolean().optional(),
-    })
+    .union([
+      z.looseObject({ mode: z.literal("always") }),
+      z.looseObject({
+        mode: z.literal("changed_paths"),
+        anyChangedPaths: z.array(persistedString).min(1).max(256),
+        caseSensitive: z.boolean().optional(),
+      }),
+      z.looseObject({
+        anyChangedPaths: z.array(persistedString).min(1).max(256),
+        caseSensitive: z.boolean().optional(),
+      }),
+    ])
     .optional(),
   requiredCallerContext: z.array(persistedString).max(256).optional(),
   passQuorum: positiveIntegerSchema,
   minimumProviderGroups: positiveIntegerSchema,
+  allowZeroOutageTolerance: z.boolean().optional(),
   adjudication: z.enum(["off", "required"]),
   gateMinimumSeverity: findingSeveritySchema,
   gateMinimumConfidence: z.enum(["high", "medium", "low"]),
@@ -412,19 +438,35 @@ const persistedFailureSchema = z.looseObject({
   diagnostics: adapterFailureDiagnosticsSchema.loose().optional(),
 });
 
-const persistedReviewerTerminalSchema = z.discriminatedUnion("status", [
-  z.looseObject({
-    reviewer_id: persistedString,
-    lens_id: persistedString.optional(),
-    status: z.literal("completed"),
-    mode: reviewerModeSchema.optional(),
-    adapter: persistedString,
-    model: persistedString,
-    provider_group: persistedString.optional(),
-    isolation: isolationLevelSchema,
-    elapsed_ms: nonNegativeIntegerSchema,
-    result: persistedReviewerResultSchema,
-  }),
+const persistedReviewerTerminalSchema = z.union([
+  z.union([
+    z.looseObject({
+      reviewer_id: persistedString,
+      lens_id: persistedString.optional(),
+      status: z.literal("completed"),
+      mode: reviewerModeSchema.optional(),
+      adapter: persistedString,
+      model: persistedString,
+      provider_group: persistedString.optional(),
+      isolation: isolationLevelSchema,
+      elapsed_ms: nonNegativeIntegerSchema,
+      result: persistedReviewerResultSchema,
+    }),
+    z.looseObject({
+      reviewer_id: persistedString,
+      lens_id: persistedString.optional(),
+      status: z.literal("completed"),
+      mode: reviewerModeSchema.optional(),
+      adapter: persistedString,
+      model: persistedString,
+      provider_group: persistedString.optional(),
+      isolation: isolationLevelSchema,
+      elapsed_ms: nonNegativeIntegerSchema,
+      result_digest: digestSchema,
+      result_byte_count: nonNegativeIntegerSchema,
+      artifact_path: persistedString.optional(),
+    }),
+  ]),
   z.looseObject({
     reviewer_id: persistedString,
     lens_id: persistedString.optional(),
@@ -536,10 +578,7 @@ const privateRecordSchema = z.union([
       ...legacyResultRecordFields,
     })
     .superRefine((value, ctx) => {
-      if (
-        value.result.schema_version !== "3" &&
-        !("kind" in value.result)
-      )
+      if (value.result.schema_version !== "3" && !("kind" in value.result))
         return;
       if (value.digest === undefined) {
         ctx.addIssue({
@@ -832,6 +871,14 @@ interface RunRecordPath {
   root: string;
   name: string;
 }
+interface OpenRunRecord {
+  handle: import("node:fs/promises").FileHandle;
+  initial: Awaited<ReturnType<import("node:fs/promises").FileHandle["stat"]>>;
+  path: string;
+  active: boolean;
+  root?: string;
+  expectedName?: string;
+}
 
 interface ReviewerMetadata {
   reviewerId: string;
@@ -848,6 +895,8 @@ interface ReviewerTerminal {
   status: "completed" | "incomplete" | "skipped";
   reason?: string;
   result?: PersistedReviewerResult;
+  resultDigest?: string | undefined;
+  resultByteCount?: number | undefined;
   resultPriority: number;
 }
 
@@ -1066,12 +1115,12 @@ async function resolveRunRecordPath(
   };
 }
 
-async function readBoundedFile(
+async function openRunRecordFile(
   path: string,
   active: boolean,
   root?: string,
   expectedName?: string,
-): Promise<string> {
+) {
   const flags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
   const handle = await open(path, flags).catch(() => undefined);
   if (handle === undefined) {
@@ -1082,14 +1131,12 @@ async function readBoundedFile(
   }
   try {
     const metadata = await handle.stat();
-    if (!metadata.isFile() || metadata.size > MAX_REPORT_RECORD_BYTES) {
+    if (!metadata.isFile()) {
       throw new RunReportError(
         "invalid_run_record",
         "The persisted run record is unavailable or exceeds the report limit.",
       );
     }
-    const text = await handle.readFile("utf8");
-    const current = await handle.stat();
     if (root !== undefined && expectedName !== undefined) {
       const canonical = await realpath(path).catch(() => undefined);
       const pathMetadata = await lstat(path, { bigint: true }).catch(
@@ -1116,18 +1163,51 @@ async function readBoundedFile(
         );
       }
     }
-    if (
-      !active &&
-      (current.size !== metadata.size || current.mtimeMs !== metadata.mtimeMs)
-    ) {
-      throw new RunReportError(
-        "invalid_run_record",
-        "The completed run record changed while the report was being read.",
-      );
-    }
-    return text;
-  } finally {
+    return {
+      handle,
+      initial: metadata,
+      path,
+      active,
+      ...(root === undefined ? {} : { root }),
+      ...(expectedName === undefined ? {} : { expectedName }),
+    } as OpenRunRecord;
+  } catch (error) {
     await handle.close();
+    throw error;
+  }
+}
+
+async function verifyRunRecordFile(opened: OpenRunRecord): Promise<void> {
+  if (opened.active) return;
+  const [current, canonical, pathMetadata] = await Promise.all([
+    opened.handle.stat(),
+    realpath(opened.path).catch(() => undefined),
+    lstat(opened.path, { bigint: true }).catch(() => undefined),
+  ]);
+  if (
+    canonical === undefined ||
+    pathMetadata === undefined ||
+    pathMetadata.isSymbolicLink() ||
+    (opened.root !== undefined && !isWithinDirectory(opened.root, canonical)) ||
+    (opened.expectedName !== undefined &&
+      basename(canonical) !== opened.expectedName) ||
+    (process.platform !== "win32" &&
+      current.dev !== 0 &&
+      pathMetadata.dev !== 0n &&
+      BigInt(current.dev) !== pathMetadata.dev) ||
+    (process.platform !== "win32" &&
+      current.ino !== 0 &&
+      pathMetadata.ino !== 0n &&
+      BigInt(current.ino) !== pathMetadata.ino) ||
+    current.size !== opened.initial.size ||
+    current.mtimeMs !== opened.initial.mtimeMs ||
+    current.dev !== opened.initial.dev ||
+    current.ino !== opened.initial.ino
+  ) {
+    throw new RunReportError(
+      "invalid_run_record",
+      "The completed run record changed while the report was being read.",
+    );
   }
 }
 
@@ -1235,6 +1315,28 @@ function upsertTerminal(
   const record = asRecord(value) ?? {};
   const result = terminalResult(record);
   const current = parsed.terminals.get(reviewerId);
+  const resultDigest = nonEmptyString(record.result_digest);
+  const resultByteCount = nonNegativeInteger(record.result_byte_count);
+  if (
+    status === "completed" &&
+    result === undefined &&
+    (resultDigest !== undefined || resultByteCount !== undefined)
+  ) {
+    if (
+      current?.result === undefined ||
+      resultDigest === undefined ||
+      resultByteCount === undefined ||
+      current.resultDigest !== resultDigest ||
+      current.resultByteCount !== resultByteCount
+    ) {
+      throw invalidRecordError(
+        0,
+        persistedReviewerTerminalRecordType,
+        "a completed terminal reference that does not match the authoritative private result",
+        ["result_digest"],
+      );
+    }
+  }
   const reason = nonEmptyString(record.reason) ?? current?.reason;
   const resultFields =
     result !== undefined && resultPriority > (current?.resultPriority ?? -1)
@@ -1246,7 +1348,12 @@ function upsertTerminal(
               current?.resultPriority ?? 0,
             ),
           }
-        : { result: current.result, resultPriority: current.resultPriority };
+        : {
+            result: current.result,
+            resultDigest: current.resultDigest,
+            resultByteCount: current.resultByteCount,
+            resultPriority: current.resultPriority,
+          };
   const terminal: ReviewerTerminal = {
     reviewerId,
     status,
@@ -1369,6 +1476,7 @@ function parseResolution(
 function parsePublicEvent(
   parsed: ParsedReportRecord,
   value: Record<string, unknown>,
+  line: number,
 ): void {
   const event = nonEmptyString(value.event);
   const reviewerId = nonEmptyString(value.reviewer_id);
@@ -1385,6 +1493,24 @@ function parsePublicEvent(
   }
   if (reviewerId !== undefined && event === "reviewer.completed") {
     upsertTerminal(parsed, reviewerId, "completed", data, 1);
+    return;
+  }
+  if (reviewerId !== undefined && event === "reviewer.result") {
+    const terminal = parsed.terminals.get(reviewerId);
+    const digest = nonEmptyString(data.digest);
+    const byteCount = nonNegativeInteger(data.byte_count);
+    if (
+      terminal?.result === undefined ||
+      terminal.resultDigest !== digest ||
+      terminal.resultByteCount !== byteCount
+    ) {
+      throw invalidRecordError(
+        line,
+        "reviewer.result",
+        "a reviewer result reference that does not match the authoritative private result",
+        ["digest"],
+      );
+    }
     return;
   }
   if (reviewerId !== undefined && event === "reviewer.incomplete") {
@@ -1479,6 +1605,14 @@ function parsePrivateRecord(
       status: current?.status ?? "completed",
       ...(current?.reason === undefined ? {} : { reason: current.reason }),
       result: structuredClone(result),
+      resultDigest:
+        result.schema_version === "3" || "kind" in result
+          ? nonEmptyString((asRecord(value.data) ?? value).digest)
+          : undefined,
+      resultByteCount:
+        result.schema_version === "3" || "kind" in result
+          ? nonNegativeInteger((asRecord(value.data) ?? value).byte_count)
+          : undefined,
       resultPriority: 3,
     });
     return;
@@ -1500,12 +1634,12 @@ function parsePrivateRecord(
   }
 }
 
-function parseRunRecord(
-  text: string,
+async function parseRunRecord(
+  handle: import("node:fs/promises").FileHandle,
   expectedRunId: string,
   allowPartialTail: boolean,
   bestEffort = false,
-): ParsedReportRecord {
+): Promise<ParsedReportRecord> {
   const parsed: ParsedReportRecord = {
     terminalEventSeen: false,
     reviewers: new Map(),
@@ -1514,15 +1648,15 @@ function parseRunRecord(
     recordWarnings: [],
     omittedRecordWarnings: 0,
   };
-  const lines = text.split(/\r?\n/u);
-  for (const [index, encoded] of lines.entries()) {
+  for await (const { line, encoded, terminated } of readRunRecordLines(
+    handle,
+  )) {
     if (encoded.trim().length === 0) continue;
-    const line = index + 1;
     let value: unknown;
     try {
       value = JSON.parse(encoded);
     } catch {
-      if (allowPartialTail && index === lines.length - 1) break;
+      if (allowPartialTail && !terminated) break;
       const error = invalidRecordError(line, "invalid_json", "invalid JSON");
       if (!bestEffort) throw error;
       addRecordWarning(parsed, error);
@@ -1539,7 +1673,10 @@ function parseRunRecord(
       const event =
         record.schema_version === "4"
           ? legacyV4PublicEventSchema.safeParse(record)
-          : publicEventSchema.safeParse(record);
+          : record.event === "reviewer.result" &&
+              asRecord(record.data)?.result === undefined
+            ? persistedPublicResultReferenceSchema.safeParse(record)
+            : publicEventSchema.safeParse(record);
       if (!event.success) {
         const paths = schemaPaths(event.error);
         const error = invalidRecordError(
@@ -1563,6 +1700,7 @@ function parseRunRecord(
       parsePublicEvent(
         parsed,
         event.data as unknown as Record<string, unknown>,
+        line,
       );
       continue;
     }
@@ -1680,10 +1818,7 @@ function parseRawFindings(parsed: ParsedReportRecord): ParsedFinding[] {
   const findings: ParsedFinding[] = [];
   const adjudicationDecisions = new Map<
     string,
-    Map<
-      string,
-      ReturnType<typeof validateAdjudication>["decisions"][number]
-    >
+    Map<string, ReturnType<typeof validateAdjudication>["decisions"][number]>
   >();
   for (const metadata of parsed.reviewers.values()) {
     if (
@@ -1762,7 +1897,8 @@ function parseRawFindings(parsed: ParsedReportRecord): ParsedFinding[] {
         adjudicationDecision?.effective_decision ?? "unadjudicated";
       const adjusted = adjudicationDecision?.effective_finding;
       const effectiveSeverity = adjusted?.severity ?? finding.severity;
-      const effectiveConfidence = adjusted?.confidence ?? richer?.confidence ?? "medium";
+      const effectiveConfidence =
+        adjusted?.confidence ?? richer?.confidence ?? "medium";
       const effectiveClassification =
         adjudication === "needs_verification"
           ? "needs_verification"
@@ -1792,8 +1928,7 @@ function parseRawFindings(parsed: ParsedReportRecord): ParsedFinding[] {
         ...((adjusted?.root_issue_id ?? deduplicationKey) === undefined
           ? {}
           : {
-              deduplication_key:
-                adjusted?.root_issue_id ?? deduplicationKey!,
+              deduplication_key: adjusted?.root_issue_id ?? deduplicationKey!,
             }),
         ...(duplicateOf === undefined ? {} : { duplicate_of: duplicateOf }),
         gate_eligible:
@@ -2016,17 +2151,24 @@ export async function readRunReport({
 }: ReadRunReportOptions): Promise<RunReport> {
   requireSafeRunId(runId);
   const recordPath = await resolveRunRecordPath(runsDirectory, runId);
-  const parsed = parseRunRecord(
-    await readBoundedFile(
-      recordPath.path,
-      recordPath.active,
-      recordPath.root,
-      recordPath.name,
-    ),
-    runId,
+  const opened = await openRunRecordFile(
+    recordPath.path,
     recordPath.active,
-    bestEffort,
+    recordPath.root,
+    recordPath.name,
   );
+  let parsed: ParsedReportRecord;
+  try {
+    parsed = await parseRunRecord(
+      opened.handle,
+      runId,
+      recordPath.active,
+      bestEffort,
+    );
+    await verifyRunRecordFile(opened);
+  } finally {
+    await opened.handle.close();
+  }
   const rawFindings = parseRawFindings(parsed).map<RawRunFinding>(
     ({ legacyDeduplicationKey: _legacyKey, ...finding }) => finding,
   );
@@ -2161,17 +2303,24 @@ export async function readRetryRunPlan(
     options.runsDirectory,
     options.runId,
   );
-  const parsed = parseRunRecord(
-    await readBoundedFile(
-      recordPath.path,
-      recordPath.active,
-      recordPath.root,
-      recordPath.name,
-    ),
-    options.runId,
+  const opened = await openRunRecordFile(
+    recordPath.path,
     recordPath.active,
-    false,
+    recordPath.root,
+    recordPath.name,
   );
+  let parsed: ParsedReportRecord;
+  try {
+    parsed = await parseRunRecord(
+      opened.handle,
+      options.runId,
+      recordPath.active,
+      false,
+    );
+    await verifyRunRecordFile(opened);
+  } finally {
+    await opened.handle.close();
+  }
   if (parsed.request === undefined) {
     throw new RunReportError(
       "invalid_run_record",
@@ -2231,6 +2380,22 @@ export function renderRunReportMarkdown(report: RunReport): string {
     "",
     `Model runs: ${report.model_runs.completed} completed, ${report.model_runs.incomplete} incomplete, ${report.model_runs.skipped} skipped (${report.model_runs.total} total).`,
   ];
+  for (const reviewer of report.reviewers) {
+    const result = reviewer.result;
+    if (
+      result === undefined ||
+      !("review_markdown" in result) ||
+      typeof result.review_markdown !== "string"
+    ) {
+      continue;
+    }
+    lines.push(
+      "",
+      `## Complete review — ${markdownCode(reviewer.reviewer_id)}`,
+      "",
+      result.review_markdown,
+    );
+  }
   if (report.incomplete_lenses.length > 0) {
     lines.push(
       "",

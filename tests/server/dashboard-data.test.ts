@@ -12,6 +12,7 @@ import type {
   AdjudicationResult,
   ReviewerResultV3,
 } from "../../src/protocol/schemas.js";
+import { reviewerResultDigest } from "../../src/results/digest.js";
 
 const roots: string[] = [];
 
@@ -565,6 +566,11 @@ describe("dashboard data", () => {
           record: "reviewer.result",
           run_id: "run-adjudicated",
           reviewer_id: "lens::source",
+          digest: reviewerResultDigest(candidateResult),
+          byte_count: Buffer.byteLength(
+            JSON.stringify(candidateResult),
+            "utf8",
+          ),
           result: candidateResult,
         },
         {
@@ -573,6 +579,11 @@ describe("dashboard data", () => {
           reviewer_id: "lens::judge",
           mode: "adjudication",
           adjudicates_reviewer_id: "lens::source",
+          digest: reviewerResultDigest(adjudicationResult),
+          byte_count: Buffer.byteLength(
+            JSON.stringify(adjudicationResult),
+            "utf8",
+          ),
           result: adjudicationResult,
           adjudication_validation: adjudicationValidation,
         },
@@ -616,6 +627,59 @@ describe("dashboard data", () => {
         consolidated: [],
         counts: { raw: 1, unique: 0, gate: 0, advisory: 0 },
       },
+    });
+  });
+
+  it("returns the complete verified reviewer result without dashboard truncation", async () => {
+    const { appPaths } = await fixture();
+    const runId = "run-complete-dashboard-result";
+    const reviewMarkdown = `# Complete review\n\n${"Evidence stays exact. ".repeat(6_000)}`;
+    const result: ReviewerResultV3 = {
+      schema_version: "3",
+      verdict: "pass",
+      review_markdown: reviewMarkdown,
+      summary: "No findings.",
+      actionable_findings: [],
+      informational_notes: [],
+    };
+    const digest = reviewerResultDigest(result);
+    const byteCount = Buffer.byteLength(JSON.stringify(result), "utf8");
+    await writeFile(
+      join(appPaths.runsDirectory, `${runId}.jsonl`),
+      [
+        {
+          record: "reviewer.result",
+          run_id: runId,
+          reviewer_id: "reviewer-1",
+          digest,
+          byte_count: byteCount,
+          result,
+        },
+        {
+          record: "reviewer.terminal",
+          run_id: runId,
+          terminal: {
+            reviewer_id: "reviewer-1",
+            status: "completed",
+            adapter: "command",
+            model: "model",
+            isolation: "prompt_only",
+            elapsed_ms: 1,
+            result_digest: digest,
+            result_byte_count: byteCount,
+          },
+        },
+      ]
+        .map((record) => JSON.stringify(record))
+        .join("\n") + "\n",
+    );
+
+    await expect(
+      readDashboardReviewer({ appPaths, runId, reviewerId: "reviewer-1" }),
+    ).resolves.toMatchObject({
+      result,
+      result_digest: digest,
+      result_byte_count: byteCount,
     });
   });
 
@@ -737,6 +801,8 @@ describe("dashboard data", () => {
           record: "reviewer.result",
           run_id: runId,
           reviewer_id: "lens::source",
+          digest: reviewerResultDigest(candidate),
+          byte_count: Buffer.byteLength(JSON.stringify(candidate), "utf8"),
           result: candidate,
         },
         {
@@ -745,6 +811,11 @@ describe("dashboard data", () => {
           reviewer_id: "lens::judge",
           mode: "adjudication",
           adjudicates_reviewer_id: "lens::source",
+          digest: reviewerResultDigest(adjudicationResult),
+          byte_count: Buffer.byteLength(
+            JSON.stringify(adjudicationResult),
+            "utf8",
+          ),
           result: adjudicationResult,
           adjudication_validation: {
             ...adjudicationValidation,

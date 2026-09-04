@@ -241,6 +241,7 @@ export function roundInput(
       circuit_breaker_threshold: 2,
       circuit_breaker_cooldown_ms: 30_000,
       retry_attempts: 2,
+      continuation_attempts: 2,
       retry_backoff_ms: 1_000,
     },
     diagnostics: { persist_runs: false, max_runs: 10 },

@@ -412,6 +412,7 @@ const executionV5Schema = executionSchema.extend({
 
 const executionV6Schema = executionV5Schema.extend({
   allow_provider_concentration: z.boolean().optional(),
+  continuation_attempts: positiveInteger.max(10).optional(),
 });
 
 const diagnosticsSchema = z.strictObject({
@@ -679,6 +680,7 @@ export interface ResolvedConfig {
     circuit_breaker_threshold: number;
     circuit_breaker_cooldown_ms: number;
     retry_attempts: number;
+    continuation_attempts: number;
     retry_backoff_ms: number;
   };
   diagnostics: TrustedConfigV1["diagnostics"];

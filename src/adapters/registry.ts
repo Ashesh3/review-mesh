@@ -59,8 +59,12 @@ export class AdapterRegistry {
     this.register("copilot", (registration) =>
       createCopilotAdapter(registration),
     );
-    this.register("openai_compatible", (registration) =>
-      createOpenAICompatibleAdapter(registration),
+    this.register("openai_compatible", (registration, options) =>
+      createOpenAICompatibleAdapter(registration, {
+        ...(options?.continuationAttempts === undefined
+          ? {}
+          : { continuationAttempts: options.continuationAttempts }),
+      }),
     );
   }
 
@@ -68,10 +72,14 @@ export class AdapterRegistry {
     this.factories.set(type, factory);
   }
 
-  create(id: string, registration: AdapterRegistration): ReviewAdapter {
+  create(
+    id: string,
+    registration: AdapterRegistration,
+    options?: { continuationAttempts?: number },
+  ): ReviewAdapter {
     const factory = this.factories.get(registration.type);
     return factory === undefined
       ? new UnavailableAdapter(id, registration.type)
-      : factory(registration);
+      : factory(registration, options);
   }
 }

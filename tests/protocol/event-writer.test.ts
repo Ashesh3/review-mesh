@@ -77,7 +77,7 @@ describe("EventWriter", () => {
     expect(stdout).toContain('"results_complete":true');
   });
 
-  it("fails terminal output when a required mirror overflows", async () => {
+  it("persists a required large result through compact mirror accounting", async () => {
     const output = new PassThrough();
     output.resume();
     const writer = createEventWriter({
@@ -86,7 +86,7 @@ describe("EventWriter", () => {
       onEvent: async () => undefined,
       onMirrorClose: async () => undefined,
       mirrorCloseRequired: true,
-      mirrorMaxPendingBytes: 1_024,
+      mirrorMaxPendingBytes: 4 * 1_024,
     });
 
     await writer.emit(largeResultEvent());
@@ -109,7 +109,50 @@ describe("EventWriter", () => {
           },
         },
       }),
-    ).rejects.toThrow(/capacity/i);
+    ).resolves.toMatchObject({ event: "run.completed" });
+  });
+
+  it("accounts for the recorder's compact persisted form when queuing a full result", async () => {
+    const output = new PassThrough();
+    output.resume();
+    const mirrored: PublicEvent[] = [];
+    const writer = createEventWriter({
+      output,
+      runId: "run-required-large-result",
+      onEvent: async (event) => {
+        mirrored.push(event);
+      },
+      onMirrorClose: async () => undefined,
+      mirrorCloseRequired: true,
+      mirrorMaxPendingBytes: 4 * 1024,
+    });
+
+    await writer.emit(largeResultEvent());
+    await writer.emitFinal?.({
+      event: "run.completed",
+      data: {
+        exit_code: 0,
+        consistency_mode: "live_worktree",
+        total_elapsed_ms: 1,
+        results_complete: true,
+        suite: {
+          total: 1,
+          deferred: 0,
+          queued: 0,
+          running: 0,
+          completed: 1,
+          incomplete: 0,
+          skipped: 0,
+        },
+      },
+    });
+
+    expect(mirrored).toContainEqual(
+      expect.objectContaining({
+        event: "reviewer.result",
+        data: expect.objectContaining({ result: expect.any(Object) }),
+      }),
+    );
   });
 
   it("propagates an authoritative publication failure instead of swallowing it", async () => {

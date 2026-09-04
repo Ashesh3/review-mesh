@@ -50,6 +50,15 @@ interface PendingMirrorEvent {
   bytes: number;
 }
 
+function mirrorEventBytes(event: PublicEvent, fallbackBytes: number): number {
+  if (event.event !== "reviewer.result") return fallbackBytes;
+  const { result: _result, ...reference } = event.data;
+  return Buffer.byteLength(
+    JSON.stringify({ ...event, data: reference }) + "\n",
+    "utf8",
+  );
+}
+
 export function createEventWriter({
   output,
   runId,
@@ -297,7 +306,8 @@ export function createEventWriter({
 
         await writeLine(line);
 
-        enqueueMirror(event, Buffer.byteLength(line, "utf8"));
+        const lineBytes = Buffer.byteLength(line, "utf8");
+        enqueueMirror(event, mirrorEventBytes(event, lineBytes));
 
         return event;
       });

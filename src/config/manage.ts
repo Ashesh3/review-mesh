@@ -111,6 +111,7 @@ export interface ManagedConfig {
     circuit_breaker_threshold?: number | undefined;
     circuit_breaker_cooldown_ms?: number | undefined;
     retry_attempts?: number | undefined;
+    continuation_attempts?: number | undefined;
     retry_backoff_ms?: number | undefined;
   };
   diagnostics: { persist_runs: boolean; max_runs: number };
@@ -246,6 +247,7 @@ function requireManagedConfig(value: unknown): ManagedConfig {
     trustedConfigV6Schema.parse(value) as unknown as ManagedConfig,
   );
   config.execution.allow_provider_concentration ??= false;
+  config.execution.continuation_attempts ??= 2;
   validateProjectNames(config.projects);
   requireAssignments(config);
   const expandedReviewerIds = new Set<string>();
@@ -450,6 +452,7 @@ function migrateLegacyShape(
       ]),
     ),
   };
+  migrated.execution.continuation_attempts = 2;
   if (legacyNeedsProviderConcentrationAcknowledgement(migrated)) {
     migrated.execution.allow_provider_concentration = true;
   }
@@ -722,6 +725,7 @@ export function emptyManagedConfig(): ManagedConfig {
       circuit_breaker_threshold: 2,
       circuit_breaker_cooldown_ms: 30_000,
       retry_attempts: 2,
+      continuation_attempts: 2,
       retry_backoff_ms: 1_000,
     },
     diagnostics: { persist_runs: true, max_runs: 50 },

@@ -4,7 +4,10 @@ import { join } from "node:path";
 import { mkdtemp } from "node:fs/promises";
 import { afterEach, describe, expect, it } from "vitest";
 import { readRunStatus } from "../../src/diagnostics/run-status.js";
-import type { ReviewerResultV3 } from "../../src/protocol/schemas.js";
+import type {
+  AdjudicationResult,
+  ReviewerResultV3,
+} from "../../src/protocol/schemas.js";
 import { reviewerResultDigest } from "../../src/results/digest.js";
 
 const temporaryRoots: string[] = [];
@@ -30,6 +33,79 @@ afterEach(async () => {
 });
 
 describe("readRunStatus", () => {
+  it("loads and verifies a complete adjudication result", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-adjudication-result";
+    const result: AdjudicationResult = {
+      schema_version: "1",
+      kind: "review-mesh.adjudication-result",
+      verdict: "pass",
+      review_markdown: "# Complete adjudication\n\nRejected candidate.",
+      summary: "Rejected candidate.",
+      actionable_findings: [],
+      decisions: [
+        {
+          source_finding_id: "candidate-1",
+          decision: "rejected",
+          rationale: "The cited path does not execute.",
+          cited_evidence: [],
+          unverified_assumptions: [],
+        },
+      ],
+      informational_notes: [],
+    };
+    const digest = reviewerResultDigest(result);
+    const byteCount = Buffer.byteLength(JSON.stringify(result), "utf8");
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      line({
+        record: "reviewer.result",
+        run_id: runId,
+        reviewer_id: "adjudicator",
+        digest,
+        byte_count: byteCount,
+        result,
+      }),
+    );
+
+    await expect(
+      readRunStatus({ runsDirectory, runId }),
+    ).resolves.toMatchObject({
+      reviewers: [
+        {
+          reviewer_id: "adjudicator",
+          complete_result: result,
+          result_digest: digest,
+          result_byte_count: byteCount,
+        },
+      ],
+    });
+  });
+
+  it("rejects a compact public result reference without an authoritative private result", async () => {
+    const { runsDirectory } = await fixture();
+    const runId = "run-orphan-public-reference";
+    await writeFile(
+      join(runsDirectory, `${runId}.jsonl`),
+      line({
+        schema_version: "5",
+        event: "reviewer.result",
+        run_id: runId,
+        seq: 1,
+        timestamp: "2026-09-04T00:00:00.000Z",
+        reviewer_id: "security",
+        data: { digest: "a".repeat(64), byte_count: 1 },
+      }),
+    );
+
+    await expect(readRunStatus({ runsDirectory, runId })).rejects.toMatchObject(
+      {
+        code: "invalid_run_record",
+        recordType: "reviewer.result",
+      },
+    );
+  });
+
   it("loads and verifies the complete private v3 result for compact artifacts", async () => {
     const { runsDirectory } = await fixture();
     const runId = "run-private-result";

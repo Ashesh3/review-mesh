@@ -92,7 +92,11 @@ describe("effective configuration description", () => {
         project_name_source: "workspace",
         matched_project_name: projectName,
       },
-      execution: { max_concurrency: 2, heartbeat_interval_ms: 5000 },
+      execution: {
+        max_concurrency: 2,
+        heartbeat_interval_ms: 5000,
+        continuation_attempts: 2,
+      },
       reviewers: [
         {
           id: "reviewer",

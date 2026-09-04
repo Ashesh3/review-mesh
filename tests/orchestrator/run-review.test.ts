@@ -47,21 +47,28 @@ function writerWithStuckSuiteHeartbeat() {
   const heartbeatStarted = new Promise<void>((resolve) => {
     resolveHeartbeatStarted = resolve;
   });
+  let rejectHeartbeat!: (error: Error) => void;
+  const stuckHeartbeat = new Promise<never>((_resolve, reject) => {
+    rejectHeartbeat = reject;
+  });
   let stuck = false;
   return {
     emitted,
     heartbeatStarted,
+    failHeartbeat: (error = new Error("stdout closed")) =>
+      rejectHeartbeat(error),
     writer: {
       emit: vi.fn((draft: { event: string; reviewer_id?: string }) => {
-        if (stuck) return new Promise<never>(() => undefined);
+        if (stuck) return Promise.reject(new Error("stdout closed"));
         emitted.push(draft);
         if (draft.event === "suite.heartbeat") {
           stuck = true;
           resolveHeartbeatStarted();
-          return new Promise<never>(() => undefined);
+          return stuckHeartbeat;
         }
         return Promise.resolve({});
       }),
+      outputFailed: vi.fn(() => stuck),
       close: vi.fn(async () => undefined),
     },
   };
@@ -877,7 +884,7 @@ describe("runReviewRound", () => {
         };
       },
     }));
-    const { emitted, heartbeatStarted, writer } =
+    const { emitted, heartbeatStarted, failHeartbeat, writer } =
       writerWithStuckSuiteHeartbeat();
     let outcome: "pending" | "resolved" | "rejected" = "pending";
     const completionPromise = runReviewRound(
@@ -905,10 +912,10 @@ describe("runReviewRound", () => {
 
     await vi.advanceTimersByTimeAsync(10);
     await heartbeatStarted;
+    failHeartbeat();
     await vi.advanceTimersByTimeAsync(200);
-
     await expect(completionPromise).rejects.toThrow(
-      "The public event stream became unavailable.",
+      "The final public event could not be written.",
     );
     expect(outcome).toBe("rejected");
     expect(
@@ -935,7 +942,7 @@ describe("runReviewRound", () => {
       },
     }));
     const controller = new AbortController();
-    const { emitted, heartbeatStarted, writer } =
+    const { emitted, heartbeatStarted, failHeartbeat, writer } =
       writerWithStuckSuiteHeartbeat();
     let outcome: "pending" | "resolved" | "rejected" = "pending";
     const completionPromise = runReviewRound(
@@ -963,11 +970,11 @@ describe("runReviewRound", () => {
 
     await vi.advanceTimersByTimeAsync(10);
     await heartbeatStarted;
+    failHeartbeat();
     controller.abort();
     await vi.advanceTimersByTimeAsync(200);
-
     await expect(completionPromise).rejects.toThrow(
-      "The public event stream became unavailable.",
+      "The final public event could not be written.",
     );
     expect(outcome).toBe("rejected");
     expect(

@@ -358,6 +358,12 @@ function recordLine(value: unknown): string {
   return line(value);
 }
 
+function eventLine(event: PublicEvent): string {
+  if (event.event !== "reviewer.result") return line(event);
+  const { result: _result, ...reference } = event.data;
+  return `${JSON.stringify({ ...event, data: reference })}\n`;
+}
+
 async function lstatIfPresent(path: string) {
   try {
     return await lstat(path);
@@ -610,7 +616,7 @@ export function createRunRecorder({
       }
       return enqueue(async () => {
         const handle = await initialize();
-        await handle.appendFile(line(event));
+        await handle.appendFile(eventLine(event));
       });
     },
     onRecord(record) {

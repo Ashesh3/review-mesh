@@ -125,6 +125,10 @@ async function setup(
   const adapter = createCommandAdapter(registration, {
     environment: sourceEnvironment(mode, options.capture),
     ...(options.captureLaunchEnvironment === true ? { launch } : {}),
+    ...(mode === "oversized-line" ? { maxStdoutLineBytes: 512 * 1024 } : {}),
+    ...(mode === "oversized-total"
+      ? { maxStdoutBytes: 2 * 1024 * 1024, maxStdoutLineBytes: 1024 * 1024 }
+      : {}),
   });
   const input: AdapterReviewInput = {
     runId: "run-command-8",
@@ -247,6 +251,40 @@ describe("generic command adapter", () => {
         actionable_findings: [{ id: "fixture-medium", severity: "medium" }],
       },
     });
+  });
+
+  it("accepts a complete result above the legacy 1 MiB line and 8 MiB total caps", async () => {
+    const { adapter, input } = await setup("large-result");
+
+    const events = await collect(adapter.run(input));
+    const result = events.at(-1);
+    if (result === undefined) throw new Error("expected terminal event");
+    expect(result.type).toBe("result");
+    if (result.type !== "result") throw new Error("expected result");
+    if (!("review_markdown" in result.result))
+      throw new Error("expected current result");
+    expect(
+      Buffer.byteLength(result.result.review_markdown, "utf8"),
+    ).toBeGreaterThan(8 * 1024 * 1024);
+  });
+
+  it("accepts an escape-heavy terminal envelope whose decoded result remains below 16 MiB", async () => {
+    const { adapter, input } = await setup("escape-heavy-result");
+    const result = (await collect(adapter.run(input))).at(-1);
+    expect(result?.type).toBe("result");
+    if (result?.type !== "result") throw new Error("expected result");
+    if (!("review_markdown" in result.result))
+      throw new Error("expected current result");
+    expect(
+      Buffer.byteLength(JSON.stringify(result.result), "utf8"),
+    ).toBeLessThan(16 * 1024 * 1024);
+    expect(
+      Buffer.byteLength(
+        JSON.stringify({ type: "result", result: result.result }) + "\n",
+        "utf8",
+      ),
+    ).toBeGreaterThan(8 * 1024 * 1024);
+    expect(result.result.review_markdown).toContain('"\\\n\t');
   });
 
   it("sanitizes credential-shaped progress and activity before yielding public messages", async () => {

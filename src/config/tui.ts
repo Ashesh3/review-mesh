@@ -1016,6 +1016,17 @@ async function editSettings(options: ConfigMenuOptions): Promise<void> {
       execution.allow_provider_concentration === true ? "y" : "n",
     ),
   );
+  execution.continuation_attempts = positiveInteger(
+    await answer(
+      options.prompt,
+      `Maximum exact continuation requests [${execution.continuation_attempts ?? 2}]: `,
+      String(execution.continuation_attempts ?? 2),
+    ),
+    "continuation attempts",
+  );
+  if (execution.continuation_attempts > 10) {
+    throw new Error("continuation attempts must be at most 10");
+  }
   diagnostics.persist_runs = yes(
     await answer(
       options.prompt,

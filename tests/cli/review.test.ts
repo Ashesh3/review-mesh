@@ -25,6 +25,7 @@ import {
 } from "../../src/protocol/schemas.js";
 import { reviewerResultDigest } from "../../src/results/digest.js";
 import { readRunReport } from "../../src/diagnostics/run-report.js";
+import { readRunStatus } from "../../src/diagnostics/run-status.js";
 import { installAbortHandlers, runCli as runCliEntry } from "../../src/cli.js";
 
 const projectRoot = resolve(import.meta.dirname, "../..");
@@ -702,6 +703,78 @@ describe("review-mesh review", () => {
       code: "ENOENT",
     });
   });
+
+  it("round-trips a result above 1 MiB through stdout and one authoritative artifact payload", async () => {
+    const fixture = await createFixture(
+      ["large-result"],
+      trustedConfig(["large-result"]).replace(
+        "persist_runs = false",
+        "persist_runs = true",
+      ),
+    );
+    const runsDirectory = join(fixture.root, "large-app-data", "runs");
+    const stdout = new PassThrough();
+    let publicOutput = "";
+    stdout.setEncoding("utf8");
+    stdout.on("data", (chunk: string) => (publicOutput += chunk));
+
+    const exitCode = await runReviewApplication({
+      requestText: fixture.request,
+      configFile: fixture.configFile,
+      stdout,
+      stderr: new PassThrough(),
+      signal: new AbortController().signal,
+      runIdFactory: () => "large-persisted-run",
+      appPaths: {
+        configFile: join(fixture.root, "unused-config.toml"),
+        reviewersDirectory: join(fixture.root, "unused-reviewers"),
+        runsDirectory,
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    const publicResult = parseEvents(publicOutput).find(
+      (event) => event.event === "reviewer.result",
+    );
+    expect(publicResult?.event).toBe("reviewer.result");
+    if (publicResult?.event !== "reviewer.result")
+      throw new Error("missing result");
+    const reviewMarkdown = publicResult.data.result.review_markdown;
+    const digest = publicResult.data.digest;
+    const byteCount = publicResult.data.byte_count;
+    expect(Buffer.byteLength(reviewMarkdown, "utf8")).toBeGreaterThan(
+      1024 * 1024,
+    );
+    const artifact = await readFile(
+      join(runsDirectory, "large-persisted-run.jsonl"),
+      "utf8",
+    );
+    expect(artifact.match(/"review_markdown"/gu)).toHaveLength(1);
+    expect(artifact).toContain(
+      `"event":"reviewer.result","run_id":"large-persisted-run"`,
+    );
+    expect(artifact).toContain(`"digest":"${digest}"`);
+    expect(artifact).toContain(`"byte_count":${byteCount}`);
+    const status = await readRunStatus({
+      runsDirectory,
+      runId: "large-persisted-run",
+    });
+    expect(status).toMatchObject({
+      reviewers: [{ complete_result: { review_markdown: reviewMarkdown } }],
+    });
+    const statusReviewers = status.reviewers as Array<Record<string, unknown>>;
+    expect(statusReviewers[0]).toMatchObject({
+      result_digest: digest,
+      result_byte_count: byteCount,
+    });
+    const report = await readRunReport({
+      runsDirectory,
+      runId: "large-persisted-run",
+    });
+    expect(report).toMatchObject({
+      reviewers: [{ result: { review_markdown: reviewMarkdown } }],
+    });
+  }, 20_000);
 
   it("publishes a sanitized details file and removes the temporary internal record", async () => {
     const fixture = await createFixture(["secret-messages"]);

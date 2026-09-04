@@ -22,6 +22,7 @@ import {
   type RunRecorderFileSystem,
   type RunRecorderOperation,
 } from "../../src/diagnostics/run-recorder.js";
+import { reviewerResultDigest } from "../../src/results/digest.js";
 import type { PublicEvent } from "../../src/protocol/schemas.js";
 
 const temporaryRoots: string[] = [];
@@ -170,6 +171,62 @@ describe("RunRecorder", () => {
       result: { review_markdown: reviewMarkdown },
     });
     expect(JSON.stringify(records[1])).not.toContain("[truncated]");
+  });
+
+  it("persists a compact reference for the mirrored public reviewer result", async () => {
+    const root = await temporaryRoot();
+    const runsDirectory = join(root, "runs");
+    const recorder = createRunRecorder({
+      applicationDataRoot: root,
+      runsDirectory,
+      runId: "run-result-reference",
+      maxRuns: 10,
+      resolution: {},
+    });
+    const result = {
+      schema_version: "3" as const,
+      verdict: "pass" as const,
+      review_markdown: `# Review\n\n${"Exact evidence. ".repeat(8_000)}`,
+      summary: "No findings.",
+      actionable_findings: [],
+      informational_notes: [],
+    };
+    const digest = reviewerResultDigest(result);
+    const byteCount = Buffer.byteLength(JSON.stringify(result), "utf8");
+    await recorder.onRecord({
+      record: "reviewer.result",
+      run_id: "run-result-reference",
+      reviewer_id: "reviewer-1",
+      digest,
+      byte_count: byteCount,
+      result,
+    });
+    await recorder.onEvent({
+      schema_version: "5",
+      event: "reviewer.result",
+      run_id: "run-result-reference",
+      seq: 1,
+      timestamp: "2026-09-04T00:00:00.000Z",
+      reviewer_id: "reviewer-1",
+      data: { digest, byte_count: byteCount, result },
+    });
+    await recorder.close();
+
+    const records = (
+      await readFile(join(runsDirectory, "run-result-reference.jsonl"), "utf8")
+    )
+      .trim()
+      .split("\n")
+      .map((entry) => JSON.parse(entry) as Record<string, unknown>);
+    const mirrored = records.find((entry) => entry.event === "reviewer.result");
+    expect(mirrored).toMatchObject({
+      event: "reviewer.result",
+      data: { digest, byte_count: byteCount },
+    });
+    expect((mirrored?.data as Record<string, unknown>).result).toBeUndefined();
+    expect(JSON.stringify(records).match(/Exact evidence\./gu)).toHaveLength(
+      8_000,
+    );
   });
 
   it("publishes a sanitized run record at the exact run path only after close", async () => {

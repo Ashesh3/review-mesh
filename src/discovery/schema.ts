@@ -5,6 +5,7 @@ import {
 } from "../config/schemas.js";
 import {
   publicEventSchema,
+  currentReviewerOutputSchema,
   reviewerResultSchema,
   reviewRequestV2Schema,
 } from "../protocol/schemas.js";
@@ -41,7 +42,7 @@ const runStatusReviewerSchema = z.strictObject({
       informational_notes: z.number().int().nonnegative(),
     })
     .optional(),
-  complete_result: reviewerResultSchema.optional(),
+  complete_result: currentReviewerOutputSchema.optional(),
   result_digest: z
     .string()
     .regex(/^[a-f0-9]{64}$/u)

@@ -194,6 +194,9 @@ export async function describeTool(options: DescribeToolOptions = {}) {
           "disabled",
         ] as const,
         exact_output_continuation: true as const,
+        continuation_attempts: configuration.valid
+          ? configuration.execution.continuation_attempts
+          : undefined,
         provider_envelope_retry_attempts: 1 as const,
       },
       review_scope: {

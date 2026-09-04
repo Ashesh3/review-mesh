@@ -494,6 +494,7 @@ export async function runReviewRound({
   let interrupted = signal.aborted;
   let writerUsable = true;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let optionalPending: Promise<void> | undefined;
 
   const circuitAdmission = (
     reviewer: ResolvedReviewer,
@@ -553,32 +554,45 @@ export async function runReviewRound({
     });
   };
 
-  const emit = async (draft: EventDraft): Promise<void> => {
-    if (!writerUsable) return;
+  const emitRequired = async (draft: EventDraft): Promise<void> => {
+    if (!writerUsable) {
+      throw new FinalOutputError(
+        new Error("The public event stream became unavailable."),
+      );
+    }
     try {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const outcome = await Promise.race([
-        Promise.resolve(writer.emit(draft)).then(
-          () => "complete" as const,
-          () => "failed" as const,
-        ),
-        new Promise<"timeout">((resolve) => {
-          timer = clock.setTimeout(
-            () => resolve("timeout"),
-            config.execution.shutdown_grace_period_ms,
-          );
-        }),
-      ]);
-      if (timer !== undefined) clock.clearTimeout(timer);
-      if (outcome !== "complete") throw new Error("event write failed");
-    } catch {
+      await optionalPending;
+      await writer.emit(draft);
+    } catch (error) {
       writerUsable = false;
+      throw new FinalOutputError(error);
     }
   };
 
+  const emitOptional = (draft: EventDraft): void => {
+    if (!writerUsable || optionalPending !== undefined) return;
+    const operation = Promise.resolve(writer.emit(draft)).then(
+      () => undefined,
+      (error: unknown) => {
+        writerUsable = false;
+        throw error;
+      },
+    );
+    const pending = operation.finally(() => {
+      if (optionalPending === pending) optionalPending = undefined;
+    });
+    optionalPending = pending;
+    void pending.catch(() => undefined);
+  };
+
   const emitFinal = async (draft: EventDraft): Promise<void> => {
-    if (!writerUsable) return;
+    if (!writerUsable) {
+      throw new FinalOutputError(
+        new Error("The public event stream became unavailable."),
+      );
+    }
     try {
+      await optionalPending;
       await (writer.emitFinal ?? writer.emit)(draft);
     } catch (error) {
       writerUsable = false;
@@ -623,7 +637,7 @@ export async function runReviewRound({
     const current = state.reviewer(reviewer.id);
     if (["completed", "incomplete", "skipped"].includes(current.status)) return;
     state.skip(reviewer.id, reason, blockedByReviewerId, missingInputs);
-    await emit({
+    await emitRequired({
       event: "reviewer.skipped",
       reviewer_id: reviewer.id,
       data: {
@@ -654,7 +668,7 @@ export async function runReviewRound({
     state.incomplete(reviewer.id, failure, isolation);
     const terminal = reviewerTerminalRecord(state, reviewer.id);
     await record({ record: "reviewer.terminal", terminal });
-    await emit({
+    await emitRequired({
       event: "reviewer.incomplete",
       reviewer_id: reviewer.id,
       data: {
@@ -850,6 +864,8 @@ export async function runReviewRound({
     }
     state.complete(reviewer.id, accepted, isolation, adjudicationOutcome);
     const terminal = reviewerTerminalRecord(state, reviewer.id);
+    const terminalReference = { ...terminal } as Record<string, unknown>;
+    delete terminalReference.result;
     resultManifest.push({
       reviewer_id: reviewer.id,
       lens_id: lensId(reviewer),
@@ -857,9 +873,17 @@ export async function runReviewRound({
       byte_count: byteCount,
       ...(reportPath === undefined ? {} : { artifact_path: reportPath }),
     });
-    await record({ record: "reviewer.terminal", terminal });
+    await record({
+      record: "reviewer.terminal",
+      terminal: {
+        ...terminalReference,
+        result_digest: digest,
+        result_byte_count: byteCount,
+        ...(reportPath === undefined ? {} : { artifact_path: reportPath }),
+      },
+    });
     const gateFindings = gateFindingCount(reviewer, accepted);
-    await emit({
+    await emitRequired({
       event: "reviewer.completed",
       reviewer_id: reviewer.id,
       data: {
@@ -881,7 +905,7 @@ export async function runReviewRound({
       },
     });
     if (outputMode === "full-jsonl") {
-      await emit({
+      await emitRequired({
         event: "reviewer.result",
         reviewer_id: reviewer.id,
         data: {
@@ -984,7 +1008,7 @@ export async function runReviewRound({
       const attemptStartedAt = clock.now();
       try {
         state.transition(reviewer.id, "starting");
-        await emit({
+        await emitRequired({
           event: "reviewer.started",
           reviewer_id: reviewer.id,
           data: {
@@ -1139,7 +1163,7 @@ export async function runReviewRound({
                 ) {
                   state.transition(reviewer.id, "validating");
                 }
-                await emit({
+                await emitRequired({
                   event: "reviewer.progress",
                   reviewer_id: reviewer.id,
                   data: {
@@ -1231,7 +1255,7 @@ export async function runReviewRound({
         break;
       const retryMessage = `Retrying after a transient reviewer failure (attempt ${attempt + 1} of ${maximumAttempts}).`;
       state.recordActivity(reviewer.id, retryMessage);
-      await emit({
+      await emitRequired({
         event: "reviewer.progress",
         reviewer_id: reviewer.id,
         data: {
@@ -1268,7 +1292,9 @@ export async function runReviewRound({
     try {
       return {
         reviewer,
-        adapter: registry.create(reviewer.adapterId, reviewer.adapter),
+        adapter: registry.create(reviewer.adapterId, reviewer.adapter, {
+          continuationAttempts: config.execution.continuation_attempts,
+        }),
       };
     } catch (error) {
       return {
@@ -1303,7 +1329,7 @@ export async function runReviewRound({
   signal.addEventListener("abort", abort, { once: true });
 
   try {
-    await emit({
+    await emitRequired({
       event: "run.started",
       data: {
         consistency_mode: "live_worktree",
@@ -1355,8 +1381,8 @@ export async function runReviewRound({
       record: "context",
       context: structuredClone(context) as unknown as JsonValue,
     });
-    await emit(compactContext(context, reportPath));
-    await emit({
+    await emitRequired(compactContext(context, reportPath));
+    await emitRequired({
       event: "suite.resolved",
       data: {
         logical_lenses: chains.size,
@@ -1375,6 +1401,7 @@ export async function runReviewRound({
           circuit_breaker_cooldown_ms:
             config.execution.circuit_breaker_cooldown_ms,
           retry_attempts: config.execution.retry_attempts,
+          continuation_attempts: config.execution.continuation_attempts,
           retry_backoff_ms: config.execution.retry_backoff_ms,
         },
         ...(config.selection === undefined
@@ -1444,7 +1471,7 @@ export async function runReviewRound({
       );
       const modelRuns = summarizeSuite(state);
       modelRuns.running = active.size + probing.length;
-      void emit({
+      emitOptional({
         event: "suite.heartbeat",
         data: {
           elapsed_ms: Math.max(0, now.getTime() - startedAt.getTime()),

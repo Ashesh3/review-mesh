@@ -125,6 +125,24 @@ switch (mode) {
     }
     break;
   }
+  case "large-result":
+    emit({
+      type: "result",
+      result: {
+        ...passResult,
+        review_markdown: `# Review\n\n${"x".repeat(9 * 1024 * 1024)}`,
+      },
+    });
+    break;
+  case "escape-heavy-result":
+    emit({
+      type: "result",
+      result: {
+        ...passResult,
+        review_markdown: `# Review\n\n${'"\\\n\t'.repeat(1_400_000)}`,
+      },
+    });
+    break;
   case "silent":
     setInterval(() => undefined, 60_000);
     break;

@@ -53,6 +53,7 @@ export interface ReviewAdapter {
 
 export type AdapterFactory = (
   registration: AdapterRegistration,
+  options?: { continuationAttempts?: number },
 ) => ReviewAdapter;
 
 const ENVIRONMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;

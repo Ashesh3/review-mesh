@@ -257,6 +257,9 @@ OpenAI-compatible adapters default streaming to auto. Multi-lens suites that
 concentrate every primary on one provider require
 execution.allow_provider_concentration=true. Multi-provider lenses with zero
 provider-outage tolerance require allow_zero_outage_tolerance=true on the lens.
+execution.continuation_attempts controls 1-10 exact continuation requests for
+length-limited results independently from whole-result retry_attempts; legacy
+configurations preserve the prior default of 2.
 
 For the complete supported TOML shape, use:
   review-mesh schema config --json

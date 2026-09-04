@@ -1,13 +1,13 @@
 import { constants } from "node:fs";
-import { open, readdir, realpath } from "node:fs/promises";
+import { lstat, open, readdir, realpath } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
-import type { ReviewerResultV3 } from "../protocol/schemas.js";
-import { reviewerResultV3Schema } from "../protocol/schemas.js";
+import type { CurrentReviewerOutput } from "../protocol/schemas.js";
+import { currentReviewerOutputSchema } from "../protocol/schemas.js";
 import { reviewerResultDigest } from "../results/digest.js";
+import { readRunRecordLines } from "./run-record-reader.js";
 
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 const ACTIVE_SUFFIX = /^\.jsonl\.active(?:\..+)?$/u;
-const MAX_STATUS_RECORD_BYTES = 64 * 1024 * 1024;
 
 export class RunStatusError extends Error {
   constructor(
@@ -69,7 +69,7 @@ interface ReviewerSnapshot {
     gate_findings?: number;
     informational_notes: number;
   };
-  complete_result?: ReviewerResultV3;
+  complete_result?: CurrentReviewerOutput;
   result_digest?: string;
   result_byte_count?: number;
   failure?: Record<string, unknown>;
@@ -124,7 +124,7 @@ function isWithinDirectory(directory: string, target: string): boolean {
 async function resolveRunRecord(
   runsDirectory: string,
   runId: string,
-): Promise<{ path: string; active: boolean }> {
+): Promise<{ path: string; active: boolean; root: string; name: string }> {
   const root = await realpath(resolve(runsDirectory)).catch(() => undefined);
   if (root === undefined) {
     throw new RunStatusError("run_not_found", `Run ${runId} was not found.`);
@@ -149,26 +149,23 @@ async function resolveRunRecord(
       "The run record path is unsafe.",
     );
   }
-  return { path, active: selected !== finalName };
+  return { path, active: selected !== finalName, root, name: selected };
 }
 
-async function readBounded(path: string): Promise<string> {
+async function openRunRecord(path: string) {
   const handle = await open(
     path,
     constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
   );
-  try {
-    const metadata = await handle.stat();
-    if (!metadata.isFile() || metadata.size > MAX_STATUS_RECORD_BYTES) {
-      throw new RunStatusError(
-        "invalid_run_record",
-        "The run record is unavailable or exceeds the status limit.",
-      );
-    }
-    return await handle.readFile("utf8");
-  } finally {
+  const metadata = await handle.stat();
+  if (!metadata.isFile()) {
     await handle.close();
+    throw new RunStatusError(
+      "invalid_run_record",
+      "The run record is unavailable or exceeds the status limit.",
+    );
   }
+  return { handle, initial: metadata };
 }
 
 function reviewerFor(
@@ -270,6 +267,30 @@ function applyPrivateTerminal(
   reviewer.elapsed_ms = integer(terminal?.elapsed_ms) ?? reviewer.elapsed_ms;
   if (status === "completed") {
     const result = asRecord(terminal?.result);
+    const digest = text(terminal?.result_digest);
+    const byteCount = integer(terminal?.result_byte_count);
+    if (
+      result === undefined &&
+      (digest !== undefined || byteCount !== undefined)
+    ) {
+      if (
+        reviewer.complete_result === undefined ||
+        digest === undefined ||
+        byteCount === undefined ||
+        reviewer.result_digest !== digest ||
+        reviewer.result_byte_count !== byteCount
+      ) {
+        throw new RunStatusError(
+          "invalid_run_record",
+          "The completed terminal result reference does not match the authoritative private result.",
+          undefined,
+          "reviewer.terminal",
+          ["result_digest"],
+        );
+      }
+      reviewer.state = "completed";
+      return;
+    }
     const findings = Array.isArray(result?.actionable_findings)
       ? result.actionable_findings.length
       : 0;
@@ -315,7 +336,7 @@ function applyVerifiedResult(
   line: number,
   source: "private" | "public",
 ): void {
-  const result = reviewerResultV3Schema.safeParse(container.result);
+  const result = currentReviewerOutputSchema.safeParse(container.result);
   if (!result.success) {
     throw new RunStatusError(
       "invalid_run_record",
@@ -400,7 +421,28 @@ function applyPublicResult(
   data: Record<string, unknown>,
   line: number,
 ): void {
-  applyVerifiedResult(reviewers, reviewerId, data, line, "public");
+  if (data.result !== undefined) {
+    applyVerifiedResult(reviewers, reviewerId, data, line, "public");
+    return;
+  }
+  const reviewer = reviewers.get(reviewerId);
+  const digest = text(data.digest);
+  const byteCount = integer(data.byte_count);
+  if (
+    reviewer?.complete_result === undefined ||
+    digest === undefined ||
+    byteCount === undefined ||
+    reviewer.result_digest !== digest ||
+    reviewer.result_byte_count !== byteCount
+  ) {
+    throw new RunStatusError(
+      "invalid_run_record",
+      `The public reviewer result reference is invalid at JSONL line ${line}.`,
+      line,
+      "reviewer.result",
+      ["digest"],
+    );
+  }
 }
 
 export async function readRunStatus({
@@ -410,185 +452,222 @@ export async function readRunStatus({
 }: ReadRunStatusOptions): Promise<Record<string, unknown>> {
   requireSafeRunId(runId);
   const location = await resolveRunRecord(runsDirectory, runId);
-  const lines = (await readBounded(location.path)).split(/\r?\n/u);
+  const opened = await openRunRecord(location.path);
   const reviewers = new Map<string, ReviewerSnapshot>();
   let completed: Record<string, unknown> | undefined;
   let lastSeq = 0;
   let resolvedModelTotal = 0;
   let legacySuite: Record<string, unknown> | undefined;
-  for (const [index, encoded] of lines.entries()) {
-    if (encoded.trim().length === 0) continue;
-    let value: unknown;
-    try {
-      value = JSON.parse(encoded);
-    } catch {
-      if (location.active && index === lines.length - 1) break;
-      const line = index + 1;
-      throw new RunStatusError(
-        "invalid_run_record",
-        `The persisted run record contains invalid JSON at JSONL line ${line} (invalid_json).`,
-        line,
-        "invalid_json",
-      );
-    }
-    const event = asRecord(value);
-    if (event === undefined) continue;
-    if (event.record === "resolution") {
-      const resolution = asRecord(event.resolution);
-      const roster = Array.isArray(resolution?.reviewers)
-        ? resolution.reviewers
-        : [];
-      resolvedModelTotal = roster.length;
-      for (const item of roster) {
-        const entry = asRecord(item);
-        const id = text(entry?.id);
-        if (id === undefined) continue;
-        reviewers.set(id, {
-          reviewer_id: id,
-          ...(text(entry?.agent_id) === undefined
-            ? {}
-            : { lens_id: text(entry?.agent_id)! }),
-          ...(text(entry?.purpose) === undefined
-            ? {}
-            : { purpose: text(entry?.purpose)! }),
-          ...(text(entry?.adapter) === undefined
-            ? {}
-            : { adapter: text(entry?.adapter)! }),
-          ...(text(entry?.model) === undefined
-            ? {}
-            : { model: text(entry?.model)! }),
-          ...(text(entry?.provider_group) === undefined
-            ? {}
-            : { provider_group: text(entry?.provider_group)! }),
-          state: (integer(entry?.model_index) ?? 0) > 0 ? "deferred" : "queued",
-        });
+  try {
+    for await (const { line, encoded, terminated } of readRunRecordLines(
+      opened.handle,
+    )) {
+      if (encoded.trim().length === 0) continue;
+      let value: unknown;
+      try {
+        value = JSON.parse(encoded);
+      } catch {
+        if (location.active && !terminated) break;
+        throw new RunStatusError(
+          "invalid_run_record",
+          `The persisted run record contains invalid JSON at JSONL line ${line} (invalid_json).`,
+          line,
+          "invalid_json",
+        );
       }
-      continue;
-    }
-    if (event.record === "reviewer.attempt") {
-      addAttempt(reviewers, event);
-      continue;
-    }
-    if (event.record === "reviewer.result") {
-      applyPrivateResult(reviewers, event, index + 1);
-      continue;
-    }
-    if (event.record === "reviewer.terminal") {
-      applyPrivateTerminal(reviewers, event);
-      continue;
-    }
-    const eventName = text(event.event);
-    if (eventName === undefined) continue;
-    lastSeq = Math.max(lastSeq, integer(event.seq) ?? 0);
-    const data = asRecord(event.data) ?? {};
-    const id = text(event.reviewer_id);
-    if (eventName === "suite.resolved") {
-      resolvedModelTotal =
-        integer(data.model_runs) ?? integer(data.total) ?? resolvedModelTotal;
-      continue;
-    }
-    if (eventName === "run.completed") {
-      completed = data;
-      legacySuite = asRecord(data.suite);
-      const terminals = Array.isArray(data.reviewers) ? data.reviewers : [];
-      for (const terminal of terminals) {
-        applyPrivateTerminal(reviewers, {
-          terminal,
-        });
+      const event = asRecord(value);
+      if (event === undefined) continue;
+      if (event.record === "resolution") {
+        const resolution = asRecord(event.resolution);
+        const roster = Array.isArray(resolution?.reviewers)
+          ? resolution.reviewers
+          : [];
+        resolvedModelTotal = roster.length;
+        for (const item of roster) {
+          const entry = asRecord(item);
+          const id = text(entry?.id);
+          if (id === undefined) continue;
+          reviewers.set(id, {
+            reviewer_id: id,
+            ...(text(entry?.agent_id) === undefined
+              ? {}
+              : { lens_id: text(entry?.agent_id)! }),
+            ...(text(entry?.purpose) === undefined
+              ? {}
+              : { purpose: text(entry?.purpose)! }),
+            ...(text(entry?.adapter) === undefined
+              ? {}
+              : { adapter: text(entry?.adapter)! }),
+            ...(text(entry?.model) === undefined
+              ? {}
+              : { model: text(entry?.model)! }),
+            ...(text(entry?.provider_group) === undefined
+              ? {}
+              : { provider_group: text(entry?.provider_group)! }),
+            state:
+              (integer(entry?.model_index) ?? 0) > 0 ? "deferred" : "queued",
+          });
+        }
+        continue;
       }
-      continue;
-    }
-    if (eventName === "reviewer.heartbeat" && id !== undefined) {
+      if (event.record === "reviewer.attempt") {
+        addAttempt(reviewers, event);
+        continue;
+      }
+      if (event.record === "reviewer.result") {
+        applyPrivateResult(reviewers, event, line);
+        continue;
+      }
+      if (event.record === "reviewer.terminal") {
+        applyPrivateTerminal(reviewers, event);
+        continue;
+      }
+      const eventName = text(event.event);
+      if (eventName === undefined) continue;
+      lastSeq = Math.max(lastSeq, integer(event.seq) ?? 0);
+      const data = asRecord(event.data) ?? {};
+      const id = text(event.reviewer_id);
+      if (eventName === "suite.resolved") {
+        resolvedModelTotal =
+          integer(data.model_runs) ?? integer(data.total) ?? resolvedModelTotal;
+        continue;
+      }
+      if (eventName === "run.completed") {
+        completed = data;
+        legacySuite = asRecord(data.suite);
+        const terminals = Array.isArray(data.reviewers) ? data.reviewers : [];
+        for (const terminal of terminals) {
+          applyPrivateTerminal(reviewers, {
+            terminal,
+          });
+        }
+        continue;
+      }
+      if (eventName === "reviewer.heartbeat" && id !== undefined) {
+        const reviewer = reviewerFor(reviewers, id);
+        reviewer.state =
+          data.phase === "probing" ||
+          data.phase === "queued" ||
+          data.phase === "starting" ||
+          data.phase === "reviewing" ||
+          data.phase === "validating"
+            ? data.phase
+            : reviewer.state;
+        reviewer.elapsed_ms = integer(data.elapsed_ms) ?? reviewer.elapsed_ms;
+        reviewer.last_activity_message =
+          text(data.last_activity_message) ?? reviewer.last_activity_message;
+        reviewer.last_event_seq = integer(event.seq);
+        reviewer.last_event_at = text(event.timestamp);
+        continue;
+      }
+      if (id === undefined) continue;
       const reviewer = reviewerFor(reviewers, id);
-      reviewer.state =
-        data.phase === "probing" ||
-        data.phase === "queued" ||
-        data.phase === "starting" ||
-        data.phase === "reviewing" ||
-        data.phase === "validating"
-          ? data.phase
-          : reviewer.state;
-      reviewer.elapsed_ms = integer(data.elapsed_ms) ?? reviewer.elapsed_ms;
-      reviewer.last_activity_message =
-        text(data.last_activity_message) ?? reviewer.last_activity_message;
       reviewer.last_event_seq = integer(event.seq);
       reviewer.last_event_at = text(event.timestamp);
-      continue;
+      reviewer.lens_id = text(data.lens_id) ?? reviewer.lens_id;
+      reviewer.adapter = text(data.adapter) ?? reviewer.adapter;
+      reviewer.model = text(data.model) ?? reviewer.model;
+      reviewer.provider_group =
+        text(data.provider_group) ?? reviewer.provider_group;
+      reviewer.elapsed_ms = integer(data.elapsed_ms) ?? reviewer.elapsed_ms;
+      if (eventName === "reviewer.started") {
+        reviewer.state = "starting";
+        reviewer.attempt = integer(data.attempt) ?? (reviewer.attempt ?? 0) + 1;
+        reviewer.purpose = text(data.purpose) ?? reviewer.purpose;
+      } else if (eventName === "reviewer.progress") {
+        const phase = text(data.phase);
+        reviewer.state =
+          phase === "probing" ||
+          phase === "starting" ||
+          phase === "reviewing" ||
+          phase === "validating" ||
+          phase === "queued"
+            ? phase
+            : reviewer.state;
+        reviewer.last_activity_message =
+          text(data.message) ?? reviewer.last_activity_message;
+      } else if (eventName === "reviewer.result") {
+        applyPublicResult(reviewers, id, data, line);
+      } else if (eventName === "reviewer.completed") {
+        reviewer.state = "completed";
+        const legacyResult = asRecord(data.result);
+        reviewer.result =
+          legacyResult === undefined
+            ? {
+                verdict: data.verdict === "fail" ? "fail" : "pass",
+                summary: text(data.summary) ?? "Completed reviewer result.",
+                actionable_findings: integer(data.actionable_findings) ?? 0,
+                ...(integer(data.gate_findings) === undefined
+                  ? {}
+                  : { gate_findings: integer(data.gate_findings)! }),
+                informational_notes: integer(data.informational_notes) ?? 0,
+              }
+            : {
+                verdict: legacyResult.verdict === "fail" ? "fail" : "pass",
+                summary:
+                  text(legacyResult.summary) ?? "Completed reviewer result.",
+                actionable_findings: Array.isArray(
+                  legacyResult.actionable_findings,
+                )
+                  ? legacyResult.actionable_findings.length
+                  : 0,
+                informational_notes: Array.isArray(
+                  legacyResult.informational_notes,
+                )
+                  ? legacyResult.informational_notes.length
+                  : 0,
+              };
+      } else if (eventName === "reviewer.incomplete") {
+        reviewer.state = "incomplete";
+        reviewer.failure = {
+          reason: data.reason,
+          message: data.message,
+          retryable: data.retryable,
+          fallback_eligible: data.fallback_eligible,
+          diagnostics: data.diagnostics,
+        };
+      } else if (eventName === "reviewer.skipped") {
+        reviewer.state = "skipped";
+        reviewer.skipped = {
+          reason: data.reason,
+          blocked_by_reviewer_id: data.blocked_by_reviewer_id,
+          missing_inputs: data.missing_inputs,
+        };
+      }
     }
-    if (id === undefined) continue;
-    const reviewer = reviewerFor(reviewers, id);
-    reviewer.last_event_seq = integer(event.seq);
-    reviewer.last_event_at = text(event.timestamp);
-    reviewer.lens_id = text(data.lens_id) ?? reviewer.lens_id;
-    reviewer.adapter = text(data.adapter) ?? reviewer.adapter;
-    reviewer.model = text(data.model) ?? reviewer.model;
-    reviewer.provider_group =
-      text(data.provider_group) ?? reviewer.provider_group;
-    reviewer.elapsed_ms = integer(data.elapsed_ms) ?? reviewer.elapsed_ms;
-    if (eventName === "reviewer.started") {
-      reviewer.state = "starting";
-      reviewer.attempt = integer(data.attempt) ?? (reviewer.attempt ?? 0) + 1;
-      reviewer.purpose = text(data.purpose) ?? reviewer.purpose;
-    } else if (eventName === "reviewer.progress") {
-      const phase = text(data.phase);
-      reviewer.state =
-        phase === "probing" ||
-        phase === "starting" ||
-        phase === "reviewing" ||
-        phase === "validating" ||
-        phase === "queued"
-          ? phase
-          : reviewer.state;
-      reviewer.last_activity_message =
-        text(data.message) ?? reviewer.last_activity_message;
-    } else if (eventName === "reviewer.result") {
-      applyPublicResult(reviewers, id, data, index + 1);
-    } else if (eventName === "reviewer.completed") {
-      reviewer.state = "completed";
-      const legacyResult = asRecord(data.result);
-      reviewer.result =
-        legacyResult === undefined
-          ? {
-              verdict: data.verdict === "fail" ? "fail" : "pass",
-              summary: text(data.summary) ?? "Completed reviewer result.",
-              actionable_findings: integer(data.actionable_findings) ?? 0,
-              ...(integer(data.gate_findings) === undefined
-                ? {}
-                : { gate_findings: integer(data.gate_findings)! }),
-              informational_notes: integer(data.informational_notes) ?? 0,
-            }
-          : {
-              verdict: legacyResult.verdict === "fail" ? "fail" : "pass",
-              summary:
-                text(legacyResult.summary) ?? "Completed reviewer result.",
-              actionable_findings: Array.isArray(
-                legacyResult.actionable_findings,
-              )
-                ? legacyResult.actionable_findings.length
-                : 0,
-              informational_notes: Array.isArray(
-                legacyResult.informational_notes,
-              )
-                ? legacyResult.informational_notes.length
-                : 0,
-            };
-    } else if (eventName === "reviewer.incomplete") {
-      reviewer.state = "incomplete";
-      reviewer.failure = {
-        reason: data.reason,
-        message: data.message,
-        retryable: data.retryable,
-        fallback_eligible: data.fallback_eligible,
-        diagnostics: data.diagnostics,
-      };
-    } else if (eventName === "reviewer.skipped") {
-      reviewer.state = "skipped";
-      reviewer.skipped = {
-        reason: data.reason,
-        blocked_by_reviewer_id: data.blocked_by_reviewer_id,
-        missing_inputs: data.missing_inputs,
-      };
+    if (!location.active) {
+      const [current, canonical, pathMetadata] = await Promise.all([
+        opened.handle.stat(),
+        realpath(location.path).catch(() => undefined),
+        lstat(location.path, { bigint: true }).catch(() => undefined),
+      ]);
+      if (
+        canonical === undefined ||
+        pathMetadata === undefined ||
+        pathMetadata.isSymbolicLink() ||
+        !isWithinDirectory(location.root, canonical) ||
+        basename(canonical) !== location.name ||
+        (process.platform !== "win32" &&
+          current.dev !== 0 &&
+          pathMetadata.dev !== 0n &&
+          BigInt(current.dev) !== pathMetadata.dev) ||
+        (process.platform !== "win32" &&
+          current.ino !== 0 &&
+          pathMetadata.ino !== 0n &&
+          BigInt(current.ino) !== pathMetadata.ino) ||
+        current.size !== opened.initial.size ||
+        current.mtimeMs !== opened.initial.mtimeMs ||
+        current.dev !== opened.initial.dev ||
+        current.ino !== opened.initial.ino
+      ) {
+        throw new RunStatusError(
+          "invalid_run_record",
+          "The completed run record changed while status was being read.",
+        );
+      }
     }
+  } finally {
+    await opened.handle.close();
   }
 
   const values = [...reviewers.values()];

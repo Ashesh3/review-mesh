@@ -55,18 +55,16 @@ function assistantResponse(
     choices: [
       {
         message,
-        ...(finishReason === undefined
-          ? {}
-          : { finish_reason: finishReason }),
+        ...(finishReason === undefined ? {} : { finish_reason: finishReason }),
       },
     ],
   });
 }
 
 function sseResponse(events: readonly unknown[]): Response {
-  const encoded = events
-    .map((event) => `data: ${JSON.stringify(event)}\n\n`)
-    .join("") + "data: [DONE]\n\n";
+  const encoded =
+    events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") +
+    "data: [DONE]\n\n";
   return new Response(encoded, {
     headers: { "content-type": "text/event-stream; charset=utf-8" },
   });
@@ -235,12 +233,10 @@ describe("OpenAI-compatible adapter", () => {
     const fetch = fetchMock(async () =>
       jsonResponse({ error: "streaming unsupported" }, 422),
     );
-    const prepared = setup(
-      "C:\\workspace",
-      { fetch },
-      undefined,
-      { ...registration, streaming: "required" as const },
-    );
+    const prepared = setup("C:\\workspace", { fetch }, undefined, {
+      ...registration,
+      streaming: "required" as const,
+    });
 
     expect(
       terminal(await collect(prepared.adapter, prepared.input)),
@@ -290,6 +286,56 @@ describe("OpenAI-compatible adapter", () => {
     expect(bodies.every((body) => body.stream === true)).toBe(true);
   });
 
+  it.each(["json", "sse"] as const)(
+    "decodes a %s wire response above 8 MiB when accepted content is below 16 MiB",
+    async (transport) => {
+      const filler = "x".repeat(9 * 1024 * 1024);
+      const largeResult = {
+        ...passResult("Large wire response."),
+        review_markdown: `# Review\n\n${filler}`,
+      };
+      const final = JSON.stringify(largeResult);
+      const finalResponse =
+        transport === "json"
+          ? assistantResponse({ role: "assistant", content: final })
+          : sseAssistant(final);
+      const wireBytes = Buffer.byteLength(
+        await finalResponse.clone().text(),
+        "utf8",
+      );
+      expect(wireBytes).toBeGreaterThan(8 * 1024 * 1024);
+      const responses =
+        transport === "json"
+          ? [
+              assistantResponse({
+                role: "assistant",
+                content: "Inspection complete.",
+              }),
+              finalResponse,
+            ]
+          : [sseAssistant("Inspection complete."), finalResponse];
+      const prepared = setup(
+        "C:\\workspace",
+        { fetch: fetchMock(async () => responses.shift()!) },
+        undefined,
+        {
+          ...registration,
+          streaming: transport === "sse" ? "required" : "disabled",
+        },
+      );
+
+      const result = terminal(await collect(prepared.adapter, prepared.input));
+      expect(result.type).toBe("result");
+      if (result.type !== "result") throw new Error("expected result");
+      if (!("review_markdown" in result.result))
+        throw new Error("expected current result");
+      expect(result.result.review_markdown).toBe(largeResult.review_markdown);
+      expect(
+        Buffer.byteLength(JSON.stringify(result.result), "utf8"),
+      ).toBeLessThan(16 * 1024 * 1024);
+    },
+  );
+
   it("forwards reasoning effort on every streamed request", async () => {
     const efforts: unknown[] = [];
     const responses = [
@@ -327,12 +373,14 @@ describe("OpenAI-compatible adapter", () => {
           return responses.shift()!;
         }),
       },
-      { reviewer: resolvedReviewer({
-        adapterId: "gateway",
-        adapter: { ...registration, streaming: "auto" },
-        model: "review-model",
-        effort: "high",
-      }) },
+      {
+        reviewer: resolvedReviewer({
+          adapterId: "gateway",
+          adapter: { ...registration, streaming: "auto" },
+          model: "review-model",
+          effort: "high",
+        }),
+      },
       { ...registration, streaming: "auto" as const },
     );
 
@@ -404,9 +452,9 @@ describe("OpenAI-compatible adapter", () => {
     );
 
     try {
-      expect(terminal(await collect(prepared.adapter, prepared.input)).type).toBe(
-        "result",
-      );
+      expect(
+        terminal(await collect(prepared.adapter, prepared.input)).type,
+      ).toBe("result");
       const toolMessage = bodies[1].messages.find(
         (message: any) => message.role === "tool",
       );
@@ -464,9 +512,7 @@ describe("OpenAI-compatible adapter", () => {
     ];
     const prepared = setup("C:\\workspace", {
       fetch: fetchMock(async (_input, init) => {
-        sessions.push(
-          new Headers(init?.headers).get("X-Client-Session-Id"),
-        );
+        sessions.push(new Headers(init?.headers).get("X-Client-Session-Id"));
         return responses.shift()!;
       }),
       sessionIdFactory: () => "doctor-session",
@@ -884,6 +930,68 @@ describe("OpenAI-compatible adapter", () => {
     expect(bodies[4].messages.at(-2).content).toBe(first + second);
   });
 
+  it("uses a continuation budget independent from whole-result retry attempts", async () => {
+    const bodies: any[] = [];
+    const encoded = JSON.stringify(passResult("Four exact fragments."));
+    const fragments = [
+      encoded.slice(0, 30),
+      encoded.slice(30, 70),
+      encoded.slice(70, 110),
+      encoded.slice(110),
+    ];
+    const responses = [
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      ...fragments.map((content, index) =>
+        assistantResponse(
+          { role: "assistant", content },
+          index === fragments.length - 1 ? "stop" : "length",
+        ),
+      ),
+    ];
+    const prepared = setup("C:\\workspace", {
+      finalizationAttempts: 1,
+      continuationAttempts: 4,
+      fetch: fetchMock(async (_input, init) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return responses.shift()!;
+      }),
+    });
+
+    expect(terminal(await collect(prepared.adapter, prepared.input))).toEqual({
+      type: "result",
+      result: passResult("Four exact fragments."),
+      isolation: "runtime_read_only",
+    });
+    expect(bodies).toHaveLength(5);
+  });
+
+  it("resets exhausted continuation bytes before a fresh result-production retry", async () => {
+    const complete = JSON.stringify(passResult("Fresh retry."));
+    const responses = [
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      assistantResponse(
+        { role: "assistant", content: '{"schema_version":"3"' },
+        "length",
+      ),
+      assistantResponse(
+        { role: "assistant", content: ',"verdict":"pass"' },
+        "length",
+      ),
+      assistantResponse({ role: "assistant", content: complete }, "stop"),
+    ];
+    const prepared = setup("C:\\workspace", {
+      finalizationAttempts: 2,
+      continuationAttempts: 1,
+      fetch: fetchMock(async () => responses.shift()!),
+    });
+
+    expect(terminal(await collect(prepared.adapter, prepared.input))).toEqual({
+      type: "result",
+      result: passResult("Fresh retry."),
+      isolation: "runtime_read_only",
+    });
+  });
+
   it("reports exhausted output truncation as non-circuit-qualifying", async () => {
     const truncated = () =>
       jsonResponse({
@@ -900,7 +1008,8 @@ describe("OpenAI-compatible adapter", () => {
       truncated(),
     ];
     const prepared = setup("C:\\workspace", {
-      finalizationAttempts: 2,
+      finalizationAttempts: 1,
+      continuationAttempts: 1,
       fetch: fetchMock(async () => responses.shift()!),
     });
 
@@ -997,14 +1106,8 @@ describe("OpenAI-compatible adapter", () => {
       assistantResponse({ role: "assistant", content: "Inspection complete." }),
       assistantResponse({ role: "assistant", content: "not " }, "length"),
       assistantResponse({ role: "assistant", content: "valid json" }, "stop"),
-      assistantResponse(
-        { role: "assistant", content: repairPrefix },
-        "length",
-      ),
-      assistantResponse(
-        { role: "assistant", content: repairSuffix },
-        "stop",
-      ),
+      assistantResponse({ role: "assistant", content: repairPrefix }, "length"),
+      assistantResponse({ role: "assistant", content: repairSuffix }, "stop"),
     ];
     const prepared = setup("C:\\workspace", {
       finalizationAttempts: 3,

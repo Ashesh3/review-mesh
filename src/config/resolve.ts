@@ -387,6 +387,7 @@ function resolveV1(
       circuit_breaker_threshold: 2,
       circuit_breaker_cooldown_ms: 30_000,
       retry_attempts: 2,
+      continuation_attempts: 2,
       retry_backoff_ms: 1_000,
     },
     diagnostics: config.diagnostics,
@@ -484,6 +485,10 @@ function resolveV2(
       retry_attempts:
         "retry_attempts" in config.execution
           ? (config.execution.retry_attempts ?? 2)
+          : 2,
+      continuation_attempts:
+        "continuation_attempts" in config.execution
+          ? (config.execution.continuation_attempts ?? 2)
           : 2,
       retry_backoff_ms:
         "retry_backoff_ms" in config.execution

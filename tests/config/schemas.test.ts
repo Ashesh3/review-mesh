@@ -51,6 +51,17 @@ function v6Config(): {
 }
 
 describe("trusted configuration schema v6", () => {
+  it("accepts continuation_attempts from 1 through 10 and rejects values outside the bound", () => {
+    const valid = v6Config();
+    valid.execution.continuation_attempts = 4;
+    expect(trustedConfigSchema.safeParse(valid).success).toBe(true);
+    for (const value of [0, 11]) {
+      const invalid = v6Config();
+      invalid.execution.continuation_attempts = value;
+      expect(trustedConfigSchema.safeParse(invalid).success).toBe(false);
+    }
+  });
+
   it("requires every lens to declare applicability and required context explicitly", () => {
     expect(trustedConfigSchema.safeParse(v6Config()).success).toBe(true);
 
