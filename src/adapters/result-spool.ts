@@ -46,6 +46,7 @@ export interface CreateResultSpoolOptions {
   directory: string;
   id: string;
   reviewedWorkspace?: string;
+  maximumBytes?: number;
   /** Test seam for deterministic pathname-replacement races after open. */
   afterCreateOpen?(path: string): void | Promise<void>;
   /** Test seam for deterministic pathname replacement before handle wipe. */
@@ -405,6 +406,7 @@ class FileResultSpool implements ResultSpool {
     private readonly fileIdentity: BigIntStats,
     private readonly beforeCleanupWipe:
       ((path: string) => void | Promise<void>) | undefined,
+    private readonly maximumBytes = MAX_RESULT_SPOOL_BYTES,
   ) {}
 
   get byteLength(): number {
@@ -459,10 +461,10 @@ class FileResultSpool implements ResultSpool {
             fragment.byteOffset,
             fragment.byteLength,
           );
-    if (this.length + bytes.byteLength > MAX_RESULT_SPOOL_BYTES) {
+    if (this.length + bytes.byteLength > this.maximumBytes) {
       throw new ResultSpoolError(
         "result_too_large",
-        "The assembled reviewer result exceeds the 16 MiB limit.",
+        `The result spool exceeds its ${this.maximumBytes}-byte limit.`,
       );
     }
     await this.verifyIdentity();
@@ -556,6 +558,12 @@ class FileResultSpool implements ResultSpool {
 export async function createResultSpool(
   options: CreateResultSpoolOptions,
 ): Promise<ResultSpool> {
+  if (
+    options.maximumBytes !== undefined &&
+    (!Number.isSafeInteger(options.maximumBytes) || options.maximumBytes < 1)
+  ) {
+    throw new TypeError("maximumBytes must be a positive safe integer");
+  }
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(options.id)) {
     throw new ResultSpoolError(
       "unsafe_directory",
@@ -665,6 +673,7 @@ export async function createResultSpool(
       handle,
       fileIdentity,
       options.beforeCleanupWipe,
+      options.maximumBytes ?? MAX_RESULT_SPOOL_BYTES,
     );
   } catch (error) {
     if (createdIdentity !== undefined) {

@@ -62,6 +62,7 @@ export interface OpenAIStreamResult {
 export interface ParseOpenAIChatStreamOptions {
   signal: AbortSignal;
   maximumBytes?: number;
+  onProgress?(event: { byteCount: number; totalBytes: number }): void;
 }
 
 interface ToolCallAccumulator {
@@ -137,8 +138,10 @@ export async function parseOpenAIChatStream(
     if (!parsed.success) {
       throw invalidStream("The stream contained an invalid chat delta.");
     }
+    let meaningful = false;
     if (parsed.data.usage !== undefined && parsed.data.usage !== null) {
       usage = parsed.data.usage;
+      meaningful = true;
     }
     for (const choice of parsed.data.choices) {
       if (choice.index !== 0) continue;
@@ -147,8 +150,10 @@ export async function parseOpenAIChatStream(
       if (typeof choice.delta.content === "string") {
         receivedContent = true;
         content += choice.delta.content;
+        if (choice.delta.content.length > 0) meaningful = true;
       }
       for (const delta of choice.delta.tool_calls ?? []) {
+        meaningful = true;
         const accumulator = toolCalls.get(delta.index) ?? {
           id: "",
           name: "",
@@ -166,7 +171,14 @@ export async function parseOpenAIChatStream(
       }
       if (choice.finish_reason !== undefined && choice.finish_reason !== null) {
         finishReason = choice.finish_reason;
+        meaningful = true;
       }
+    }
+    if (meaningful) {
+      options.onProgress?.({
+        byteCount: Buffer.byteLength(encoded, "utf8"),
+        totalBytes: responseBytes,
+      });
     }
   };
 

@@ -106,6 +106,22 @@ describe("result spool", () => {
     await spool.cleanup();
   });
 
+  it("supports a smaller caller-owned maximum for one semantic page", async () => {
+    const directory = await root();
+    const spool = await createResultSpool({
+      directory,
+      id: "page-limit",
+      maximumBytes: 8,
+    });
+
+    await spool.append("12345678");
+    await expect(spool.append("9")).rejects.toMatchObject({
+      code: "result_too_large",
+    });
+    expect(await spool.readText()).toBe("12345678");
+    await spool.cleanup();
+  });
+
   it("rejects a replaced spool path and never deletes the foreign replacement", async () => {
     const directory = await root();
     const spool = await createResultSpool({ directory, id: "identity" });

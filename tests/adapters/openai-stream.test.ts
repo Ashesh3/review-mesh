@@ -115,6 +115,30 @@ describe("OpenAI-compatible SSE reconstruction", () => {
     });
   });
 
+  it("reports only newly admitted meaningful stream bytes", async () => {
+    const progress: Array<{ byteCount: number; totalBytes: number }> = [];
+    const stream = [
+      ": keepalive\n\n",
+      'data: {"choices":[{"index":0,"delta":{"content":"one"}}]}\n\n',
+      ": keepalive\n\n",
+      'data: {"choices":[{"index":0,"delta":{"content":"two"},"finish_reason":"stop"}]}\n\n',
+      "data: [DONE]\n\n",
+    ];
+
+    const result = await parseOpenAIChatStream(
+      chunkedBody(stream.map((value) => new TextEncoder().encode(value))),
+      {
+        signal: new AbortController().signal,
+        onProgress: (event) => progress.push(event),
+      },
+    );
+
+    expect(result.message.content).toBe("onetwo");
+    expect(progress).toHaveLength(2);
+    expect(progress.every((event) => event.byteCount > 0)).toBe(true);
+    expect(progress[1]!.totalBytes).toBeGreaterThan(progress[0]!.totalBytes);
+  });
+
   it("rejects malformed events and streams that end without DONE", async () => {
     await expect(
       parseOpenAIChatStream(
