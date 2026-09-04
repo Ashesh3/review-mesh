@@ -813,6 +813,14 @@ export const publicEventSchema = z.discriminatedUnion(
   "event",
   publicEventSchemas,
 );
+export const publicEventV4Schema = publicEventSchema.refine(
+  (event) => event.schema_version === "4",
+  "expected public event schema version 4",
+);
+export const publicEventV5Schema = publicEventSchema.refine(
+  (event) => event.schema_version === "5",
+  "expected public event schema version 5",
+);
 
 export type ReviewRequest = z.infer<typeof reviewRequestSchema>;
 export type ReviewerResult = z.infer<typeof reviewerResultSchema>;
@@ -841,3 +849,45 @@ export type FindingClassification = z.infer<typeof findingClassificationSchema>;
 export type FindingCategory = z.infer<typeof findingCategorySchema>;
 export type ReviewerMode = z.infer<typeof reviewerModeSchema>;
 export type ReviewOutputMode = z.infer<typeof reviewOutputModeSchema>;
+
+export {
+  actionableFindingV4Schema,
+  adjudicationDecisionV2Schema,
+  adjudicationResultV2Schema,
+  changeCoverageResultSchema,
+  coverageAttestationEntrySchema,
+  coverageAttestationSchema,
+  providerReviewerResultV4Schema,
+  publicEventV6Schema,
+  pullRequestV3Schema,
+  resultKindSchema,
+  resultPageKindSchema,
+  resultPageSchema,
+  reviewRequestV3Schema,
+  reviewerResultV4Schema,
+  v9CoverageOutcomeSchema,
+  v9CoverageProofKindSchema,
+  v9CoverageStatusSchema,
+  v9FindingCategorySchema,
+  v9FindingClassificationSchema,
+  v9FindingConfidenceSchema,
+  v9FindingSeveritySchema,
+  v9GateOutcomeSchema,
+  v9IncompleteReasonSchema,
+  v9RunOutcomeSchema,
+  type ActionableFindingV4,
+  type AdjudicationDecisionV2,
+  type AdjudicationResultV2,
+  type ChangeCoverageResult,
+  type CoverageAttestation,
+  type ProviderReviewerResultV4,
+  type PublicEventV6,
+  type PullRequestV3,
+  type ResultPage,
+  type ReviewRequestV3,
+  type ReviewerResultV4,
+  type V9CoverageOutcome,
+  type V9GateOutcome,
+  type V9IncompleteReason,
+  type V9RunOutcome,
+} from "./v9.js";
