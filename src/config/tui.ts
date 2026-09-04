@@ -24,6 +24,16 @@ import {
   validateChangedPathGlob,
 } from "../orchestrator/lens-policy.js";
 
+const CHANGE_READINESS_SELECTORS = [
+  "/request/pull_request/id",
+  "/request/pull_request/url",
+  "/request/pull_request/title",
+  "/request/pull_request/description",
+  "/request/pull_request/work_items",
+  "/request/pull_request/validation",
+  "/request/pull_request/contract_impact",
+] as const;
+
 export interface ConfigPrompter {
   ask(question: string, signal?: AbortSignal): Promise<string>;
   close(): void;
@@ -792,6 +802,17 @@ async function editAgentPolicy(options: ConfigMenuOptions): Promise<void> {
   const id = await answer(options.prompt, "Agent id for policy: ");
   const agent = options.config.agents[id];
   if (agent === undefined) throw new Error(`unknown agent: ${id}`);
+  const kind = (
+    await answer(
+      options.prompt,
+      `Lens kind (generic or change_readiness) [${agent.kind ?? "generic"}]: `,
+      agent.kind ?? "generic",
+    )
+  ).toLowerCase();
+  if (kind !== "generic" && kind !== "change_readiness") {
+    throw new Error("lens kind must be generic or change_readiness");
+  }
+  agent.kind = kind;
   const currentApplicability = agent.applicability ?? {
     mode: "always" as const,
   };
@@ -840,15 +861,67 @@ async function editAgentPolicy(options: ConfigMenuOptions): Promise<void> {
       case_sensitive: caseSensitive,
     };
   }
-  agent.required_input = commaSeparatedValues(
+  if (kind === "change_readiness") {
+    agent.required_input = [...CHANGE_READINESS_SELECTORS];
+  } else {
+    agent.required_input = commaSeparatedValues(
+      await answer(
+        options.prompt,
+        `Required input selectors [${(agent.required_input ?? []).join(",")}]: `,
+        (agent.required_input ?? []).join(","),
+      ),
+      "caller-context selector",
+      validateCallerContextRequirement,
+    );
+  }
+  const lensDeadline = await answer(
+    options.prompt,
+    `Lens deadline milliseconds [${agent.lens_deadline_ms ?? "run deadline"}; '-' clears]: `,
+    agent.lens_deadline_ms === undefined ? "-" : String(agent.lens_deadline_ms),
+  );
+  if (lensDeadline === "-") delete agent.lens_deadline_ms;
+  else
+    agent.lens_deadline_ms = timerMilliseconds(lensDeadline, "lens deadline");
+  const coverage = agent.change_coverage ?? {
+    relevant_paths: ["**"],
+    minimum_inspection: "full_file" as const,
+    proof: "attested" as const,
+  };
+  coverage.relevant_paths = commaSeparatedValues(
     await answer(
       options.prompt,
-      `Required input selectors [${(agent.required_input ?? []).join(",")}]: `,
-      (agent.required_input ?? []).join(","),
+      `Coverage relevant paths [${coverage.relevant_paths.join(",")}]: `,
+      coverage.relevant_paths.join(","),
     ),
-    "caller-context selector",
-    validateCallerContextRequirement,
+    "coverage path",
+    validateChangedPathGlob,
   );
+  if (coverage.relevant_paths.length === 0) {
+    throw new Error("change coverage requires at least one relevant path");
+  }
+  const minimumInspection = (
+    await answer(
+      options.prompt,
+      `Minimum inspection (full_file or diff) [${coverage.minimum_inspection}]: `,
+      coverage.minimum_inspection,
+    )
+  ).toLowerCase();
+  if (minimumInspection !== "full_file" && minimumInspection !== "diff") {
+    throw new Error("minimum inspection must be full_file or diff");
+  }
+  coverage.minimum_inspection = minimumInspection;
+  const proof = (
+    await answer(
+      options.prompt,
+      `Coverage proof (observed or attested) [${coverage.proof}]: `,
+      coverage.proof,
+    )
+  ).toLowerCase();
+  if (proof !== "observed" && proof !== "attested") {
+    throw new Error("coverage proof must be observed or attested");
+  }
+  coverage.proof = proof;
+  agent.change_coverage = coverage;
   if (agent.model_runs !== undefined) {
     agent.pass_quorum = positiveInteger(
       await answer(

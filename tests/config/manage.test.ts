@@ -474,6 +474,10 @@ append_instructions = "extra"
     expect(result.config.agents["agent-one"]?.instructions).toBe(
       "base\n\nextra",
     );
+    expect(result.warnings.map(({ code }) => code)).toEqual([
+      "implicit_v9_deadline",
+      "implicit_v9_change_coverage",
+    ]);
   });
 
   it("reads scalar v2 configuration and promotes it to managed v4", () => {
@@ -486,6 +490,10 @@ append_instructions = "extra"
       model: "gemini-flash",
       effort: "high",
     });
+    expect(result.warnings.map(({ code }) => code)).toEqual([
+      "implicit_v9_deadline",
+      "implicit_v9_change_coverage",
+    ]);
   });
 
   it("preserves configured primary order when promoting v4 to v6", () => {

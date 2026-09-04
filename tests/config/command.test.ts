@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { stringify } from "smol-toml";
 import { runConfigCommand } from "../../src/config/command.js";
 import type { CopilotAccountService } from "../../src/copilot/account.js";
 import {
@@ -243,6 +244,36 @@ describe("config command", () => {
     });
     expect(exported.revision).toMatch(/^[a-f0-9]{64}$/);
     expect(exported.config.agents.gemini.instructions).toBe("review");
+  });
+
+  it("exports legacy migration warnings for an opaque adapter", async () => {
+    const { file } = await fixture();
+    const legacy = config();
+    const legacyV2 = { ...legacy, schema_version: "2" as const };
+    legacy.adapters.gateway = {
+      type: "command",
+      command: "reviewer",
+      protocol: "review-mesh-command-v1",
+    };
+    await writeFile(file, `${stringify(legacyV2)}\n`);
+    const io = streams();
+    expect(
+      await runConfigCommand({
+        args: ["export", "--json"],
+        configFile: file,
+        ...io,
+      }),
+    ).toBe(0);
+    expect(JSON.parse(io.stdout()).warnings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: "implicit_v9_deadline" }),
+        expect.objectContaining({ code: "implicit_v9_change_coverage" }),
+        expect.objectContaining({
+          code: "attested_coverage_requires_adapter_upgrade",
+          lens_ids: ["gemini"],
+        }),
+      ]),
+    );
   });
 
   it("resolves effective configuration for a workspace without disclosing instructions", async () => {
@@ -540,6 +571,24 @@ describe("config command", () => {
     controller.abort(new Error("stop"));
     expect(await running).toBe(4);
     expect(JSON.parse(io.stderr())).toMatchObject({ error: "interrupted" });
+  });
+
+  it("describes a legacy interactive migration as saving schema v7", async () => {
+    const { file } = await fixture();
+    const legacy = config();
+    await writeFile(file, `${stringify(legacy)}\n`);
+    const io = streams();
+    io.input.isTTY = true;
+    io.output.isTTY = true;
+    io.input.end("q\n");
+    await runConfigCommand({
+      args: [],
+      configFile: file,
+      interactive: true,
+      ...io,
+    });
+    expect(`${io.stdout()}${io.stderr()}`).toContain("save it as v7");
+    expect(`${io.stdout()}${io.stderr()}`).not.toContain("save it as v4");
   });
 
   it("reports invalid configuration without exposing stored values", async () => {

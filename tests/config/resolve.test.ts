@@ -826,7 +826,14 @@ profile = "second"
         workspace,
       });
       expect(loaded.trusted.schema_version).toBe("7");
+      expect(loaded.migrated).toBe(true);
+      expect(loaded.migrationWarnings.map(({ code }) => code)).toEqual([
+        "implicit_v9_deadline",
+        "implicit_v9_change_coverage",
+      ]);
       const resolved = resolveConfig(loaded);
+      expect(resolved.sourceSchemaVersion).toBe("1");
+      expect(resolved.migrationWarnings).toEqual(loaded.migrationWarnings);
       expect(resolved.execution.distribute_primaries).toBe(false);
       expect(resolved.reviewers.map(({ id }) => id)).toEqual([
         "first",
@@ -893,6 +900,14 @@ instructions_file = "project.md"
         workspace,
       });
       expect(loaded.trusted.schema_version).toBe("7");
+      expect(loaded.migrationWarnings).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            code: "attested_coverage_requires_adapter_upgrade",
+            lens_ids: ["agent"],
+          }),
+        ]),
+      );
       const resolved = resolveConfig(loaded);
       expect(resolved.reviewers[0]?.instruction_layers).toEqual([
         { source: "trusted", content: "Agent instructions." },

@@ -447,6 +447,7 @@ export async function runConfigCommand(
           revision: configRevision(loaded.snapshot),
           exists: loaded.snapshot.exists,
           migrated: loaded.migrated,
+          warnings: loaded.warnings,
           config: loaded.config,
         })}\n`,
       );
@@ -673,7 +674,7 @@ export async function runConfigCommand(
     if (loaded.migrated) {
       await write(
         options.output,
-        "Loaded legacy v1/v2/v3 configuration; the first successful change will save it as v4.\n",
+        "Loaded legacy configuration; the first successful change will save it as v7.\n",
       );
     }
     await runConfigMenu({

@@ -222,6 +222,11 @@ export interface ConfigMigrationWarning {
   lens_ids: string[];
 }
 
+export interface ManagedConfigMigration {
+  config: ManagedConfig;
+  warnings: ConfigMigrationWarning[];
+}
+
 interface ReadSnapshot {
   snapshot: ConfigSnapshot;
   text?: string;
@@ -586,7 +591,7 @@ function appendInstructions(
 }
 
 /** Converts the former adapter/profile/roster layout without writing it. */
-export function migrateV1Config(value: unknown): ManagedConfig {
+function migrateV1ConfigResult(value: unknown): ManagedConfigMigration {
   const record = asRecord(value);
   if (record?.schema_version !== "1") {
     throw new Error("configuration is not a Review Mesh v1 configuration");
@@ -633,11 +638,15 @@ export function migrateV1Config(value: unknown): ManagedConfig {
     agents: agents as unknown as TrustedConfigV5["agents"],
     defaults: { agents: defaults },
     projects: {},
-  }).config;
+  });
+}
+
+export function migrateV1Config(value: unknown): ManagedConfig {
+  return migrateV1ConfigResult(value).config;
 }
 
 /** Promotes a scalar-agent v2 document to the current managed shape. */
-export function migrateV2Config(value: unknown): ManagedConfig {
+function migrateV2ConfigResult(value: unknown): ManagedConfigMigration {
   const parsed = trustedConfigSchema.parse(value);
   if (parsed.schema_version !== "2") {
     throw new Error("configuration is not a Review Mesh v2 configuration");
@@ -647,7 +656,11 @@ export function migrateV2Config(value: unknown): ManagedConfig {
       clone(parsed) as TrustedConfigV2,
     ) as unknown as Omit<TrustedConfigV5, "schema_version">),
     projects: migrateLegacyProjects(parsed.projects),
-  }).config;
+  });
+}
+
+export function migrateV2Config(value: unknown): ManagedConfig {
+  return migrateV2ConfigResult(value).config;
 }
 
 function migrateLegacyProjects(
@@ -696,7 +709,7 @@ async function migrateLegacyProjectsByIdentity(
 }
 
 /** Promotes path-keyed multi-model v3 projects to name-keyed v4 projects. */
-export function migrateV3Config(value: unknown): ManagedConfig {
+function migrateV3ConfigResult(value: unknown): ManagedConfigMigration {
   const parsed = trustedConfigSchema.parse(value);
   if (parsed.schema_version !== "3") {
     throw new Error("configuration is not a Review Mesh v3 configuration");
@@ -707,15 +720,18 @@ export function migrateV3Config(value: unknown): ManagedConfig {
       clone(parsed) as TrustedConfigV3,
     ) as unknown as Omit<TrustedConfigV5, "schema_version">),
     projects: migrateLegacyProjects(parsed.projects),
-  }).config;
+  });
 }
 
-/** Migrates legacy path keys using repository identity for paths that still exist. */
-export async function migrateLegacyConfig(
+export function migrateV3Config(value: unknown): ManagedConfig {
+  return migrateV3ConfigResult(value).config;
+}
+
+export async function migrateLegacyConfigWithWarnings(
   value: unknown,
-): Promise<ManagedConfig> {
+): Promise<ManagedConfigMigration> {
   const parsed = trustedConfigSchema.parse(value);
-  if (parsed.schema_version === "1") return migrateV1Config(parsed);
+  if (parsed.schema_version === "1") return migrateV1ConfigResult(parsed);
   if (parsed.schema_version === "2") {
     validateProjectKeys(parsed.projects);
     return migrateLegacyShape({
@@ -723,7 +739,7 @@ export async function migrateLegacyConfig(
         clone(parsed) as TrustedConfigV2,
       ) as unknown as Omit<TrustedConfigV5, "schema_version">),
       projects: await migrateLegacyProjectsByIdentity(parsed.projects),
-    }).config;
+    });
   }
   if (parsed.schema_version === "3") {
     validateProjectKeys(parsed.projects);
@@ -732,24 +748,31 @@ export async function migrateLegacyConfig(
         clone(parsed) as TrustedConfigV3,
       ) as unknown as Omit<TrustedConfigV5, "schema_version">),
       projects: await migrateLegacyProjectsByIdentity(parsed.projects),
-    }).config;
+    });
   }
   if (parsed.schema_version === "4") {
     return migrateLegacyShape(
       preserveLegacyPrimaryOrder(
         clone(parsed) as TrustedConfigV4,
       ) as unknown as Omit<TrustedConfigV5, "schema_version">,
-    ).config;
+    );
   }
   if (parsed.schema_version === "5") {
     const { schema_version: _schemaVersion, ...legacy } = clone(parsed);
-    return migrateLegacyShape(legacy, "5").config;
+    return migrateLegacyShape(legacy, "5");
   }
   if (parsed.schema_version === "6") {
     const { schema_version: _schemaVersion, ...legacy } = clone(parsed);
-    return migrateLegacyShape(legacy, "6").config;
+    return migrateLegacyShape(legacy, "6");
   }
-  return requireManagedConfig(parsed);
+  return { config: requireManagedConfig(parsed), warnings: [] };
+}
+
+/** Migrates legacy path keys using repository identity for paths that still exist. */
+export async function migrateLegacyConfig(
+  value: unknown,
+): Promise<ManagedConfig> {
+  return (await migrateLegacyConfigWithWarnings(value)).config;
 }
 
 export function parseManagedConfig(text: string): {
@@ -760,21 +783,20 @@ export function parseManagedConfig(text: string): {
   const parsed = parse(text);
   const version = asRecord(parsed)?.schema_version;
   if (version === "1")
-    return { config: migrateV1Config(parsed), migrated: true, warnings: [] };
+    return { ...migrateV1ConfigResult(parsed), migrated: true };
   if (version === "2")
-    return { config: migrateV2Config(parsed), migrated: true, warnings: [] };
+    return { ...migrateV2ConfigResult(parsed), migrated: true };
   if (version === "3")
-    return { config: migrateV3Config(parsed), migrated: true, warnings: [] };
+    return { ...migrateV3ConfigResult(parsed), migrated: true };
   if (version === "4") {
     const legacy = trustedConfigV4Schema.parse(parsed);
     return {
-      config: migrateLegacyShape(
+      ...migrateLegacyShape(
         preserveLegacyPrimaryOrder(
           clone(legacy) as TrustedConfigV4,
         ) as unknown as Omit<TrustedConfigV5, "schema_version">,
-      ).config,
+      ),
       migrated: true,
-      warnings: [],
     };
   }
   if (version === "5") {
@@ -965,9 +987,8 @@ export async function loadManagedConfig(
   const parsed =
     version === "2" || version === "3"
       ? {
-          config: await migrateLegacyConfig(source),
+          ...(await migrateLegacyConfigWithWarnings(source)),
           migrated: true,
-          warnings: [],
         }
       : parseManagedConfig(sourceText);
   return { ...parsed, snapshot: current.snapshot, sourceText };

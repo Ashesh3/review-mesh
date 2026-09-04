@@ -32,6 +32,9 @@ export interface ResolveConfigInput {
   projectName?: string;
   projectNameSource?:
     "git_remote" | "git_common_directory" | "git_root" | "workspace";
+  sourceSchemaVersion?: TrustedConfig["schema_version"];
+  migrated?: boolean;
+  migrationWarnings?: ResolvedConfig["migrationWarnings"];
 }
 
 type ReviewerProfileBase = Pick<
@@ -571,12 +574,19 @@ function resolveV2(
 
 export function resolveConfig(input: ResolveConfigInput): ResolvedConfig {
   const trusted = trustedConfigSchema.parse(input.trusted);
-  return trusted.schema_version === "1"
-    ? resolveV1(trusted, input.projectName, input.projectNameSource)
-    : resolveV2(
-        trusted,
-        input.workspace,
-        input.projectName,
-        input.projectNameSource,
-      );
+  const resolved =
+    trusted.schema_version === "1"
+      ? resolveV1(trusted, input.projectName, input.projectNameSource)
+      : resolveV2(
+          trusted,
+          input.workspace,
+          input.projectName,
+          input.projectNameSource,
+        );
+  return {
+    ...resolved,
+    sourceSchemaVersion: input.sourceSchemaVersion ?? trusted.schema_version,
+    migrated: input.migrated ?? false,
+    migrationWarnings: structuredClone(input.migrationWarnings ?? []),
+  };
 }

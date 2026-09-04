@@ -165,42 +165,10 @@ export function describeResolvedConfig(
   }
   const warnings: EffectiveConfigDescription["warnings"] = [
     ...describeTopology(input.resolved),
-    ...(input.migrated
-      ? [
-          {
-            code: "implicit_v9_deadline" as const,
-            message:
-              "Schema v7 derives an adaptive run deadline and no-progress timeout.",
-            lens_ids: [...lenses.keys()],
-            provider_groups: [],
-          },
-          {
-            code: "implicit_v9_change_coverage" as const,
-            message:
-              "Schema v7 derives full-file coverage requirements for legacy lenses.",
-            lens_ids: [...lenses.keys()],
-            provider_groups: [],
-          },
-        ]
-      : []),
-    ...[...lenses.entries()]
-      .filter(
-        ([, members]) =>
-          members[0]?.policy?.changeCoverage?.proof === "attested",
-      )
-      .map(([id, members]) => ({
-        code: "attested_coverage_requires_adapter_upgrade" as const,
-        message:
-          "This lens uses attested coverage because at least one configured candidate lacks mediated reads.",
-        lens_ids: [id],
-        provider_groups: [
-          ...new Set(
-            members.map(
-              (reviewer) => reviewer.providerGroup ?? reviewer.adapterId,
-            ),
-          ),
-        ],
-      })),
+    ...(input.resolved.migrationWarnings ?? []).map((warning) => ({
+      ...warning,
+      provider_groups: [],
+    })),
   ];
   return {
     valid: true,
@@ -357,6 +325,9 @@ export async function describeEffectiveConfig(
       workspace: loaded.workspace,
       projectName: loaded.projectName,
       projectNameSource: loaded.projectNameSource,
+      sourceSchemaVersion: loaded.sourceSchemaVersion,
+      migrated: loaded.migrated,
+      migrationWarnings: loaded.migrationWarnings,
     });
     const after = await loadManagedConfig(configFile);
     if (configRevision(after.snapshot) !== revision) {
@@ -366,7 +337,7 @@ export async function describeEffectiveConfig(
       configFile,
       revision,
       configSchemaVersion: loaded.trusted.schema_version,
-      migrated: managed.migrated,
+      migrated: loaded.migrated,
       workspace,
       resolved,
       ...(input.environment === undefined

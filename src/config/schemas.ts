@@ -902,6 +902,16 @@ export interface ResolvedReviewer {
 }
 
 export interface ResolvedConfig {
+  sourceSchemaVersion?: TrustedConfig["schema_version"];
+  migrated?: boolean;
+  migrationWarnings?: Array<{
+    code:
+      | "implicit_v9_deadline"
+      | "implicit_v9_change_coverage"
+      | "attested_coverage_requires_adapter_upgrade";
+    message: string;
+    lens_ids: string[];
+  }>;
   execution: TrustedConfigV1["execution"] & {
     distribute_primaries: boolean;
     allow_provider_concentration: boolean;

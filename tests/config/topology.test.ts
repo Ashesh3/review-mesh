@@ -2,6 +2,23 @@ import { describe, expect, it } from "vitest";
 import { describeTopology } from "../../src/config/topology.js";
 
 describe("describeTopology", () => {
+  it("does not call a single-provider suite concentrated", () => {
+    const reviewers = ["one", "two"].map((agentId) => ({
+      id: agentId,
+      agentId,
+      modelIndex: 0,
+      providerGroup: "only",
+      adapterId: "only",
+    }));
+
+    expect(
+      describeTopology({
+        execution: { default_provider_concurrency: 2 },
+        reviewers,
+      }).map(({ code }) => code),
+    ).not.toContain("provider_concentration");
+  });
+
   it("reports stable acknowledged topology warnings without changing policy", () => {
     const reviewers = Array.from({ length: 5 }, (_, index) => ({
       id: `lens::${index}`,

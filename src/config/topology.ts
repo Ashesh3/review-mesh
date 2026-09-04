@@ -49,7 +49,16 @@ export function describeTopology(config: TopologyConfig): TopologyWarning[] {
       return primary.providerGroup ?? primary.adapterId;
     }),
   );
-  if (lenses.size > 1 && primaryGroups.size === 1) {
+  const allProviderGroups = new Set(
+    [...lenses.values()].flatMap((members) =>
+      members.map((member) => member.providerGroup ?? member.adapterId),
+    ),
+  );
+  if (
+    lenses.size > 1 &&
+    allProviderGroups.size > 1 &&
+    primaryGroups.size === 1
+  ) {
     warnings.push({
       code: "provider_concentration",
       message:

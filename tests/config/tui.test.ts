@@ -34,6 +34,81 @@ afterEach(async () => {
 });
 
 describe("config menu", () => {
+  it("converts a lens to change readiness and edits every v7 policy field", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "review-mesh-config-tui-"));
+    roots.push(directory);
+    const file = join(directory, "config.toml");
+    const initial = normalizeManagedConfig({
+      schema_version: "5",
+      execution: {
+        max_concurrency: 1,
+        heartbeat_interval_ms: 1_000,
+        shutdown_grace_period_ms: 1_000,
+      },
+      diagnostics: { persist_runs: false, max_runs: 2 },
+      adapters: {
+        command: {
+          type: "command",
+          command: "reviewer",
+          protocol: "review-mesh-command-v1",
+        },
+      },
+      agents: {
+        readiness: {
+          adapter: "command",
+          model: "model",
+          purpose: "Readiness",
+          instructions: "Review readiness.",
+          isolation: "prefer_enforced",
+          timeout_ms: 60_000,
+        },
+      },
+      defaults: { agents: ["readiness"] },
+      projects: {},
+    });
+    await writeFile(file, serializeManagedConfig(initial));
+    const loaded = await loadManagedConfig(file);
+    await runConfigMenu({
+      configFile: file,
+      config: loaded.config,
+      snapshot: loaded.snapshot,
+      prompt: new Answers([
+        "y",
+        "readiness",
+        "change_readiness",
+        "always",
+        "900000",
+        "src/**,tests/**",
+        "diff",
+        "attested",
+        "y",
+        "y",
+        "q",
+      ]),
+      output: new PassThrough(),
+    });
+
+    expect(
+      (await loadManagedConfig(file)).config.agents.readiness,
+    ).toMatchObject({
+      kind: "change_readiness",
+      required_input: [
+        "/request/pull_request/id",
+        "/request/pull_request/url",
+        "/request/pull_request/title",
+        "/request/pull_request/description",
+        "/request/pull_request/work_items",
+        "/request/pull_request/validation",
+        "/request/pull_request/contract_impact",
+      ],
+      lens_deadline_ms: 900_000,
+      change_coverage: {
+        relevant_paths: ["src/**", "tests/**"],
+        minimum_inspection: "diff",
+        proof: "attested",
+      },
+    });
+  });
   it("logs in, discovers Copilot models, and stores model plus effort", async () => {
     const directory = await mkdtemp(join(tmpdir(), "review-mesh-config-tui-"));
     roots.push(directory);
