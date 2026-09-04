@@ -648,4 +648,88 @@ describe("public event v6", () => {
     );
     expect(publicEventV6Schema.safeParse(event).success).toBe(true);
   });
+
+  it("accepts out-of-scope and policy counts as disjoint non-gating components", () => {
+    const event = {
+      schema_version: "6",
+      event: "run.completed",
+      run_id: "run-1",
+      seq: 9,
+      timestamp: "2026-09-05T10:00:00.000Z",
+      data: {
+        run_outcome: "clear",
+        gate_outcome: "no_gate_findings",
+        coverage_outcome: "complete",
+        exit_code: 0,
+        raw_source_findings: 5,
+        atomic_subfindings: 5,
+        canonical_roots: 1,
+        gate_eligible_subfindings: 0,
+        advisory_subfindings: 1,
+        rejected_subfindings: 1,
+        needs_verification_subfindings: 1,
+        out_of_scope_subfindings: 1,
+        policy_non_gating_subfindings: 1,
+        non_gating_subfindings: 5,
+        incomplete_lenses: 0,
+        result_delivery: {
+          completed_results: 1,
+          artifact: "complete",
+          planned_public_stream: "references_only",
+        },
+        artifact: {
+          path: ".review-mesh/runs/run-1.jsonl",
+          sha256,
+          byte_count: 1234,
+          completed_results: 1,
+        },
+        lens_summaries: [],
+        exclusions: [],
+        warnings: [],
+        deficit_samples: [],
+      },
+    };
+    expect(publicEventV6Schema.safeParse(event).success).toBe(true);
+  });
+
+  it("rejects a terminal event whose named non-gating components contradict the total", () => {
+    const event = {
+      schema_version: "6",
+      event: "run.completed",
+      run_id: "run-1",
+      seq: 9,
+      timestamp: "2026-09-05T10:00:00.000Z",
+      data: {
+        run_outcome: "clear",
+        gate_outcome: "no_gate_findings",
+        coverage_outcome: "complete",
+        exit_code: 0,
+        raw_source_findings: 5,
+        atomic_subfindings: 5,
+        canonical_roots: 1,
+        gate_eligible_subfindings: 0,
+        advisory_subfindings: 5,
+        rejected_subfindings: 1,
+        needs_verification_subfindings: 0,
+        non_gating_subfindings: 5,
+        incomplete_lenses: 0,
+        result_delivery: {
+          completed_results: 1,
+          artifact: "complete",
+          planned_public_stream: "references_only",
+        },
+        artifact: {
+          path: ".review-mesh/runs/run-1.jsonl",
+          sha256,
+          byte_count: 1234,
+          completed_results: 1,
+        },
+        lens_summaries: [],
+        exclusions: [],
+        warnings: [],
+        deficit_samples: [],
+      },
+    };
+    expect(publicEventV6Schema.safeParse(event).success).toBe(false);
+  });
 });

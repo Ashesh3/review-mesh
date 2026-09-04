@@ -615,16 +615,33 @@ const v6RunCompletedDataSchema = z
       });
     const expectedNonGating =
       value.atomic_subfindings - value.gate_eligible_subfindings;
+    const componentNonGating =
+      value.advisory_subfindings +
+      value.rejected_subfindings +
+      value.needs_verification_subfindings +
+      (value.out_of_scope_subfindings ?? 0) +
+      (value.policy_non_gating_subfindings ?? 0);
     if (value.non_gating_subfindings !== expectedNonGating)
       ctx.addIssue({
         code: "custom",
         message:
           "non_gating_subfindings must equal atomic minus gate-eligible subfindings",
       });
+    if (value.non_gating_subfindings !== componentNonGating)
+      ctx.addIssue({
+        code: "custom",
+        message:
+          "non_gating_subfindings must equal the five named non-gating components",
+      });
     if (
       value.raw_source_findings < value.atomic_subfindings ||
       value.gate_eligible_subfindings > value.atomic_subfindings ||
-      value.non_gating_subfindings > value.atomic_subfindings
+      value.non_gating_subfindings > value.atomic_subfindings ||
+      value.advisory_subfindings > value.atomic_subfindings ||
+      value.rejected_subfindings > value.atomic_subfindings ||
+      value.needs_verification_subfindings > value.atomic_subfindings ||
+      (value.out_of_scope_subfindings ?? 0) > value.atomic_subfindings ||
+      (value.policy_non_gating_subfindings ?? 0) > value.atomic_subfindings
     )
       ctx.addIssue({
         code: "custom",
