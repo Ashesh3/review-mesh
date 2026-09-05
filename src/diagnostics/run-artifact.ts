@@ -1,7 +1,7 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, open, type FileHandle } from "node:fs/promises";
-import { resolve } from "node:path";
+import { link, lstat, open, type FileHandle } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { z } from "zod";
 import {
   artifactResolutionV1Schema,
@@ -272,18 +272,261 @@ function chunks(text: string): string[] {
   return result;
 }
 
+/** Copy from an owned open descriptor; never buffer a whole run in memory. */
+async function copyArtifactHandle(
+  source: FileHandle,
+  target: FileHandle,
+  expectedBytes: number,
+) {
+  const hash = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  let offset = 0;
+  for (;;) {
+    const { bytesRead } = await source.read(buffer, 0, buffer.length, offset);
+    if (bytesRead === 0) break;
+    if (offset + bytesRead > expectedBytes)
+      throw new RunArtifactError(
+        "artifact_digest_mismatch",
+        "Artifact grew during copying.",
+      );
+    hash.update(buffer.subarray(0, bytesRead));
+    let written = 0;
+    while (written < bytesRead) {
+      const result = await target.write(
+        buffer,
+        written,
+        bytesRead - written,
+        offset + written,
+      );
+      if (result.bytesWritten === 0)
+        throw new Error("Artifact copy made no progress.");
+      written += result.bytesWritten;
+    }
+    offset += bytesRead;
+  }
+  return { sha256: hash.digest("hex"), byte_count: offset };
+}
+
+export async function copyVerifiedArtifact(
+  reference: ArtifactReference,
+  target: FileHandle,
+) {
+  const verified = await verifyArtifactFile(reference.path);
+  if (
+    verified.sha256 !== reference.sha256 ||
+    verified.byte_count !== reference.byte_count
+  )
+    throw new RunArtifactError(
+      "artifact_digest_mismatch",
+      "Artifact source no longer matches its reference.",
+    );
+  const source = await open(
+    reference.path,
+    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+  );
+  try {
+    if (
+      !sameArtifactIdentity(
+        artifactIdentity(await source.stat({ bigint: true })),
+        verified.identity,
+      )
+    )
+      throw new RunArtifactError(
+        "artifact_identity_changed",
+        "Artifact source changed before copying.",
+      );
+    const copied = await copyArtifactHandle(
+      source,
+      target,
+      reference.byte_count,
+    );
+    if (
+      copied.sha256 !== reference.sha256 ||
+      copied.byte_count !== reference.byte_count
+    )
+      throw new RunArtifactError(
+        "artifact_digest_mismatch",
+        "Artifact copy does not match its reference.",
+      );
+    await target.sync();
+  } finally {
+    await source.close();
+  }
+}
+
+export async function createManagedRunArtifact(options: {
+  runsDirectory: string;
+  runId: string;
+  toolVersion: string;
+  createdAt?: string;
+  beforeFinalVerify?: () => void | Promise<void>;
+  publishManaged?: boolean;
+  beforePublication?: (candidatePath: string) => void | Promise<void>;
+}) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(options.runId))
+    throw new RunArtifactError("invalid_run_id", "Run ID is invalid.");
+  const publishedPath = resolve(
+    options.runsDirectory,
+    `${options.runId}.jsonl`,
+  );
+  const artifact = await createRunArtifact({
+    path: `${publishedPath}.active`,
+    retainHandles: true,
+    recoveryPath: join(
+      options.runsDirectory,
+      ".recovery",
+      `${options.runId}.${randomUUID()}.jsonl`,
+    ),
+    runId: options.runId,
+    toolVersion: options.toolVersion,
+    ...(options.createdAt === undefined
+      ? {}
+      : { createdAt: options.createdAt }),
+    ...(options.beforeFinalVerify === undefined
+      ? {}
+      : { beforeFinalVerify: options.beforeFinalVerify }),
+  });
+  let publishedReference: ArtifactReference | undefined;
+  return {
+    ...artifact,
+    get recoveryReference() {
+      return artifact.recoveryReference;
+    },
+    get publishedReference() {
+      return publishedReference;
+    },
+    async finalize(
+      summary: Record<string, unknown>,
+    ): Promise<ArtifactReference> {
+      let stage = "artifact_final_verification";
+      try {
+        const active = await artifact.finalize(summary);
+        if (options.publishManaged === false)
+          return artifact.recoveryReference!;
+        stage = "artifact_publication";
+        const recovery = artifact.recoveryReference!;
+        const parent = await safeArtifactParent(publishedPath);
+        const candidatePath = join(
+          options.runsDirectory,
+          ".recovery",
+          `${options.runId}.${randomUUID()}.publication`,
+        );
+        const target = await open(
+          candidatePath,
+          constants.O_RDWR |
+            constants.O_CREAT |
+            constants.O_EXCL |
+            (constants.O_NOFOLLOW ?? 0),
+          0o600,
+        );
+        let targetIdentity: ArtifactIdentity;
+        try {
+          targetIdentity = artifactIdentity(
+            await target.stat({ bigint: true }),
+          );
+          await copyVerifiedArtifact(recovery, target);
+        } finally {
+          await target.close();
+        }
+        const candidate = await verifyArtifactFile(
+          candidatePath,
+          targetIdentity,
+        );
+        if (
+          candidate.sha256 !== active.sha256 ||
+          candidate.byte_count !== active.byte_count
+        )
+          throw new RunArtifactError(
+            "artifact_digest_mismatch",
+            "Published artifact failed verification.",
+          );
+        await options.beforePublication?.(candidatePath);
+        // Link only a complete verified inode; link is exclusive even when the
+        // destination appears between the preflight and this operation.
+        const currentCandidate = await verifyArtifactFile(
+          candidatePath,
+          targetIdentity,
+        );
+        if (
+          currentCandidate.sha256 !== active.sha256 ||
+          currentCandidate.byte_count !== active.byte_count
+        )
+          throw new RunArtifactError(
+            "artifact_digest_mismatch",
+            "Publication candidate changed after verification.",
+          );
+        await link(candidatePath, publishedPath);
+        const verified = await verifyArtifactFile(
+          publishedPath,
+          targetIdentity,
+          parent,
+        );
+        if (
+          verified.sha256 !== active.sha256 ||
+          verified.byte_count !== active.byte_count
+        )
+          throw new RunArtifactError(
+            "artifact_digest_mismatch",
+            "Published artifact failed verification.",
+          );
+        publishedReference = { ...active, path: publishedPath };
+        return publishedReference;
+      } catch (error) {
+        throw new RunArtifactError(
+          error instanceof RunArtifactError
+            ? error.code
+            : "artifact_unavailable",
+          "Artifact publication failed; retained recovery evidence is available when listed.",
+          {
+            cause: error,
+            diagnosticDetails: {
+              ...(error instanceof RunArtifactError
+                ? error.diagnosticDetails
+                : {}),
+              stage,
+              path:
+                stage === "artifact_publication"
+                  ? publishedPath
+                  : artifact.path,
+              run_id: options.runId,
+              ...(typeof error === "object" &&
+              error !== null &&
+              "code" in error &&
+              typeof error.code === "string" &&
+              /^[A-Z0-9_]+$/u.test(error.code)
+                ? { native_error_code: error.code }
+                : {}),
+              ...(artifact.recoveryReference === undefined
+                ? {}
+                : {
+                    recovery_artifact: artifact.recoveryReference,
+                    recovery_command: `review-mesh recover ${options.runId} --artifact ${JSON.stringify(artifact.recoveryReference.path)}`,
+                  }),
+            },
+          },
+        );
+      }
+    },
+    async persisted() {
+      await artifact.releaseStaging(options.publishManaged === false);
+    },
+  };
+}
+
 export async function createRunArtifact(options: {
   path: string;
   runId: string;
   toolVersion: string;
   createdAt?: string;
   beforeFinalVerify?: () => void | Promise<void>;
+  recoveryPath?: string;
+  retainHandles?: boolean;
 }) {
   const path = resolve(options.path);
   const parent = await createSafeArtifactParent(path);
   const handle = await open(
     path,
-    constants.O_WRONLY |
+    constants.O_RDWR |
       constants.O_CREAT |
       constants.O_EXCL |
       (constants.O_NOFOLLOW ?? 0),
@@ -293,6 +536,9 @@ export async function createRunArtifact(options: {
   let finalized = false;
   let tail = Promise.resolve();
   let bytes = 0;
+  let recoveryReference: ArtifactReference | undefined;
+  let recoveryHandle: FileHandle | undefined;
+  let handleClosed = false;
   const contentHash = createHash("sha256");
   const resultIds = new Set<string>();
   const append = async (record: unknown) => {
@@ -324,6 +570,9 @@ export async function createRunArtifact(options: {
   }
   return {
     path,
+    get recoveryReference() {
+      return recoveryReference;
+    },
     record(value: Record<string, unknown>): Promise<void> {
       return enqueue(async () => {
         if (value.run_id !== undefined && value.run_id !== options.runId)
@@ -439,7 +688,53 @@ export async function createRunArtifact(options: {
         await handle.sync();
         const completedResults = resultIds.size;
         const expectedMetadata = await handle.stat({ bigint: true });
-        await handle.close();
+        const attemptedHash = contentHash.copy().digest("hex");
+        if (options.recoveryPath !== undefined) {
+          const recoveryPath = resolve(options.recoveryPath);
+          await createSafeArtifactParent(recoveryPath);
+          const recovery = await open(
+            recoveryPath,
+            constants.O_RDWR |
+              constants.O_CREAT |
+              constants.O_EXCL |
+              (constants.O_NOFOLLOW ?? 0),
+            0o600,
+          );
+          try {
+            const copied = await copyArtifactHandle(handle, recovery, bytes);
+            if (copied.sha256 !== attemptedHash || copied.byte_count !== bytes)
+              throw new RunArtifactError(
+                "artifact_digest_mismatch",
+                "Recovery bytes do not match serialized artifact records.",
+              );
+            await recovery.sync();
+            const verifiedRecovery = await verifyArtifactFile(
+              recoveryPath,
+              artifactIdentity(await recovery.stat({ bigint: true })),
+            );
+            if (
+              verifiedRecovery.sha256 !== attemptedHash ||
+              verifiedRecovery.byte_count !== bytes
+            )
+              throw new RunArtifactError(
+                "artifact_digest_mismatch",
+                "Recovery copy failed verification.",
+              );
+            recoveryReference = {
+              path: recoveryPath,
+              sha256: attemptedHash,
+              byte_count: bytes,
+              completed_results: completedResults,
+            };
+            if (options.retainHandles) recoveryHandle = recovery;
+          } finally {
+            if (recoveryHandle !== recovery) await recovery.close();
+          }
+        }
+        if (!options.retainHandles) {
+          await handle.close();
+          handleClosed = true;
+        }
         await options.beforeFinalVerify?.();
         const verified = await verifyArtifactFile(
           path,
@@ -447,7 +742,6 @@ export async function createRunArtifact(options: {
           parent,
           expectedMetadata,
         );
-        const attemptedHash = contentHash.digest("hex");
         if (verified.sha256 !== attemptedHash || verified.byte_count !== bytes)
           throw new RunArtifactError(
             "artifact_digest_mismatch",
@@ -460,14 +754,42 @@ export async function createRunArtifact(options: {
           completed_results: completedResults,
         };
       } finally {
-        await handle.close().catch(() => undefined);
+        if (!options.retainHandles) {
+          await handle.close().catch(() => undefined);
+          handleClosed = true;
+        }
+      }
+    },
+    async releaseStaging(wipeRecovery: boolean) {
+      // Cleanup only after all required verified publication succeeds. The
+      // original descriptors avoid deleting a subsequently replaced pathname.
+      if (!handleClosed) {
+        await handle.truncate(0);
+        await handle.sync();
+        await handle.close();
+        handleClosed = true;
+      }
+      if (recoveryHandle) {
+        if (wipeRecovery) {
+          await recoveryHandle.truncate(0);
+          await recoveryHandle.sync();
+        }
+        await recoveryHandle.close();
+        recoveryHandle = undefined;
       }
     },
     async close(): Promise<void> {
       if (!finalized) {
         finalized = true;
         await tail.finally(() => handle.close());
+        handleClosed = true;
       }
+      if (!handleClosed) {
+        await handle.close();
+        handleClosed = true;
+      }
+      await recoveryHandle?.close();
+      recoveryHandle = undefined;
     },
   };
 }

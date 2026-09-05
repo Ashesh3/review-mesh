@@ -19,9 +19,12 @@ export async function loadV9Run(
     () => true,
     () => false,
   );
-  const candidate = join(runsDirectory, `${runId}.jsonl`);
+  let candidate = join(runsDirectory, `${runId}.jsonl`);
   if (!indexed) {
-    const handle = await open(candidate, "r").catch(() => undefined);
+    const activeCandidate = `${candidate}.active`;
+    let handle = await open(activeCandidate, "r").catch(() => undefined);
+    if (handle) candidate = activeCandidate;
+    else handle = await open(candidate, "r").catch(() => undefined);
     if (!handle) return undefined;
     try {
       if (
@@ -41,13 +44,29 @@ export async function loadV9Run(
     } finally {
       await handle.close();
     }
-    return readNormalizedRun(candidate, { allowActive: true });
+    const run = await readNormalizedRun(candidate, { allowActive: true });
+    if (candidate === activeCandidate && !run.active) {
+      // A sealed staging file has evidence, but publication is not complete.
+      run.active = true;
+      run.run_outcome = "inconclusive";
+      run.coverage_outcome = "partial";
+      run.execution_coverage = { status: "partial" };
+      run.exit_code = 3;
+      run.summary = {
+        ...run.summary,
+        run_outcome: "inconclusive",
+        coverage_outcome: "partial",
+        exit_code: 3,
+        publication_pending: true,
+      };
+    }
+    return run;
   }
   const resolved = await resolveRunArtifact(runId, {
     runsDirectory,
     ...options,
   });
-  return readNormalizedRun(resolved.artifact.path, {
+  const run = await readNormalizedRun(resolved.artifact.path, {
     ...(resolved.digest_status === "verified"
       ? { expectedSha256: resolved.artifact.sha256 }
       : {}),
@@ -56,6 +75,8 @@ export async function loadV9Run(
       ? { observedPublicStream: resolved.observed_public_stream }
       : {}),
   });
+  run.artifact_resolution = resolved.resolution;
+  return run;
 }
 export function v9Headline(run: NormalizedRun): string {
   const counts = run.canonical.counts;
@@ -148,6 +169,9 @@ export function v9Status(
     model_runs: live.model_runs,
     reviewers: live.reviewers.map(dashboardReviewerSummary),
     artifact: run.artifact,
+    ...(run.artifact_resolution
+      ? { artifact_resolution: run.artifact_resolution }
+      : {}),
     details_file_policy: "published_at_finalization",
     ...(!run.active
       ? {
@@ -233,6 +257,9 @@ export function v9RunSummary(run: NormalizedRun, updatedAt?: string) {
     reviewers: live.reviewers.map(dashboardReviewerSummary),
     deadline: live.deadline,
     artifact: run.artifact,
+    ...(run.artifact_resolution
+      ? { artifact_resolution: run.artifact_resolution }
+      : {}),
     digest_status: run.digest_status,
     headline: v9Headline(run),
   });
@@ -244,8 +271,17 @@ export async function listV9Runs(runsDirectory: string): Promise<string[]> {
   return [
     ...new Set(
       entries
-        .filter((entry) => entry.isFile() && entry.name.endsWith(".index.json"))
-        .map((entry) => entry.name.slice(0, -11)),
+        .filter(
+          (entry) =>
+            entry.isFile() &&
+            (entry.name.endsWith(".index.json") ||
+              entry.name.endsWith(".jsonl.active")),
+        )
+        .map((entry) =>
+          entry.name.endsWith(".index.json")
+            ? entry.name.slice(0, -11)
+            : entry.name.slice(0, -13),
+        ),
     ),
   ].sort();
 }

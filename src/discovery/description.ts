@@ -125,6 +125,7 @@ export async function describeTool(options: DescribeToolOptions = {}) {
         output_modes: ["concise-jsonl", "full-jsonl", "compact-jsonl"] as const,
         stderr: "diagnostic-jsonl-v1" as const,
         final_event: "run.completed" as const,
+        persistence_failure_event: "run.persistence_failed" as const,
         status_query: "review-mesh status RUN_ID [REVIEWER_ID] --json" as const,
       },
     },

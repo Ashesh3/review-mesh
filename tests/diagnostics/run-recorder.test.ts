@@ -1,4 +1,5 @@
 import {
+  open,
   link,
   lstat,
   mkdir,
@@ -42,6 +43,30 @@ function startedEvent(): PublicEvent {
     timestamp: "2026-08-30T10:00:00.000Z",
     data: { consistency_mode: "live_worktree" },
   };
+}
+
+function completedEvent(runId: string): PublicEvent {
+  return {
+    schema_version: "5",
+    event: "run.completed",
+    run_id: runId,
+    seq: 2,
+    timestamp: "2026-09-05T10:00:00.000Z",
+    data: {},
+  } as PublicEvent;
+}
+
+async function completedLegacy(root: string, runId: string, maxRuns = 100) {
+  const recorder = createRunRecorder({
+    applicationDataRoot: root,
+    runsDirectory: join(root, "runs"),
+    runId,
+    maxRuns,
+    resolution: {},
+  });
+  await recorder.onEvent({ ...startedEvent(), run_id: runId });
+  await recorder.onEvent(completedEvent(runId));
+  await recorder.close();
 }
 
 async function activeRecordPath(runsDirectory: string): Promise<string> {
@@ -94,6 +119,161 @@ it("redacts credentials embedded in persisted string values", async () => {
 });
 
 describe("RunRecorder", () => {
+  it("retains only owned completed legacy files while current reviews and caller copies coexist", async () => {
+    const root = await temporaryRoot();
+    const runsDirectory = join(root, "runs");
+    await mkdir(runsDirectory);
+    const protectedFiles = new Map([
+      [
+        "current-active.jsonl",
+        '{"record":"run.artifact","artifact_format_version":"2","run_id":"current-active"}\n',
+      ],
+      [
+        "current-final.jsonl",
+        '{"record":"run.artifact","artifact_format_version":"2","run_id":"current-final"}\n{"record":"run.artifact_terminal"}\n',
+      ],
+      [
+        "current-final.index.json",
+        '{"kind":"review-mesh.run-index","run_id":"current-final"}\n',
+      ],
+      [
+        "orphan.index.json",
+        '{"kind":"review-mesh.run-index","run_id":"orphan"}\n',
+      ],
+      [
+        "caller-details.jsonl",
+        '{"record":"resolution","run_id":"different-run","resolution":{}}\n{"schema_version":"5","event":"run.completed","run_id":"different-run"}\n',
+      ],
+      [
+        "old-unmarked.jsonl",
+        '{"record":"resolution","run_id":"old-unmarked","resolution":{}}\n{"schema_version":"5","event":"run.completed","run_id":"old-unmarked"}\n',
+      ],
+      [
+        "backup.jsonl",
+        '{"record":"run.artifact","artifact_format_version":"2","run_id":"backup"}\n',
+      ],
+      [
+        "current-lookalike.jsonl.active.424242.1.old-owner",
+        '{"record":"run.artifact","artifact_format_version":"2","run_id":"current-lookalike"}\n',
+      ],
+    ]);
+    for (const [name, bytes] of protectedFiles) {
+      await writeFile(join(runsDirectory, name), bytes);
+      await utimes(join(runsDirectory, name), new Date(1000), new Date(1000));
+    }
+    const activePath = join(runsDirectory, "doctor-active.jsonl.active");
+    const active = await open(activePath, "wx", 0o600);
+    try {
+      await active.writeFile(
+        '{"record":"run.artifact","artifact_format_version":"2","run_id":"doctor-active"}\n',
+      );
+      await completedLegacy(root, "legacy-old");
+      await completedLegacy(root, "legacy-new", 1);
+      await active.appendFile(
+        '{"record":"reviewer.activity","run_id":"doctor-active"}\n',
+      );
+      for (const [name, bytes] of protectedFiles)
+        await expect(readFile(join(runsDirectory, name), "utf8")).resolves.toBe(
+          bytes,
+        );
+      await expect(
+        stat(join(runsDirectory, "legacy-old.jsonl")),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(
+        readFile(join(runsDirectory, "legacy-new.jsonl"), "utf8"),
+      ).resolves.toContain('"event":"run.completed"');
+      await expect(readFile(activePath, "utf8")).resolves.toContain(
+        '"record":"reviewer.activity"',
+      );
+    } finally {
+      await active.close();
+    }
+  });
+
+  it("preserves marked files replaced by current artifacts and indexed legacy candidates", async () => {
+    const root = await temporaryRoot();
+    const runsDirectory = join(root, "runs");
+    await completedLegacy(root, "changed-to-current");
+    await completedLegacy(root, "indexed-legacy");
+    const changed = join(runsDirectory, "changed-to-current.jsonl");
+    const current =
+      '{"record":"run.artifact","artifact_format_version":"2","run_id":"changed-to-current"}\n';
+    await writeFile(changed, current);
+    // Even a stale/mistaken marker that has the new identity cannot establish
+    // legacy ownership for a current-format header.
+    const metadata = await stat(changed, { bigint: true });
+    await writeFile(
+      join(runsDirectory, ".legacy-owned", "changed-to-current.json"),
+      JSON.stringify({
+        schema_version: "1",
+        kind: "review-mesh.legacy-run-ownership",
+        run_id: "changed-to-current",
+        completed: true,
+        dev: String(metadata.dev),
+        ino: String(metadata.ino),
+        byte_count: Number(metadata.size),
+        mtime_ns: String(metadata.mtimeNs),
+      }),
+    );
+    const index =
+      '{"kind":"review-mesh.run-index","run_id":"indexed-legacy","artifact":{"path":"caller-owned"}}';
+    await writeFile(join(runsDirectory, "indexed-legacy.index.json"), index);
+    await completedLegacy(root, "newest", 1);
+    await expect(readFile(changed, "utf8")).resolves.toBe(current);
+    await expect(
+      readFile(join(runsDirectory, "indexed-legacy.jsonl"), "utf8"),
+    ).resolves.toContain('"event":"run.completed"');
+    await expect(
+      readFile(join(runsDirectory, "indexed-legacy.index.json"), "utf8"),
+    ).resolves.toBe(index);
+  });
+
+  it("does not grant retention ownership to a recorder closed without run completion", async () => {
+    const root = await temporaryRoot();
+    const runsDirectory = join(root, "runs");
+    const interrupted = createRunRecorder({
+      applicationDataRoot: root,
+      runsDirectory,
+      runId: "incomplete-legacy",
+      maxRuns: 1,
+      resolution: {},
+    });
+    await interrupted.onEvent({
+      ...startedEvent(),
+      run_id: "incomplete-legacy",
+    });
+    await interrupted.close();
+    await completedLegacy(root, "completed-legacy", 1);
+    await expect(
+      readFile(join(runsDirectory, "incomplete-legacy.jsonl"), "utf8"),
+    ).resolves.toContain('"event":"run.started"');
+    await expect(
+      stat(join(runsDirectory, ".legacy-owned", "incomplete-legacy.json")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("preserves a replaced pathname and an in-place modified owned legacy publication", async () => {
+    const root = await temporaryRoot();
+    const runsDirectory = join(root, "runs");
+    await completedLegacy(root, "replaced");
+    await completedLegacy(root, "modified");
+    const replaced = join(runsDirectory, "replaced.jsonl");
+    const preserved = join(root, "caller-backup.jsonl");
+    await rename(replaced, preserved);
+    const unrelated = "caller-owned replacement\n";
+    await writeFile(replaced, unrelated);
+    const modified = join(runsDirectory, "modified.jsonl");
+    const original = await readFile(modified, "utf8");
+    const changed = original.replace('"seq":2', '"seq":3');
+    await writeFile(modified, changed);
+    await utimes(modified, new Date(2000), new Date(2000));
+    await completedLegacy(root, "newest", 1);
+    await expect(readFile(replaced, "utf8")).resolves.toBe(unrelated);
+    await expect(readFile(modified, "utf8")).resolves.toBe(changed);
+    await expect(readFile(preserved, "utf8")).resolves.toContain(
+      '"event":"run.completed"',
+    );
+  });
   it("keeps an active record observable but does not publish it when publish is disabled", async () => {
     const root = await temporaryRoot();
     const runsDirectory = join(root, "runs");
@@ -444,17 +624,8 @@ describe("RunRecorder", () => {
     await mkdir(runsDirectory, { recursive: true });
     const old = join(runsDirectory, "run-old.jsonl");
     const middle = join(runsDirectory, "run-middle.jsonl");
-    await Promise.all([writeFile(old, "old\n"), writeFile(middle, "middle\n")]);
-    await utimes(
-      old,
-      new Date("2026-08-28T00:00:00.000Z"),
-      new Date("2026-08-28T00:00:00.000Z"),
-    );
-    await utimes(
-      middle,
-      new Date("2026-08-29T00:00:00.000Z"),
-      new Date("2026-08-29T00:00:00.000Z"),
-    );
+    await completedLegacy(root, "run-old");
+    await completedLegacy(root, "run-middle");
     const recorder = createRunRecorder({
       runsDirectory,
       applicationDataRoot: root,
@@ -464,10 +635,13 @@ describe("RunRecorder", () => {
     });
 
     await recorder.onEvent(startedEvent());
+    await recorder.onEvent(completedEvent("run-current"));
     await recorder.close();
 
     await expect(stat(old)).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(readFile(middle, "utf8")).resolves.toBe("middle\n");
+    await expect(readFile(middle, "utf8")).resolves.toContain(
+      '"event":"run.completed"',
+    );
     await expect(
       readFile(join(runsDirectory, "run-current.jsonl"), "utf8"),
     ).resolves.toContain('"event":"run.started"');
@@ -642,10 +816,8 @@ describe("RunRecorder", () => {
     const root = await temporaryRoot();
     const runsDirectory = join(root, "runs");
     await mkdir(runsDirectory, { recursive: true });
-    await Promise.all([
-      writeFile(join(runsDirectory, "run-old-a.jsonl"), "old\n"),
-      writeFile(join(runsDirectory, "run-old-b.jsonl"), "old\n"),
-    ]);
+    await completedLegacy(root, "run-old-a");
+    await completedLegacy(root, "run-old-b");
     const first = createRunRecorder({
       runsDirectory,
       applicationDataRoot: root,
@@ -662,8 +834,12 @@ describe("RunRecorder", () => {
     });
 
     await Promise.all([
-      first.onEvent(startedEvent()),
-      second.onEvent(startedEvent()),
+      first.onEvent({ ...startedEvent(), run_id: "run-current-a" }),
+      second.onEvent({ ...startedEvent(), run_id: "run-current-b" }),
+    ]);
+    await Promise.all([
+      first.onEvent(completedEvent("run-current-a")),
+      second.onEvent(completedEvent("run-current-b")),
     ]);
 
     await Promise.all([first.close(), second.close()]);
@@ -717,8 +893,9 @@ describe("RunRecorder", () => {
       fileSystem: pausingFileSystem,
     });
 
-    await first.onEvent(startedEvent());
-    await second.onEvent(startedEvent());
+    await first.onEvent({ ...startedEvent(), run_id: "run-current-a" });
+    await second.onEvent({ ...startedEvent(), run_id: "run-current-b" });
+    await second.onEvent(completedEvent("run-current-b"));
     const closingSecond = second.close();
     await retentionStarted;
     await first.onEvent({ ...startedEvent(), seq: 2 });
@@ -728,6 +905,7 @@ describe("RunRecorder", () => {
     ).resolves.toContain('"seq":2');
     releaseRetention();
     await closingSecond;
+    await first.onEvent(completedEvent("run-current-a"));
     await first.close();
 
     expect(

@@ -1,4 +1,6 @@
 import { publicEventV6Schema, type PublicEventV6 } from "./v9.js";
+import { RunArtifactError } from "../diagnostics/run-index.js";
+import { sanitizePublicText } from "../adapters/errors.js";
 import type {
   ArtifactReference,
   PublicStreamOutcome,
@@ -148,6 +150,44 @@ export function createV9EventWriter(options: V9EventWriterOptions) {
         // Optional liveness writes remain admissible while durable artifact
         // finalization is in progress, but must settle before the terminal line.
         await tail;
+      } catch (error) {
+        await tail;
+        terminal = true;
+        finalizing = false;
+        const details =
+          error instanceof RunArtifactError ? error.diagnosticDetails : {};
+        const failureEvent = materialize({
+          event: "run.persistence_failed",
+          data: {
+            terminal: true,
+            exit_code: 3,
+            reason:
+              error instanceof RunArtifactError
+                ? error.code
+                : "persistence_failed",
+            stage:
+              typeof details.stage === "string"
+                ? details.stage
+                : "artifact_finalization",
+            message:
+              error instanceof RunArtifactError
+                ? (sanitizePublicText(error.message) ??
+                  "Artifact publication failed.")
+                : "Artifact publication failed.",
+            ...(typeof details.native_error_code === "string"
+              ? { native_error_code: details.native_error_code }
+              : {}),
+            ...(typeof details.path === "string" ? { path: details.path } : {}),
+            ...(typeof details.recovery_command === "string"
+              ? { recovery_command: details.recovery_command }
+              : {}),
+            ...(details.recovery_artifact
+              ? { recovery_artifact: details.recovery_artifact }
+              : {}),
+          },
+        } as V9EventDraft);
+        await write(failureEvent).catch(() => undefined);
+        throw error;
       } finally {
         terminal = true;
         finalizing = false;

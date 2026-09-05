@@ -12,6 +12,7 @@ export type HelpTopic =
   | "cancel"
   | "pause"
   | "resume"
+  | "recover"
   | "diagnostics"
   | "doctor"
   | "serve"
@@ -28,7 +29,8 @@ const overview = `Review Mesh ${reviewMeshVersion}
 
 Agent-first multi-runtime code review gate. Review Mesh runs the complete trusted
 agent suite selected for a workspace, streams factual JSONL progress, waits for
-each agent's executed model chain, and exits only after run.completed.
+each agent's executed model chain, and reports run.completed after durable
+publication or run.persistence_failed if terminal storage fails.
 
 USAGE
   review-mesh review [WORKSPACE] [--output-mode concise-jsonl|full-jsonl|compact-jsonl] [--no-ansi]
@@ -40,6 +42,7 @@ USAGE
   review-mesh cancel RUN_ID
   review-mesh pause RUN_ID
   review-mesh resume RUN_ID
+  review-mesh recover RUN_ID --artifact PATH
   review-mesh diagnostics list RUN_ID
   review-mesh doctor [WORKSPACE] [--adapter ID] [--model MODEL]
       [--structured-output]
@@ -63,7 +66,7 @@ AGENT QUICK START
      With empty stdin, Review Mesh reviews only the current Git change set above
      the inferred default branch, including local staged/unstaged/untracked work.
      With JSON on stdin, send the current v3 request described below.
-  4. Read stdout one JSON object per line until run.completed. Logical lenses
+  4. Read stdout until run.completed or run.persistence_failed. Logical lenses
      run in parallel. A transient failure may retry; an operational failure
      advances to an eligible fallback. Clean runs stop at quorum, while findings
      can be independently adjudicated.
@@ -84,7 +87,7 @@ REVIEW I/O CONTRACT
 HELP TOPICS
   review, status, report, findings, retry, doctor, serve, config, config-file,
   adapters, command-adapter, describe, schema, events, exit-codes,
-  cancel, pause, resume, diagnostics
+  cancel, pause, resume, recover, diagnostics
 
 Run 'review-mesh help TOPIC' or 'review-mesh TOPIC --help' for details.
 `;
@@ -125,7 +128,8 @@ omitted head means the checked-out HEAD. An explicit branch/head must match the
 checked-out worktree. Committed changes above the merge base plus staged,
 unstaged, and untracked files form the review scope. paths only narrows it.
 Use mode=full only when the caller explicitly asks for the entire codebase.
-During a run, consume stdout as JSONL until run.completed. The caller cannot
+During a run, consume stdout as JSONL until run.completed, run.persistence_failed,
+or process termination. A persistence failure exits 3 without a clear gate. The caller cannot
 disable, replace, reorder, or select mandatory reviewers. A positional WORKSPACE
 and a piped non-empty JSON request are mutually exclusive.
 
@@ -217,6 +221,22 @@ USAGE
 Starts a child run equivalent to retry RUN_ID --only-incomplete after the parent
 has finalized. Git head/base/scope must still match. Completed compatible model
 results are reused; incomplete attempts restart with fresh Git evidence.
+`,
+  recover: `REVIEW-MESH RECOVER
+
+USAGE
+  review-mesh recover RUN_ID --artifact PATH
+
+Repair an orphaned managed index using an existing complete details/recovery
+artifact. Verify its exact SHA256, byte count, run ID, complete record schemas
+and file identity against the index before attaching it. The file remains
+caller-owned and is never overwritten or deleted by this command.
+
+This restores stored review evidence; it does not invoke a model or claim the
+current worktree matches the old review. Retry performs separate freshness checks.
+An active run, mismatched/corrupt copy or conflicting valid index fails closed.
+Registered verified backups are used automatically for a missing primary; status
+and report expose artifact_resolution when reading an alternate.
 `,
   report: `REVIEW-MESH REPORT
 
@@ -392,8 +412,9 @@ Sequence and meaning:
   reviewer.incomplete  Reviewer/runtime did not return a valid result.
   reviewer.skipped     A later fallback was not needed after findings/failure.
   run.completed        Outcomes, canonical counts, result manifest, and artifact.
+  run.persistence_failed Terminal exit 3 with storage stage and recovery details.
 
-Always continue reading until run.completed or process termination. Operational
+Always continue reading until run.completed, run.persistence_failed or process termination. Operational
 failures advance to eligible fallbacks; clean passes stop at configured quorum.
 Review Mesh reports factual phases and elapsed time, never invented percentages.
 Use 'review-mesh schema events --json' for the exact machine contract.

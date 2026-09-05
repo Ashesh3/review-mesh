@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, expect, it } from "vitest";
@@ -295,8 +295,11 @@ agents = ["lens0", "lens1"]
         expect(version.stdout.trim()).toBe(
           `review-mesh ${packageMetadata.version}`,
         );
+        const detailsPath = join(root, "details.jsonl");
+        const commandDetailsPath =
+          platform === "Linux" ? await wslPath(detailsPath) : detailsPath;
         const result = await run(
-          ["review"],
+          ["review", "--details-file", commandDetailsPath],
           JSON.stringify({
             schema_version: "3",
             project_name: "workspace",
@@ -329,6 +332,102 @@ agents = ["lens0", "lens1"]
         );
         expect(status).toMatchObject({ terminal: true, run_outcome: "clear" });
         expect(status).not.toHaveProperty("context");
+        const managedPath =
+          platform === "Windows"
+            ? status.artifact.path
+            : (
+                await exec(
+                  "wsl.exe",
+                  [
+                    "-d",
+                    "Ubuntu",
+                    "--exec",
+                    "wslpath",
+                    "-w",
+                    status.artifact.path,
+                  ],
+                  root,
+                )
+              ).stdout.trim();
+        const indexPath =
+          platform === "Windows"
+            ? join(
+                home,
+                "review-mesh",
+                "Data",
+                "runs",
+                `${terminal.run_id}.index.json`,
+              )
+            : join(
+                home,
+                "data",
+                "review-mesh",
+                "runs",
+                `${terminal.run_id}.index.json`,
+              );
+        const index = JSON.parse(await readFile(indexPath, "utf8"));
+        expect(index.schema_version).toBe("2");
+        expect(index.alternatives.length).toBeGreaterThan(0);
+        await rm(managedPath);
+        const alternate = await run(["status", terminal.run_id, "--json"]);
+        expect(alternate.code, alternate.stderr).toBe(0);
+        expect(JSON.parse(alternate.stdout)).toMatchObject({
+          run_outcome: "clear",
+          artifact_resolution: { source: "alternate" },
+        });
+        // Reproduce the older v1 orphan-index contract with the same verified
+        // terminal digest and caller copy; no model should run during recovery.
+        const legacyIndex = {
+          schema_version: "1",
+          kind: index.kind,
+          run_id: index.run_id,
+          artifact: index.artifact,
+          identity: index.identity,
+          observed_public_stream: index.observed_public_stream,
+        };
+        await writeFile(indexPath, JSON.stringify(legacyIndex));
+        const missing = await run([
+          "report",
+          terminal.run_id,
+          "--format",
+          "json",
+        ]);
+        expect(missing.code).toBe(2);
+        expect(JSON.parse(missing.stderr)).toMatchObject({
+          error: "artifact_unavailable",
+          native_error_code: "ENOENT",
+        });
+        const requestsBeforeRecovery = [...observed.values()].reduce(
+          (sum, state) => sum + state.requests,
+          0,
+        );
+        const recovered = await run([
+          "recover",
+          terminal.run_id,
+          "--artifact",
+          commandDetailsPath,
+        ]);
+        expect(recovered.code, recovered.stderr).toBe(0);
+        expect(JSON.parse(recovered.stdout)).toMatchObject({
+          status: "recovered",
+          caller_owned: true,
+        });
+        const recoveredReport = await run([
+          "report",
+          terminal.run_id,
+          "--format",
+          "json",
+        ]);
+        expect(recoveredReport.code, recoveredReport.stderr).toBe(0);
+        expect(JSON.parse(recoveredReport.stdout)).toMatchObject({
+          run_outcome: "clear",
+        });
+        expect(
+          [...observed.values()].reduce(
+            (sum, state) => sum + state.requests,
+            0,
+          ),
+        ).toBe(requestsBeforeRecovery);
         expect((await run(["help", "review"])).stdout).toContain(
           'The string "3"',
         );

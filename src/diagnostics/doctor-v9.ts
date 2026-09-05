@@ -10,8 +10,12 @@ import type { ResolvedConfig, ResolvedReviewer } from "../config/schemas.js";
 import { resolveContext } from "../context/resolve.js";
 import { createGitRunner } from "../context/git.js";
 import { getAppPaths } from "../config/paths.js";
-import { createRunArtifact, readRunArtifact } from "./run-artifact.js";
-import { indexRunArtifact, observePublicStream } from "./run-index.js";
+import { createManagedRunArtifact, readRunArtifact } from "./run-artifact.js";
+import {
+  indexRunArtifact,
+  observePublicStream,
+  RunArtifactError,
+} from "./run-index.js";
 import { createV9EventWriter } from "../protocol/v9-event-writer.js";
 import { runV9Review } from "../orchestrator/run-v9.js";
 import { reviewMeshVersion } from "../discovery/help.js";
@@ -25,7 +29,8 @@ export async function runDoctorV9(
   runsDirectory = getAppPaths().runsDirectory,
 ) {
   const directory = await mkdtemp(join(tmpdir(), "review-mesh-doctor-v9-"));
-  let artifact: Awaited<ReturnType<typeof createRunArtifact>> | undefined;
+  let artifact:
+    Awaited<ReturnType<typeof createManagedRunArtifact>> | undefined;
   let writer: ReturnType<typeof createV9EventWriter> | undefined;
   try {
     const workspace = join(directory, "workspace");
@@ -140,8 +145,8 @@ export async function runDoctorV9(
     }));
     const output = new PassThrough();
     output.resume();
-    const openedArtifact = await createRunArtifact({
-      path: join(paths.runsDirectory, `${runId}.jsonl`),
+    const openedArtifact = await createManagedRunArtifact({
+      runsDirectory: paths.runsDirectory,
       runId,
       toolVersion: reviewMeshVersion,
     });
@@ -153,12 +158,42 @@ export async function runDoctorV9(
       recordEvent: (event) => openedArtifact.record(event),
       finalize: async (summary) => {
         const ref = await openedArtifact.finalize(summary);
-        await indexRunArtifact({
-          runsDirectory: paths.runsDirectory,
-          runId,
-          artifact: ref,
-        });
-        return ref;
+        try {
+          await indexRunArtifact({
+            runsDirectory: paths.runsDirectory,
+            runId,
+            artifact: ref,
+            ownership: "managed",
+            alternatives: openedArtifact.recoveryReference
+              ? [openedArtifact.recoveryReference]
+              : [],
+          });
+          await openedArtifact.persisted();
+          return ref;
+        } catch (error) {
+          throw new RunArtifactError(
+            error instanceof RunArtifactError
+              ? error.code
+              : "artifact_unavailable",
+            "Doctor artifact index publication failed.",
+            {
+              cause: error,
+              diagnosticDetails: {
+                ...(error instanceof RunArtifactError
+                  ? error.diagnosticDetails
+                  : {}),
+                stage: "artifact_index_publication",
+                run_id: runId,
+                ...(openedArtifact.recoveryReference
+                  ? {
+                      recovery_artifact: openedArtifact.recoveryReference,
+                      recovery_command: `review-mesh recover ${runId} --artifact ${JSON.stringify(openedArtifact.recoveryReference.path)}`,
+                    }
+                  : {}),
+              },
+            },
+          );
+        }
       },
       observe: (outcome) =>
         observePublicStream({
@@ -183,7 +218,9 @@ export async function runDoctorV9(
     // Reading validates the durable page chain, digest, and assembled result
     // against the recorded reviewer output; a whole-result adapter bypass is
     // insufficient evidence that its paged output path works.
-    const persisted = await readRunArtifact(openedArtifact.path);
+    const persisted = await readRunArtifact(
+      openedArtifact.publishedReference!.path,
+    );
     const coverageEntries = persisted.records
       .flatMap((record) => {
         if (

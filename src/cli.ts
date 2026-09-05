@@ -21,6 +21,10 @@ import { resolveConfig } from "./config/resolve.js";
 import { resolveContext } from "./context/resolve.js";
 import { readRunStatus, RunStatusError } from "./diagnostics/run-status.js";
 import {
+  RunArtifactError,
+  recoverRunArtifact,
+} from "./diagnostics/run-index.js";
+import {
   readRunFindings,
   readRunReport,
   readRetryRunPlan,
@@ -782,12 +786,16 @@ export async function runCli(
         process.exitCode = 0;
       } catch (error) {
         await writeDiagnostic(
-          error instanceof RunStatusError ? error.code : "status_failed",
-          error instanceof RunStatusError
+          error instanceof RunStatusError || error instanceof RunArtifactError
+            ? error.code
+            : "status_failed",
+          error instanceof RunStatusError || error instanceof RunArtifactError
             ? error.message
             : "The persisted Review Mesh run status could not be read.",
           errorOutput,
-          error instanceof RunStatusError ? error.diagnosticDetails : {},
+          error instanceof RunStatusError || error instanceof RunArtifactError
+            ? { ...error.diagnosticDetails }
+            : {},
         );
         process.exitCode = 2;
       }
@@ -832,12 +840,16 @@ export async function runCli(
         process.exitCode = 0;
       } catch (error) {
         await writeDiagnostic(
-          error instanceof RunReportError ? error.code : "report_failed",
-          error instanceof RunReportError
+          error instanceof RunReportError || error instanceof RunArtifactError
+            ? error.code
+            : "report_failed",
+          error instanceof RunReportError || error instanceof RunArtifactError
             ? error.message
             : "The persisted Review Mesh report could not be read.",
           errorOutput,
-          error instanceof RunReportError ? error.diagnosticDetails : {},
+          error instanceof RunReportError || error instanceof RunArtifactError
+            ? { ...error.diagnosticDetails }
+            : {},
         );
         process.exitCode = 2;
       }
@@ -893,12 +905,54 @@ export async function runCli(
         process.exitCode = 0;
       } catch (error) {
         await writeDiagnostic(
-          error instanceof RunReportError ? error.code : "report_failed",
-          error instanceof RunReportError
+          error instanceof RunReportError || error instanceof RunArtifactError
+            ? error.code
+            : "report_failed",
+          error instanceof RunReportError || error instanceof RunArtifactError
             ? error.message
             : "The persisted Review Mesh findings could not be read.",
           errorOutput,
-          error instanceof RunReportError ? error.diagnosticDetails : {},
+          error instanceof RunReportError || error instanceof RunArtifactError
+            ? { ...error.diagnosticDetails }
+            : {},
+        );
+        process.exitCode = 2;
+      }
+      return;
+    }
+    if (argv[0] === "recover") {
+      if (
+        argv.length !== 4 ||
+        !argv[1] ||
+        argv[2] !== "--artifact" ||
+        !argv[3]
+      ) {
+        await writeUsageDiagnostic(
+          "Expected: review-mesh recover RUN_ID --artifact PATH",
+          "review-mesh help recover",
+          errorOutput,
+        );
+        process.exitCode = 2;
+        return;
+      }
+      try {
+        const recovered = await recoverRunArtifact({
+          runsDirectory: (runtime.appPaths ?? getAppPaths()).runsDirectory,
+          runId: argv[1],
+          artifactPath: resolve(runtime.cwd ?? process.cwd(), argv[3]),
+        });
+        await writeText(output, `${JSON.stringify(recovered)}\n`);
+        process.exitCode = 0;
+      } catch (error) {
+        await writeDiagnostic(
+          error instanceof RunArtifactError ? error.code : "recovery_failed",
+          error instanceof RunArtifactError
+            ? error.message
+            : "The supplied artifact could not recover this run.",
+          errorOutput,
+          error instanceof RunArtifactError
+            ? { ...error.diagnosticDetails }
+            : {},
         );
         process.exitCode = 2;
       }
@@ -1037,11 +1091,16 @@ export async function runCli(
         }
       } catch (error) {
         await writeDiagnostic(
-          error instanceof RunReportError ? error.code : "retry_failed",
-          error instanceof RunReportError
+          error instanceof RunReportError || error instanceof RunArtifactError
+            ? error.code
+            : "retry_failed",
+          error instanceof RunReportError || error instanceof RunArtifactError
             ? error.message
             : "The incomplete review lenses could not be retried.",
           errorOutput,
+          error instanceof RunArtifactError
+            ? { ...error.diagnosticDetails }
+            : {},
         );
         process.exitCode = 2;
       }

@@ -52,6 +52,13 @@ export interface NormalizedRun {
   artifact: ArtifactReference;
   digest_status: "verified" | "final_digest_unavailable";
   observed_public_stream?: PublicStreamOutcome;
+  artifact_resolution?: {
+    source: "primary" | "alternate";
+    primary_path: string;
+    resolved_path: string;
+    recovered_from_unindexed?: true;
+    warnings: Array<{ code: string; message: string }>;
+  };
   reported_outcome?: Record<string, unknown>;
   reported_counts?: Record<string, unknown>;
   summary: Record<string, unknown>;

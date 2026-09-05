@@ -1,6 +1,6 @@
 {
   "name": "review-mesh",
-  "version": "9.2.0",
+  "version": "9.3.0",
   "private": true,
   "files": [
     "dist/review-mesh.mjs",

@@ -1,6 +1,7 @@
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { createV9EventWriter } from "../../src/protocol/v9-event-writer.js";
+import { RunArtifactError } from "../../src/diagnostics/run-index.js";
 
 const terminal = {
   run_outcome: "clear",
@@ -27,6 +28,61 @@ const terminal = {
   deficit_samples: [],
 };
 describe("v6 public writer", () => {
+  it("emits a terminal persistence failure without claiming a clear completed run", async () => {
+    const output = new PassThrough();
+    let text = "";
+    output.on("data", (chunk) => (text += String(chunk)));
+    const recorded: string[] = [];
+    const writer = createV9EventWriter({
+      output,
+      runId: "run-1",
+      recordEvent: async (event) => {
+        recorded.push(event.event);
+      },
+      finalize: async () => {
+        throw new RunArtifactError(
+          "artifact_unavailable",
+          "Artifact vanished",
+          {
+            cause: Object.assign(new Error("sensitive native message"), {
+              code: "ENOENT",
+            }),
+          },
+        );
+      },
+      observe: async () => {
+        throw new Error("No index should be observed");
+      },
+    });
+    await writer.emit({
+      event: "run.started",
+      data: { consistency_mode: "live_worktree" },
+    });
+    await expect(writer.finish(terminal)).rejects.toThrow("Artifact vanished");
+    const events = text
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    expect(events.at(-1)).toMatchObject({
+      event: "run.persistence_failed",
+      data: {
+        terminal: true,
+        exit_code: 3,
+        reason: "artifact_unavailable",
+        stage: "artifact_finalization",
+      },
+    });
+    expect(text).not.toContain('"run.completed"');
+    expect(text).not.toContain("sensitive native message");
+    expect(recorded).toEqual(["run.started"]);
+    await expect(
+      writer.emit({
+        event: "run.started",
+        data: { consistency_mode: "live_worktree" },
+      }),
+    ).rejects.toThrow(/terminal/);
+    await writer.close();
+  });
   it("finalizes the artifact before terminal output and refuses post-terminal writes", async () => {
     const output = new PassThrough();
     let text = "";

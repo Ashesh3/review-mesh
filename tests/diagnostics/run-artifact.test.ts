@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createRunArtifact,
+  createManagedRunArtifact,
   readRunArtifact,
 } from "../../src/diagnostics/run-artifact.js";
 import { reviewerResultDigest } from "../../src/results/digest.js";
@@ -54,6 +55,135 @@ const complete = {
 };
 
 describe("immutable artifact format two", () => {
+  it.each(["remove", "replace"])(
+    "retains verified recovery bytes when active artifact is %s before final verification",
+    async (operation) => {
+      const { root } = await fixture();
+      const activePath = join(root, "run-1.jsonl.active");
+      const writer = await createManagedRunArtifact({
+        runsDirectory: root,
+        runId: "run-1",
+        toolVersion: "9.3.0",
+        beforeFinalVerify: async () => {
+          await rm(activePath);
+          if (operation === "replace")
+            await writeFile(activePath, "foreign replacement\n");
+        },
+      });
+      await writer.result("reviewer", {
+        schema_version: "4",
+        verdict: "pass",
+        summary: "Retain me",
+        review_markdown: "Completed expensive review",
+        actionable_findings: [],
+        informational_notes: [],
+        change_coverage: {
+          status: "not_applicable",
+          inspected_count: 0,
+          deficit_count: 0,
+          deficit_sample: [],
+        },
+      });
+      await expect(writer.finalize(complete)).rejects.toMatchObject({
+        diagnosticDetails: expect.objectContaining({
+          stage: "artifact_final_verification",
+          recovery_artifact: expect.objectContaining({ completed_results: 1 }),
+        }),
+      });
+      expect(writer.recoveryReference).toBeDefined();
+      const recovery = await readRunArtifact(writer.recoveryReference!.path, {
+        expectedSha256: writer.recoveryReference!.sha256,
+      });
+      expect(recovery.results[0]?.result.review_markdown).toBe(
+        "Completed expensive review",
+      );
+      await expect(lstat(join(root, "run-1.jsonl"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      if (operation === "replace")
+        expect(await readFile(activePath, "utf8")).toBe(
+          "foreign replacement\n",
+        );
+      await writer.close();
+    },
+  );
+
+  it("publishes a managed artifact exclusively and retains an identical independent backup", async () => {
+    const { root } = await fixture();
+    const writer = await createManagedRunArtifact({
+      runsDirectory: root,
+      runId: "run-1",
+      toolVersion: "9.3.0",
+    });
+    expect(writer.path).toBe(join(root, "run-1.jsonl.active"));
+    const reference = await writer.finalize({
+      ...complete,
+      result_delivery: { ...complete.result_delivery, completed_results: 0 },
+    });
+    expect(reference.path).toBe(join(root, "run-1.jsonl"));
+    expect(writer.recoveryReference).toMatchObject({
+      sha256: reference.sha256,
+      byte_count: reference.byte_count,
+    });
+    await rm(reference.path);
+    await expect(
+      readRunArtifact(writer.recoveryReference!.path),
+    ).resolves.toMatchObject({ active: false, run_id: "run-1" });
+    await writer.close();
+  });
+
+  it("refuses to overwrite a final managed artifact and keeps recovery available", async () => {
+    const { root } = await fixture();
+    const writer = await createManagedRunArtifact({
+      runsDirectory: root,
+      runId: "run-1",
+      toolVersion: "9.3.0",
+    });
+    await writeFile(join(root, "run-1.jsonl"), "foreign artifact\n");
+    await expect(
+      writer.finalize({
+        ...complete,
+        result_delivery: { ...complete.result_delivery, completed_results: 0 },
+      }),
+    ).rejects.toMatchObject({
+      diagnosticDetails: expect.objectContaining({
+        stage: "artifact_publication",
+        native_error_code: "EEXIST",
+      }),
+    });
+    expect(await readFile(join(root, "run-1.jsonl"), "utf8")).toBe(
+      "foreign artifact\n",
+    );
+    await expect(
+      readRunArtifact(writer.recoveryReference!.path),
+    ).resolves.toMatchObject({ active: false });
+    await writer.close();
+  });
+
+  it("keeps the final name absent when a publication candidate is interrupted", async () => {
+    const { root } = await fixture();
+    const writer = await createManagedRunArtifact({
+      runsDirectory: root,
+      runId: "run-1",
+      toolVersion: "9.3.0",
+      beforePublication: (candidate) =>
+        writeFile(candidate, "interrupted copy\n"),
+    });
+    await expect(
+      writer.finalize({
+        ...complete,
+        result_delivery: { ...complete.result_delivery, completed_results: 0 },
+      }),
+    ).rejects.toMatchObject({ code: "artifact_digest_mismatch" });
+    await expect(lstat(join(root, "run-1.jsonl"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await expect(
+      readRunArtifact(writer.recoveryReference!.path),
+    ).resolves.toMatchObject({ active: false });
+    await writer.close();
+  });
+
   it.each(["1", "2"])(
     "accepts resolution v%s but rejects mismatched version declarations",
     async (version) => {

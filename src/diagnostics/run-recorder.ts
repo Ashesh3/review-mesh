@@ -24,6 +24,8 @@ const ACTIVE_RUN_FILE =
   /^(?<runId>.+)\.jsonl\.active\.(?<pid>\d+)\.(?<startedAtMs>\d+)\.(?<nonce>[A-Za-z0-9-]{1,128})$/;
 const STALE_ACTIVE_MIN_AGE_MS = 60 * 60 * 1_000;
 const STALE_ACTIVE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1_000;
+const LEGACY_OWNERS_DIRECTORY = ".legacy-owned";
+const MAX_LEGACY_HEADER_BYTES = 256 * 1024;
 
 export type RunRecorderOperation = "open" | "link" | "scavenge" | "retention";
 
@@ -423,9 +425,14 @@ async function removeExpiredRuns(
           const path = join(runsDirectory, entry.name);
           try {
             await assertPinnedRunsDirectory(runsDirectory, pinned);
+            const owner = await ownedCompletedLegacyRecord(
+              runsDirectory,
+              entry.name,
+            );
+            if (owner === undefined) return undefined;
             const mtimeMs = (await fileSystem.stat(path)).mtimeMs;
             await assertPinnedRunsDirectory(runsDirectory, pinned);
-            return { path, mtimeMs };
+            return { path, mtimeMs, owner, name: entry.name };
           } catch (error) {
             if (isNotFound(error)) return undefined;
             throw error;
@@ -442,15 +449,229 @@ async function removeExpiredRuns(
     const oldest = records[0];
     if (oldest === undefined) return;
     try {
+      const current = await ownedCompletedLegacyRecord(
+        runsDirectory,
+        oldest.name,
+      );
+      if (
+        current === undefined ||
+        current.dev !== oldest.owner.dev ||
+        current.ino !== oldest.owner.ino ||
+        current.byteCount !== oldest.owner.byteCount ||
+        current.mtimeNs !== oldest.owner.mtimeNs
+      )
+        continue;
       await removeFromPinnedDirectory(
         fileSystem,
         runsDirectory,
         pinned,
         oldest.path,
       );
+      // An orphan ownership marker is harmless and is not itself retention
+      // authority without the exact pinned legacy file. Keep it rather than
+      // risking a second pathname deletion after concurrent replacement.
     } catch (error) {
       if (!isNotFound(error)) throw error;
     }
+  }
+}
+
+interface LegacyOwner {
+  dev: string;
+  ino: string;
+  byteCount: number;
+  runId: string;
+  mtimeNs: string;
+}
+
+async function legacyOwnerDirectory(
+  runsDirectory: string,
+  create = false,
+): Promise<string | undefined> {
+  const path = join(runsDirectory, LEGACY_OWNERS_DIRECTORY);
+  if (create) await mkdir(path, { recursive: true, mode: 0o700 });
+  const metadata = await lstatIfPresent(path);
+  if (metadata === undefined) return undefined;
+  if (metadata.isSymbolicLink() || !metadata.isDirectory())
+    throw new Error("legacy ownership directory is unsafe");
+  return path;
+}
+
+async function readPinnedBytes(
+  path: string,
+  maximumBytes: number,
+): Promise<
+  | { bytes: Buffer; dev: string; ino: string; size: number; mtimeNs: string }
+  | undefined
+> {
+  const before = await lstat(path, { bigint: true }).catch((error) => {
+    if (isNotFound(error)) return undefined;
+    throw error;
+  });
+  if (before === undefined || before.isSymbolicLink() || !before.isFile())
+    return undefined;
+  const handle = await open(
+    path,
+    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+  );
+  try {
+    const opened = await handle.stat({ bigint: true });
+    if (
+      !opened.isFile() ||
+      before.dev !== opened.dev ||
+      before.ino !== opened.ino ||
+      opened.size !== before.size
+    )
+      return undefined;
+    const bytes = Buffer.alloc(Math.min(Number(opened.size), maximumBytes));
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = await handle.read(
+        bytes,
+        offset,
+        bytes.length - offset,
+        offset,
+      );
+      if (read.bytesRead === 0) return undefined;
+      offset += read.bytesRead;
+    }
+    const after = await lstat(path, { bigint: true });
+    if (
+      after.isSymbolicLink() ||
+      opened.dev !== after.dev ||
+      opened.ino !== after.ino ||
+      after.size !== opened.size ||
+      after.mtimeNs !== opened.mtimeNs
+    )
+      return undefined;
+    return {
+      bytes,
+      dev: String(opened.dev),
+      ino: String(opened.ino),
+      size: Number(opened.size),
+      mtimeNs: String(opened.mtimeNs),
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Only this recorder's completed, identity-pinned publications are evictable. */
+async function ownedCompletedLegacyRecord(
+  runsDirectory: string,
+  name: string,
+): Promise<LegacyOwner | undefined> {
+  const runId = name.slice(0, -".jsonl".length);
+  if (!SAFE_RUN_ID.test(runId) || runId === "." || runId === "..")
+    return undefined;
+  // Any index means current or recovered ownership. Even malformed/orphan
+  // indexes are excluded from legacy cleanup rather than repaired destructively.
+  if (
+    (await lstatIfPresent(join(runsDirectory, `${runId}.index.json`))) !==
+    undefined
+  )
+    return undefined;
+  const directory = await legacyOwnerDirectory(runsDirectory);
+  if (directory === undefined) return undefined;
+  const marker = await readPinnedBytes(join(directory, `${runId}.json`), 4097);
+  if (marker === undefined || marker.size > 4096) return undefined;
+  let value: Record<string, unknown>;
+  try {
+    value = JSON.parse(marker.bytes.toString("utf8")) as Record<
+      string,
+      unknown
+    >;
+  } catch {
+    return undefined;
+  }
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    value.schema_version !== "1" ||
+    value.kind !== "review-mesh.legacy-run-ownership" ||
+    value.run_id !== runId ||
+    value.completed !== true ||
+    typeof value.dev !== "string" ||
+    typeof value.ino !== "string" ||
+    typeof value.byte_count !== "number"
+  )
+    return undefined;
+  const file = await readPinnedBytes(
+    join(runsDirectory, name),
+    MAX_LEGACY_HEADER_BYTES,
+  );
+  if (
+    file === undefined ||
+    file.dev !== value.dev ||
+    file.ino !== value.ino ||
+    file.size !== value.byte_count ||
+    file.mtimeNs !== value.mtime_ns
+  )
+    return undefined;
+  const end = file.bytes.indexOf(10);
+  if (end < 0) return undefined;
+  let header: Record<string, unknown>;
+  try {
+    header = JSON.parse(file.bytes.subarray(0, end).toString("utf8")) as Record<
+      string,
+      unknown
+    >;
+  } catch {
+    return undefined;
+  }
+  if (
+    header === null ||
+    typeof header !== "object" ||
+    header.record !== "resolution" ||
+    header.run_id !== runId ||
+    !("resolution" in header) ||
+    "artifact_format_version" in header
+  )
+    return undefined;
+  return {
+    dev: file.dev,
+    ino: file.ino,
+    byteCount: file.size,
+    runId,
+    mtimeNs: file.mtimeNs,
+  };
+}
+
+async function recordLegacyOwnership(
+  runsDirectory: string,
+  runId: string,
+  identity: { dev: string; ino: string },
+  byteCount: number,
+  mtimeNs: string,
+): Promise<void> {
+  const directory = await legacyOwnerDirectory(runsDirectory, true);
+  if (directory === undefined)
+    throw new Error("legacy ownership directory is unavailable");
+  const marker = join(directory, `${runId}.json`);
+  const handle = await open(
+    marker,
+    constants.O_WRONLY |
+      constants.O_CREAT |
+      constants.O_EXCL |
+      (constants.O_NOFOLLOW ?? 0),
+    0o600,
+  );
+  try {
+    await handle.writeFile(
+      JSON.stringify({
+        schema_version: "1",
+        kind: "review-mesh.legacy-run-ownership",
+        run_id: runId,
+        dev: identity.dev,
+        ino: identity.ino,
+        byte_count: byteCount,
+        mtime_ns: mtimeNs,
+        completed: true,
+      }),
+    );
+    await handle.sync();
+  } finally {
+    await handle.close();
   }
 }
 
@@ -474,6 +695,17 @@ async function removeStaleActiveRuns(
       const identity = parseActiveRunFileName(entry.name);
       if (identity === undefined) return;
       const path = join(runsDirectory, entry.name);
+      const prefix = await readPinnedBytes(path, MAX_LEGACY_HEADER_BYTES);
+      if (
+        prefix?.bytes
+          .subarray(
+            0,
+            prefix.bytes.indexOf(10) < 0 ? undefined : prefix.bytes.indexOf(10),
+          )
+          .toString("utf8")
+          .includes('"run.artifact"')
+      )
+        return;
       let mtimeMs: number;
       try {
         await assertPinnedRunsDirectory(runsDirectory, pinned);
@@ -538,6 +770,7 @@ export function createRunRecorder({
   let closePromise: Promise<void> | undefined;
   let pinnedRunsDirectory: PinnedDirectory | undefined;
   let state: "open" | "closing" | "closed" = "open";
+  let legacyCompleted = false;
 
   const initialize = (): Promise<FileHandle> => {
     initialized ??= (async () => {
@@ -615,6 +848,12 @@ export function createRunRecorder({
       return enqueue(async () => {
         const handle = await initialize();
         await handle.appendFile(eventLine(event));
+        if (
+          event.event === "run.completed" &&
+          event.run_id === runId &&
+          ["1", "2", "3", "4", "5"].includes(event.schema_version)
+        )
+          legacyCompleted = true;
       });
     },
     onRecord(record) {
@@ -640,6 +879,7 @@ export function createRunRecorder({
             throw new Error("runs directory identity was not initialized");
           }
           let published = false;
+          let publishedIdentity: { dev: string; ino: string } | undefined;
           try {
             if (publish) {
               await beforeOperation("link");
@@ -662,6 +902,11 @@ export function createRunRecorder({
                   "published run record identity does not match active handle",
                 );
               }
+              const exact = await handle.stat({ bigint: true });
+              publishedIdentity = {
+                dev: String(exact.dev),
+                ino: String(exact.ino),
+              };
             }
           } catch (error) {
             if (published) {
@@ -682,6 +927,28 @@ export function createRunRecorder({
             throw error;
           }
           await handle.close();
+          if (published && legacyCompleted) {
+            await assertPinnedRunsDirectory(resolvedRunsDirectory, pinned);
+            const metadata = await lstat(runFile, { bigint: true });
+            if (
+              publishedIdentity === undefined ||
+              metadata.isSymbolicLink() ||
+              !metadata.isFile() ||
+              String(metadata.dev) !== publishedIdentity.dev ||
+              String(metadata.ino) !== publishedIdentity.ino
+            )
+              throw new Error(
+                "legacy publication identity changed before ownership registration",
+              );
+            await recordLegacyOwnership(
+              resolvedRunsDirectory,
+              runId,
+              publishedIdentity,
+              Number(metadata.size),
+              String(metadata.mtimeNs),
+            );
+            await assertPinnedRunsDirectory(resolvedRunsDirectory, pinned);
+          }
           await removeFromPinnedDirectory(
             fileSystem,
             resolvedRunsDirectory,

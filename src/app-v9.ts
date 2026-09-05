@@ -1,13 +1,6 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import {
-  lstat,
-  mkdir,
-  open,
-  readFile,
-  unlink,
-  type FileHandle,
-} from "node:fs/promises";
+import { lstat, open, unlink, type FileHandle } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { loadConfigFiles } from "./config/load.js";
 import { resolveConfig } from "./config/resolve.js";
@@ -17,13 +10,17 @@ import { createGitRunner } from "./context/git.js";
 import { reviewRequestV2Schema } from "./protocol/schemas.js";
 import { reviewRequestV3Schema } from "./protocol/v9.js";
 import { createV9EventWriter } from "./protocol/v9-event-writer.js";
-import { createRunArtifact } from "./diagnostics/run-artifact.js";
+import {
+  createManagedRunArtifact,
+  copyVerifiedArtifact,
+} from "./diagnostics/run-artifact.js";
 import {
   indexRunArtifact,
   observePublicStream,
   createSafeArtifactParent,
   safeArtifactParent,
   verifyArtifactFile,
+  RunArtifactError,
   type ArtifactReference,
 } from "./diagnostics/run-index.js";
 import { runV9Review } from "./orchestrator/run-v9.js";
@@ -155,8 +152,6 @@ export async function runV9Application(
     return 2;
   }
   await createSafeArtifactParent(join(paths.runsDirectory, ".index-marker"));
-  const managedPath = join(paths.runsDirectory, `${runId}.jsonl`);
-  const primaryPath = managedPath;
   let detailsHandle: FileHandle | undefined;
   let detailsIdentity: { dev: bigint; ino: bigint } | undefined;
   if (options.detailsFile) {
@@ -179,14 +174,14 @@ export async function runV9Application(
       return 2;
     }
   }
-  let artifact: Awaited<ReturnType<typeof createRunArtifact>>;
+  let artifact: Awaited<ReturnType<typeof createManagedRunArtifact>>;
   let externalPublished = false;
-  let stagingRemoved = false;
   try {
-    artifact = await createRunArtifact({
-      path: primaryPath,
+    artifact = await createManagedRunArtifact({
+      runsDirectory: paths.runsDirectory,
       runId,
       toolVersion: reviewMeshVersion,
+      publishManaged: config.diagnostics.persist_runs,
     });
   } catch {
     await detailsHandle?.close();
@@ -205,54 +200,97 @@ export async function runV9Application(
     shutdownGraceMs: config.execution.shutdown_grace_period_ms,
     recordEvent: (event) => artifact.record(event),
     finalize: async (summary) => {
-      const stagingReference = await artifact.finalize(summary);
-      let reference = stagingReference;
-      if (detailsHandle) {
-        const target = await lstat(options.detailsFile!, { bigint: true });
-        if (
-          !target.isFile() ||
-          target.isSymbolicLink() ||
-          target.dev !== detailsIdentity?.dev ||
-          target.ino !== detailsIdentity.ino
-        )
-          throw new Error("Details file identity changed.");
-        const bytes = await readFile(stagingReference.path);
-        await detailsHandle.writeFile(bytes);
-        await detailsHandle.sync();
-        await detailsHandle.close();
-        detailsHandle = undefined;
-        const copy = await verifyArtifactFile(
-          resolve(options.detailsFile!),
-          detailsIdentity === undefined
-            ? undefined
-            : {
-                dev: String(detailsIdentity.dev),
-                ino: String(detailsIdentity.ino),
-              },
-        );
-        if (
-          copy.byte_count !== stagingReference.byte_count ||
-          copy.sha256 !== stagingReference.sha256
-        )
-          throw new Error("Details file verification failed.");
-        if (!config.diagnostics.persist_runs) {
-          reference = {
-            ...stagingReference,
-            path: resolve(options.detailsFile!),
-          };
-          externalPublished = true;
+      let stage = "artifact_finalization";
+      try {
+        const stagingReference = await artifact.finalize(summary);
+        let reference = stagingReference;
+        const alternatives: ArtifactReference[] =
+          config.diagnostics.persist_runs && artifact.recoveryReference
+            ? [artifact.recoveryReference]
+            : [];
+        if (detailsHandle) {
+          stage = "artifact_details_publication";
+          const target = await lstat(options.detailsFile!, { bigint: true });
+          if (
+            !target.isFile() ||
+            target.isSymbolicLink() ||
+            target.dev !== detailsIdentity?.dev ||
+            target.ino !== detailsIdentity.ino
+          )
+            throw new Error("Details file identity changed.");
+          await copyVerifiedArtifact(
+            artifact.recoveryReference ?? stagingReference,
+            detailsHandle,
+          );
+          await detailsHandle.close();
+          detailsHandle = undefined;
+          const copy = await verifyArtifactFile(
+            resolve(options.detailsFile!),
+            detailsIdentity === undefined
+              ? undefined
+              : {
+                  dev: String(detailsIdentity.dev),
+                  ino: String(detailsIdentity.ino),
+                },
+          );
+          if (
+            copy.byte_count !== stagingReference.byte_count ||
+            copy.sha256 !== stagingReference.sha256
+          )
+            throw new Error("Details file verification failed.");
+          if (!config.diagnostics.persist_runs) {
+            reference = {
+              ...stagingReference,
+              path: resolve(options.detailsFile!),
+            };
+            externalPublished = true;
+          } else
+            alternatives.push({
+              ...stagingReference,
+              path: resolve(options.detailsFile!),
+            });
         }
+        stage = "artifact_index_publication";
+        await indexRunArtifact({
+          runsDirectory: paths.runsDirectory,
+          runId,
+          artifact: reference,
+          alternatives,
+          ownership: config.diagnostics.persist_runs ? "managed" : "caller",
+        });
+        await artifact.persisted();
+        return reference;
+      } catch (error) {
+        throw new RunArtifactError(
+          error instanceof RunArtifactError
+            ? error.code
+            : "artifact_unavailable",
+          error instanceof Error
+            ? error.message
+            : "Artifact publication failed.",
+          {
+            cause: error,
+            diagnosticDetails: {
+              ...(error instanceof RunArtifactError
+                ? error.diagnosticDetails
+                : {}),
+              stage:
+                stage === "artifact_finalization" &&
+                error instanceof RunArtifactError &&
+                error.diagnosticDetails.stage
+                  ? error.diagnosticDetails.stage
+                  : stage,
+              run_id: runId,
+              ...(artifact.recoveryReference
+                ? {
+                    recovery_artifact: artifact.recoveryReference,
+                    recovery_command: `review-mesh recover ${runId} --artifact ${JSON.stringify(artifact.recoveryReference.path)}`,
+                  }
+                : {}),
+            },
+          },
+        );
       }
-      await indexRunArtifact({
-        runsDirectory: paths.runsDirectory,
-        runId,
-        artifact: reference,
-      });
-      if (!config.diagnostics.persist_runs) {
-        await unlink(stagingReference.path);
-        stagingRemoved = true;
-      }
-      return reference;
     },
     observe: (outcome) =>
       observePublicStream({
@@ -285,6 +323,9 @@ export async function runV9Application(
     diagnostic(
       "review_failed",
       error instanceof Error ? error.message : "The review failed.",
+      error instanceof RunArtifactError
+        ? { details: error.diagnosticDetails }
+        : {},
     );
     return options.signal.aborted ? 4 : 3;
   } finally {
@@ -293,8 +334,6 @@ export async function runV9Application(
     await writer.close().catch(() => undefined);
     await artifact.close().catch(() => undefined);
     await detailsHandle?.close();
-    if (!config.diagnostics.persist_runs && !stagingRemoved)
-      await unlink(managedPath).catch(() => undefined);
     if (
       !config.diagnostics.persist_runs &&
       !externalPublished &&

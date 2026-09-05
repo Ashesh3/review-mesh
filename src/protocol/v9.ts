@@ -758,6 +758,24 @@ const progressData = z.strictObject({
 const publicEventV6BaseSchema = z.discriminatedUnion("event", [
   z.strictObject({
     ...v6EventEnvelope,
+    event: z.literal("run.persistence_failed"),
+    data: z.strictObject({
+      terminal: z.literal(true),
+      exit_code: z.literal(3),
+      reason: boundedId,
+      stage: boundedId,
+      message: utf8String(1000),
+      native_error_code: z
+        .string()
+        .regex(/^[A-Z][A-Z0-9_]{0,63}$/u)
+        .optional(),
+      path: utf8String(4096).optional(),
+      recovery_command: utf8String(4096).optional(),
+      recovery_artifact: artifactReferenceSchema.optional(),
+    }),
+  }),
+  z.strictObject({
+    ...v6EventEnvelope,
     event: z.literal("run.completed"),
     data: v6RunCompletedDataSchema,
   }),
@@ -907,7 +925,9 @@ const publicEventV6BaseSchema = z.discriminatedUnion("event", [
 export const publicEventV6Schema = publicEventV6BaseSchema.superRefine(
   (value, ctx) => {
     if (
-      (value.event === "run.completed" || value.event === "suite.heartbeat") &&
+      (value.event === "run.completed" ||
+        value.event === "run.persistence_failed" ||
+        value.event === "suite.heartbeat") &&
       Buffer.byteLength(JSON.stringify(value), "utf8") >= 16 * 1_024
     ) {
       ctx.addIssue({
