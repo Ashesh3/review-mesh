@@ -193,7 +193,7 @@ describe("portable CLI", () => {
 
     const version = await runArguments(artifact, ["--version"], options);
     expect(version).toMatchObject({ exitCode: 0, stderr: "" });
-    expect(version.stdout).toBe("review-mesh 8.0.0\n");
+    expect(version.stdout).toBe("review-mesh 9.0.0\n");
 
     const schema = await runArguments(
       artifact,

@@ -267,7 +267,7 @@ describe("compiled CLI acceptance", () => {
     expect(result).toMatchObject({
       exitCode: 0,
       signal: null,
-      stdout: "review-mesh 8.0.0\n",
+      stdout: "review-mesh 9.0.0\n",
       stderr: "",
     });
   });
