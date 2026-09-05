@@ -45,6 +45,7 @@ import type {
   V9EventDraft,
 } from "../protocol/v9-event-writer.js";
 import { reviewerResultDigest } from "../results/digest.js";
+import { sanitizedResultPages } from "../results/sanitized-pages.js";
 import {
   ResultSanitizationError,
   sanitizeReviewerOutput,
@@ -66,6 +67,23 @@ export interface V9RunInput {
     result: ReviewerResultV4 | AdjudicationResultV2,
   ): Promise<void>;
   outputMode?: "concise-jsonl" | "compact-jsonl" | "full-jsonl";
+  retry?: {
+    parentRunId: string;
+    runLensIds: readonly string[];
+    inherited: ReadonlyArray<{
+      reviewerId: string;
+      lensId: string;
+      result: ReviewerResultV4 | AdjudicationResultV2;
+      resultDigest: string;
+      resultByteCount: number;
+      coverageEntries: readonly Record<string, unknown>[];
+      terminal: Record<string, unknown>;
+    }>;
+    inheritance: "exact" | "rerun_all";
+    rawFindings: readonly CanonicalRawFinding[];
+    proofBySourceRef: Readonly<Record<string, CanonicalFindingCoreProof>>;
+    adjudicationOutcomes: readonly Record<string, unknown>[];
+  };
   now?: () => number;
 }
 interface Job {
@@ -150,20 +168,27 @@ export async function runV9Review(input: V9RunInput) {
     () => controller.abort(new Error("Run deadline exceeded.")),
     Math.max(0, runDeadline - now()),
   );
-  const jobs: Job[] = input.config.reviewers.map((reviewer) => ({
-    reviewer,
-    status: "queued",
-    phase: "queued",
-    mode: "full_review",
-    attempt: 0,
-    startedAt: start,
-    attemptStartedAt: start,
-    attemptDeadline: runDeadline,
-    lensDeadline: Math.min(
-      runDeadline,
-      start + (reviewer.policy?.lensDeadlineMs ?? deadline.duration_ms),
-    ),
-  }));
+  const runLensIds =
+    input.retry === undefined ? undefined : new Set(input.retry.runLensIds);
+  const jobs: Job[] = input.config.reviewers
+    .filter(
+      (reviewer) =>
+        runLensIds === undefined || runLensIds.has(lensId(reviewer)),
+    )
+    .map((reviewer) => ({
+      reviewer,
+      status: "queued",
+      phase: "queued",
+      mode: "full_review",
+      attempt: 0,
+      startedAt: start,
+      attemptStartedAt: start,
+      attemptDeadline: runDeadline,
+      lensDeadline: Math.min(
+        runDeadline,
+        start + (reviewer.policy?.lensDeadlineMs ?? deadline.duration_ms),
+      ),
+    }));
   const chains = new Map<string, Job[]>();
   for (const job of jobs)
     chains.set(lensId(job.reviewer), [
@@ -174,9 +199,14 @@ export async function runV9Review(input: V9RunInput) {
     ...describeTopology(input.config),
     ...(input.config.migrationWarnings ?? []),
   ];
-  const raw: CanonicalRawFinding[] = [];
-  const proofBySourceRef: Record<string, CanonicalFindingCoreProof> = {};
-  const adjudicationOutcomes: Array<Record<string, unknown>> = [];
+  const raw: CanonicalRawFinding[] = structuredClone([
+    ...(input.retry?.rawFindings ?? []),
+  ]);
+  const proofBySourceRef: Record<string, CanonicalFindingCoreProof> =
+    structuredClone(input.retry?.proofBySourceRef ?? {});
+  const adjudicationOutcomes: Array<Record<string, unknown>> = structuredClone([
+    ...(input.retry?.adjudicationOutcomes ?? []),
+  ]);
   const lensStates = new Map<
     string,
     "passed" | "findings" | "incomplete" | "not_applicable" | "not_evaluated"
@@ -199,7 +229,7 @@ export async function runV9Review(input: V9RunInput) {
   let cleanupDeadline: number | undefined;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   let pendingHeartbeat: Promise<void> | undefined;
-  let completedResults = 0;
+  let completedResults = input.retry?.inherited.length ?? 0;
   let outputFailure = false;
   const mode = input.outputMode ?? "concise-jsonl";
   const circuitAdmission = (reviewer: ResolvedReviewer) => {
@@ -270,8 +300,8 @@ export async function runV9Review(input: V9RunInput) {
     if (adapter?.forceCleanup === undefined || cleanupScheduled.has(adapter))
       return undefined;
     cleanupScheduled.add(adapter);
-    const cleanup = adapter
-      .forceCleanup()
+    const cleanup = Promise.resolve()
+      .then(() => adapter.forceCleanup!())
       .catch(() => undefined)
       .finally(() => cleanupTasks.delete(cleanup));
     cleanupTasks.add(cleanup);
@@ -885,7 +915,16 @@ export async function runV9Review(input: V9RunInput) {
             });
           if (terminal.resultStorage?.pages !== undefined) {
             let index = 0;
-            for await (const page of terminal.resultStorage.pages()) {
+            const pageResult =
+              final.schema_version === "4"
+                ? (({ change_coverage: _coverage, ...provider }) => provider)(
+                    final,
+                  )
+                : final;
+            for (const page of await sanitizedResultPages(
+              terminal.resultStorage.pages(),
+              pageResult,
+            )) {
               await input.record({
                 record: "reviewer.result_page",
                 reviewer_id: reviewer.id,
@@ -893,6 +932,9 @@ export async function runV9Review(input: V9RunInput) {
                   index,
                   raw: page.raw,
                   sha256: page.sha256,
+                  serialization_boundary:
+                    terminal.resultStorage.serializationBoundary ??
+                    "provider_raw",
                 },
               });
               index += 1;
@@ -1039,7 +1081,12 @@ export async function runV9Review(input: V9RunInput) {
   try {
     await emit({
       event: "run.started",
-      data: { consistency_mode: "live_worktree" },
+      data: {
+        consistency_mode: "live_worktree",
+        ...(input.retry === undefined
+          ? {}
+          : { parent_run_id: input.retry.parentRunId }),
+      },
     });
     await input.record({ record: "context", context: input.context });
     const { source: _source, ...reviewScope } = input.context.review_scope;
@@ -1105,6 +1152,31 @@ export async function runV9Review(input: V9RunInput) {
         detail_ref: "resolution",
       },
     });
+    for (const inherited of input.retry?.inherited ?? []) {
+      await input.recordResult(inherited.reviewerId, inherited.result);
+      for (
+        let index = 0;
+        index < inherited.coverageEntries.length;
+        index += 256
+      )
+        await input.record({
+          record: "reviewer.coverage",
+          reviewer_id: inherited.reviewerId,
+          data: {
+            index: index / 256,
+            entries: inherited.coverageEntries.slice(index, index + 256),
+          },
+        });
+      await input.record({
+        record: "reviewer.terminal",
+        reviewer_id: inherited.reviewerId,
+        data: structuredClone(inherited.terminal),
+      });
+      lensStates.set(
+        inherited.lensId,
+        inherited.result.verdict === "fail" ? "findings" : "passed",
+      );
+    }
     heartbeat = setInterval(() => {
       if (pendingHeartbeat || outputFailure) return;
       const active = jobs.filter(

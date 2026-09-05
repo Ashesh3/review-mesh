@@ -1,4 +1,5 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -823,8 +824,11 @@ describe("v9 run orchestration", () => {
           },
           resultStorage: {
             async *pages() {
-              yield { raw: '{"page":0}', sha256: "a".repeat(64) };
-              yield { raw: '{"page":1}', sha256: "b".repeat(64) };
+              const page = JSON.stringify({ schema_version: "1", kind: "review-mesh.result-page", result_id: "fixture-pages", result_kind: "reviewer", result_schema_version: "4", page_index: 0, page_count: 2, page_kind: "header", previous_page_digest: null, payload: { verdict: "pass", summary: "done", informational_notes: [], narrative_byte_count: 4, narrative_fragment_count: 1, actionable_finding_count: 0, coverage_attestation: null } });
+              const digest = createHash("sha256").update(page).digest("hex");
+              yield { raw: page, sha256: digest };
+              const next = JSON.stringify({ schema_version: "1", kind: "review-mesh.result-page", result_id: "fixture-pages", result_kind: "reviewer", result_schema_version: "4", page_index: 1, page_count: 2, page_kind: "narrative", previous_page_digest: digest, payload: { text_fragment: "done" } });
+              yield { raw: next, sha256: createHash("sha256").update(next).digest("hex") };
             },
             persisted() {
               order.push("persisted");
@@ -868,10 +872,7 @@ describe("v9 run orchestration", () => {
       records
         .filter((record) => record.record === "reviewer.result_page")
         .map((record) => record.data),
-    ).toEqual([
-      { index: 0, raw: '{"page":0}', sha256: "a".repeat(64) },
-      { index: 1, raw: '{"page":1}', sha256: "b".repeat(64) },
-    ]);
+    ).toEqual([expect.objectContaining({ index: 0, serialization_boundary: "provider_raw" }), expect.objectContaining({ index: 1, serialization_boundary: "provider_raw" })]);
   });
 
   it("falls back when repeated activity identities do not make progress", async () => {

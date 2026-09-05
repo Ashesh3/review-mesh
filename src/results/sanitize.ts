@@ -173,6 +173,11 @@ function sanitizeValue(value: unknown): unknown {
   return null;
 }
 
+/** Lossless credential redaction for private metadata; never truncates text. */
+export function sanitizeRunMetadata(value: unknown): unknown {
+  return sanitizeValue(value);
+}
+
 export function sanitizeReviewerResult(value: unknown): ReviewerResultV3 {
   const sanitized = reviewerResultV3Schema.parse(sanitizeValue(value));
   const byteLength = Buffer.byteLength(JSON.stringify(sanitized), "utf8");
