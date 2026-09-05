@@ -20,6 +20,7 @@ import { adapterFailure, type AdapterFailure } from "./errors.js";
 import { createReadOnlyFileTools } from "./file-tools.js";
 import {
   acknowledgeInitialDiffDelivery,
+  assembleResultPages,
   createResultPageStorageBridge,
   nextPageAssignment,
   outputTruncatedFailure,
@@ -558,6 +559,7 @@ class ClaudeAdapter implements ReviewAdapter {
         type: "json_schema",
         schema: input.resultJsonSchema,
       },
+      includePartialMessages: true,
       persistSession: sessionDirectory !== undefined,
       ...(resumeSessionId === undefined ? {} : { resume: resumeSessionId }),
       env: {
@@ -926,9 +928,22 @@ class ClaudeAdapter implements ReviewAdapter {
             byteCount: Buffer.byteLength(raw, "utf8"),
           };
           if (!pages.collector.complete) continue;
+          const assembled = await assembleResultPages(
+            pages.collector,
+            pageStorage!,
+            "Claude",
+          );
+          if (!assembled.ok) {
+            yield {
+              type: "failure",
+              failure: assembled.failure,
+              isolation: sandboxed ? "enforced_read_only" : "prompt_only",
+            };
+            return;
+          }
           yield {
             type: "result",
-            result: pages.collector.assemble(),
+            result: assembled.result,
             isolation: sandboxed ? "enforced_read_only" : "prompt_only",
             resultStorage: pageStorage!.resultStorage(),
           };

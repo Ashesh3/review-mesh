@@ -10,6 +10,7 @@ import { adapterFailure } from "./errors.js";
 import { createReadOnlyFileTools } from "./file-tools.js";
 import {
   acknowledgeInitialDiffDelivery,
+  assembleResultPages,
   createResultPageStorageBridge,
   nextPageAssignment,
   outputTruncatedFailure,
@@ -880,9 +881,22 @@ class CopilotAdapter implements ReviewAdapter {
             byteCount: Buffer.byteLength(finalMessage.data.content, "utf8"),
           };
         }
+        const assembled = await assembleResultPages(
+          pages.collector,
+          pageStorage,
+          "Copilot",
+        );
+        if (!assembled.ok) {
+          yield {
+            type: "failure",
+            failure: assembled.failure,
+            isolation,
+          };
+          return;
+        }
         yield {
           type: "result",
-          result: pages.collector.assemble(),
+          result: assembled.result,
           isolation,
           resultStorage: pageStorage.resultStorage(),
         };

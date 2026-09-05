@@ -101,6 +101,22 @@ export interface ResultPageStorageBridge {
   };
 }
 
+export async function assembleResultPages(
+  collector: ResultPageCollector,
+  storage: ResultPageStorageBridge,
+  provider: string,
+): Promise<
+  | { ok: true; result: ReturnType<ResultPageCollector["assemble"]> }
+  | { ok: false; failure: AdapterFailure }
+> {
+  try {
+    return { ok: true, result: collector.assemble() };
+  } catch (error) {
+    await storage.abandon();
+    return { ok: false, failure: pageFailure(error, provider) };
+  }
+}
+
 /** Stores each serialized page before validation and retains rejected bytes. */
 export function createResultPageStorageBridge(
   input: AdapterReviewInput,

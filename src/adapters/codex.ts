@@ -12,6 +12,7 @@ import { getAppPaths } from "../config/paths.js";
 import { currentReviewerOutputSchema } from "../protocol/schemas.js";
 import { adapterFailure } from "./errors.js";
 import {
+  assembleResultPages,
   createResultPageStorageBridge,
   nextPageAssignment,
   pageCollectorFor,
@@ -443,9 +444,22 @@ class CodexAdapter implements ReviewAdapter {
             byteCount: Buffer.byteLength(completedAgentMessage, "utf8"),
           };
         }
+        const assembled = await assembleResultPages(
+          pages.collector,
+          pageStorage,
+          "Codex",
+        );
+        if (!assembled.ok) {
+          yield {
+            type: "failure",
+            failure: assembled.failure,
+            isolation: "runtime_read_only",
+          };
+          return;
+        }
         yield {
           type: "result",
-          result: pages.collector.assemble(),
+          result: assembled.result,
           isolation: "runtime_read_only",
           resultStorage: pageStorage.resultStorage(),
         };

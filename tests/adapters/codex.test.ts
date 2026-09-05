@@ -298,6 +298,136 @@ describe("Codex adapter", () => {
     );
     expect(capabilities.observed_file_access).toBe(false);
   });
+  it("preserves an assembly-only invalid-result failure", async () => {
+    const raw = JSON.stringify({
+      schema_version: "1",
+      kind: "review-mesh.result-page",
+      result_id: "codex-false-count",
+      result_kind: "reviewer",
+      result_schema_version: "4",
+      page_index: 0,
+      page_count: 1,
+      page_kind: "header",
+      previous_page_digest: null,
+      payload: {
+        verdict: "pass",
+        summary: "clean",
+        informational_notes: [],
+        narrative_byte_count: 1,
+        narrative_fragment_count: 1,
+        actionable_finding_count: 0,
+        coverage_attestation: null,
+      },
+    });
+    const prepared = await setup({
+      stream: events(
+        {
+          type: "item.completed",
+          item: { id: "page", type: "agent_message", text: raw },
+        },
+        { type: "turn.completed", usage: completedUsage() },
+      ),
+    });
+    prepared.input.resultPages = createResultPageCollector({
+      resultId: "codex-false-count",
+      resultKind: "reviewer",
+    });
+
+    const terminal = terminalFailure(
+      await collect(prepared.adapter.run(prepared.input)),
+    );
+
+    expect(terminal.failure).toMatchObject({
+      reason: "invalid_result",
+      diagnostics: {
+        failure_code: "provider_response_invalid",
+        failure_stage: "structured_result_page",
+      },
+    });
+  });
+  it("preserves an aggregate result-too-large failure from final assembly", async () => {
+    const resultId = "codex-aggregate-oversize";
+    const fragment = "x".repeat(24 * 1_024);
+    const fragmentCount = 683;
+    const pageCount = fragmentCount + 1;
+    const collector = createResultPageCollector({
+      resultId,
+      resultKind: "reviewer",
+    });
+    let previous = JSON.stringify({
+      schema_version: "1",
+      kind: "review-mesh.result-page",
+      result_id: resultId,
+      result_kind: "reviewer",
+      result_schema_version: "4",
+      page_index: 0,
+      page_count: pageCount,
+      page_kind: "header",
+      previous_page_digest: null,
+      payload: {
+        verdict: "pass",
+        summary: "clean",
+        informational_notes: [],
+        narrative_byte_count: fragment.length * fragmentCount,
+        narrative_fragment_count: fragmentCount,
+        actionable_finding_count: 0,
+        coverage_attestation: null,
+      },
+    });
+    collector.addPage(previous);
+    for (let pageIndex = 1; pageIndex < fragmentCount; pageIndex += 1) {
+      const raw = JSON.stringify({
+        schema_version: "1",
+        kind: "review-mesh.result-page",
+        result_id: resultId,
+        result_kind: "reviewer",
+        result_schema_version: "4",
+        page_index: pageIndex,
+        page_count: pageCount,
+        page_kind: "narrative",
+        previous_page_digest: createHash("sha256")
+          .update(previous)
+          .digest("hex"),
+        payload: { text_fragment: fragment },
+      });
+      collector.addPage(raw);
+      previous = raw;
+    }
+    const finalPage = JSON.stringify({
+      schema_version: "1",
+      kind: "review-mesh.result-page",
+      result_id: resultId,
+      result_kind: "reviewer",
+      result_schema_version: "4",
+      page_index: fragmentCount,
+      page_count: pageCount,
+      page_kind: "narrative",
+      previous_page_digest: createHash("sha256").update(previous).digest("hex"),
+      payload: { text_fragment: fragment },
+    });
+    const prepared = await setup({
+      stream: events(
+        {
+          type: "item.completed",
+          item: { id: "page", type: "agent_message", text: finalPage },
+        },
+        { type: "turn.completed", usage: completedUsage() },
+      ),
+    });
+    prepared.input.resultPages = collector;
+
+    const terminal = terminalFailure(
+      await collect(prepared.adapter.run(prepared.input)),
+    );
+
+    expect(terminal.failure).toMatchObject({
+      reason: "result_too_large",
+      diagnostics: {
+        failure_code: "provider_response_invalid",
+        failure_stage: "structured_result_page",
+      },
+    });
+  });
   it("continues v9 pages through the same facade thread", async () => {
     const first = JSON.stringify({
       schema_version: "1",

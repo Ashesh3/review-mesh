@@ -329,6 +329,7 @@ describe("Claude Agent SDK adapter", () => {
       stored.push(entry);
     expect(stored[0]?.raw).toBe(JSON.stringify(page));
     const options = prepared.query.calls[0]!.options;
+    expect(options.includePartialMessages).toBe(true);
     expect(options.tools).toEqual([]);
     expect(options.allowedTools).toEqual([
       "mcp__review_mesh__list_files",
@@ -346,6 +347,48 @@ describe("Claude Agent SDK adapter", () => {
     await expect(
       permission("Read", {}, permissionContext()),
     ).resolves.toMatchObject({ behavior: "deny" });
+  });
+  it("preserves an assembly-only invalid-result failure", async () => {
+    const prepared = setup([
+      messages(
+        successResult({
+          schema_version: "1",
+          kind: "review-mesh.result-page",
+          result_id: "claude-false-count",
+          result_kind: "reviewer",
+          result_schema_version: "4",
+          page_index: 0,
+          page_count: 1,
+          page_kind: "header",
+          previous_page_digest: null,
+          payload: {
+            verdict: "pass",
+            summary: "clean",
+            informational_notes: [],
+            narrative_byte_count: 1,
+            narrative_fragment_count: 1,
+            actionable_finding_count: 0,
+            coverage_attestation: null,
+          },
+        }),
+      ),
+    ]);
+    prepared.input.resultPages = createResultPageCollector({
+      resultId: "claude-false-count",
+      resultKind: "reviewer",
+    });
+
+    const terminal = terminalFailure(
+      await collect(prepared.adapter.run(prepared.input)),
+    );
+
+    expect(terminal.failure).toMatchObject({
+      reason: "invalid_result",
+      diagnostics: {
+        failure_code: "provider_response_invalid",
+        failure_stage: "structured_result_page",
+      },
+    });
   });
   it("credits observed reads only after the exact MCP body appears in a tool-result carrier", async () => {
     const acknowledgeDelivered = vi.fn(() => true);

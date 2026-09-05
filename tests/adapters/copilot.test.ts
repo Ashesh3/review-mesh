@@ -295,6 +295,46 @@ describe("Copilot adapter", () => {
       "copilot-pages",
     );
   });
+  it("preserves an assembly-only invalid-result failure", async () => {
+    const page = JSON.stringify({
+      schema_version: "1",
+      kind: "review-mesh.result-page",
+      result_id: "copilot-false-count",
+      result_kind: "reviewer",
+      result_schema_version: "4",
+      page_index: 0,
+      page_count: 1,
+      page_kind: "header",
+      previous_page_digest: null,
+      payload: {
+        verdict: "pass",
+        summary: "clean",
+        informational_notes: [],
+        narrative_byte_count: 1,
+        narrative_fragment_count: 1,
+        actionable_finding_count: 0,
+        coverage_attestation: null,
+      },
+    });
+    const fake = fakeFactory({ response: finalMessage(page) });
+    const prepared = setup({ createClient: fake.createClient });
+    prepared.input.resultPages = createResultPageCollector({
+      resultId: "copilot-false-count",
+      resultKind: "reviewer",
+    });
+
+    const terminal = terminalFailure(
+      await collect(prepared.adapter.run(prepared.input)),
+    );
+
+    expect(terminal.failure).toMatchObject({
+      reason: "invalid_result",
+      diagnostics: {
+        failure_code: "provider_response_invalid",
+        failure_stage: "structured_result_page",
+      },
+    });
+  });
   it("credits a serialized body only after Copilot reports the same model-facing tool result", async () => {
     const acknowledgeDelivered = vi.fn(() => true);
     const fake = fakeFactory({
