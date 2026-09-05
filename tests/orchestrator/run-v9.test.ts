@@ -94,6 +94,7 @@ describe("v9 run orchestration", () => {
         };
       },
     }));
+    const recorded: Record<string, unknown>[] = [];
     const completion = await runV9Review({
       runId: "full-scope-unread",
       config: base.config,
@@ -114,10 +115,22 @@ describe("v9 run orchestration", () => {
         outputFailed: () => false,
         close: async () => undefined,
       },
-      record: async () => undefined,
+      record: async (value) => {
+        recorded.push(value);
+      },
       recordResult: async () => undefined,
     });
     expect(completion.canonical.counts.gate_eligible_subfindings).toBe(0);
+    const resolution = recorded.find((entry) => entry.record === "resolution")
+      ?.resolution as { reviewers: Record<string, unknown>[] };
+    expect(resolution.reviewers[0]).toMatchObject({
+      adapter: base.config.reviewers[0]!.adapterId,
+      model: base.config.reviewers[0]!.model,
+      purpose: base.config.reviewers[0]!.purpose,
+      isolation: base.config.reviewers[0]!.isolationPolicy,
+    });
+    expect(resolution.reviewers[0]).not.toHaveProperty("instruction_layers");
+    expect(resolution.reviewers[0]).not.toHaveProperty("runtime");
     expect(completion.canonical.atomics[0]?.gate_eligibility.reasons).toContain(
       "evidence_unverified",
     );

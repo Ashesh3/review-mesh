@@ -2,10 +2,16 @@ import { lstat, open, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { readNormalizedRun, type NormalizedRun } from "./normalize-run.js";
 import { resolveRunArtifact } from "./run-index.js";
+import {
+  dashboardReviewerSummary,
+  projectDashboardRun,
+  sanitizeDashboardValue,
+} from "./dashboard-projection.js";
 
 export async function loadV9Run(
   runsDirectory: string,
   runId: string,
+  options: { maximumBytes?: number } = {},
 ): Promise<NormalizedRun | undefined> {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(runId))
     throw new Error("Invalid run ID.");
@@ -18,6 +24,11 @@ export async function loadV9Run(
     const handle = await open(candidate, "r").catch(() => undefined);
     if (!handle) return undefined;
     try {
+      if (
+        options.maximumBytes !== undefined &&
+        (await handle.stat()).size > options.maximumBytes
+      )
+        throw new Error("Artifact exceeds the dashboard byte budget.");
       const buffer = Buffer.alloc(4096);
       const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
       if (
@@ -32,7 +43,10 @@ export async function loadV9Run(
     }
     return readNormalizedRun(candidate, { allowActive: true });
   }
-  const resolved = await resolveRunArtifact(runId, { runsDirectory });
+  const resolved = await resolveRunArtifact(runId, {
+    runsDirectory,
+    ...options,
+  });
   return readNormalizedRun(resolved.artifact.path, {
     ...(resolved.digest_status === "verified"
       ? { expectedSha256: resolved.artifact.sha256 }
@@ -112,8 +126,10 @@ export function v9Status(run: NormalizedRun, reviewerId?: string) {
     reviewers,
   };
 }
-export function v9DashboardRun(run: NormalizedRun) {
+export function v9DashboardRun(run: NormalizedRun, fileUpdatedAt?: string) {
   const report = v9Report(run);
+  const live = projectDashboardRun(run, Date.now(), fileUpdatedAt);
+  const git = run.context?.git as Record<string, unknown> | undefined;
   const {
     records: _records,
     request: _request,
@@ -121,69 +137,51 @@ export function v9DashboardRun(run: NormalizedRun) {
     context: _context,
     ...safeReport
   } = report;
-  return {
+  return sanitizeDashboardValue({
     ...safeReport,
+    ...live,
+    active: run.active && !live.stale,
+    status: live.stale ? "stale" : report.status,
     context: {
       project_name: run.context?.project_name,
       workspace: run.context?.workspace,
       review_scope: run.context?.review_scope,
-      git: run.context?.git
-        ? {
-            is_repository: true,
-            branch: (run.context.git as Record<string, unknown>).branch,
-            head: (run.context.git as Record<string, unknown>).head,
-            changed_files_count: Array.isArray(
-              (run.context.git as Record<string, unknown>).changed_files,
-            )
-              ? (
-                  (run.context.git as Record<string, unknown>)
-                    .changed_files as unknown[]
-                ).length
-              : 0,
-          }
-        : { is_repository: false },
+      git:
+        git?.is_repository === true
+          ? {
+              is_repository: true,
+              branch: git.branch,
+              head: git.head,
+              changed_files_count: Array.isArray(git.changed_files)
+                ? git.changed_files.length
+                : 0,
+            }
+          : { is_repository: false },
     },
     schema_version: "2",
-    reviewers: run.reviewers.map((reviewer) => ({
-      ...reviewer,
-      ...((run.records.find(
-        (record) =>
-          record.event === "reviewer.started" &&
-          record.reviewer_id === reviewer.reviewer_id,
-      )?.data as Record<string, unknown> | undefined) ?? {}),
-      activity: run.records
-        .filter(
-          (record) =>
-            record.record === "reviewer.activity" &&
-            record.reviewer_id === reviewer.reviewer_id,
-        )
-        .map((record) => record.data),
-      state: reviewer.status,
-      result_digest: reviewer.digest,
-      result_byte_count: reviewer.byte_count,
-    })),
     findings: run.canonical.atomics,
     roots: run.canonical.roots,
-    events: run.records.filter((record) => typeof record.event === "string"),
     activity_notice:
       "Activity is coalesced; complete results are stored in the artifact.",
-  };
+  });
 }
-export function v9RunSummary(
-  run: NormalizedRun,
-  updatedAt = new Date().toISOString(),
-) {
+export function v9RunSummary(run: NormalizedRun, updatedAt?: string) {
   const git = run.context?.git as Record<string, unknown> | undefined;
-  return {
+  const live = projectDashboardRun(run, Date.now(), updatedAt);
+  return sanitizeDashboardValue({
     run_id: run.run_id,
-    active: run.active,
-    status: run.active ? "running" : run.run_outcome,
+    active: run.active && !live.stale,
+    status: live.stale ? "stale" : run.active ? "running" : run.run_outcome,
+    stale: live.stale,
     run_outcome: run.run_outcome,
     gate_outcome: run.gate_outcome,
     coverage_outcome: run.coverage_outcome,
     execution_coverage: run.execution_coverage,
     change_coverage: run.change_coverage,
-    updated_at: updatedAt,
+    updated_at: live.updated_at ?? updatedAt ?? new Date().toISOString(),
+    started_at: live.started_at,
+    finished_at: live.finished_at,
+    stage: live.stage,
     project_name: run.context?.project_name,
     workspace: run.context?.workspace,
     branch: git?.branch,
@@ -191,15 +189,18 @@ export function v9RunSummary(
       ? git.changed_files.length
       : 0,
     scope: (run.context?.review_scope as { mode?: string } | undefined)?.mode,
-    total_elapsed_ms: run.summary.total_elapsed_ms,
+    total_elapsed_ms: live.total_elapsed_ms,
     findings: run.canonical.counts.atomic_subfindings,
     ...run.canonical.counts,
-    model_runs: run.summary.model_runs,
-    deadline: run.summary.deadline,
+    logical_lenses: live.logical_lenses,
+    lenses: live.lenses,
+    model_runs: live.model_runs,
+    reviewers: live.reviewers.map(dashboardReviewerSummary),
+    deadline: live.deadline,
     artifact: run.artifact,
     digest_status: run.digest_status,
     headline: v9Headline(run),
-  };
+  });
 }
 export async function listV9Runs(runsDirectory: string): Promise<string[]> {
   const entries = await readdir(runsDirectory, { withFileTypes: true }).catch(

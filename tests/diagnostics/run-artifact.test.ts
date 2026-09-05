@@ -54,6 +54,38 @@ const complete = {
 };
 
 describe("immutable artifact format two", () => {
+  it("accepts legacy resolution metadata but rejects mismatched version declarations", async () => {
+    const { path } = await fixture();
+    const writer = await createRunArtifact({
+      path,
+      runId: "run-1",
+      toolVersion: "9.0.0",
+    });
+    await writer.record({
+      record: "resolution",
+      resolution: { reviewers: [{ id: "security" }] },
+    });
+    const original = await readFile(path, "utf8");
+    await writer.close();
+    await writeFile(
+      path,
+      original.replace('"resolution":"2"', '"resolution":"1"'),
+    );
+    await expect(
+      readRunArtifact(path, { allowActive: true }),
+    ).rejects.toMatchObject({ code: "unsupported_schema_version" });
+    const legacy = original
+      .replace('"resolution":"2"', '"resolution":"1"')
+      .replace(
+        '"record":"resolution","resolution":',
+        '"record":"resolution","resolution":',
+      )
+      .replace(/("record":"resolution"[^\n]*"schema_version":)"2"/u, '$1"1"');
+    await writeFile(path, legacy);
+    await expect(
+      readRunArtifact(path, { allowActive: true }),
+    ).resolves.toMatchObject({ active: true });
+  });
   it("reads an active prefix without pretending its terminal digest is finalized", async () => {
     const { path } = await fixture();
     const writer = await createRunArtifact({
@@ -226,7 +258,24 @@ describe("immutable artifact format two", () => {
     });
     await writer.record({
       record: "resolution",
-      resolution: { reviewers: [] },
+      resolution: {
+        reviewers: [
+          {
+            id: "security::primary",
+            agent_id: "security",
+            adapter: "copilot",
+            model: "model-a",
+            effort: "high",
+            provider_group: "provider-a",
+            purpose: "Review security",
+            model_index: 0,
+            configured_model_index: 1,
+            model_count: 3,
+            isolation: "prefer_enforced",
+            timeout_ms: 60000,
+          },
+        ],
+      },
     });
     const artifact = await writer.finalize({
       ...complete,
@@ -239,6 +288,22 @@ describe("immutable artifact format two", () => {
       record: "run.artifact",
       artifact_format_version: "2",
     });
+    expect(
+      records.find((record) => record.record === "resolution")?.resolution
+        .reviewers[0],
+    ).toMatchObject({
+      id: "security::primary",
+      adapter: "copilot",
+      model: "model-a",
+      effort: "high",
+      model_index: 0,
+      configured_model_index: 1,
+      model_count: 3,
+    });
+    expect(
+      records.find((record) => record.record === "resolution")?.schema_version,
+    ).toBe("2");
+    expect(records[0].private_record_versions.resolution).toBe("2");
     expect(records.at(-2)?.record).toBe("run.terminal_summary");
     expect(records.at(-1)?.record).toBe("run.artifact_terminal");
     expect(records.some((record) => record.event === "run.completed")).toBe(

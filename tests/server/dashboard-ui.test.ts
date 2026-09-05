@@ -80,7 +80,6 @@ describe("embedded dashboard UI", () => {
     expect(style).toMatch(
       /@media\s*\(max-width:\s*480px\)[\s\S]*?tbody\s+tr\s*\{[^}]*display:\s*grid/u,
     );
-    expect(dashboardHtml).toMatch(/<td\b[^>]*data-label=/u);
   });
 
   it("fully disables decorative motion when reduced motion is requested", () => {

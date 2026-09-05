@@ -1134,7 +1134,9 @@ async function readRunSummary(
   try {
     const { loadV9Run, v9RunSummary } =
       await import("../diagnostics/v9-views.js");
-    const current = await loadV9Run(dirname(candidate.path), candidate.runId);
+    const current = await loadV9Run(dirname(candidate.path), candidate.runId, {
+      maximumBytes: candidate.size,
+    });
     if (current)
       return v9RunSummary(current, candidate.modifiedAt) as DashboardRunSummary;
     const parsed = await parseCandidate(candidate);
@@ -1357,11 +1359,40 @@ export async function readDashboardSnapshot(input: {
   );
   const { listV9Runs, loadV9Run, v9RunSummary } =
     await import("../diagnostics/v9-views.js");
+  const considered = new Set(
+    [...candidates.selected, ...candidates.omitted].map(
+      (candidate) => candidate.runId,
+    ),
+  );
+  let remainingBytes = Math.max(
+    0,
+    (input.maximumTotalBytes ?? MAX_DASHBOARD_TOTAL_BYTES) -
+      candidates.selected.reduce(
+        (total, candidate) => total + candidate.size,
+        0,
+      ),
+  );
   for (const runId of await listV9Runs(input.appPaths.runsDirectory)) {
-    if (runs.some((run) => run.run_id === runId)) continue;
+    if (considered.has(runId)) continue;
+    if (runs.length >= MAX_DASHBOARD_RUNS) break;
+    considered.add(runId);
     try {
-      const current = await loadV9Run(input.appPaths.runsDirectory, runId);
-      if (current) runs.push(v9RunSummary(current) as DashboardRunSummary);
+      const current = await loadV9Run(input.appPaths.runsDirectory, runId, {
+        maximumBytes: remainingBytes,
+      });
+      if (current) {
+        remainingBytes = Math.max(
+          0,
+          remainingBytes - current.artifact.byte_count,
+        );
+        const updated = await stat(current.artifact.path);
+        runs.push(
+          v9RunSummary(
+            current,
+            updated.mtime.toISOString(),
+          ) as DashboardRunSummary,
+        );
+      }
     } catch (error) {
       runs.push({
         run_id: runId,
@@ -1661,7 +1692,10 @@ export async function readDashboardRun(input: {
   const { loadV9Run, v9DashboardRun } =
     await import("../diagnostics/v9-views.js");
   const current = await loadV9Run(input.appPaths.runsDirectory, input.runId);
-  if (current) return v9DashboardRun(current);
+  if (current) {
+    const updated = await stat(current.artifact.path);
+    return v9DashboardRun(current, updated.mtime.toISOString());
+  }
   const candidate = (
     await listRunFiles(input.appPaths.runsDirectory, Number.MAX_SAFE_INTEGER)
   ).selected.find((item) => item.runId === input.runId);

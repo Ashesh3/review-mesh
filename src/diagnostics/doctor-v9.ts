@@ -13,6 +13,7 @@ import { createRunArtifact } from "./run-artifact.js";
 import { indexRunArtifact, observePublicStream } from "./run-index.js";
 import { createV9EventWriter } from "../protocol/v9-event-writer.js";
 import { runV9Review } from "../orchestrator/run-v9.js";
+import { reviewMeshVersion } from "../discovery/help.js";
 
 export async function runDoctorV9(
   adapter: ReviewAdapter,
@@ -129,7 +130,7 @@ export async function runDoctorV9(
   const artifact = await createRunArtifact({
     path: join(paths.runsDirectory, `${runId}.jsonl`),
     runId,
-    toolVersion: "9.0.0",
+    toolVersion: reviewMeshVersion,
   });
   const writer = createV9EventWriter({
     output,

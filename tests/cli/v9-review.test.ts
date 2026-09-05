@@ -1,4 +1,5 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, readFile } from "node:fs/promises";
+import packageMetadata from "../../package.json" with { type: "json" };
 import { tmpdir } from "node:os";
 import { join, basename } from "node:path";
 import { PassThrough } from "node:stream";
@@ -141,6 +142,10 @@ agents = ["test"]
     const artifact = await resolveRunArtifact("run-test", {
       runsDirectory: paths.runsDirectory,
     });
+    const artifactHeader = JSON.parse(
+      (await readFile(artifact.artifact.path, "utf8")).split("\n")[0]!,
+    );
+    expect(artifactHeader.tool_version).toBe(packageMetadata.version);
     const normalized = await readNormalizedRun(artifact.artifact.path, {
       expectedSha256: artifact.artifact.sha256,
       expectedIdentity: artifact.expected_identity,

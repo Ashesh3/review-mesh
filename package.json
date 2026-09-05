@@ -1,6 +1,6 @@
 {
   "name": "review-mesh",
-  "version": "9.0.0",
+  "version": "9.1.0",
   "private": true,
   "files": [
     "dist/review-mesh.mjs",
@@ -43,6 +43,7 @@
   "devDependencies": {
     "@types/node": "22.20.0",
     "esbuild": "0.28.2",
+    "happy-dom": "20.11.15",
     "prettier": "3.9.6",
     "tsx": "4.23.12",
     "typescript": "5.9.3",

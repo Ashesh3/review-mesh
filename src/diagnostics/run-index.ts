@@ -178,6 +178,7 @@ export async function verifyArtifactFile(
     mtimeNs: bigint;
     ctimeNs: bigint;
   },
+  maximumBytes?: number,
 ) {
   if (!isAbsolute(path))
     throw new RunArtifactError(
@@ -197,6 +198,11 @@ export async function verifyArtifactFile(
         "The artifact directory identity changed.",
       );
     const before = await lstat(path, { bigint: true });
+    if (maximumBytes !== undefined && before.size > BigInt(maximumBytes))
+      throw new RunArtifactError(
+        "artifact_unavailable",
+        "Artifact exceeds the dashboard byte budget.",
+      );
     if (!before.isFile() || before.isSymbolicLink())
       throw new RunArtifactError(
         "artifact_identity_changed",
@@ -212,6 +218,11 @@ export async function verifyArtifactFile(
       );
     handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     const opened = await handle.stat({ bigint: true });
+    if (maximumBytes !== undefined && opened.size > BigInt(maximumBytes))
+      throw new RunArtifactError(
+        "artifact_unavailable",
+        "Artifact exceeds the dashboard byte budget.",
+      );
     if (
       !opened.isFile() ||
       !sameArtifactIdentity(artifactIdentity(opened), artifactIdentity(before))
@@ -227,10 +238,17 @@ export async function verifyArtifactFile(
       const { bytesRead } = await handle.read(
         buffer,
         0,
-        buffer.length,
+        maximumBytes === undefined
+          ? buffer.length
+          : Math.min(buffer.length, maximumBytes - position + 1),
         position,
       );
       if (bytesRead === 0) break;
+      if (maximumBytes !== undefined && position + bytesRead > maximumBytes)
+        throw new RunArtifactError(
+          "artifact_unavailable",
+          "Artifact exceeds the dashboard byte budget.",
+        );
       hash.update(buffer.subarray(0, bytesRead));
       position += bytesRead;
     }
@@ -468,7 +486,7 @@ export async function indexRunArtifact(input: {
 
 export async function resolveRunArtifact(
   id: string,
-  options: { runsDirectory: string },
+  options: { runsDirectory: string; maximumBytes?: number },
 ): Promise<{
   artifact: ArtifactReference;
   observed_public_stream?: PublicStreamOutcome;
@@ -478,7 +496,13 @@ export async function resolveRunArtifact(
   const index = await readIndex(indexPath(options.runsDirectory, id), id);
   if (index === undefined) {
     const path = join(resolve(options.runsDirectory), `${id}.jsonl`);
-    const verified = await verifyArtifactFile(path);
+    const verified = await verifyArtifactFile(
+      path,
+      undefined,
+      undefined,
+      undefined,
+      options.maximumBytes,
+    );
     return {
       artifact: {
         path,
@@ -490,9 +514,20 @@ export async function resolveRunArtifact(
       digest_status: "final_digest_unavailable",
     };
   }
+  if (
+    options.maximumBytes !== undefined &&
+    index.artifact.byte_count > options.maximumBytes
+  )
+    throw new RunArtifactError(
+      "artifact_unavailable",
+      "Artifact exceeds the dashboard byte budget.",
+    );
   const verified = await verifyArtifactFile(
     index.artifact.path,
     index.identity,
+    undefined,
+    undefined,
+    options.maximumBytes,
   );
   if (
     verified.sha256 !== index.artifact.sha256 ||

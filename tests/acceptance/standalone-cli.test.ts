@@ -351,7 +351,7 @@ describe.skipIf(!verifyStandalone)("standalone release executables", () => {
       const version = await runner.run(fixture, ["--version"]);
       expect(version, runner.name).toEqual({
         exitCode: 0,
-        stdout: "review-mesh 9.0.0\n",
+        stdout: "review-mesh 9.1.0\n",
         stderr: "",
       });
 

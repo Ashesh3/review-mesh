@@ -90,9 +90,11 @@ review-mesh serve [--host 127.0.0.1] [--port 0] [--no-open]
 ```
 
 `serve` starts the embedded Review Mesh Observer. The Reviews view shows active
-and recent runs as factual lens/reviewer timelines; selecting a run exposes its
-context, events, findings, attempts, and concrete reviewer results. Agents,
-Projects, and System show the complete configured catalog through a dedicated
+and recent runs with compact circular lifecycle stages and one row per logical
+reviewer. Expand a reviewer to inspect its configured model attempts. Timeline,
+Findings, and Events share a resizable bottom panel for recorded activity,
+results, coverage, and runtime details. Reviewers, Projects, and System show
+the complete configured catalog through a dedicated
 sanitized view. Instruction bodies and paths, project context values, runtime
 objects, adapter commands/arguments, endpoint values, and credential values are
 not served.
@@ -101,6 +103,11 @@ The server is deliberately local-only, read-only, same-origin, and dependency
 free. It defaults to `127.0.0.1` and an available operating-system-assigned port.
 The UI and server are compiled into both single-file distributions; no asset
 directory or CDN is required.
+
+The sun, moon, and monitor buttons select Light, Dark, or System appearance and
+remember the choice. Filters, selection, keyboard focus, and scroll position
+are preserved during live updates. Phone layouts reflow tables into cards.
+See [the v9.1 release notes](docs/releases/v9.1.0.md) for artifact compatibility.
 
 Review Mesh records sanitized phase and activity summaries for the reviewer
 inspector, plus full structured findings/results. These are not raw provider
@@ -122,13 +129,9 @@ For an AI caller, identity and scope are separate:
 
 ### Download a standalone executable
 
-Release `v9.0.0` is a breaking review-delivery and configuration release. The
-default review output is now bounded `concise-jsonl`; live reviewer results use
-schema v4; current configuration is schema v7; bounded result pages and
-length-limited provider output use exact continuation; streaming is configurable; strict
-artifacts reproduce the public digests and canonical counts; and structured
-doctor runs the real reviewer path. The self-contained Bun executables do not
-require Node.js or Bun:
+Release `v9.1.0` adds the redesigned dashboard, complete live reviewer rosters,
+and Light/Dark/System themes. It retains the v9 public review and configuration
+contracts. The self-contained Bun executables do not require Node.js or Bun:
 
 - Windows x64: `review-mesh-windows-x64.exe`
 - Linux x64 (glibc): `review-mesh-linux-x64`
@@ -136,14 +139,14 @@ require Node.js or Bun:
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v9.0.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
+Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v9.1.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
 .\review-mesh.exe review
 ```
 
 Linux:
 
 ```bash
-curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v9.0.0/review-mesh-linux-x64
+curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v9.1.0/review-mesh-linux-x64
 chmod +x ./review-mesh-linux-x64
 ./review-mesh-linux-x64 review
 ```
@@ -152,7 +155,7 @@ Each executable contains Review Mesh and its JavaScript dependencies. Git, trust
 
 Release binaries are built with Bun 1.4.0. Download and verify the exact checksum
 manifest from
-`https://github.com/Ashesh3/review-mesh/releases/download/v9.0.0/SHA256SUMS.txt`.
+`https://github.com/Ashesh3/review-mesh/releases/download/v9.1.0/SHA256SUMS.txt`.
 
 ### Build the portable Node.js file
 

@@ -263,11 +263,31 @@ export const artifactResolutionSchema = z.strictObject({
     z.strictObject({
       id,
       agent_id: id.optional(),
+      adapter: text.optional(),
+      model: text.optional(),
+      effort: text.optional(),
+      provider_group: text.optional(),
+      purpose: text.optional(),
+      model_index: count.optional(),
+      configured_model_index: count.optional(),
+      model_count: count.optional(),
+      isolation: text.optional(),
+      timeout_ms: count.optional(),
       policy: artifactResolutionPolicySchema.optional(),
     }),
   ),
   warnings: z.array(warning).optional(),
   deadline: selectedDeadlineSchema.optional(),
+});
+
+export const artifactResolutionV1Schema = artifactResolutionSchema.extend({
+  reviewers: z.array(
+    z.strictObject({
+      id,
+      agent_id: id.optional(),
+      policy: artifactResolutionPolicySchema.optional(),
+    }),
+  ),
 });
 
 export const privatePayloadSchemas: Record<string, z.ZodType> = {

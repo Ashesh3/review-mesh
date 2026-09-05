@@ -1,0 +1,258 @@
+export function dashboardFixture() {
+  const timestamp = "2026-09-05T08:30:00.000Z";
+  const reviewers = [
+    {
+      reviewer_id: "security::primary",
+      lens_id: "security",
+      state: "reviewing",
+      phase: "reviewing",
+      adapter: "copilot",
+      model: "Model A",
+      attempt: 1,
+      model_index: 0,
+      model_count: 2,
+      started_at: timestamp,
+      last_activity_at: timestamp,
+      mode: "full_review",
+      activity: [
+        { timestamp, summary: "Inspecting changed authentication code" },
+      ],
+    },
+    {
+      reviewer_id: "security::fallback",
+      lens_id: "security",
+      state: "deferred",
+      phase: "deferred",
+      adapter: "codex",
+      model: "Model B",
+      model_index: 1,
+      model_count: 2,
+    },
+    {
+      reviewer_id: "reliability::primary",
+      lens_id: "reliability",
+      state: "validating",
+      phase: "validating",
+      adapter: "codex",
+      model: "Model C",
+      attempt: 1,
+      model_index: 0,
+    },
+    {
+      reviewer_id: "performance::primary",
+      lens_id: "performance",
+      state: "queued",
+      phase: "queued",
+      adapter: "copilot",
+      model: "Model D",
+      model_index: 0,
+    },
+  ];
+  const finding = {
+    id: "finding-1",
+    title: "Retry can submit a payment twice",
+    severity: "high",
+    description: "A retry can duplicate a completed payment.",
+    evidence: [
+      {
+        path: "src/payment.ts",
+        start_line: 84,
+        end_line: 86,
+        detail: "The retry does not reuse the transaction key.",
+      },
+    ],
+    reviewer_ids: ["security::primary"],
+    source_refs: ["security::primary#finding-1"],
+    gate_eligibility: { status: "eligible", reasons: [] },
+    suggested_direction: "Reuse the transaction key.",
+    classification: "confirmed_defect",
+    confidence: "high",
+    claim: {
+      trigger: "A request is retried",
+      affected_behavior: "Payment submission",
+      outcome: "Duplicate payment",
+    },
+  };
+  const events = [
+    {
+      event: "run.started",
+      seq: 1,
+      timestamp,
+      data: { message: "Review started" },
+    },
+    {
+      event: "reviewer.started",
+      seq: 2,
+      timestamp,
+      reviewer_id: "security::primary",
+      data: { model: "Model A", adapter: "copilot", mode: "full_review" },
+    },
+    {
+      event: "run.heartbeat",
+      seq: 3,
+      timestamp,
+      data: { message: "Run remains active" },
+    },
+    {
+      event: "run.heartbeat",
+      seq: 4,
+      timestamp,
+      data: { message: "Run remains active" },
+    },
+    {
+      event: "reviewer.retry_scheduled",
+      seq: 5,
+      timestamp,
+      reviewer_id: "reliability::primary",
+      data: {
+        reason: "provider_unavailable",
+        message: "Temporary provider failure",
+        attempt: 1,
+      },
+    },
+  ];
+  const active = {
+    run_id: "run-active",
+    project_name: "payment-service",
+    branch: "feature/payment-retry",
+    active: true,
+    status: "running",
+    stage: "execute_lenses",
+    started_at: timestamp,
+    updated_at: timestamp,
+    elapsed_ms: 402000,
+    scope: "changes",
+    changed_files_count: 18,
+    reviewers,
+    model_runs: {
+      total: 4,
+      running: 2,
+      queued: 1,
+      deferred: 1,
+      completed: 0,
+      incomplete: 0,
+      skipped: 0,
+    },
+    logical_lenses: { total: 3, running: 2, queued: 1, completed: 0 },
+    findings: 0,
+  };
+  const completed = {
+    ...active,
+    run_id: "run-complete",
+    active: false,
+    status: "gate_findings",
+    run_outcome: "gate_findings",
+    stage: "complete",
+    gate_outcome: "gate_findings",
+    coverage_outcome: "complete",
+    execution_coverage: { status: "complete" },
+    change_coverage: { status: "complete" },
+    findings: 1,
+    gate_eligible_subfindings: 1,
+    logical_lenses: { total: 3, completed: 3 },
+    model_runs: { total: 4, completed: 3, skipped: 1, running: 0, queued: 0 },
+    reviewers: reviewers.map((r) => ({
+      ...r,
+      state: r.state === "deferred" ? "skipped" : "completed",
+      phase: "terminal",
+    })),
+  };
+  const agents = ["security", "reliability", "performance"].map((id) => ({
+    id,
+    purpose: `Review ${id}`,
+    adapter: "copilot",
+    pass_quorum: 1,
+    minimum_provider_groups: 1,
+    adjudication: "off",
+    isolation: "prefer_enforced",
+    timeout_ms: 60000,
+    has_instructions: true,
+    projects: ["payment-service"],
+    model_runs: [
+      {
+        id: "primary",
+        model: "Model A",
+        adapter: "copilot",
+        provider_group: "provider-a",
+        configured_index: 0,
+      },
+      {
+        id: "fallback",
+        model: "Model B",
+        adapter: "codex",
+        provider_group: "provider-b",
+        configured_index: 1,
+      },
+    ],
+  }));
+  const snapshot = {
+    generated_at: timestamp,
+    revision: "revision-a",
+    server: {
+      version: "9.0.0",
+      host: "127.0.0.1",
+      port: 3000,
+      read_only: true,
+    },
+    configuration: {
+      valid: true,
+      schema_version: "7",
+      revision: "config-a",
+      defaults: { agents: ["security", "reliability"] },
+      execution: { max_concurrency: 4, heartbeat_interval_ms: 15000 },
+      diagnostics: { persist_runs: true, max_runs: 100 },
+      config_path: "C:/example/config.toml",
+      runs_directory: "C:/example/runs",
+      adapters: [
+        { id: "copilot", type: "copilot", credential_environment: [] },
+        {
+          id: "gateway",
+          type: "openai_compatible",
+          credential_environment: [{ name: "REVIEW_API_KEY", present: false }],
+        },
+      ],
+    },
+    agents,
+    projects: [
+      {
+        name: "payment-service",
+        agents: ["security", "reliability", "performance"],
+        settings: { max_concurrency: 4 },
+        has_guidance: true,
+        has_context: false,
+      },
+      {
+        name: "dashboard-app",
+        agents: ["security"],
+        settings: {},
+        has_guidance: false,
+        has_context: false,
+      },
+    ],
+    runs: [active, completed],
+  };
+  const runs: Record<string, Record<string, unknown>> = {
+    "run-active": {
+      ...active,
+      context: {
+        project_name: "payment-service",
+        git: { branch: active.branch, changed_files_count: 18 },
+        review_scope: { mode: "changes" },
+      },
+      events,
+      findings: [],
+    },
+    "run-complete": {
+      ...completed,
+      events,
+      findings: [finding],
+      roots: [],
+      context: {
+        project_name: "payment-service",
+        git: { branch: active.branch, changed_files_count: 18 },
+        review_scope: { mode: "changes" },
+      },
+    },
+  };
+  return { snapshot, runs, reviewers, finding, events };
+}

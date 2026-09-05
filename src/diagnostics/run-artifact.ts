@@ -3,7 +3,10 @@ import { constants } from "node:fs";
 import { lstat, open, type FileHandle } from "node:fs/promises";
 import { resolve } from "node:path";
 import { z } from "zod";
-import { privatePayloadSchemas } from "./artifact-payloads.js";
+import {
+  artifactResolutionV1Schema,
+  privatePayloadSchemas,
+} from "./artifact-payloads.js";
 import { runFindingsRecordSchema } from "./artifact-record-schemas.js";
 import { createResultPageCollector } from "../results/result-pages.js";
 import {
@@ -42,7 +45,7 @@ const MAX_NARRATIVE_CHUNKS = Math.ceil(
   MAX_REVIEWER_RESULT_BYTES / NARRATIVE_CHUNK_BYTES,
 );
 const PRIVATE_VERSIONS = {
-  resolution: "1",
+  resolution: "2",
   request: "3",
   context: "1",
   "reviewer.attempt": "1",
@@ -68,7 +71,7 @@ const headerSchema = z.strictObject({
       Object.fromEntries(
         Object.entries(PRIVATE_VERSIONS).map(([key, value]) => [
           key,
-          z.literal(value),
+          key === "resolution" ? z.enum(["1", "2"]) : z.literal(value),
         ]),
       ),
     )
@@ -116,7 +119,7 @@ const genericRecords: Record<string, z.ZodType> = {
   "run.findings": runFindingsRecordSchema,
   resolution: z.strictObject({
     record: z.literal("resolution"),
-    schema_version: z.literal("1"),
+    schema_version: z.enum(["1", "2"]),
     run_id: id,
     resolution: z.record(z.string(), z.unknown()),
   }),
@@ -171,7 +174,10 @@ function parseRecord<T>(schema: z.ZodType<T>, value: unknown): T {
 }
 function validatePayload(record: Record<string, unknown>): void {
   const kind = String(record.record);
-  const schema = privatePayloadSchemas[kind];
+  const schema =
+    kind === "resolution" && record.schema_version === "1"
+      ? artifactResolutionV1Schema
+      : privatePayloadSchemas[kind];
   if (schema)
     parseRecord(
       schema,
@@ -192,7 +198,11 @@ function validateHeaderManifest(record: Record<string, unknown>): void {
     fail("Artifact header manifest is invalid.");
   for (const [kind, expected] of Object.entries(PRIVATE_VERSIONS)) {
     const declared = (manifest as Record<string, unknown>)[kind];
-    if (typeof declared === "string" && declared !== expected)
+    if (
+      typeof declared === "string" &&
+      declared !== expected &&
+      !(kind === "resolution" && declared === "1")
+    )
       throw new RunArtifactError(
         "unsupported_schema_version",
         `Private artifact record ${kind} schema version is unsupported.`,
@@ -531,8 +541,7 @@ export async function readRunArtifact(
         if (header === undefined || record.run_id !== header.run_id)
           fail("Artifact run identity mismatch.");
         if (typeof record.record === "string") {
-          const expected =
-            PRIVATE_VERSIONS[record.record as keyof typeof PRIVATE_VERSIONS];
+          const expected = header.private_record_versions[record.record];
           if (expected !== undefined && record.schema_version !== expected)
             throw new RunArtifactError(
               "unsupported_schema_version",

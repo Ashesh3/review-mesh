@@ -30,6 +30,7 @@ import { runV9Review } from "./orchestrator/run-v9.js";
 import { createDefaultRegistry, type ReviewApplicationOptions } from "./app.js";
 import { sanitizePublicText } from "./adapters/errors.js";
 import { prepareV9Retry, V9RetryError } from "./diagnostics/retry-v9.js";
+import { reviewMeshVersion } from "./discovery/help.js";
 
 export async function runV9Application(
   options: ReviewApplicationOptions,
@@ -184,7 +185,7 @@ export async function runV9Application(
     artifact = await createRunArtifact({
       path: primaryPath,
       runId,
-      toolVersion: "9.0.0",
+      toolVersion: reviewMeshVersion,
     });
   } catch {
     await detailsHandle?.close();
