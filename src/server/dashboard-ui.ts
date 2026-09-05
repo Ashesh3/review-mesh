@@ -539,7 +539,7 @@ export const dashboardHtml = String.raw`<!doctype html>
     var STREAM_RETRY = 5000;
     var STAGES = ["Resolve context", "Resolve suite", "Execute lenses", "Consolidate", "Complete"];
     var ACTIVE_STATES = ["running", "probing", "starting", "reviewing", "validating"];
-    var TERMINAL_STATES = ["passed", "findings", "incomplete", "completed", "skipped", "failed"];
+    var TERMINAL_STATES = ["passed", "findings", "incomplete", "completed", "skipped", "failed", "clear", "gate_findings", "inconclusive", "cancelled"];
     var state = {
       snapshot: null,
       snapshotError: null,
@@ -805,7 +805,7 @@ export const dashboardHtml = String.raw`<!doctype html>
 
     function findingsCount(source) {
       if (!isObject(source)) return undefined;
-      var direct = number(firstDefined(source.unique_findings, source.findings_count, source.actionable_findings, get(source, ["counts", "findings"]), get(source, ["result", "actionable_findings_count"]), get(source, ["result", "actionable_findings"]))) ;
+      var direct = number(firstDefined(source.atomic_subfindings, get(source, ["canonical", "counts", "atomic_subfindings"]), source.unique_findings, source.findings_count, source.actionable_findings, get(source, ["counts", "findings"]), get(source, ["result", "actionable_findings_count"]), get(source, ["result", "actionable_findings"]))) ;
       if (direct !== undefined) return direct;
       var consolidated = get(source, ["findings", "consolidated"]);
       if (Array.isArray(consolidated)) return consolidated.length;
@@ -842,7 +842,7 @@ export const dashboardHtml = String.raw`<!doctype html>
     }
 
     function runStartedAt(run) {
-      return firstDefined(run && run.started_at, run && run.created_at, get(run, ["timestamps", "started_at"]), run && run.timestamp);
+      return firstDefined(run && run.started_at, run && run.created_at, get(run, ["summary", "deadline", "started_at"]), get(run, ["deadline", "started_at"]), get(run, ["timestamps", "started_at"]), run && run.timestamp);
     }
 
     function runUpdatedAt(run) {

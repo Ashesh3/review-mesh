@@ -146,6 +146,18 @@ export function v9DashboardRun(run: NormalizedRun) {
     schema_version: "2",
     reviewers: run.reviewers.map((reviewer) => ({
       ...reviewer,
+      ...((run.records.find(
+        (record) =>
+          record.event === "reviewer.started" &&
+          record.reviewer_id === reviewer.reviewer_id,
+      )?.data as Record<string, unknown> | undefined) ?? {}),
+      activity: run.records
+        .filter(
+          (record) =>
+            record.record === "reviewer.activity" &&
+            record.reviewer_id === reviewer.reviewer_id,
+        )
+        .map((record) => record.data),
       state: reviewer.status,
       result_digest: reviewer.digest,
       result_byte_count: reviewer.byte_count,
@@ -178,6 +190,7 @@ export function v9RunSummary(
     changed_files_count: Array.isArray(git?.changed_files)
       ? git.changed_files.length
       : 0,
+    scope: (run.context?.review_scope as { mode?: string } | undefined)?.mode,
     total_elapsed_ms: run.summary.total_elapsed_ms,
     findings: run.canonical.counts.atomic_subfindings,
     ...run.canonical.counts,
