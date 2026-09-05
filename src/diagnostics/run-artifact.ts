@@ -4,6 +4,8 @@ import { lstat, open, type FileHandle } from "node:fs/promises";
 import { resolve } from "node:path";
 import { z } from "zod";
 import { privatePayloadSchemas } from "./artifact-payloads.js";
+import { runFindingsRecordSchema } from "./artifact-record-schemas.js";
+import { createResultPageCollector } from "../results/result-pages.js";
 import {
   adjudicationResultV2Schema,
   reviewerResultV4Schema,
@@ -12,7 +14,7 @@ import {
   type ReviewerResultV4,
 } from "../protocol/v9.js";
 import { reviewerResultDigest } from "../results/digest.js";
-import { MAX_REVIEWER_RESULT_BYTES } from "../results/sanitize.js";
+import { MAX_REVIEWER_RESULT_BYTES, sanitizeRunMetadata } from "../results/sanitize.js";
 import {
   artifactIdentity,
   createSafeArtifactParent,
@@ -108,29 +110,7 @@ const resultSchema = z.strictObject({
     .optional(),
 });
 const genericRecords: Record<string, z.ZodType> = {
-  "run.findings": z.strictObject({
-    record: z.literal("run.findings"),
-    schema_version: z.literal("1"),
-    run_id: id,
-    data: z.strictObject({
-      raw: z.array(z.record(z.string(), z.unknown())).max(16384),
-      proof_by_source_ref: z.record(
-        z.string(),
-        z.record(z.string(), z.unknown()),
-      ),
-      adjudication_outcomes: z
-        .array(z.unknown())
-        .or(z.record(z.string(), z.unknown())),
-      gate_policies: z.record(
-        z.string(),
-        z.strictObject({
-          minimumSeverity: z.enum(["critical", "high", "medium", "low"]),
-          minimumConfidence: z.enum(["high", "medium", "low"]),
-        }),
-      ),
-      canonical_counts: z.record(z.string(), count),
-    }),
-  }),
+  "run.findings": runFindingsRecordSchema,
   resolution: z.strictObject({
     record: z.literal("resolution"),
     schema_version: z.literal("1"),
@@ -317,8 +297,9 @@ export async function createRunArtifact(options: {
         const kind = String(value.record);
         const schema = genericRecords[kind];
         if (schema === undefined) fail("Unknown private artifact record type.");
+        const cleanValue = (kind === "request" || kind === "context" || kind === "resolution" || kind === "reviewer.attempt" || kind === "reviewer.activity" || kind === "reviewer.activity_summary") ? sanitizeRunMetadata(value) as Record<string, unknown> : value;
         const parsed = schema.parse({
-          ...value,
+          ...cleanValue,
           run_id: options.runId,
           schema_version:
             PRIVATE_VERSIONS[kind as keyof typeof PRIVATE_VERSIONS],
@@ -498,6 +479,7 @@ export async function readRunArtifact(
     let terminalSeen = false;
     const records: Record<string, unknown>[] = [];
     const results: ArtifactReadResult["results"] = [];
+    const pages = new Map<string, string[]>();
     const narratives = new Map<
       string,
       { fragments: string[]; byteCount: number }
@@ -649,6 +631,13 @@ export async function readRunArtifact(
             fail("Unknown private artifact record type.");
           const parsed = parseRecord(schema, record) as Record<string, unknown>;
           validatePayload(parsed);
+          if (parsed.record === "reviewer.result_page") {
+            const body = parsed.data as { index: number; raw: string };
+            const previous = pages.get(String(parsed.reviewer_id)) ?? [];
+            if (body.index !== previous.length) fail("Artifact result pages contain a gap or duplicate.");
+            if (previous.length >= 951) fail("Artifact result page count exceeds its bound.");
+            previous.push(body.raw); pages.set(String(parsed.reviewer_id), previous);
+          }
           records.push(parsed);
         }
       }
@@ -681,24 +670,8 @@ export async function readRunArtifact(
         fail("Artifact record exceeds the line limit.");
     }
     const active = !terminalSeen;
-    if (
-      active &&
-      options.allowActive &&
-      header !== undefined &&
-      options.expectedSha256 === undefined
-    ) {
-      return {
-        run_id: header.run_id,
-        active: true,
-        results,
-        records,
-        summary: summary ?? {},
-        sha256: hashAll.digest("hex"),
-        byte_count: byteCount,
-        digest_status: "final_digest_unavailable",
-      };
-    }
-    if (carry.length || !terminalSeen || !header || !summary || narratives.size)
+    const allowActive = active && options.allowActive === true && header !== undefined && options.expectedSha256 === undefined;
+    if (!allowActive && (carry.length || !terminalSeen || !header || !summary || narratives.size))
       fail("Artifact is incomplete.");
     const sha256 = hashAll.digest("hex");
     if (
@@ -727,12 +700,8 @@ export async function readRunArtifact(
       );
     }
     if (
-      after.size !== opened.size ||
-      after.mtimeNs !== opened.mtimeNs ||
-      after.ctimeNs !== opened.ctimeNs ||
-      current.size !== opened.size ||
-      current.mtimeNs !== opened.mtimeNs ||
-      current.ctimeNs !== opened.ctimeNs ||
+      (!allowActive && (after.size !== opened.size || after.mtimeNs !== opened.mtimeNs || after.ctimeNs !== opened.ctimeNs || current.size !== opened.size || current.mtimeNs !== opened.mtimeNs || current.ctimeNs !== opened.ctimeNs)) ||
+      (allowActive && (after.size < opened.size || current.size < opened.size)) ||
       current.ino !== opened.ino ||
       current.dev !== opened.dev ||
       current.isSymbolicLink() ||
@@ -745,6 +714,20 @@ export async function readRunArtifact(
         ))
     )
       identityFail("Artifact identity changed while reading.");
+    if (allowActive) return { run_id: header!.run_id, active: true, results, records, summary: summary ?? {}, sha256, byte_count: byteCount, digest_status: "final_digest_unavailable" };
+    if (!summary || !header) fail("Artifact is incomplete.");
+    for (const [reviewerId, rawPages] of pages) {
+      const result = results.find(item => item.reviewer_id === reviewerId)?.result;
+      if (!result) fail("Artifact pages have no complete reviewer result.");
+      const firstPage = JSON.parse(rawPages[0]!) as { result_id: string; result_kind: "reviewer" | "adjudication" };
+      const collector = createResultPageCollector({ resultId: firstPage.result_id, resultKind: firstPage.result_kind, ...(result.schema_version === "2" ? { candidateIds: result.decisions.map(decision => decision.source_finding_id) } : {}) });
+      try {
+        for (const raw of rawPages) collector.addPage(raw);
+        const assembled = collector.assemble();
+        const expected = result.schema_version === "4" ? (({ change_coverage: _coverage, ...provider }) => provider)(result) : result;
+        if (reviewerResultDigest(assembled) !== reviewerResultDigest(expected)) fail("Artifact result pages do not reproduce the accepted result.");
+      } catch (error) { if (error instanceof RunArtifactError) throw error; throw new RunArtifactError("invalid_artifact_record", "Artifact result page chain is invalid.", { cause: error }); }
+    }
     const delivery = summary.result_delivery as
       { completed_results?: unknown } | undefined;
     if (delivery?.completed_results !== results.length)

@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { createHash } from "node:crypto";
 import {
+  pullRequestV3Schema,
   reviewRequestV3Schema,
   resultPageSchema,
   selectedDeadlineSchema,
@@ -8,6 +9,7 @@ import {
   v9FindingSeveritySchema,
   v9FindingConfidenceSchema,
 } from "../protocol/v9.js";
+import { runFindingsPayloadSchema } from "./artifact-record-schemas.js";
 
 const id = z.string().min(1).max(128),
   count = z.number().int().nonnegative(),
@@ -72,15 +74,133 @@ const proof = z.strictObject({
   policy_non_gating: z.boolean().optional(),
   unrelated_coverage_deficits: z.array(text).optional(),
 });
-const failure = z.strictObject({
+export const failureDiagnosticsSchema = z.strictObject({
+  failure_code: z
+    .enum([
+      "rate_limited",
+      "provider_unavailable",
+      "gateway_timeout",
+      "provider_response_invalid",
+      "output_truncated",
+      "request_timeout",
+      "transport_error",
+      "response_too_large",
+      "streaming_unsupported",
+      "result_page_too_large",
+      "structured_page_limit_exceeded",
+    ])
+    .optional(),
+  failure_stage: z.string().min(1).max(64).optional(),
+  scope: z.enum(["run_input", "adapter", "provider", "model"]).optional(),
+  http_status: z.number().int().min(100).max(599).optional(),
+  provider_request_id: z.string().min(1).max(256).optional(),
+  retry_after_ms: z.number().int().min(0).max(60_000).optional(),
+  correlation_headers: z
+    .strictObject({
+      "x-request-id": z.string().min(1).max(256).optional(),
+      "request-id": z.string().min(1).max(256).optional(),
+      "x-correlation-id": z.string().min(1).max(256).optional(),
+      "trace-id": z.string().min(1).max(256).optional(),
+      "cf-ray": z.string().min(1).max(256).optional(),
+      traceparent: z.string().min(1).max(256).optional(),
+    })
+    .optional(),
+  retry_blocked_by_circuit: z.boolean().optional(),
+  circuit_caused_by_reviewer_id: z.string().min(1).max(256).optional(),
+  finish_reason: z.string().min(1).max(128).optional(),
+  content_types: z.array(z.string().min(1).max(128)).max(32).optional(),
+  response_bytes: count.optional(),
+  response_fingerprint: digest.optional(),
+  response_structure: z
+    .strictObject({
+      root_type: z.string().min(1).max(128),
+      top_level_keys: z.array(z.string().min(1).max(128)).max(32).optional(),
+      choices_count: count.optional(),
+      first_choice_type: z.string().min(1).max(128).optional(),
+      first_choice_keys: z.array(z.string().min(1).max(128)).max(32).optional(),
+      message_type: z.string().min(1).max(128).optional(),
+      message_keys: z.array(z.string().min(1).max(128)).max(32).optional(),
+    })
+    .optional(),
+  validation_issues: z
+    .array(
+      z.strictObject({
+        path: z.string().max(256),
+        code: z.string().min(1).max(64),
+        message: z.string().min(1).max(256),
+      }),
+    )
+    .max(12)
+    .optional(),
+  truncated: z.boolean().optional(),
+  repair_attempted: z.boolean().optional(),
+  repair_outcome: z.enum(["not_attempted", "succeeded", "failed"]).optional(),
+  attempt_count: z.number().int().min(1).max(100).optional(),
+  retry_outcome: z.enum(["not_attempted", "succeeded", "exhausted"]).optional(),
+});
+export const persistedFailureSchema = z.strictObject({
   reason: v9IncompleteReasonSchema.or(z.literal("timeout")),
   message: text.max(1000),
   retryable: z.boolean(),
   fallback_eligible: z.boolean().optional(),
   circuit_qualifying: z.boolean().optional(),
-  diagnostics: z.record(text, z.unknown()).optional(),
+  diagnostics: failureDiagnosticsSchema.optional(),
 });
-const policy = z.strictObject({
+export const normalizedRequestMetadataSchema = z.strictObject({
+  schema_version: z.enum(["1", "2", "3"]),
+  request_id: z
+    .string()
+    .min(1)
+    .max(16 * 1024)
+    .optional(),
+  pull_request: pullRequestV3Schema.optional(),
+});
+export const capturedGitContextSchema = z.union([
+  z.strictObject({ is_repository: z.literal(false) }),
+  z.strictObject({
+    is_repository: z.literal(true),
+    root: text,
+    branch: text.nullable(),
+    head: text.nullable(),
+    base: z
+      .strictObject({
+        requested: text,
+        resolved: text.nullable(),
+        error: text.optional(),
+      })
+      .optional(),
+    requested_head: z
+      .strictObject({
+        requested: text,
+        resolved: text.nullable(),
+        error: text.optional(),
+      })
+      .optional(),
+    merge_base: text.nullable(),
+    status_entries: z.array(text).max(4096),
+    changed_files: z.array(text).max(4096),
+    changed_paths: z
+      .array(
+        z.strictObject({
+          path: text,
+          kind: z.enum(["tracked", "deleted", "untracked"]),
+        }),
+      )
+      .max(4096)
+      .optional(),
+    diff_stat: text,
+    diff: text,
+    raw_diff: z.strictObject({ byte_count: count, sha256: digest }).optional(),
+    shallow: z.boolean().optional(),
+    truncated: z.strictObject({
+      status_entries: z.boolean(),
+      changed_files: z.boolean(),
+      diff_stat: z.boolean(),
+      diff: z.boolean(),
+    }),
+  }),
+]);
+export const artifactResolutionPolicySchema = z.strictObject({
   kind: z.enum(["generic", "change_readiness"]).optional(),
   lensDeadlineMs: count.optional(),
   requiredInput: z.array(text).optional(),
@@ -102,8 +222,8 @@ const policy = z.strictObject({
     ])
     .optional(),
   requiredCallerContext: z.array(text).optional(),
-  passQuorum: count,
-  minimumProviderGroups: count,
+  passQuorum: z.number().int().positive(),
+  minimumProviderGroups: z.number().int().positive(),
   allowZeroOutageTolerance: z.boolean().optional(),
   adjudication: z.enum(["off", "required"]),
   gateMinimumSeverity: v9FindingSeveritySchema,
@@ -112,7 +232,7 @@ const policy = z.strictObject({
   adjudicatesReviewerId: id.optional(),
   candidateFindings: z.json().optional(),
 });
-const execution = z.strictObject({
+export const artifactResolutionExecutionSchema = z.strictObject({
   max_concurrency: count,
   heartbeat_interval_ms: count,
   shutdown_grace_period_ms: count,
@@ -137,27 +257,29 @@ const warning = z.strictObject({
   provider_groups: z.array(id).optional(),
 });
 
+export const artifactResolutionSchema = z.strictObject({
+  execution: artifactResolutionExecutionSchema.optional(),
+  reviewers: z.array(
+    z.strictObject({
+      id,
+      agent_id: id.optional(),
+      policy: artifactResolutionPolicySchema.optional(),
+    }),
+  ),
+  warnings: z.array(warning).optional(),
+  deadline: selectedDeadlineSchema.optional(),
+});
+
 export const privatePayloadSchemas: Record<string, z.ZodType> = {
   request: reviewRequestV3Schema,
-  resolution: z.strictObject({
-    execution: execution.optional(),
-    reviewers: z.array(
-      z.strictObject({
-        id,
-        agent_id: id.optional(),
-        policy: policy.optional(),
-      }),
-    ),
-    warnings: z.array(warning).optional(),
-    deadline: selectedDeadlineSchema.optional(),
-  }),
+  resolution: artifactResolutionSchema,
   context: z.strictObject({
     consistency_mode: z.literal("live_worktree").optional(),
     workspace: text.optional(),
     project_name: text.optional(),
     instructions: text.optional(),
     caller_context: z.json().optional(),
-    request: z.record(text, z.unknown()).optional(),
+    request: normalizedRequestMetadataSchema.optional(),
     review_scope: z
       .strictObject({
         mode: z.enum(["changes", "full"]),
@@ -168,13 +290,13 @@ export const privatePayloadSchemas: Record<string, z.ZodType> = {
         paths: z.array(text).optional(),
       })
       .optional(),
-    git: z.record(text, z.unknown()).optional(),
+    git: capturedGitContextSchema.optional(),
   }),
   "reviewer.attempt": z.strictObject({
     attempt: count,
     started_at: z.iso.datetime({ offset: true }),
     elapsed_ms: count,
-    failure,
+    failure: persistedFailureSchema,
     causes: z.array(v9IncompleteReasonSchema).optional(),
   }),
   "reviewer.activity": z.strictObject({
@@ -214,6 +336,9 @@ export const privatePayloadSchemas: Record<string, z.ZodType> = {
       index: count,
       raw: text.refine((value) => Buffer.byteLength(value, "utf8") <= 32768),
       sha256: digest,
+      serialization_boundary: z
+        .enum(["provider_raw", "sdk_canonical_json"])
+        .optional(),
     })
     .superRefine((value, ctx) => {
       if (
@@ -244,4 +369,5 @@ export const privatePayloadSchemas: Record<string, z.ZodType> = {
       )
       .optional(),
   }),
+  "run.findings": runFindingsPayloadSchema,
 };
