@@ -17,6 +17,10 @@ import {
   nextPageAssignment,
   pageCollectorFor,
   pageFailure,
+  isRepairablePageError,
+  pageRepairMessage,
+  failedPageRepair,
+  MAX_PAGE_SCHEMA_REPAIRS,
 } from "./sdk-pages.js";
 import {
   buildAllowlistedEnvironment,
@@ -330,6 +334,8 @@ class CodexAdapter implements ReviewAdapter {
       const pages = pageCollectorFor(input);
       if (pages !== undefined) {
         pageStorage = createResultPageStorageBridge(input);
+        let repairPrompt: string | undefined;
+        let pageRepairs = 0;
         while (!pages.collector.complete) {
           const assignment = nextPageAssignment(
             pages.collector,
@@ -355,9 +361,10 @@ class CodexAdapter implements ReviewAdapter {
             },
             systemPrompt: input.prompt.system,
             userPrompt:
-              assignment.request.pageIndex === 0
+              repairPrompt ??
+              (assignment.request.pageIndex === 0
                 ? `${input.prompt.user}\n\n${assignment.prompt}`
-                : assignment.prompt,
+                : assignment.prompt),
             outputSchema: assignment.schema,
             signal: input.signal,
           });
@@ -429,14 +436,34 @@ class CodexAdapter implements ReviewAdapter {
               assignment.request.pageIndex,
             );
           } catch (error) {
+            if (
+              isRepairablePageError(error) &&
+              pageRepairs < MAX_PAGE_SCHEMA_REPAIRS
+            ) {
+              pageRepairs += 1;
+              repairPrompt = pageRepairMessage(error, assignment.prompt);
+              yield {
+                type: "progress",
+                phase: "schema_repair",
+                identity: `${assignment.request.resultId}:page:${assignment.request.pageIndex}:repair:${pageRepairs}`,
+              };
+              continue;
+            }
             await pageStorage.abandon();
             yield {
               type: "failure",
-              failure: pageFailure(error, "Codex"),
+              failure: failedPageRepair(
+                error,
+                "Codex",
+                pageRepairs,
+                assignment.request.resultId,
+              ),
               isolation: "runtime_read_only",
             };
             return;
           }
+          pageRepairs = 0;
+          repairPrompt = undefined;
           yield {
             type: "progress",
             phase: "result_page",

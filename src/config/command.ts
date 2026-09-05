@@ -1,4 +1,5 @@
 import { resolve as resolvePath } from "node:path";
+import { TomlError } from "smol-toml";
 import { getAppPaths } from "./paths.js";
 import {
   ConfigConflictError,
@@ -258,8 +259,8 @@ function safeIssues(error: unknown): Array<{
 function safeErrorDetails(error: unknown): Record<string, unknown> {
   const issues = safeIssues(error);
   if (issues.length > 0) return { issues };
-  if (typeof error !== "object" || error === null) return {};
-  const record = error as Record<string, unknown>;
+  if (!(error instanceof TomlError)) return {};
+  const record = error;
   return {
     ...(typeof record.line === "number" ? { line: record.line } : {}),
     ...(typeof record.column === "number" ? { column: record.column } : {}),
@@ -532,6 +533,7 @@ export async function runConfigCommand(
       }
       const desiredText = serializeManagedConfig(desired);
       if (
+        loaded.snapshot.exists &&
         !loaded.migrated &&
         serializeManagedConfig(loaded.config) === desiredText
       ) {

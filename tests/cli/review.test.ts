@@ -588,7 +588,7 @@ describe("review-mesh review", () => {
       },
       request_examples: {
         changes: {
-          schema_version: "2",
+          schema_version: "3",
           project_name: "workspace",
           review_scope: { mode: "changes" },
         },

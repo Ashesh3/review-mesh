@@ -65,6 +65,9 @@ export interface AdapterValidationIssue {
   path: string;
   code: string;
   message: string;
+  expected_max_bytes?: number;
+  actual_bytes?: number;
+  unknown_keys?: string[];
 }
 
 export interface AdapterResponseStructure {
@@ -99,6 +102,9 @@ export interface AdapterFailureDiagnostics {
   repair_outcome?: AdapterRepairOutcome;
   attempt_count?: number;
   retry_outcome?: AdapterRetryOutcome;
+  checkpoint_id?: string;
+  artifact_ref?: string;
+  recommended_action?: string;
 }
 
 export interface AdapterFailureOptions {
@@ -288,7 +294,34 @@ function sanitizeDiagnostics(
             code === undefined ||
             message === undefined
             ? []
-            : [{ path, code, message }];
+            : [
+                {
+                  path,
+                  code,
+                  message,
+                  ...(finiteInteger(
+                    issue.expected_max_bytes,
+                    0,
+                    Number.MAX_SAFE_INTEGER,
+                  ) === undefined
+                    ? {}
+                    : { expected_max_bytes: issue.expected_max_bytes }),
+                  ...(finiteInteger(
+                    issue.actual_bytes,
+                    0,
+                    Number.MAX_SAFE_INTEGER,
+                  ) === undefined
+                    ? {}
+                    : { actual_bytes: issue.actual_bytes }),
+                  ...(sanitizeStructureKeys(issue.unknown_keys) === undefined
+                    ? {}
+                    : {
+                        unknown_keys: sanitizeStructureKeys(
+                          issue.unknown_keys,
+                        )!,
+                      }),
+                },
+              ];
         })
     : undefined;
   const responseFingerprint =
@@ -298,6 +331,15 @@ function sanitizeDiagnostics(
       : undefined;
   const responseStructure = sanitizeResponseStructure(input.response_structure);
   const diagnostics: AdapterFailureDiagnostics = {
+    ...(sanitizedText(input.checkpoint_id, 256) === undefined
+      ? {}
+      : { checkpoint_id: sanitizedText(input.checkpoint_id, 256)! }),
+    ...(sanitizedText(input.artifact_ref, 4096) === undefined
+      ? {}
+      : { artifact_ref: sanitizedText(input.artifact_ref, 4096)! }),
+    ...(sanitizedText(input.recommended_action, 256) === undefined
+      ? {}
+      : { recommended_action: sanitizedText(input.recommended_action, 256)! }),
     ...(failureCode === undefined ? {} : { failure_code: failureCode }),
     ...(failureStage === undefined ? {} : { failure_stage: failureStage }),
     ...(scope === undefined ? {} : { scope }),

@@ -200,6 +200,20 @@ async function fixture(
 }
 
 describe("v9 live dashboard projection", () => {
+  it("keeps active CLI status compact with a complete roster and no provisional exit", async () => {
+    const f = await fixture();
+    await f.resolve();
+    const run = await readNormalizedRun(f.path, { allowActive: true });
+    const status = v9Status(run);
+    expect(status).toMatchObject({ terminal: false, status: "running" });
+    expect(status).not.toHaveProperty("request");
+    expect(status).not.toHaveProperty("context");
+    expect(status).not.toHaveProperty("exit_code");
+    expect(status).not.toHaveProperty("run_outcome");
+    expect(status.reviewers).toHaveLength(3);
+    expect(JSON.stringify(status)).not.toContain("PRIVATE");
+    expect(v9Status(run, undefined, true)).toHaveProperty("context");
+  });
   it("shows the whole configured roster and distinguishes logical lenses from sequential model slots", async () => {
     const f = await fixture();
     await f.resolve();

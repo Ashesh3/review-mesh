@@ -107,6 +107,170 @@ describe("createChangeCoverageLedger", () => {
     return path;
   }
 
+  it("captures a newly written file when Windows settles its metadata during the first open", async () => {
+    const root = await workspace();
+    await writeFile(join(root, "changed.txt"), "x".repeat(131072));
+    const ledger = await createChangeCoverageLedger({
+      context: context(root, [{ path: "changed.txt", kind: "tracked" }]),
+      policy: observedFullFile,
+    });
+    expect(await ledger.readFile({ path: "changed.txt" })).toMatchObject({
+      ok: true,
+      byteCount: 131072,
+    });
+  });
+
+  it("fingerprints untracked and supporting snapshot bytes across fresh captures", async () => {
+    const root = await workspace();
+    await writeFile(join(root, "worker.ts"), "first");
+    await writeFile(join(root, "neighbor.ts"), "support");
+    const resolved = context(root, [{ path: "worker.ts", kind: "untracked" }]);
+    const first = await createChangeCoverageLedger({
+      context: resolved,
+      policy: observedFullFile,
+    });
+    expect(first.snapshotIdentity()).toMatchObject({
+      schema_version: "1",
+      complete: true,
+      file_count: 2,
+    });
+    await writeFile(join(root, "neighbor.ts"), "changed support");
+    const fresh = await createChangeCoverageLedger({
+      context: structuredClone(resolved),
+      policy: observedFullFile,
+    });
+    expect(fresh.snapshotIdentity().sha256).not.toBe(
+      first.snapshotIdentity().sha256,
+    );
+    await writeFile(join(root, "worker.ts"), "new untracked bytes");
+    const changed = await createChangeCoverageLedger({
+      context: structuredClone(resolved),
+      policy: observedFullFile,
+    });
+    expect(changed.snapshotIdentity().sha256).not.toBe(
+      fresh.snapshotIdentity().sha256,
+    );
+  });
+
+  it("marks snapshot identity incomplete when capture skipped unreadable evidence", async () => {
+    const root = await workspace();
+    await writeFile(join(root, "worker.ts"), Buffer.from([0]));
+    const ledger = await createChangeCoverageLedger({
+      context: context(root, []),
+      policy: observedFullFile,
+    });
+    expect(ledger.snapshotIdentity().complete).toBe(false);
+  });
+
+  it.each(["diff", "full_file"] as const)(
+    "reads changed relevant, changed supporting, and unchanged files with %s coverage",
+    async (minimumInspection) => {
+      const root = await workspace();
+      await writeFile(join(root, "worker.ts"), "rélevant", "utf8");
+      await writeFile(join(root, "support.ts"), "supporting change", "utf8");
+      await writeFile(join(root, "neighbor.ts"), "unchanged neighbor", "utf8");
+      const resolved = context(root, [
+        { path: "worker.ts", kind: "tracked" },
+        { path: "support.ts", kind: "tracked" },
+      ]);
+      const ledger = await createChangeCoverageLedger({
+        context: resolved,
+        policy: {
+          ...observedFullFile,
+          minimumInspection,
+          relevantPaths: ["worker.ts"],
+        },
+      });
+      await writeFile(join(root, "support.ts"), "later live content", "utf8");
+      ledger.recordDiffDelivery(["worker.ts"], diffProof(resolved));
+
+      for (const [path, content] of [
+        ["worker.ts", "rélevant"],
+        ["support.ts", "supporting change"],
+        ["neighbor.ts", "unchanged neighbor"],
+      ] as const) {
+        const read = await ledger.readFile({ path });
+        expect(read, path).toMatchObject({ ok: true });
+        if (!read.ok) throw new Error(read.reason);
+        expect(Buffer.from(read.bytes).toString("utf8")).toBe(content);
+        read.acknowledgeDelivered();
+        expect(ledger.observedFile(path)).toBe(true);
+      }
+      expect(ledger.summary()).toMatchObject({
+        status: "complete",
+        inspected_count: 1,
+        deficit_count: 0,
+      });
+    },
+  );
+
+  it("keeps an unavailable initial changed snapshot unavailable for later reviewers", async () => {
+    const root = await workspace();
+    const resolved = context(root, [{ path: "worker.ts", kind: "untracked" }]);
+    const first = await createChangeCoverageLedger({
+      context: resolved,
+      policy: observedFullFile,
+    });
+    expect((await first.readFile({ path: "worker.ts" })).ok).toBe(false);
+    await writeFile(join(root, "worker.ts"), "created after capture", "utf8");
+    const second = await createChangeCoverageLedger({
+      context: resolved,
+      policy: observedFullFile,
+    });
+    expect(await second.readFile({ path: "worker.ts" })).toEqual({
+      ok: false,
+      path: "worker.ts",
+      reason: "unavailable",
+    });
+  });
+
+  it("keeps optional unreadable supporting snapshots separate from required diff coverage", async () => {
+    const root = await workspace();
+    await writeFile(join(root, "worker.ts"), Buffer.from([0, 1]));
+    const resolved = context(root, [{ path: "worker.ts", kind: "tracked" }]);
+    const ledger = await createChangeCoverageLedger({
+      context: resolved,
+      policy: { ...observedFullFile, minimumInspection: "diff" },
+    });
+    ledger.recordDiffDelivery(["worker.ts"], diffProof(resolved));
+    expect(await ledger.readFile({ path: "worker.ts" })).toEqual({
+      ok: false,
+      path: "worker.ts",
+      reason: "binary",
+    });
+    expect(ledger.summary()).toMatchObject({
+      status: "complete",
+      deficit_count: 0,
+    });
+  });
+
+  it("keeps changed files outside a full-review path filter unavailable", async () => {
+    const root = await workspace();
+    await mkdir(join(root, "allowed"));
+    await mkdir(join(root, "outside"));
+    await writeFile(join(root, "allowed/worker.ts"), "allowed", "utf8");
+    await writeFile(join(root, "outside/worker.ts"), "outside", "utf8");
+    const ledger = await createChangeCoverageLedger({
+      context: context(
+        root,
+        [
+          { path: "allowed/worker.ts", kind: "tracked" },
+          { path: "outside/worker.ts", kind: "tracked" },
+        ],
+        { mode: "full", scopePaths: ["allowed"] },
+      ),
+      policy: observedFullFile,
+    });
+    expect(await ledger.readFile({ path: "allowed/worker.ts" })).toMatchObject({
+      ok: true,
+    });
+    expect(await ledger.readFile({ path: "outside/worker.ts" })).toEqual({
+      ok: false,
+      path: "outside/worker.ts",
+      reason: "unavailable",
+    });
+  });
+
   it("requires acknowledged gap-free chunks and the tracked diff", async () => {
     const root = await workspace();
     await writeFile(join(root, "worker.ts"), "abcdef", "utf8");
@@ -443,7 +607,7 @@ describe("createChangeCoverageLedger", () => {
     });
   });
 
-  it("keeps a failed observed read sticky and rejects provider attestation", async () => {
+  it("recovers a corrected read range while still rejecting provider attestation", async () => {
     const root = await workspace();
     await writeFile(join(root, "worker.ts"), "abcdef", "utf8");
     const ledger = await createChangeCoverageLedger({
@@ -451,10 +615,22 @@ describe("createChangeCoverageLedger", () => {
       policy: observedFullFile,
     });
     await unlink(join(root, "worker.ts"));
-    await ledger.readFile({ path: "worker.ts", byteCount: 128 * 1024 + 1 });
+    expect(
+      await ledger.readFile({ path: "worker.ts", byteCount: 128 * 1024 + 1 }),
+    ).toEqual({
+      ok: false,
+      path: "worker.ts",
+      reason: "invalid_range",
+      maximumByteCount: 128 * 1024,
+      totalByteCount: 6,
+    });
     const read = await ledger.readFile({ path: "worker.ts" });
     if (!read.ok) throw new Error(read.reason);
     read.acknowledgeDelivered();
+    expect(ledger.summary()).toMatchObject({
+      status: "complete",
+      deficit_count: 0,
+    });
     const attestation: CoverageAttestation = {
       scope_digest: ledger.scopeDigest,
       entries: [
@@ -468,6 +644,203 @@ describe("createChangeCoverageLedger", () => {
     expect(() => ledger.reconcileAttestation(attestation)).toThrow(
       /observed coverage cannot accept provider attestation/i,
     );
+  });
+
+  it.each([131071, 131072, 131073])(
+    "applies the shared read limit to %i-byte requests without poisoning coverage",
+    async (byteCount) => {
+      const root = await workspace();
+      await writeFile(join(root, "worker.ts"), Buffer.alloc(131073, 65));
+      const ledger = await createChangeCoverageLedger({
+        context: context(root, [{ path: "worker.ts", kind: "untracked" }]),
+        policy: observedFullFile,
+      });
+      const read = await ledger.readFile({ path: "worker.ts", byteCount });
+      if (byteCount <= 131072) {
+        expect(read).toMatchObject({ ok: true, byteCount });
+        if (!read.ok) throw new Error(read.reason);
+        read.acknowledgeDelivered();
+      } else {
+        expect(read).toEqual({
+          ok: false,
+          path: "worker.ts",
+          reason: "invalid_range",
+          maximumByteCount: 131072,
+          totalByteCount: 131073,
+        });
+        const corrected = await ledger.readFile({
+          path: "worker.ts",
+          byteCount: 131072,
+        });
+        if (!corrected.ok) throw new Error(corrected.reason);
+        corrected.acknowledgeDelivered();
+      }
+      const tail = await ledger.readFile({
+        path: "worker.ts",
+        offset: Math.min(byteCount, 131072),
+      });
+      if (!tail.ok) throw new Error(tail.reason);
+      tail.acknowledgeDelivered();
+      expect(ledger.summary()).toMatchObject({
+        status: "complete",
+        deficit_count: 0,
+      });
+    },
+  );
+
+  it("reports exact acknowledged UTF-8 byte gaps and independent diff obligations", async () => {
+    const root = await workspace();
+    await writeFile(join(root, "worker.ts"), "aé😀z", "utf8");
+    const resolved = context(root, [{ path: "worker.ts", kind: "tracked" }]);
+    const ledger = await createChangeCoverageLedger({
+      context: resolved,
+      policy: observedFullFile,
+    });
+    const read = await ledger.readFile({
+      path: "worker.ts",
+      offset: 1,
+      byteCount: 3,
+    });
+    if (!read.ok) throw new Error(read.reason);
+    expect(ledger.status().deficits[0]).toMatchObject({
+      path: "worker.ts",
+      delivered_byte_ranges: [],
+      missing_byte_ranges: [{ offset: 0, byte_count: 8 }],
+      snapshot_content_delivered: false,
+      diff_required: true,
+      diff_delivery: "not_inspected",
+    });
+    read.acknowledgeDelivered();
+    expect(ledger.status().deficits[0]).toMatchObject({
+      delivered_byte_ranges: [{ offset: 1, byte_count: 3 }],
+      missing_byte_ranges: [
+        { offset: 0, byte_count: 1 },
+        { offset: 4, byte_count: 4 },
+      ],
+    });
+    for (const range of ledger.status().deficits[0]!.missing_byte_ranges) {
+      const gap = await ledger.readFile({
+        path: "worker.ts",
+        offset: range.offset,
+        byteCount: range.byte_count,
+      });
+      if (!gap.ok) throw new Error(gap.reason);
+      gap.acknowledgeDelivered();
+    }
+    expect(ledger.status()).toMatchObject({
+      complete: false,
+      maximum_read_bytes: 131072,
+      deficits: [
+        {
+          path: "worker.ts",
+          snapshot_content_delivered: true,
+          missing_byte_ranges: [],
+          diff_delivery: "not_inspected",
+        },
+      ],
+    });
+    ledger.recordDiffDelivery(["worker.ts"], diffProof(resolved));
+    expect(ledger.status()).toMatchObject({ complete: true, deficits: [] });
+  });
+
+  it("splits outstanding bytes into valid reads including an unread empty file", async () => {
+    const root = await workspace();
+    await writeFile(join(root, "worker.ts"), Buffer.alloc(262145, 65));
+    await writeFile(join(root, "empty.ts"), "", "utf8");
+    const ledger = await createChangeCoverageLedger({
+      context: context(root, [
+        { path: "worker.ts", kind: "untracked" },
+        { path: "empty.ts", kind: "untracked" },
+      ]),
+      policy: observedFullFile,
+    });
+    expect(ledger.status().deficits).toMatchObject([
+      { path: "empty.ts", missing_byte_ranges: [{ offset: 0, byte_count: 0 }] },
+      {
+        path: "worker.ts",
+        missing_byte_ranges: [
+          { offset: 0, byte_count: 131072 },
+          { offset: 131072, byte_count: 131072 },
+          { offset: 262144, byte_count: 1 },
+        ],
+      },
+    ]);
+    for (const entry of ledger.status().deficits) {
+      for (const range of entry.missing_byte_ranges) {
+        const read = await ledger.readFile({
+          path: entry.path,
+          offset: range.offset,
+          byteCount: range.byte_count,
+        });
+        if (!read.ok) throw new Error(read.reason);
+        read.acknowledgeDelivered();
+      }
+    }
+    expect(ledger.status()).toMatchObject({ complete: true, deficits: [] });
+  });
+
+  it("shows delivered content separately from a sticky integrity failure", async () => {
+    const root = await workspace();
+    await writeFile(join(root, "worker.ts"), "abc", "utf8");
+    const ledger = await createChangeCoverageLedger({
+      context: context(root, [{ path: "worker.ts", kind: "untracked" }]),
+      policy: observedFullFile,
+    });
+    const altered = await ledger.readFile({ path: "worker.ts" });
+    if (!altered.ok) throw new Error(altered.reason);
+    altered.bytes[0] = 0;
+    altered.acknowledgeDelivered();
+    const retry = await ledger.readFile({ path: "worker.ts" });
+    if (!retry.ok) throw new Error(retry.reason);
+    retry.acknowledgeDelivered();
+    expect(ledger.status()).toMatchObject({
+      complete: false,
+      deficits: [
+        {
+          path: "worker.ts",
+          reason: "response_bytes_changed",
+          snapshot_content_delivered: true,
+          missing_byte_ranges: [],
+        },
+      ],
+    });
+  });
+
+  it("reports attested-policy delivery without replacing the required attestation", async () => {
+    const root = await workspace();
+    await writeFile(join(root, "worker.ts"), "abc", "utf8");
+    const ledger = await createChangeCoverageLedger({
+      context: context(root, [{ path: "worker.ts", kind: "untracked" }]),
+      policy: { ...observedFullFile, proof: "attested" },
+    });
+    const read = await ledger.readFile({ path: "worker.ts" });
+    if (!read.ok) throw new Error(read.reason);
+    read.acknowledgeDelivered();
+    expect(ledger.status()).toMatchObject({
+      complete: false,
+      deficits: [
+        {
+          snapshot_content_delivered: true,
+          missing_byte_ranges: [],
+          attestation_required: true,
+          attestation_received: false,
+        },
+      ],
+    });
+    ledger.reconcileAttestation({
+      scope_digest: ledger.scopeDigest,
+      entries: [
+        {
+          path: "worker.ts",
+          method: "full_file",
+          snapshot_digest: read.snapshotDigest,
+        },
+      ],
+    });
+    expect(ledger.status()).toMatchObject({
+      complete: true,
+      entries: [{ attestation_received: true }],
+    });
   });
 
   it("does not credit acknowledgement after returned bytes are mutated or the ledger closes", async () => {

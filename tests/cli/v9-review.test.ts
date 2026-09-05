@@ -172,9 +172,7 @@ agents = ["test"]
     expect(report.schema_version).toBe("2");
     expect(status.schema_version).toBe("3");
     expect(dashboard.schema_version).toBe("2");
-    expect(report.finding_counts).toEqual(
-      (status.canonical as typeof normalized.canonical).counts,
-    );
+    expect(report.finding_counts).toEqual(status.finding_counts);
     expect((dashboard.canonical as typeof normalized.canonical).counts).toEqual(
       normalized.canonical.counts,
     );

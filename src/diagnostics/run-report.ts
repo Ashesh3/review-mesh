@@ -2529,15 +2529,26 @@ export async function readRetryRunPlan(
       parent_run_id: current.run_id,
       request: current.request,
       incomplete_lenses: [
-        ...new Set(
-          current.reviewers
+        ...new Set([
+          ...current.reviewers
             .filter(
               (reviewer) =>
                 reviewer.status === "incomplete" ||
                 reviewer.reason === "not_evaluated_missing_input",
             )
             .map((reviewer) => reviewer.lens_id),
-        ),
+          ...(Array.isArray(current.summary.lens_summaries)
+            ? current.summary.lens_summaries.flatMap((entry) => {
+                if (typeof entry !== "object" || entry === null) return [];
+                const lens = entry as Record<string, unknown>;
+                return typeof lens.lens_id === "string" &&
+                  (lens.outcome === "incomplete" ||
+                    lens.outcome === "not_evaluated")
+                  ? [lens.lens_id]
+                  : [];
+              })
+            : []),
+        ]),
       ],
     };
   }

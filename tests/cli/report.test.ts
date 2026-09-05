@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { EventEmitter } from "node:events";
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AdapterRegistry } from "../../src/adapters/registry.js";
 import type { AdapterReviewInput } from "../../src/adapters/types.js";
@@ -19,7 +20,14 @@ import {
 } from "../../src/config/manage.js";
 import { runCli } from "../../src/cli.js";
 import type { ReviewApplicationOptions } from "../../src/app.js";
-import { passResult } from "../helpers/fixtures.js";
+import {
+  passResult,
+  resolvedReviewer,
+  roundInput,
+} from "../helpers/fixtures.js";
+import { canonicalJson } from "../../src/results/digest.js";
+import { runDoctorV9 } from "../../src/diagnostics/doctor-v9.js";
+import { readRunArtifact } from "../../src/diagnostics/run-artifact.js";
 
 const roots: string[] = [];
 
@@ -341,144 +349,359 @@ describe("report and findings commands", () => {
     process.exitCode = undefined;
   });
 
-  it("uses the v9 adapter run path, selected effort, mediated tools, and page contract for doctor", async () => {
-    const root = await mkdtemp(join(tmpdir(), "review-mesh-doctor-cli-"));
-    roots.push(root);
-    const workspace = join(root, "demo");
-    const configFile = join(root, "config.toml");
-    await mkdir(workspace);
-    const config: ManagedConfig = {
-      schema_version: "5",
-      execution: {
-        max_concurrency: 1,
-        heartbeat_interval_ms: 1_000,
-        shutdown_grace_period_ms: 100,
-      },
-      diagnostics: { persist_runs: false, max_runs: 1 },
-      adapters: {
-        fake: {
-          type: "command",
-          command: "unused",
-          protocol: "review-mesh-command-v1",
+  it.each([
+    { pages: true, authenticated: true, ready: true },
+    { pages: false, authenticated: true, ready: false },
+    { pages: true, authenticated: "unknown" as const, ready: false },
+  ])(
+    "verifies the actual doctor page contract and required checks ($pages/$authenticated)",
+    async (testCase) => {
+      const root = await mkdtemp(join(tmpdir(), "review-mesh-doctor-cli-"));
+      roots.push(root);
+      const workspace = join(root, "demo");
+      const configFile = join(root, "config.toml");
+      await mkdir(workspace);
+      const config: ManagedConfig = {
+        schema_version: "5",
+        execution: {
+          max_concurrency: 1,
+          heartbeat_interval_ms: 1_000,
+          shutdown_grace_period_ms: 100,
         },
-      },
-      agents: {
-        security: {
-          adapter: "fake",
-          model: "review-model",
-          effort: "high",
-          purpose: "Security",
-          instructions: "Review security.",
-          isolation: "prefer_enforced",
-          timeout_ms: 1_000,
-        },
-      },
-      defaults: { agents: ["security"] },
-      projects: {},
-    };
-    await writeFile(configFile, serializeManagedConfig(config));
-
-    let runInput: AdapterReviewInput | undefined;
-    let sentinel = "";
-    const registry = new AdapterRegistry();
-    registry.register("command", () => ({
-      id: "fake",
-      async probe() {
-        return {
-          available: true,
-          authenticated: true,
-          model_available: true,
-          streaming: true,
-          cancellation: true,
-          maximumIsolation: "prompt_only",
-        };
-      },
-      async *run(input) {
-        runInput = input;
-        sentinel = await readFile(
-          join(input.context.workspace, "review-mesh-doctor.txt"),
-          "utf8",
-        );
-        const read = await input.coverage!.readFile({
-          path: "review-mesh-doctor.txt",
-        });
-        if (!read.ok) throw new Error("doctor fixture unavailable");
-        yield { type: "progress", phase: "reviewing" };
-        yield {
-          type: "activity",
-          message: "Read review-mesh-doctor.txt with the adapter tool.",
-        };
-        yield { type: "progress", phase: "validating" };
-        yield {
-          type: "result",
-          result: {
-            schema_version: "4",
-            verdict: "pass",
-            summary: "Doctor parity.",
-            review_markdown: "Doctor parity.",
-            actionable_findings: [],
-            informational_notes: [],
-            coverage_attestation: {
-              scope_digest: input.coverage!.scopeDigest,
-              entries: [
-                {
-                  path: "review-mesh-doctor.txt",
-                  method: "full_file",
-                  snapshot_digest: read.snapshotDigest,
-                },
-              ],
-            },
+        diagnostics: { persist_runs: false, max_runs: 1 },
+        adapters: {
+          fake: {
+            type: "command",
+            command: "unused",
+            protocol: "review-mesh-command-v1",
           },
-          isolation: "prompt_only",
-        };
-      },
-    }));
-    const stdout = stream();
-    const processLike = Object.assign(new EventEmitter(), { exitCode: 0 });
-    await runCli(processLike, {
-      argv: ["doctor", workspace, "--structured-output"],
-      output: stdout,
-      error: stream(),
-      configFile,
-      cwd: root,
-      adapterRegistry: registry,
-    });
-
-    expect(runInput?.reviewer).toMatchObject({
-      id: "doctor",
-      model: "review-model",
-      effort: "high",
-    });
-    expect(runInput?.context.workspace).not.toBe(await realpath(workspace));
-    expect(sentinel).toContain("Review Mesh doctor.");
-    expect(runInput?.resultPages).toMatchObject({ resultKind: "reviewer" });
-    expect(JSON.parse(await output(stdout))).toMatchObject({
-      schema_version: "1",
-      kind: "review-mesh.doctor",
-      workspace: await realpath(workspace),
-      ready: true,
-      reviewers: [
-        {
-          reviewer_id: "security",
-          adapter: "fake",
-          model: "review-model",
-          provider_group: "fake",
-          ready: true,
-          checks: expect.arrayContaining([
-            { name: "authentication", passed: true },
-            { name: "model", passed: true },
-            { name: "streaming_negotiation", passed: true },
-            { name: "changed_file_access", passed: true },
-            { name: "result_page_assembly", passed: true },
-            { name: "coverage_reconciliation", passed: true },
-            { name: "schema_validation", passed: true },
-          ]),
         },
-      ],
-    });
-    expect(process.exitCode).toBe(0);
-    process.exitCode = undefined;
-  });
+        agents: {
+          security: {
+            adapter: "fake",
+            model: "review-model",
+            effort: "high",
+            purpose: "Security",
+            instructions: "Review security.",
+            isolation: "prefer_enforced",
+            timeout_ms: 1_000,
+          },
+        },
+        defaults: { agents: ["security"] },
+        projects: {},
+      };
+      await writeFile(configFile, serializeManagedConfig(config));
+
+      let runInput: AdapterReviewInput | undefined;
+      let sentinel = "";
+      const registry = new AdapterRegistry();
+      registry.register("command", () => ({
+        id: "fake",
+        async probe() {
+          return {
+            available: true,
+            authenticated: testCase.authenticated,
+            model_available: true,
+            streaming: true,
+            cancellation: true,
+            maximumIsolation: "prompt_only",
+          };
+        },
+        async *run(input) {
+          runInput = input;
+          sentinel = await readFile(
+            join(input.context.workspace, "review-mesh-doctor.txt"),
+            "utf8",
+          );
+          const read = await input.coverage!.readFile({
+            path: "review-mesh-doctor.txt",
+          });
+          if (!read.ok) throw new Error("doctor fixture unavailable");
+          if (input.context.git.is_repository && input.context.git.raw_diff)
+            input.coverage!.recordDiffDelivery(
+              input.context.git.changed_files,
+              {
+                byteCount: input.context.git.raw_diff.byte_count,
+                sha256: input.context.git.raw_diff.sha256,
+              },
+            );
+          yield { type: "progress", phase: "reviewing" };
+          yield {
+            type: "activity",
+            message: "Read review-mesh-doctor.txt with the adapter tool.",
+          };
+          yield { type: "progress", phase: "validating" };
+          const entries = [
+            {
+              path: "review-mesh-doctor.txt",
+              method: "full_file" as const,
+              snapshot_digest: read.snapshotDigest,
+            },
+          ];
+          const resultId =
+            input.resultPages && "resultId" in input.resultPages
+              ? input.resultPages.resultId
+              : "doctor-pages";
+          const bodies = [
+            {
+              page_kind: "header",
+              payload: {
+                verdict: "pass",
+                summary: "Doctor parity.",
+                informational_notes: [],
+                actionable_finding_count: 0,
+                narrative_byte_count: 14,
+                narrative_fragment_count: 1,
+                coverage_attestation: {
+                  scope_digest: input.coverage!.scopeDigest,
+                  entry_count: 1,
+                  entries_digest: createHash("sha256")
+                    .update(canonicalJson(entries))
+                    .digest("hex"),
+                },
+              },
+            },
+            { page_kind: "coverage", payload: { entries } },
+            {
+              page_kind: "narrative",
+              payload: { text_fragment: "Doctor parity." },
+            },
+          ];
+          const pages: Array<{ raw: string; sha256: string }> = [];
+          for (const [index, body] of bodies.entries()) {
+            const raw = JSON.stringify({
+              schema_version: "1",
+              kind: "review-mesh.result-page",
+              result_id: resultId,
+              result_kind: "reviewer",
+              result_schema_version: "4",
+              page_index: index,
+              page_count: 3,
+              previous_page_digest: pages.at(-1)?.sha256 ?? null,
+              ...body,
+            });
+            pages.push({
+              raw,
+              sha256: createHash("sha256").update(raw).digest("hex"),
+            });
+          }
+          yield {
+            type: "result",
+            result: {
+              schema_version: "4",
+              verdict: "pass",
+              summary: "Doctor parity.",
+              review_markdown: "Doctor parity.",
+              actionable_findings: [],
+              informational_notes: [],
+              coverage_attestation: {
+                scope_digest: input.coverage!.scopeDigest,
+                entries: [
+                  {
+                    path: "review-mesh-doctor.txt",
+                    method: "full_file",
+                    snapshot_digest: read.snapshotDigest,
+                  },
+                ],
+              },
+            },
+            isolation: "prompt_only",
+            ...(testCase.pages
+              ? {
+                  resultStorage: {
+                    async *pages() {
+                      yield* pages;
+                    },
+                    persisted() {},
+                    abandoned() {},
+                  },
+                }
+              : {}),
+          };
+        },
+      }));
+      const stdout = stream();
+      const processLike = Object.assign(new EventEmitter(), { exitCode: 0 });
+      await runCli(processLike, {
+        argv: ["doctor", workspace, "--structured-output"],
+        output: stdout,
+        error: stream(),
+        configFile,
+        cwd: root,
+        adapterRegistry: registry,
+      });
+
+      expect(runInput?.reviewer).toMatchObject({
+        id: "doctor",
+        model: "review-model",
+        effort: "high",
+      });
+      expect(runInput?.context.workspace).not.toBe(await realpath(workspace));
+      expect(sentinel).toContain("Review Mesh doctor.");
+      expect(runInput?.context.git).toMatchObject({
+        is_repository: true,
+        changed_paths: [{ path: "review-mesh-doctor.txt", kind: "tracked" }],
+      });
+      expect(
+        runInput?.context.git.is_repository && runInput.context.git.diff,
+      ).toContain("+Review Mesh doctor.");
+      expect(
+        runInput?.context.git.is_repository && runInput.context.git.head,
+      ).toMatch(/^[a-f0-9]{40}$/);
+      expect(runInput?.resultPages).toMatchObject({ resultKind: "reviewer" });
+      expect(JSON.parse(await output(stdout))).toMatchObject({
+        schema_version: "1",
+        kind: "review-mesh.doctor",
+        workspace: await realpath(workspace),
+        ready: testCase.ready,
+        reviewers: [
+          {
+            reviewer_id: "security",
+            adapter: "fake",
+            model: "review-model",
+            provider_group: "fake",
+            ready: testCase.ready,
+            checks: expect.arrayContaining([
+              {
+                name: "authentication",
+                passed: testCase.authenticated === true,
+              },
+              { name: "model", passed: true },
+              { name: "streaming_negotiation", passed: true },
+              { name: "changed_file_access", passed: true },
+              { name: "result_page_assembly", passed: testCase.pages },
+              { name: "coverage_reconciliation", passed: true },
+              { name: "schema_validation", passed: true },
+            ]),
+          },
+        ],
+      });
+      expect(process.exitCode).toBe(testCase.ready ? 0 : 3);
+      process.exitCode = undefined;
+    },
+  );
+
+  it.each([
+    { read: true, diff: true },
+    { read: true, diff: false },
+    { read: false, diff: true },
+  ])(
+    "keeps doctor coverage facets independent after page failure ($read/$diff)",
+    async (scenario) => {
+      const root = await mkdtemp(join(tmpdir(), "review-mesh-doctor-facets-"));
+      roots.push(root);
+      const reviewer = resolvedReviewer({
+        timeoutMs: 5_000,
+        policy: {
+          applicability: { mode: "always" },
+          requiredCallerContext: [],
+          passQuorum: 1,
+          minimumProviderGroups: 1,
+          adjudication: "off",
+          gateMinimumSeverity: "medium",
+          gateMinimumConfidence: "medium",
+          changeCoverage: {
+            relevantPaths: ["**"],
+            minimumInspection: "full_file",
+            proof: "observed",
+          },
+        },
+      });
+      const result = await runDoctorV9(
+        {
+          id: "facets",
+          async probe() {
+            return {
+              available: true,
+              authenticated: true,
+              model_available: true,
+              streaming: true,
+              cancellation: true,
+              maximumIsolation: "runtime_read_only",
+              observed_file_access: true,
+              progress_observable: true,
+            };
+          },
+          async *run(input) {
+            yield {
+              type: "progress",
+              phase: "response",
+              byteCount: 0,
+              identity: "response-admitted",
+            };
+            if (scenario.read) {
+              const read = await input.coverage!.readFile({
+                path: "review-mesh-doctor.txt",
+              });
+              if (!read.ok) throw new Error("Missing doctor fixture");
+              read.acknowledgeDelivered();
+            }
+            if (
+              scenario.diff &&
+              input.context.git.is_repository &&
+              input.context.git.raw_diff
+            )
+              input.coverage!.recordDiffDelivery(
+                input.context.git.changed_files,
+                {
+                  byteCount: input.context.git.raw_diff.byte_count,
+                  sha256: input.context.git.raw_diff.sha256,
+                },
+              );
+            yield {
+              type: "failure",
+              failure: {
+                reason: "invalid_result",
+                message: "Empty result page",
+                retryable: false,
+                diagnostics: {
+                  failure_stage: "structured_result_page",
+                  scope: "model",
+                },
+              },
+            };
+          },
+        },
+        reviewer,
+        new AbortController().signal,
+        roundInput().config,
+        join(root, "runs"),
+      );
+      expect(result.ready).toBe(false);
+      expect(result.checks).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            name: "streaming_negotiation",
+            passed: true,
+          }),
+          expect.objectContaining({
+            name: "changed_file_access",
+            passed: scenario.read,
+          }),
+          expect.objectContaining({
+            name: "git_diff_delivery",
+            passed: scenario.diff,
+          }),
+          expect.objectContaining({
+            name: "coverage_reconciliation",
+            passed: scenario.read && scenario.diff,
+          }),
+          expect.objectContaining({
+            name: "result_page_assembly",
+            passed: false,
+          }),
+          expect.objectContaining({ name: "schema_validation", passed: false }),
+        ]),
+      );
+      const artifact = await readRunArtifact(result.artifact);
+      expect(artifact.records).toContainEqual(
+        expect.objectContaining({
+          record: "reviewer.coverage",
+          reviewer_id: "doctor",
+        }),
+      );
+    },
+  );
 
   it("labels a real run tool-stage failure and retains typed diagnostics", async () => {
     const root = await mkdtemp(join(tmpdir(), "review-mesh-doctor-tool-"));
@@ -801,7 +1024,9 @@ describe("report and findings commands", () => {
     expect(created).toEqual(["second"]);
     expect(probed).toEqual(["second"]);
     expect(JSON.parse(await output(stdout))).toMatchObject({
-      ready: true,
+      ready: false,
+      probe_ready: true,
+      readiness_scope: "credentials_and_model",
       reviewers: [{ reviewer_id: "second", adapter: "second" }],
     });
     process.exitCode = undefined;

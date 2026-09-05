@@ -9,6 +9,10 @@ export type HelpTopic =
   | "report"
   | "findings"
   | "retry"
+  | "cancel"
+  | "pause"
+  | "resume"
+  | "diagnostics"
   | "doctor"
   | "serve"
   | "config"
@@ -33,6 +37,10 @@ USAGE
   review-mesh report RUN_ID [--format markdown|json] [--best-effort]
   review-mesh findings RUN_ID [--deduplicate] [--json] [--best-effort]
   review-mesh retry RUN_ID --only-incomplete
+  review-mesh cancel RUN_ID
+  review-mesh pause RUN_ID
+  review-mesh resume RUN_ID
+  review-mesh diagnostics list RUN_ID
   review-mesh doctor [WORKSPACE] [--adapter ID] [--model MODEL]
       [--structured-output]
   review-mesh serve [--host 127.0.0.1] [--port 0] [--no-open]
@@ -54,7 +62,7 @@ AGENT QUICK START
   3. Run: review-mesh review [WORKSPACE]
      With empty stdin, Review Mesh reviews only the current Git change set above
      the inferred default branch, including local staged/unstaged/untracked work.
-     With JSON on stdin, send the explicit v2 request described below.
+     With JSON on stdin, send the current v3 request described below.
   4. Read stdout one JSON object per line until run.completed. Logical lenses
      run in parallel. A transient failure may retry; an operational failure
      advances to an eligible fallback. Clean runs stop at quorum, while findings
@@ -75,7 +83,8 @@ REVIEW I/O CONTRACT
 
 HELP TOPICS
   review, status, report, findings, retry, doctor, serve, config, config-file,
-  adapters, command-adapter, describe, schema, events, exit-codes
+  adapters, command-adapter, describe, schema, events, exit-codes,
+  cancel, pause, resume, diagnostics
 
 Run 'review-mesh help TOPIC' or 'review-mesh TOPIC --help' for details.
 `;
@@ -89,14 +98,14 @@ USAGE
   <request.json review-mesh review
 
 WORKSPACE defaults to the current directory. If stdin is a terminal or is empty,
-Review Mesh synthesizes this request immediately:
+Review Mesh synthesizes this legacy v2-compatible request immediately:
   {"schema_version":"2","project_name":"<resolved repository name>",
    "workspace":"<current directory>",
    "instructions":"Review the current change set for evidence-backed defects.",
    "review_scope":{"mode":"changes"}}
 
 If stdin is not empty, it must be exactly one request object. Required fields:
-  schema_version  The string "2".
+  schema_version  The string "3" (legacy v2 requests remain supported).
   project_name    Copy configuration.selection.project_name from describe.
   workspace       An existing local directory.
   instructions    Review focus sent to every mandatory reviewer.
@@ -106,6 +115,7 @@ If stdin is not empty, it must be exactly one request object. Required fields:
 Optional fields:
   request_id      Caller correlation id copied into every event.
   context         Arbitrary JSON supplied as lower-priority caller context.
+  pull_request    Optional v3 PR metadata (title, body, base/head refs and SHAs).
 
 Before running, use 'review-mesh describe WORKSPACE --json' to see the exact
 project_name and trusted suite. project_name is an assertion: it must match the
@@ -124,7 +134,8 @@ reviewer.result with the complete sanitized v4 result, digest, and byte count in
 the original invocation. Select --output-mode compact-jsonl explicitly for the
 compatibility/operations stream; its terminal manifest still identifies the
 authoritative artifact. --details-file writes the sanitized detailed artifact
-to a new caller-selected path and fails rather than overwriting an existing file.
+to a new caller-selected path at finalization and fails rather than overwriting
+an existing file. During execution, status reports the active artifact path.
 
 Exit codes: 0 passed, 1 findings, 2 invalid request/config/usage,
 3 incomplete reviewer/runtime, 4 interrupted.
@@ -151,7 +162,7 @@ in that case their transient record is removed when the review exits.
   status: `REVIEW-MESH STATUS
 
 USAGE
-  review-mesh status RUN_ID [REVIEWER_ID] [--json]
+  review-mesh status RUN_ID [REVIEWER_ID] [--json] [--details]
 
 Reads the sanitized persisted record for one active or completed run. With only
 RUN_ID it returns a compact snapshot for the whole reviewer roster. Add an exact
@@ -163,6 +174,49 @@ This command is read-only and does not contact, cancel, or otherwise change the
 running review. It is available when diagnostics.persist_runs is enabled. Use
 the run_id from run.started; callers can poll this command instead of retaining
 every progress or heartbeat event in their own context.
+Use --details for the full sanitized report; default run status omits request
+and context bodies. terminal=false means no final outcome or exit code yet.
+`,
+  cancel: `REVIEW-MESH CANCEL
+
+USAGE
+  review-mesh cancel RUN_ID
+
+Requests cooperative cancellation through the run's private local control lease.
+The runner completes cleanup and finalizes a cancelled artifact. Poll status
+until terminal=true. Completed compatible model results remain reusable.
+`,
+  diagnostics: `REVIEW-MESH DIAGNOSTICS
+
+USAGE
+  review-mesh diagnostics list RUN_ID
+  review-mesh diagnostics export RUN_ID ARTIFACT_REF DESTINATION
+  review-mesh diagnostics cleanup RUN_ID [ARTIFACT_REF]
+
+List private failed-result page metadata without exposing raw content. Export
+writes an exact raw page to a new private file; it may contain code or secrets.
+Cleanup immediately wipes the selected verified owned raw files. Successful
+pages are wiped after persistence. Failed pages are eligible for stale cleanup
+after 24 hours; cleanup runs on later spool creation, not continuously. Use
+explicit cleanup to wipe earlier. Empty owned directories can remain.
+`,
+  pause: `REVIEW-MESH PAUSE
+
+USAGE
+  review-mesh pause RUN_ID
+
+Stops the run cooperatively and finalizes its checkpoint as cancelled. Completed
+model results are preserved. In-flight model conversations are not persisted;
+resume retries unfinished work with current config and verified Git evidence.
+`,
+  resume: `REVIEW-MESH RESUME
+
+USAGE
+  review-mesh resume RUN_ID
+
+Starts a child run equivalent to retry RUN_ID --only-incomplete after the parent
+has finalized. Git head/base/scope must still match. Completed compatible model
+results are reused; incomplete attempts restart with fresh Git evidence.
 `,
   report: `REVIEW-MESH REPORT
 
@@ -193,7 +247,10 @@ USAGE
 
 Starts a new review linked to the persisted parent run and targets the logical
 lenses that lacked a verdict. The normalized request is recovered from the
-private run artifact; completed lens evidence remains available in the parent.
+private run artifact. Git evidence is rebuilt and original head/base/scope must
+match. Completed compatible model slots are reused, including inside incomplete
+lenses. Changed trusted config causes a fresh pass; retry metadata explains reuse.
+Redacted caller narrative remains redacted. Use resume RUN_ID after cancel/pause.
 `,
   doctor: `REVIEW-MESH DOCTOR
 
@@ -208,6 +265,10 @@ negotiation, read-tool execution, bounded v4 result-page production, and schema
 validation with the selected model, effort, retry, continuation, and deadline
 rules. --adapter and --model are exact, case-sensitive filters. The command
 fails without contacting a provider when no reviewer matches the selection.
+Basic mode reports probe_ready for credentials/model and marks remaining facets
+not_tested; it never reports full ready. Structured mode uses a real changed Git
+file and verifies coverage, page production, and deterministic retry inheritance.
+Observed versus attested proof is explicitly reported.
 `,
   config: `REVIEW-MESH CONFIG
 
@@ -402,7 +463,7 @@ adapter protocol section for full request and limit details.
 Review Mesh uses one trusted global config.toml. Run 'review-mesh config path'
 for its exact platform path. Workspace .review-mesh.toml files are ignored.
 
-Schema version 6 contains:
+Schema version 7 contains:
   execution    max concurrency, heartbeat interval, shutdown grace, primary
                distribution/concentration policy, provider limits, circuit
                breaking, retries, and exact-continuation attempts

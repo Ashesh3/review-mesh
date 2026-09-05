@@ -39,6 +39,7 @@ export interface ReadRunStatusOptions {
   runsDirectory: string;
   runId: string;
   reviewerId?: string;
+  details?: boolean;
   afterOpen?: () => void | Promise<void>;
 }
 
@@ -571,12 +572,13 @@ export async function readRunStatus({
   runsDirectory,
   runId,
   reviewerId,
+  details,
   afterOpen,
 }: ReadRunStatusOptions): Promise<Record<string, unknown>> {
   requireSafeRunId(runId);
   const { loadV9Run, v9Status } = await import("./v9-views.js");
   const current = await loadV9Run(runsDirectory, runId);
-  if (current) return v9Status(current, reviewerId);
+  if (current) return v9Status(current, reviewerId, details);
   const location = await resolveRunRecord(runsDirectory, runId);
   const opened = await openRunRecord(location.path);
   await afterOpen?.();

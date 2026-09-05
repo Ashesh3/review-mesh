@@ -62,6 +62,16 @@ const coverageEntry = z.strictObject({
   disposition: z.enum(["satisfied", "deficit"]),
   reason: text.optional(),
 });
+export const runSnapshotIdentitySchema = z.strictObject({
+  schema_version: z.literal("1"),
+  sha256: digest,
+  file_count: count,
+  complete: z.boolean(),
+});
+export const artifactCoverageV1Schema = z.strictObject({
+  index: count,
+  entries: z.array(coverageEntry).max(256),
+});
 const proof = z.strictObject({
   evidence_verified: z.boolean().optional(),
   source_coverage_verified: z.boolean().optional(),
@@ -128,12 +138,18 @@ export const failureDiagnosticsSchema = z.strictObject({
         path: z.string().max(256),
         code: z.string().min(1).max(64),
         message: z.string().min(1).max(256),
+        expected_max_bytes: count.optional(),
+        actual_bytes: count.optional(),
+        unknown_keys: z.array(z.string().max(128)).max(32).optional(),
       }),
     )
     .max(12)
     .optional(),
   truncated: z.boolean().optional(),
   repair_attempted: z.boolean().optional(),
+  checkpoint_id: z.string().max(256).optional(),
+  artifact_ref: z.string().max(4096).optional(),
+  recommended_action: z.string().max(256).optional(),
   repair_outcome: z.enum(["not_attempted", "succeeded", "failed"]).optional(),
   attempt_count: z.number().int().min(1).max(100).optional(),
   retry_outcome: z.enum(["not_attempted", "succeeded", "exhausted"]).optional(),
@@ -274,13 +290,38 @@ export const artifactResolutionSchema = z.strictObject({
       isolation: text.optional(),
       timeout_ms: count.optional(),
       policy: artifactResolutionPolicySchema.optional(),
+      config_fingerprint: digest.optional(),
     }),
   ),
   warnings: z.array(warning).optional(),
   deadline: selectedDeadlineSchema.optional(),
+  retry: z
+    .strictObject({
+      parent_run_id: id,
+      inheritance: z.enum(["exact", "rerun_all"]),
+      reused_reviewer_ids: z.array(id),
+      evidence: z.enum([
+        "reconstructed_and_verified",
+        "snapshot_identity_verified",
+        "snapshot_identity_unavailable",
+        "scope_or_policy_changed",
+      ]),
+      narrative: z.literal("sanitized_parent_context"),
+    })
+    .optional(),
 });
 
-export const artifactResolutionV1Schema = artifactResolutionSchema.extend({
+export const artifactResolutionV2Schema = artifactResolutionSchema
+  .omit({ retry: true })
+  .extend({
+    reviewers: z.array(
+      artifactResolutionSchema.shape.reviewers.element.omit({
+        config_fingerprint: true,
+      }),
+    ),
+  });
+
+export const artifactResolutionV1Schema = artifactResolutionV2Schema.extend({
   reviewers: z.array(
     z.strictObject({
       id,
@@ -288,6 +329,14 @@ export const artifactResolutionV1Schema = artifactResolutionSchema.extend({
       policy: artifactResolutionPolicySchema.optional(),
     }),
   ),
+});
+
+export const artifactAttemptV1Schema = z.strictObject({
+  attempt: count,
+  started_at: z.iso.datetime({ offset: true }),
+  elapsed_ms: count,
+  failure: persistedFailureSchema,
+  causes: z.array(v9IncompleteReasonSchema).optional(),
 });
 
 export const privatePayloadSchemas: Record<string, z.ZodType> = {
@@ -316,7 +365,15 @@ export const privatePayloadSchemas: Record<string, z.ZodType> = {
     attempt: count,
     started_at: z.iso.datetime({ offset: true }),
     elapsed_ms: count,
-    failure: persistedFailureSchema,
+    failure: persistedFailureSchema.optional(),
+    ended_at: z.iso.datetime({ offset: true }).optional(),
+    admitted_at: z.iso.datetime({ offset: true }).optional(),
+    queued_at: z.iso.datetime({ offset: true }).optional(),
+    probe_started_at: z.iso.datetime({ offset: true }).optional(),
+    probe_elapsed_ms: count.optional(),
+    queue_wait_ms: count.optional(),
+    execution_elapsed_ms: count.optional(),
+    expired_boundary: v9IncompleteReasonSchema.optional(),
     causes: z.array(v9IncompleteReasonSchema).optional(),
   }),
   "reviewer.activity": z.strictObject({
@@ -347,9 +404,8 @@ export const privatePayloadSchemas: Record<string, z.ZodType> = {
       )
       .max(10),
   }),
-  "reviewer.coverage": z.strictObject({
-    index: count,
-    entries: z.array(coverageEntry).max(256),
+  "reviewer.coverage": artifactCoverageV1Schema.extend({
+    snapshot_identity: runSnapshotIdentitySchema.optional(),
   }),
   "reviewer.result_page": z
     .strictObject({
@@ -379,6 +435,8 @@ export const privatePayloadSchemas: Record<string, z.ZodType> = {
     lens_id: id,
     mode: z.enum(["full_review", "adjudication"]).optional(),
     reason: text.optional(),
+    failure_stage: phase.optional(),
+    expired_boundary: v9IncompleteReasonSchema.optional(),
     finding_proofs: z.record(text, proof).optional(),
     missing_inputs: z
       .array(
@@ -391,3 +449,19 @@ export const privatePayloadSchemas: Record<string, z.ZodType> = {
   }),
   "run.findings": runFindingsPayloadSchema,
 };
+
+export const artifactTerminalV1Schema = z.strictObject({
+  status: z.enum(["completed", "incomplete", "skipped"]),
+  lens_id: id,
+  mode: z.enum(["full_review", "adjudication"]).optional(),
+  reason: text.optional(),
+  finding_proofs: z.record(text, proof).optional(),
+  missing_inputs: z
+    .array(
+      z.strictObject({
+        selector: text,
+        code: z.enum(["missing_required_input", "invalid_required_input"]),
+      }),
+    )
+    .optional(),
+});

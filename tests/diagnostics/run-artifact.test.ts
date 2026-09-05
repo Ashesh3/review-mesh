@@ -54,37 +54,126 @@ const complete = {
 };
 
 describe("immutable artifact format two", () => {
-  it("accepts legacy resolution metadata but rejects mismatched version declarations", async () => {
+  it.each(["1", "2"])(
+    "accepts resolution v%s but rejects mismatched version declarations",
+    async (version) => {
+      const { path } = await fixture();
+      const writer = await createRunArtifact({
+        path,
+        runId: "run-1",
+        toolVersion: "9.0.0",
+      });
+      await writer.record({
+        record: "resolution",
+        resolution: { reviewers: [{ id: "security" }] },
+      });
+      const original = await readFile(path, "utf8");
+      await writer.close();
+      await writeFile(
+        path,
+        original.replace('"resolution":"3"', `"resolution":"${version}"`),
+      );
+      await expect(
+        readRunArtifact(path, { allowActive: true }),
+      ).rejects.toMatchObject({ code: "unsupported_schema_version" });
+      const legacy = original
+        .replace('"resolution":"3"', `"resolution":"${version}"`)
+        .replace(
+          /("record":"resolution"[^\n]*"schema_version":)"3"/u,
+          `$1"${version}"`,
+        );
+      await writeFile(path, legacy);
+      await expect(
+        readRunArtifact(path, { allowActive: true }),
+      ).resolves.toMatchObject({ active: true });
+    },
+  );
+  it("declares admitted timing attempts separately from legacy failure attempts", async () => {
     const { path } = await fixture();
     const writer = await createRunArtifact({
       path,
       runId: "run-1",
-      toolVersion: "9.0.0",
+      toolVersion: "9.2.0",
     });
     await writer.record({
-      record: "resolution",
-      resolution: { reviewers: [{ id: "security" }] },
+      record: "reviewer.attempt",
+      reviewer_id: "reviewer-1",
+      data: {
+        attempt: 1,
+        started_at: "2026-09-05T00:00:01.000Z",
+        admitted_at: "2026-09-05T00:00:01.000Z",
+        ended_at: "2026-09-05T00:00:02.000Z",
+        elapsed_ms: 1_000,
+        execution_elapsed_ms: 1_000,
+        probe_elapsed_ms: 300,
+        queue_wait_ms: 700,
+      },
     });
-    const original = await readFile(path, "utf8");
     await writer.close();
-    await writeFile(
-      path,
-      original.replace('"resolution":"2"', '"resolution":"1"'),
-    );
-    await expect(
-      readRunArtifact(path, { allowActive: true }),
-    ).rejects.toMatchObject({ code: "unsupported_schema_version" });
-    const legacy = original
-      .replace('"resolution":"2"', '"resolution":"1"')
-      .replace(
-        '"record":"resolution","resolution":',
-        '"record":"resolution","resolution":',
-      )
-      .replace(/("record":"resolution"[^\n]*"schema_version":)"2"/u, '$1"1"');
-    await writeFile(path, legacy);
+    const records = (await readFile(path, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    expect(records[0].private_record_versions["reviewer.attempt"]).toBe("2");
+    expect(records[1].schema_version).toBe("2");
     await expect(
       readRunArtifact(path, { allowActive: true }),
     ).resolves.toMatchObject({ active: true });
+    records[0].private_record_versions["reviewer.attempt"] = "1";
+    records[1].schema_version = "1";
+    await writeFile(
+      path,
+      records.map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+    await expect(
+      readRunArtifact(path, { allowActive: true }),
+    ).rejects.toMatchObject({ code: "invalid_artifact_record" });
+    records[1].data = {
+      attempt: 1,
+      started_at: "2026-09-05T00:00:00.000Z",
+      elapsed_ms: 1_000,
+      failure: {
+        reason: "invalid_result",
+        message: "Invalid result",
+        retryable: false,
+      },
+    };
+    await writeFile(
+      path,
+      records.map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+    await expect(
+      readRunArtifact(path, { allowActive: true }),
+    ).resolves.toMatchObject({ active: true });
+  });
+
+  it("rejects retry fingerprints in artifacts declaring the older resolution contract", async () => {
+    const { path } = await fixture();
+    const writer = await createRunArtifact({
+      path,
+      runId: "run-1",
+      toolVersion: "9.2.0",
+    });
+    await writer.record({
+      record: "resolution",
+      resolution: {
+        reviewers: [{ id: "one", config_fingerprint: "a".repeat(64) }],
+      },
+    });
+    await writer.close();
+    const records = (await readFile(path, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    records[0].private_record_versions.resolution = "2";
+    records[1].schema_version = "2";
+    await writeFile(
+      path,
+      records.map((record) => JSON.stringify(record)).join("\n") + "\n",
+    );
+    await expect(
+      readRunArtifact(path, { allowActive: true }),
+    ).rejects.toMatchObject({ code: "invalid_artifact_record" });
   });
   it("reads an active prefix without pretending its terminal digest is finalized", async () => {
     const { path } = await fixture();
@@ -302,8 +391,8 @@ describe("immutable artifact format two", () => {
     });
     expect(
       records.find((record) => record.record === "resolution")?.schema_version,
-    ).toBe("2");
-    expect(records[0].private_record_versions.resolution).toBe("2");
+    ).toBe("3");
+    expect(records[0].private_record_versions.resolution).toBe("3");
     expect(records.at(-2)?.record).toBe("run.terminal_summary");
     expect(records.at(-1)?.record).toBe("run.artifact_terminal");
     expect(records.some((record) => record.event === "run.completed")).toBe(

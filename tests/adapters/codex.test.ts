@@ -439,69 +439,81 @@ describe("Codex adapter", () => {
       },
     });
   });
-  it("continues v9 pages through the same facade thread", async () => {
-    const first = JSON.stringify({
-      schema_version: "1",
-      kind: "review-mesh.result-page",
-      result_id: "codex-two",
-      result_kind: "reviewer",
-      result_schema_version: "4",
-      page_index: 0,
-      page_count: 2,
-      page_kind: "header",
-      previous_page_digest: null,
-      payload: {
-        verdict: "pass",
-        summary: "clean",
-        informational_notes: [],
-        narrative_byte_count: 1,
-        narrative_fragment_count: 1,
-        actionable_finding_count: 0,
-        coverage_attestation: null,
-      },
-    });
-    const second = JSON.stringify({
-      schema_version: "1",
-      kind: "review-mesh.result-page",
-      result_id: "codex-two",
-      result_kind: "reviewer",
-      result_schema_version: "4",
-      page_index: 1,
-      page_count: 2,
-      page_kind: "narrative",
-      previous_page_digest: createHash("sha256").update(first).digest("hex"),
-      payload: { text_fragment: "x" },
-    });
-    let call = 0;
-    const starts: CodexSdkStartInput[] = [];
-    const prepared = await setup({
-      facade: {
-        async start(input) {
-          starts.push(input);
-          const raw = call++ === 0 ? first : second;
-          return events(
-            {
-              type: "item.completed",
-              item: { id: `page-${call}`, type: "agent_message", text: raw },
-            },
-            { type: "turn.completed", usage: completedUsage() },
-          );
+  it.each([false, true])(
+    "continues v9 pages through the same facade thread (repair=%s)",
+    async (repair) => {
+      const first = JSON.stringify({
+        schema_version: "1",
+        kind: "review-mesh.result-page",
+        result_id: "codex-two",
+        result_kind: "reviewer",
+        result_schema_version: "4",
+        page_index: 0,
+        page_count: 2,
+        page_kind: "header",
+        previous_page_digest: null,
+        payload: {
+          verdict: "pass",
+          summary: "clean",
+          informational_notes: [],
+          narrative_byte_count: 1,
+          narrative_fragment_count: 1,
+          actionable_finding_count: 0,
+          coverage_attestation: null,
         },
-      },
-    });
-    prepared.input.resultPages = createResultPageCollector({
-      resultId: "codex-two",
-      resultKind: "reviewer",
-    });
+      });
+      const second = JSON.stringify({
+        schema_version: "1",
+        kind: "review-mesh.result-page",
+        result_id: "codex-two",
+        result_kind: "reviewer",
+        result_schema_version: "4",
+        page_index: 1,
+        page_count: 2,
+        page_kind: "narrative",
+        previous_page_digest: createHash("sha256").update(first).digest("hex"),
+        payload: { text_fragment: "x" },
+      });
+      let call = 0;
+      const invalid = JSON.parse(first);
+      invalid.page_index = 1;
+      const responses = [
+        ...(repair ? [JSON.stringify(invalid)] : []),
+        first,
+        second,
+      ];
+      const starts: CodexSdkStartInput[] = [];
+      const prepared = await setup({
+        facade: {
+          async start(input) {
+            starts.push(input);
+            const raw = responses[call++]!;
+            return events(
+              {
+                type: "item.completed",
+                item: { id: `page-${call}`, type: "agent_message", text: raw },
+              },
+              { type: "turn.completed", usage: completedUsage() },
+            );
+          },
+        },
+      });
+      prepared.input.resultPages = createResultPageCollector({
+        resultId: "codex-two",
+        resultKind: "reviewer",
+      });
 
-    const output = await collect(prepared.adapter.run(prepared.input));
+      const output = await collect(prepared.adapter.run(prepared.input));
 
-    expect(terminalResult(output).result).toMatchObject({
-      review_markdown: "x",
-    });
-    expect(starts).toHaveLength(2);
-    expect(starts[1]!.userPrompt).not.toContain(prepared.prompt.user);
-  });
+      expect(terminalResult(output).result).toMatchObject({
+        review_markdown: "x",
+      });
+      expect(starts).toHaveLength(repair ? 3 : 2);
+      if (repair)
+        expect(starts[1]!.userPrompt).toContain("unexpected page index");
+      expect(starts[1]!.userPrompt).not.toContain(prepared.prompt.user);
+    },
+  );
   it("probes the pinned adapter without starting a model turn", async () => {
     const prepared = await setup();
 

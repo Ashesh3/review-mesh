@@ -1,3 +1,4 @@
+import packageMetadata from "../../package.json" with { type: "json" };
 import {
   createServer,
   type IncomingMessage,
@@ -193,7 +194,7 @@ describe("portable CLI", () => {
 
     const version = await runArguments(artifact, ["--version"], options);
     expect(version).toMatchObject({ exitCode: 0, stderr: "" });
-    expect(version.stdout).toBe("review-mesh 9.1.0\n");
+    expect(version.stdout).toBe(`review-mesh ${packageMetadata.version}\n`);
 
     const schema = await runArguments(
       artifact,
@@ -413,7 +414,7 @@ describe("portable CLI", () => {
 
     for (const [args, assertion] of [
       [
-        ["status", completed.run_id, "--json"],
+        ["status", completed.run_id, "--json", "--details"],
         {
           reviewers: [
             {

@@ -101,7 +101,11 @@ export function v9Report(run: NormalizedRun) {
     headline: v9Headline(run),
   };
 }
-export function v9Status(run: NormalizedRun, reviewerId?: string) {
+export function v9Status(
+  run: NormalizedRun,
+  reviewerId?: string,
+  details = false,
+): Record<string, unknown> {
   const reviewers = run.reviewers.map((reviewer) => ({
     ...reviewer,
     state: reviewer.status,
@@ -119,12 +123,43 @@ export function v9Status(run: NormalizedRun, reviewerId?: string) {
       ...reviewer,
     };
   }
-  return {
-    ...v9Report(run),
+  if (details)
+    return {
+      ...v9Report(run),
+      schema_version: "3",
+      kind: "review-mesh.run-status",
+      reviewers,
+    };
+  const live = projectDashboardRun(run);
+  return sanitizeDashboardValue({
     schema_version: "3",
     kind: "review-mesh.run-status",
-    reviewers,
-  };
+    run_id: run.run_id,
+    terminal: !run.active,
+    active: run.active,
+    status: run.active ? "running" : run.run_outcome,
+    stale: live.stale,
+    stage: live.stage,
+    started_at: live.started_at,
+    updated_at: live.updated_at,
+    total_elapsed_ms: live.total_elapsed_ms,
+    deadline: live.deadline,
+    logical_lenses: live.logical_lenses,
+    model_runs: live.model_runs,
+    reviewers: live.reviewers.map(dashboardReviewerSummary),
+    artifact: run.artifact,
+    details_file_policy: "published_at_finalization",
+    ...(!run.active
+      ? {
+          run_outcome: run.run_outcome,
+          gate_outcome: run.gate_outcome,
+          coverage_outcome: run.coverage_outcome,
+          exit_code: run.exit_code,
+          change_coverage: run.change_coverage,
+          finding_counts: run.canonical.counts,
+        }
+      : {}),
+  });
 }
 export function v9DashboardRun(run: NormalizedRun, fileUpdatedAt?: string) {
   const report = v9Report(run);

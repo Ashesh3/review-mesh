@@ -286,8 +286,12 @@ export function projectDashboardRun(
           "run_deadline_remaining_ms",
           "lens_deadline_remaining_ms",
           "attempt_deadline_remaining_ms",
+          "queue_wait_ms",
+          "probe_elapsed_ms",
         ])
           if (count(entry[key]) !== undefined) reviewer[key] = entry[key];
+        for (const key of ["admitted_at", "queue_reason"])
+          if (entry[key] !== undefined) reviewer[key] = entry[key];
         if (at && count(entry.last_progress_age_ms) !== undefined)
           activityAt(
             reviewer,
@@ -323,6 +327,9 @@ export function projectDashboardRun(
         "timeout_ms",
         "progress_observable",
         "proof",
+        "admitted_at",
+        "queue_wait_ms",
+        "probe_elapsed_ms",
       ])
         if (data[key] !== undefined) reviewer[key] = data[key];
       if (at) {
@@ -335,12 +342,15 @@ export function projectDashboardRun(
           status: "running",
         });
       setPhase(reviewer, "reviewing", at);
+      delete reviewer.queue_reason;
     } else if (
       record.event === "reviewer.progress" ||
       record.event === "reviewer.heartbeat"
     ) {
       if (terminalIds.has(id)) continue;
       setPhase(reviewer, data.phase, at);
+      for (const key of ["queued_at", "queue_reason"])
+        if (data[key] !== undefined) reviewer[key] = data[key];
       if (text(data.mode)) reviewer.mode = data.mode;
       if (count(data.attempt)) attempt(reviewer, count(data.attempt)!);
       if (count(data.maximum_attempts))
@@ -358,7 +368,7 @@ export function projectDashboardRun(
     } else if (record.record === "reviewer.attempt") {
       if (count(data.attempt))
         Object.assign(attempt(reviewer, count(data.attempt)!), data, {
-          status: "incomplete",
+          status: data.failure ? "incomplete" : "completed",
         });
       if (!terminalIds.has(id)) reviewer.failure = data.failure;
     } else if (record.record === "reviewer.activity") {
@@ -430,6 +440,25 @@ export function projectDashboardRun(
         Date.parse(reviewer.finished_at) - Date.parse(reviewer.started_at),
       );
     reviewer.attempts.sort((a, b) => Number(a.attempt) - Number(b.attempt));
+    if (reviewer.last_activity_at)
+      reviewer.last_progress_age_ms = Math.max(
+        0,
+        observedNow - Date.parse(reviewer.last_activity_at),
+      );
+    const coverage = reviewer.change_coverage as
+      Record<string, unknown> | undefined;
+    if (coverage) {
+      reviewer.successful_files = count(coverage.inspected_count) ?? 0;
+      reviewer.required_files =
+        (count(coverage.inspected_count) ?? 0) +
+        (count(coverage.deficit_count) ?? 0);
+    }
+    reviewer.finalization_count = reviewer.activity.filter(
+      (item) => item.phase === "finalizing",
+    ).length;
+    reviewer.repair_count = reviewer.activity.filter((item) =>
+      /repair/i.test(String(item.message ?? "")),
+    ).length;
   }
   const modelRuns = {
     total: reviewers.length,

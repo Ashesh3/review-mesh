@@ -6,6 +6,7 @@ import {
   createChangeCoverageLedger,
   releaseRunSnapshot,
   type ChangeCoverageLedger,
+  type RunSnapshotIdentity,
 } from "../context/change-coverage.js";
 import { evaluateRequiredInput } from "../context/required-input.js";
 import {
@@ -45,6 +46,7 @@ import type {
   V9EventDraft,
 } from "../protocol/v9-event-writer.js";
 import { reviewerResultDigest } from "../results/digest.js";
+import { reviewerConfigFingerprint } from "../diagnostics/retry-v9.js";
 import { sanitizedResultPages } from "../results/sanitized-pages.js";
 import {
   ResultSanitizationError,
@@ -77,9 +79,11 @@ export interface V9RunInput {
       resultDigest: string;
       resultByteCount: number;
       coverageEntries: readonly Record<string, unknown>[];
+      snapshotIdentity?: RunSnapshotIdentity;
       terminal: Record<string, unknown>;
     }>;
     inheritance: "exact" | "rerun_all";
+    evidenceReason?: string;
     rawFindings: readonly CanonicalRawFinding[];
     proofBySourceRef: Readonly<Record<string, CanonicalFindingCoreProof>>;
     adjudicationOutcomes: readonly Record<string, unknown>[];
@@ -96,6 +100,13 @@ interface Job {
   attemptStartedAt: number;
   attemptDeadline: number;
   lensDeadline: number;
+  admittedAt?: number;
+  queueStartedAt?: number;
+  queueWaitMs?: number;
+  queueReason?: "provider_limit" | "execution_limit";
+  probeStartedAt?: number;
+  probeElapsedMs?: number;
+  expiredBoundary?: V9IncompleteReason;
   reason?: string;
   result?: ReviewerResultV4 | AdjudicationResultV2;
   ledger?: ChangeCoverageLedger;
@@ -170,10 +181,14 @@ export async function runV9Review(input: V9RunInput) {
   );
   const runLensIds =
     input.retry === undefined ? undefined : new Set(input.retry.runLensIds);
+  const inheritedByReviewer = new Map(
+    input.retry?.inherited.map((item) => [item.reviewerId, item]) ?? [],
+  );
   const jobs: Job[] = input.config.reviewers
     .filter(
       (reviewer) =>
-        runLensIds === undefined || runLensIds.has(lensId(reviewer)),
+        !inheritedByReviewer.has(reviewer.id) &&
+        (runLensIds === undefined || runLensIds.has(lensId(reviewer))),
     )
     .map((reviewer) => ({
       reviewer,
@@ -195,6 +210,9 @@ export async function runV9Review(input: V9RunInput) {
       ...(chains.get(lensId(job.reviewer)) ?? []),
       job,
     ]);
+  // A fully inherited lens still needs its aggregate quorum/adjudication check.
+  for (const inherited of inheritedByReviewer.values())
+    if (!chains.has(inherited.lensId)) chains.set(inherited.lensId, []);
   const warnings = [
     ...describeTopology(input.config),
     ...(input.config.migrationWarnings ?? []),
@@ -212,6 +230,72 @@ export async function runV9Review(input: V9RunInput) {
     "passed" | "findings" | "incomplete" | "not_applicable" | "not_evaluated"
   >();
   const providerActive = new Map<string, number>();
+  let executionActive = 0;
+  const admissionQueue: Array<{
+    job: Job;
+    signal: AbortSignal;
+    boundary: number;
+    admit(): void;
+    abort(): void;
+  }> = [];
+  const providerLimit = (job: Job) =>
+    execution.provider_limits[provider(job.reviewer)] ??
+    execution.default_provider_concurrency;
+  const drainAdmissions = () => {
+    for (const pending of [...admissionQueue]) {
+      if (pending.signal.aborted || now() >= pending.boundary) {
+        pending.abort();
+        continue;
+      }
+      const group = provider(pending.job.reviewer);
+      if ((providerActive.get(group) ?? 0) >= providerLimit(pending.job)) {
+        pending.job.queueReason = "provider_limit";
+        continue;
+      }
+      if (executionActive >= execution.max_concurrency) {
+        pending.job.queueReason = "execution_limit";
+        continue;
+      }
+      providerActive.set(group, (providerActive.get(group) ?? 0) + 1);
+      executionActive += 1;
+      pending.admit();
+    }
+  };
+  const acquireAdmission = (job: Job, signal: AbortSignal, boundary: number) =>
+    new Promise<() => void>((resolve, reject) => {
+      const remove = () => {
+        const index = admissionQueue.indexOf(pending);
+        if (index >= 0) admissionQueue.splice(index, 1);
+        signal.removeEventListener("abort", pending.abort);
+      };
+      const pending = {
+        job,
+        signal,
+        boundary,
+        admit() {
+          remove();
+          let released = false;
+          resolve(() => {
+            if (released) return;
+            released = true;
+            const group = provider(job.reviewer);
+            providerActive.set(
+              group,
+              Math.max(0, (providerActive.get(group) ?? 1) - 1),
+            );
+            executionActive = Math.max(0, executionActive - 1);
+            drainAdmissions();
+          });
+        },
+        abort() {
+          remove();
+          reject(signal.reason ?? new Error("Queue deadline exceeded."));
+        },
+      };
+      admissionQueue.push(pending);
+      signal.addEventListener("abort", pending.abort, { once: true });
+      drainAdmissions();
+    });
   const capabilities = new Map<
     string,
     Awaited<ReturnType<ReviewAdapter["probe"]>>
@@ -326,13 +410,31 @@ export async function runV9Review(input: V9RunInput) {
     }
   };
   const modelCounts = () => ({
-    total: jobs.length,
-    completed: jobs.filter((job) => job.status === "completed").length,
+    total: jobs.length + inheritedByReviewer.size,
+    completed:
+      jobs.filter((job) => job.status === "completed").length +
+      inheritedByReviewer.size,
     incomplete: jobs.filter((job) => job.status === "incomplete").length,
     skipped: jobs.filter((job) => job.status === "skipped").length,
     running: jobs.filter((job) => job.status === "running").length,
     queued: jobs.filter((job) => job.status === "queued").length,
   });
+  const recordCoverage = async (job: Job) => {
+    if (job.ledger === undefined) return;
+    const entries = job.ledger.entries();
+    for (let index = 0; index < Math.max(1, entries.length); index += 256)
+      await input.record({
+        record: "reviewer.coverage",
+        reviewer_id: job.reviewer.id,
+        data: {
+          index: index / 256,
+          entries: entries.slice(index, index + 256),
+          ...(index === 0
+            ? { snapshot_identity: job.ledger.snapshotIdentity() }
+            : {}),
+        },
+      });
+  };
   const skip = async (
     job: Job,
     reason: string,
@@ -373,6 +475,7 @@ export async function runV9Review(input: V9RunInput) {
     job.status = "incomplete";
     job.phase = "terminal";
     job.reason = reason;
+    if (job.result === undefined) await recordCoverage(job);
     await input.record({
       record: "reviewer.terminal",
       reviewer_id: job.reviewer.id,
@@ -381,6 +484,10 @@ export async function runV9Review(input: V9RunInput) {
         lens_id: lensId(job.reviewer),
         reason,
         mode: job.mode,
+        failure_stage: failurePhase,
+        ...(job.expiredBoundary === undefined
+          ? {}
+          : { expired_boundary: job.expiredBoundary }),
       },
     });
     await emit({
@@ -392,10 +499,14 @@ export async function runV9Review(input: V9RunInput) {
         reason: reason as V9IncompleteReason,
         message: sanitizePublicText(message) ?? "Reviewer incomplete.",
         failure_stage: failurePhase,
+        ...(job.expiredBoundary === undefined
+          ? {}
+          : { expired_boundary: job.expiredBoundary }),
         attempt_count: Math.max(1, job.attempt),
         retryable: false,
         fallback_eligible:
-          reason !== "run_deadline_exceeded" && reason !== "cancelled",
+          job.fallbackEligible ??
+          (reason !== "run_deadline_exceeded" && reason !== "cancelled"),
         detail_ref: "reviewer.terminal",
         elapsed_ms: Math.max(0, now() - job.startedAt),
       },
@@ -419,24 +530,21 @@ export async function runV9Review(input: V9RunInput) {
     job.adapter = input.registry.create(reviewer.adapterId, reviewer.adapter, {
       continuationAttempts: execution.continuation_attempts,
     });
-    const candidateDeadline = Math.min(
-      job.lensDeadline,
-      start + reviewer.timeoutMs,
-    );
-    job.ledger = await createChangeCoverageLedger({
-      context: input.context,
-      policy: changePolicy(reviewer),
-      signal: controller.signal,
-    });
+    let candidateDeadline = Number.POSITIVE_INFINITY;
     const group = provider(reviewer);
     let adjudicationResult: ReviewerResultV4 | undefined;
     let candidates: ReturnType<typeof buildAdjudicationCandidates> | undefined;
-    const limit =
-      execution.provider_limits[group] ??
-      execution.default_provider_concurrency;
     for (let attempt = 1; attempt <= execution.retry_attempts; attempt++) {
       job.attempt = attempt;
       job.phase = "probing";
+      job.status = "queued";
+      delete job.admittedAt;
+      job.probeStartedAt = now();
+      job.probeElapsedMs = 0;
+      delete job.queueStartedAt;
+      job.queueWaitMs = 0;
+      delete job.queueReason;
+      delete job.expiredBoundary;
       const boundary = Math.min(
         runDeadline,
         job.lensDeadline,
@@ -447,22 +555,117 @@ export async function runV9Review(input: V9RunInput) {
       job.controller = child;
       const onAbort = () => child.abort(controller.signal.reason);
       controller.signal.addEventListener("abort", onAbort, { once: true });
-      const attemptDeadline = Math.min(
+      const probeDeadline = Math.min(
         boundary,
         now() + (reviewer.attemptTimeoutMs ?? reviewer.timeoutMs),
       );
-      const timer = setTimeout(
-        () => child.abort(new Error("Attempt deadline exceeded.")),
-        Math.max(0, attemptDeadline - now()),
+      let attemptDeadline = Number.POSITIVE_INFINITY;
+      let timer = setTimeout(
+        () => child.abort(new Error("Probe deadline exceeded.")),
+        Math.max(0, probeDeadline - now()),
       );
+      const armDeadline = (at: number, message: string) => {
+        clearTimeout(timer);
+        timer = setTimeout(
+          () => child.abort(new Error(message)),
+          Math.max(0, at - now()),
+        );
+      };
       let progressTimer: ReturnType<typeof setInterval> | undefined;
       let admitted = false;
+      let releaseAdmission: (() => void) | undefined;
       let terminal:
         Extract<AdapterEvent, { type: "result" | "failure" }> | undefined;
       let resultStoragePersisted = false;
       let failure: AdapterFailure | undefined;
       const attemptId = String(attempt);
+      const expiration = () => {
+        const cause = deadlineCause({
+          now: now(),
+          cancelled: input.signal.aborted,
+          run: runDeadline,
+          lens: job.lensDeadline,
+          candidate: candidateDeadline,
+          ...(admitted ? { attempt: attemptDeadline } : {}),
+          ...(admitted && job.progressObservable
+            ? {
+                progress:
+                  now() -
+                  activity.snapshot(reviewer.id, now()).lastProgressAgeMs +
+                  (execution.no_progress_timeout_ms ?? 300000),
+              }
+            : {}),
+        });
+        if (cause === undefined) delete job.expiredBoundary;
+        else job.expiredBoundary = cause;
+        if (cause === "cancelled") return cause;
+        if (job.phase === "queued") return "queue_deadline_exceeded";
+        if (!admitted) return cause ?? "probe_deadline_exceeded";
+        return cause ?? "attempt_deadline_exceeded";
+      };
+      const recordAttempt = async (attemptFailure?: AdapterFailure) => {
+        const endedAt = now();
+        const startedAt = job.admittedAt ?? job.probeStartedAt!;
+        await input.record({
+          record: "reviewer.attempt",
+          reviewer_id: reviewer.id,
+          data: {
+            attempt,
+            started_at: new Date(startedAt).toISOString(),
+            ended_at: new Date(endedAt).toISOString(),
+            elapsed_ms: Math.max(0, endedAt - startedAt),
+            probe_started_at: new Date(job.probeStartedAt!).toISOString(),
+            probe_elapsed_ms: job.probeElapsedMs,
+            queue_wait_ms:
+              job.queueStartedAt === undefined
+                ? 0
+                : Math.max(0, (job.admittedAt ?? endedAt) - job.queueStartedAt),
+            execution_elapsed_ms:
+              job.admittedAt === undefined
+                ? 0
+                : Math.max(0, endedAt - job.admittedAt),
+            ...(job.queueStartedAt === undefined
+              ? {}
+              : { queued_at: new Date(job.queueStartedAt).toISOString() }),
+            ...(job.admittedAt === undefined
+              ? {}
+              : { admitted_at: new Date(job.admittedAt).toISOString() }),
+            ...(job.expiredBoundary === undefined
+              ? {}
+              : { expired_boundary: job.expiredBoundary }),
+            ...(attemptFailure === undefined
+              ? {}
+              : { failure: attemptFailure }),
+          },
+        });
+      };
       try {
+        activity.record({
+          reviewerId: reviewer.id,
+          attemptId,
+          phase: "probing",
+          at: now(),
+        });
+        await emit({
+          event: "reviewer.progress",
+          reviewer_id: reviewer.id,
+          data: {
+            lens_id: lensId(reviewer),
+            mode: job.mode,
+            phase: "probing",
+            attempt,
+          },
+        });
+        job.ledger ??= await abortable(
+          createChangeCoverageLedger({
+            context: input.context,
+            policy: changePolicy(reviewer),
+            // Shared immutable evidence belongs to the run, so a short probe
+            // budget cannot poison capture for queued candidates or fallbacks.
+            signal: controller.signal,
+          }),
+          child.signal,
+        );
         let adapterCapabilities = capabilities.get(reviewer.id);
         if (adapterCapabilities === undefined) {
           adapterCapabilities = await abortable(
@@ -471,6 +674,7 @@ export async function runV9Review(input: V9RunInput) {
           );
           capabilities.set(reviewer.id, adapterCapabilities);
         }
+        job.probeElapsedMs = Math.max(0, now() - job.probeStartedAt!);
         if (
           !adapterCapabilities.available ||
           adapterCapabilities.authenticated === false ||
@@ -497,13 +701,37 @@ export async function runV9Review(input: V9RunInput) {
           );
         if (!failure) {
           job.phase = "queued";
-          while (
-            (providerActive.get(group) ?? 0) >= limit &&
-            !child.signal.aborted
-          )
-            await delay(10, child.signal);
-          if (child.signal.aborted)
-            throw new Error("Provider queue deadline exceeded");
+          job.queueStartedAt = now();
+          armDeadline(boundary, "Queue deadline exceeded.");
+          activity.record({
+            reviewerId: reviewer.id,
+            attemptId,
+            phase: "queued",
+            at: now(),
+          });
+          const admissionPromise = acquireAdmission(
+            job,
+            child.signal,
+            boundary,
+          );
+          // Attach rejection handling before awaiting public delivery.
+          void admissionPromise.catch(() => undefined);
+          if (job.queueReason !== undefined)
+            await emit({
+              event: "reviewer.progress",
+              reviewer_id: reviewer.id,
+              data: {
+                lens_id: lensId(reviewer),
+                mode: job.mode,
+                phase: "queued",
+                attempt,
+                queue_reason: job.queueReason,
+                queued_at: new Date(job.queueStartedAt).toISOString(),
+              },
+            });
+          releaseAdmission = await admissionPromise;
+          if (child.signal.aborted || now() >= boundary)
+            throw new Error("Queue deadline exceeded.");
           const admission = circuitAdmission(reviewer);
           if (!admission.allowed) {
             failure = sanitizeAdapterFailure(
@@ -529,11 +757,24 @@ export async function runV9Review(input: V9RunInput) {
           }
         }
         if (!failure) {
-          providerActive.set(group, (providerActive.get(group) ?? 0) + 1);
           admitted = true;
           job.status = "running";
-          job.attemptStartedAt = now();
+          job.admittedAt = now();
+          job.startedAt = job.admittedAt;
+          job.attemptStartedAt = job.admittedAt;
+          job.queueWaitMs = Math.max(0, job.admittedAt - job.queueStartedAt!);
+          delete job.queueReason;
+          candidateDeadline = Math.min(
+            candidateDeadline,
+            job.lensDeadline,
+            job.admittedAt + reviewer.timeoutMs,
+          );
+          attemptDeadline = Math.min(
+            candidateDeadline,
+            job.admittedAt + (reviewer.attemptTimeoutMs ?? reviewer.timeoutMs),
+          );
           job.attemptDeadline = attemptDeadline;
+          armDeadline(attemptDeadline, "Attempt deadline exceeded.");
           job.phase = "reviewing";
           job.progressObservable =
             adapterCapabilities.progress_observable === true;
@@ -567,6 +808,9 @@ export async function runV9Review(input: V9RunInput) {
               attempt,
               maximum_attempts: execution.retry_attempts,
               timeout_ms: Math.max(0, attemptDeadline - now()),
+              admitted_at: new Date(job.admittedAt).toISOString(),
+              queue_wait_ms: job.queueWaitMs,
+              probe_elapsed_ms: job.probeElapsedMs,
               run_deadline_remaining_ms: Math.max(0, runDeadline - now()),
               lens_deadline_remaining_ms: Math.max(0, job.lensDeadline - now()),
               progress_observable: job.progressObservable,
@@ -681,15 +925,21 @@ export async function runV9Review(input: V9RunInput) {
                 terminal = event;
                 continue;
               }
-              const phase =
+              const repairing =
                 event.type === "progress" &&
-                [
-                  "reviewing",
-                  "validating",
-                  "continuing",
-                  "retry_backoff",
-                  "finalizing",
-                ].includes(event.phase)
+                ["schema_repair", "coverage_repair"].includes(event.phase);
+              const phase = repairing
+                ? event.phase === "schema_repair"
+                  ? "validating"
+                  : "reviewing"
+                : event.type === "progress" &&
+                    [
+                      "reviewing",
+                      "validating",
+                      "continuing",
+                      "retry_backoff",
+                      "finalizing",
+                    ].includes(event.phase)
                   ? event.phase
                   : job.phase;
               const changed = phase !== job.phase;
@@ -714,7 +964,7 @@ export async function runV9Review(input: V9RunInput) {
                       },
                     }),
               });
-              if (changed)
+              if (changed || repairing)
                 await emit({
                   event: "reviewer.progress",
                   reviewer_id: reviewer.id,
@@ -724,6 +974,15 @@ export async function runV9Review(input: V9RunInput) {
                     phase: phase as "reviewing",
                     attempt,
                     maximum_attempts: execution.retry_attempts,
+                    ...(repairing
+                      ? {
+                          message:
+                            sanitizePublicText(event.message) ??
+                            (event.phase === "schema_repair"
+                              ? "Repairing the current result page."
+                              : "Repairing observed change coverage."),
+                        }
+                      : {}),
                   },
                 });
             }
@@ -733,26 +992,7 @@ export async function runV9Review(input: V9RunInput) {
           }
         }
         if (child.signal.aborted) {
-          const reason =
-            deadlineCause({
-              now: now(),
-              cancelled: input.signal.aborted,
-              run: runDeadline,
-              lens: job.lensDeadline,
-              candidate: candidateDeadline,
-              attempt: attemptDeadline,
-              ...(job.progressObservable
-                ? {
-                    progress:
-                      now() -
-                      activity.snapshot(reviewer.id, now()).lastProgressAgeMs +
-                      (execution.no_progress_timeout_ms ?? 300000),
-                  }
-                : {}),
-            }) ??
-            (admitted
-              ? "attempt_deadline_exceeded"
-              : "queue_deadline_exceeded");
+          const reason = expiration();
           failure = sanitizeAdapterFailure(
             reason,
             "Reviewer exhausted its execution budget.",
@@ -809,15 +1049,7 @@ export async function runV9Review(input: V9RunInput) {
           completedResults++;
           job.result = final;
           const entries = job.ledger.entries();
-          for (let index = 0; index < entries.length; index += 256)
-            await input.record({
-              record: "reviewer.coverage",
-              reviewer_id: reviewer.id,
-              data: {
-                index: index / 256,
-                entries: entries.slice(index, index + 256),
-              },
-            });
+          await recordCoverage(job);
           if (final.schema_version === "4") {
             const sourceRaw = buildCanonicalRawFindings({
               reviewer_id: reviewer.id,
@@ -989,61 +1221,38 @@ export async function runV9Review(input: V9RunInput) {
                 detail_ref: "reviewer.result",
               },
             });
+            await recordAttempt();
             return final.verdict === "fail" ? "findings" : "pass";
           }
         }
       } catch (error) {
-        const reason = child.signal.aborted
-          ? (deadlineCause({
-              now: now(),
-              cancelled: input.signal.aborted,
-              run: runDeadline,
-              lens: job.lensDeadline,
-              candidate: candidateDeadline,
-              attempt: attemptDeadline,
-              ...(job.progressObservable
-                ? {
-                    progress:
-                      now() -
-                      activity.snapshot(reviewer.id, now()).lastProgressAgeMs +
-                      (execution.no_progress_timeout_ms ?? 300000),
-                  }
-                : {}),
-            }) ?? "probe_deadline_exceeded")
-          : error instanceof ResultSanitizationError
-            ? "result_too_large"
-            : "invalid_result";
+        const reason =
+          child.signal.aborted || now() >= boundary || now() >= attemptDeadline
+            ? expiration()
+            : error instanceof ResultSanitizationError
+              ? "result_too_large"
+              : "invalid_result";
         failure = sanitizeAdapterFailure(
           reason,
           error instanceof Error ? error.message : "Reviewer result failed",
-          false,
+          reason === "attempt_deadline_exceeded" ||
+            reason === "no_progress_timeout",
         );
       } finally {
         clearTimeout(timer);
         if (progressTimer) clearInterval(progressTimer);
         controller.signal.removeEventListener("abort", onAbort);
-        if (admitted)
-          providerActive.set(
-            group,
-            Math.max(0, (providerActive.get(group) ?? 1) - 1),
-          );
+        if (job.phase === "probing")
+          job.probeElapsedMs = Math.max(0, now() - job.probeStartedAt!);
+        if (failure !== undefined) recordCircuitFailure(reviewer, failure);
+        releaseAdmission?.();
         if (child.signal.aborted) scheduleCleanup(job.adapter);
         if (terminal?.type === "result" && !resultStoragePersisted)
           void Promise.resolve(terminal.resultStorage?.abandoned()).catch(
             () => undefined,
           );
       }
-      await input.record({
-        record: "reviewer.attempt",
-        reviewer_id: reviewer.id,
-        data: {
-          attempt,
-          started_at: new Date(job.startedAt).toISOString(),
-          elapsed_ms: now() - job.attemptStartedAt,
-          failure,
-        },
-      });
-      if (failure !== undefined) recordCircuitFailure(reviewer, failure);
+      await recordAttempt(failure);
       job.fallbackEligible = failure?.fallback_eligible === true;
       if (
         !failure?.retryable ||
@@ -1059,6 +1268,7 @@ export async function runV9Review(input: V9RunInput) {
         return "incomplete";
       }
       job.phase = "retry_backoff";
+      job.status = "queued";
       await delay(
         Math.min(
           execution.retry_backoff_ms * attempt,
@@ -1069,11 +1279,13 @@ export async function runV9Review(input: V9RunInput) {
     }
     await fail(
       job,
-      input.signal.aborted
-        ? "cancelled"
-        : now() >= runDeadline
-          ? "run_deadline_exceeded"
-          : "lens_deadline_exceeded",
+      deadlineCause({
+        now: now(),
+        cancelled: input.signal.aborted,
+        run: runDeadline,
+        lens: job.lensDeadline,
+        candidate: candidateDeadline,
+      }) ?? "unknown",
       "Reviewer execution budget expired.",
     );
     return "incomplete";
@@ -1108,6 +1320,20 @@ export async function runV9Review(input: V9RunInput) {
       record: "resolution",
       resolution: {
         execution,
+        ...(input.retry === undefined
+          ? {}
+          : {
+              retry: {
+                parent_run_id: input.retry.parentRunId,
+                inheritance: input.retry.inheritance,
+                reused_reviewer_ids: input.retry.inherited.map(
+                  (item) => item.reviewerId,
+                ),
+                evidence:
+                  input.retry.evidenceReason ?? "reconstructed_and_verified",
+                narrative: "sanitized_parent_context",
+              },
+            }),
         reviewers: input.config.reviewers.map((reviewer) => ({
           id: reviewer.id,
           agent_id: lensId(reviewer),
@@ -1121,6 +1347,7 @@ export async function runV9Review(input: V9RunInput) {
           model_count: reviewer.modelCount ?? 1,
           isolation: reviewer.isolationPolicy,
           timeout_ms: reviewer.timeoutMs,
+          config_fingerprint: reviewerConfigFingerprint(reviewer),
           policy: reviewer.policy,
         })),
         warnings,
@@ -1166,7 +1393,7 @@ export async function runV9Review(input: V9RunInput) {
       await input.recordResult(inherited.reviewerId, inherited.result);
       for (
         let index = 0;
-        index < inherited.coverageEntries.length;
+        index < Math.max(1, inherited.coverageEntries.length);
         index += 256
       )
         await input.record({
@@ -1175,6 +1402,9 @@ export async function runV9Review(input: V9RunInput) {
           data: {
             index: index / 256,
             entries: inherited.coverageEntries.slice(index, index + 256),
+            ...(index === 0 && inherited.snapshotIdentity !== undefined
+              ? { snapshot_identity: inherited.snapshotIdentity }
+              : {}),
           },
         });
       await input.record({
@@ -1182,15 +1412,19 @@ export async function runV9Review(input: V9RunInput) {
         reviewer_id: inherited.reviewerId,
         data: structuredClone(inherited.terminal),
       });
-      lensStates.set(
-        inherited.lensId,
-        inherited.result.verdict === "fail" ? "findings" : "passed",
-      );
+      if (!chains.has(inherited.lensId))
+        lensStates.set(
+          inherited.lensId,
+          inherited.result.verdict === "fail" ? "findings" : "passed",
+        );
     }
     heartbeat = setInterval(() => {
       if (pendingHeartbeat || outputFailure) return;
       const active = jobs.filter(
-        (job) => job.status === "running" || job.phase === "probing",
+        (job) =>
+          job.status === "running" ||
+          job.phase === "probing" ||
+          (job.phase === "queued" && job.queueStartedAt !== undefined),
       );
       const ordered = [...active].sort((a, b) =>
         a.reviewer.id.localeCompare(b.reviewer.id),
@@ -1211,13 +1445,28 @@ export async function runV9Review(input: V9RunInput) {
           attempt: Math.max(1, job.attempt),
           maximum_attempts: execution.retry_attempts,
           phase: job.phase as "reviewing",
-          attempt_elapsed_ms: now() - job.startedAt,
+          attempt_elapsed_ms:
+            job.admittedAt === undefined ? 0 : now() - job.admittedAt,
+          ...(job.admittedAt === undefined
+            ? {}
+            : { admitted_at: new Date(job.admittedAt).toISOString() }),
+          ...(job.queueReason === undefined
+            ? {}
+            : { queue_reason: job.queueReason }),
+          queue_wait_ms:
+            job.queueStartedAt === undefined
+              ? 0
+              : Math.max(0, (job.admittedAt ?? now()) - job.queueStartedAt),
+          probe_elapsed_ms:
+            job.phase === "probing"
+              ? now() - job.probeStartedAt!
+              : (job.probeElapsedMs ?? 0),
           lens_elapsed_ms: now() - start,
           run_deadline_remaining_ms: Math.max(0, runDeadline - now()),
           lens_deadline_remaining_ms: Math.max(0, job.lensDeadline - now()),
           attempt_deadline_remaining_ms: Math.max(
             0,
-            job.attemptDeadline - now(),
+            job.admittedAt === undefined ? 0 : job.attemptDeadline - now(),
           ),
           last_progress_age_ms: activity.snapshot(job.reviewer.id, now())
             .lastProgressAgeMs,
@@ -1245,110 +1494,129 @@ export async function runV9Review(input: V9RunInput) {
           pendingHeartbeat = undefined;
         });
     }, interval);
-    const queue = [...chains.entries()];
-    let next = 0;
     await Promise.all(
-      Array.from(
-        { length: Math.min(execution.max_concurrency, queue.length) },
-        async () => {
-          for (;;) {
-            const chain = queue[next++];
-            if (!chain) return;
-            const [id, members] = chain;
-            const reviewer = members[0]!.reviewer;
-            const missing = evaluateRequiredInput(
-              request,
-              reviewer.policy?.requiredInput ?? [],
-            );
-            if (missing.length) {
-              lensStates.set(id, "not_evaluated");
-              for (const job of members)
-                await skip(job, "not_evaluated_missing_input", missing);
-              continue;
-            }
-            const relevant =
-              input.context.review_scope.mode === "full" ||
-              !input.context.git.is_repository ||
-              input.context.git.truncated.changed_files ||
-              input.context.git.changed_files.some((path) =>
-                changePolicy(reviewer).relevantPaths.some((pattern) =>
-                  changedPathMatchesGlob(pattern, path),
-                ),
-              );
-            if (!relevant) {
-              lensStates.set(id, "not_applicable");
-              for (const job of members) await skip(job, "not_applicable");
-              continue;
-            }
-            const passes: Array<{ providerGroup: string }> = [];
-            let source:
-              | { reviewer: ResolvedReviewer; result: ReviewerResultV4 }
-              | undefined;
-            lensStates.set(id, "incomplete");
-            for (let index = 0; index < members.length; index++) {
-              const job = members[index]!;
-              if (controller.signal.aborted || now() >= job.lensDeadline) {
-                await skip(
-                  job,
-                  input.signal.aborted
-                    ? "cancelled"
-                    : now() >= runDeadline
-                      ? "run_deadline_exceeded"
-                      : "lens_deadline_exceeded",
-                );
-                continue;
-              }
-              const result = await execute(job, source);
-              if (result === "incomplete") {
-                if (!job.fallbackEligible) {
-                  for (const rest of members.slice(index + 1))
-                    await skip(rest, "blocked_by_infrastructure_failure");
-                  break;
-                }
-                continue;
-              }
-              if (source && job.result?.schema_version === "2") {
-                lensStates.set(
-                  id,
-                  job.result.verdict === "fail" ? "findings" : "passed",
-                );
-                for (const rest of members.slice(index + 1))
-                  await skip(rest, "short_circuited_after_finding");
-                break;
-              }
-              if (result === "findings") {
-                if (
-                  job.reviewer.policy?.adjudication === "required" &&
-                  job.result?.schema_version === "4"
-                ) {
-                  source = { reviewer: job.reviewer, result: job.result };
-                  continue;
-                }
-                lensStates.set(id, "findings");
-                for (const rest of members.slice(index + 1))
-                  await skip(rest, "short_circuited_after_finding");
-                break;
-              }
-              passes.push({ providerGroup: provider(job.reviewer) });
-              if (
-                evaluatePassQuorum(
-                  {
-                    passQuorum: reviewer.policy?.passQuorum ?? members.length,
-                    minimumProviderGroups:
-                      reviewer.policy?.minimumProviderGroups ?? 1,
-                  },
-                  passes,
-                ).satisfied
-              ) {
-                lensStates.set(id, "passed");
-                for (const rest of members.slice(index + 1))
-                  await skip(rest, "not_needed_after_quorum");
-                break;
-              }
-            }
+      [...chains.entries()].map(async ([id, members]) => {
+        const allMembers = input.config.reviewers.filter(
+          (reviewer) => lensId(reviewer) === id,
+        );
+        const reviewer = allMembers[0]!;
+        const missing = evaluateRequiredInput(
+          request,
+          reviewer.policy?.requiredInput ?? [],
+        );
+        if (missing.length) {
+          lensStates.set(id, "not_evaluated");
+          for (const job of members)
+            await skip(job, "not_evaluated_missing_input", missing);
+          return;
+        }
+        const relevant =
+          input.context.review_scope.mode === "full" ||
+          !input.context.git.is_repository ||
+          input.context.git.truncated.changed_files ||
+          input.context.git.changed_files.some((path) =>
+            changePolicy(reviewer).relevantPaths.some((pattern) =>
+              changedPathMatchesGlob(pattern, path),
+            ),
+          );
+        if (!relevant) {
+          lensStates.set(id, "not_applicable");
+          for (const job of members) await skip(job, "not_applicable");
+          return;
+        }
+        const inheritedMembers = allMembers.flatMap((reviewer) => {
+          const inherited = inheritedByReviewer.get(reviewer.id);
+          return inherited === undefined
+            ? []
+            : [{ reviewer, result: inherited.result }];
+        });
+        const passes: Array<{ providerGroup: string }> = inheritedMembers
+          .filter((member) => member.result.verdict === "pass")
+          .map((member) => ({ providerGroup: provider(member.reviewer) }));
+        let source:
+          { reviewer: ResolvedReviewer; result: ReviewerResultV4 } | undefined;
+        lensStates.set(id, "incomplete");
+        for (const inherited of inheritedMembers) {
+          if (inherited.result.verdict !== "fail") continue;
+          if (
+            inherited.result.schema_version === "4" &&
+            inherited.reviewer.policy?.adjudication === "required"
+          ) {
+            source = { reviewer: inherited.reviewer, result: inherited.result };
+          } else {
+            lensStates.set(id, "findings");
+            for (const job of members)
+              await skip(job, "short_circuited_after_finding");
+            return;
           }
-        },
-      ),
+        }
+        const quorumSatisfied = () =>
+          evaluatePassQuorum(
+            {
+              passQuorum: reviewer.policy?.passQuorum ?? allMembers.length,
+              minimumProviderGroups:
+                reviewer.policy?.minimumProviderGroups ?? 1,
+            },
+            passes,
+          ).satisfied;
+        if (source === undefined && quorumSatisfied()) {
+          lensStates.set(id, "passed");
+          for (const job of members) await skip(job, "not_needed_after_quorum");
+          return;
+        }
+        for (let index = 0; index < members.length; index++) {
+          const job = members[index]!;
+          if (controller.signal.aborted || now() >= job.lensDeadline) {
+            await skip(
+              job,
+              input.signal.aborted
+                ? "cancelled"
+                : now() >= runDeadline
+                  ? "run_deadline_exceeded"
+                  : "lens_deadline_exceeded",
+            );
+            continue;
+          }
+          const result = await execute(job, source);
+          if (result === "incomplete") {
+            if (!job.fallbackEligible) {
+              for (const rest of members.slice(index + 1))
+                await skip(rest, "blocked_by_infrastructure_failure");
+              break;
+            }
+            continue;
+          }
+          if (source && job.result?.schema_version === "2") {
+            lensStates.set(
+              id,
+              job.result.verdict === "fail" ? "findings" : "passed",
+            );
+            for (const rest of members.slice(index + 1))
+              await skip(rest, "short_circuited_after_finding");
+            break;
+          }
+          if (result === "findings") {
+            if (
+              job.reviewer.policy?.adjudication === "required" &&
+              job.result?.schema_version === "4"
+            ) {
+              source = { reviewer: job.reviewer, result: job.result };
+              continue;
+            }
+            lensStates.set(id, "findings");
+            for (const rest of members.slice(index + 1))
+              await skip(rest, "short_circuited_after_finding");
+            break;
+          }
+          passes.push({ providerGroup: provider(job.reviewer) });
+          if (quorumSatisfied()) {
+            lensStates.set(id, "passed");
+            for (const rest of members.slice(index + 1))
+              await skip(rest, "not_needed_after_quorum");
+            break;
+          }
+        }
+      }),
     );
     for (const record of activity.records())
       await input.record({

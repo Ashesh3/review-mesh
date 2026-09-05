@@ -8,6 +8,9 @@ export function createReadOnlyFileTools(options: {
   ledger: ChangeCoverageLedger;
 }) {
   return {
+    coverageStatus() {
+      return options.ledger.status();
+    },
     async readFile(input: {
       path: string;
       offset?: number;

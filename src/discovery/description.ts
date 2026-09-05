@@ -95,7 +95,7 @@ export async function describeTool(options: DescribeToolOptions = {}) {
   const explicitChangeRequest =
     configuration.valid && configuration.selection.project_name !== undefined
       ? {
-          schema_version: "2" as const,
+          schema_version: "3" as const,
           project_name: configuration.selection.project_name,
           workspace: effectiveWorkspace,
           instructions:

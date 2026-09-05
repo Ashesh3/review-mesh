@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import type { AdapterRegistration } from "../config/schemas.js";
+import { MAX_READ_BYTES, MAX_FILE_BYTES } from "../context/read-limits.js";
 import {
   currentReviewerOutputSchema,
   type CurrentReviewerOutput,
@@ -23,6 +24,13 @@ import {
   type ResultPageCollector,
 } from "../results/result-pages.js";
 import { createReadOnlyFileTools } from "./file-tools.js";
+import {
+  acknowledgeInitialDiffDelivery,
+  isRepairablePageError,
+  pageRepairMessage,
+  failedPageRepair,
+  MAX_PAGE_SCHEMA_REPAIRS,
+} from "./sdk-pages.js";
 import {
   adapterFailure,
   sanitizeAdapterFailure,
@@ -38,6 +46,7 @@ import {
 } from "./openai-pages.js";
 import {
   createResultSpool,
+  recordInvalidResultSpool,
   ResultSpoolError,
   type ResultSpool,
 } from "./result-spool.js";
@@ -51,7 +60,6 @@ import type {
 const DEFAULT_REQUEST_TIMEOUT_MS = 180_000;
 const DEFAULT_MAX_TURNS = 80;
 const DEFAULT_FINALIZATION_ATTEMPTS = 2;
-const MAX_FILE_BYTES = 512 * 1_024;
 const MAX_SNAPSHOT_BYTES = 32 * 1_024 * 1_024;
 const MAX_LIST_ENTRIES = 2_000;
 const MAX_SEARCH_RESULTS = 200;
@@ -59,7 +67,7 @@ const MAX_SEARCH_RESULTS = 200;
 // response/SSE framing overhead. Keep transport bounded without rejecting it.
 const MAX_PROVIDER_RESPONSE_BYTES =
   MAX_REVIEWER_RESULT_BYTES * 6 + 1_024 * 1_024;
-const MAX_TOOL_RESULT_BYTES = 128 * 1_024;
+const MAX_TOOL_RESULT_BYTES = Math.ceil(MAX_READ_BYTES / 3) * 4 + 8 * 1_024;
 const MAX_CONVERSATION_BYTES = 6 * 1_024 * 1_024;
 const FINALIZATION_RESERVE_BYTES = 256 * 1_024;
 const MAX_ASSISTANT_MESSAGE_BYTES = 512 * 1_024;
@@ -212,7 +220,7 @@ const readFileArgumentsSchema = z
 const exactReadFileArgumentsSchema = z.strictObject({
   path: z.string().min(1).max(MAX_PATH_LENGTH),
   offset: z.number().int().nonnegative().optional(),
-  byte_count: z.number().int().positive().max(MAX_FILE_BYTES).optional(),
+  byte_count: z.number().int().nonnegative().max(MAX_READ_BYTES).optional(),
 });
 
 const searchTextArgumentsSchema = z.strictObject({
@@ -287,12 +295,25 @@ const EXACT_READ_ONLY_TOOLS = [
         properties: {
           path: { type: "string", minLength: 1, maxLength: MAX_PATH_LENGTH },
           offset: { type: "integer", minimum: 0 },
-          byte_count: { type: "integer", minimum: 1, maximum: MAX_FILE_BYTES },
+          byte_count: { type: "integer", minimum: 0, maximum: MAX_READ_BYTES },
         },
       },
     },
   },
   READ_ONLY_TOOLS[2],
+  {
+    type: "function",
+    function: {
+      name: "coverage_status",
+      description:
+        "List observed coverage obligations and exact outstanding byte ranges before finalization.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {},
+      },
+    },
+  },
 ] as const;
 
 interface ExecutedToolResult {
@@ -944,6 +965,7 @@ function retryAfterMilliseconds(
 }
 
 function retryableResultProductionFailure(failure: AdapterFailure): boolean {
+  if (failure.diagnostics?.finish_reason === "content_filter") return false;
   return (
     failure.retryable ||
     (failure.reason === "protocol_violation" &&
@@ -973,6 +995,10 @@ function pageFailure(error: ResultPageError): AdapterFailure {
       failure_code: failureCode,
       failure_stage: "structured_result_page",
       scope: "model",
+      validation_issues: error.validationIssues,
+      ...(error.artifactRef === undefined
+        ? {}
+        : { artifact_ref: error.artifactRef }),
       ...(error.receivedBytes === undefined
         ? {}
         : { response_bytes: error.receivedBytes }),
@@ -2500,12 +2526,18 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           : { error: "The inspection tool arguments are invalid." },
       };
     }
+    if (name === "coverage_status" && coverageTools !== undefined) {
+      return { response: coverageTools.coverageStatus() };
+    }
     if (name === "read_file") {
       if (coverageTools !== undefined) {
         const parsed = exactReadFileArgumentsSchema.safeParse(argumentsValue);
         if (!parsed.success) {
           return {
-            response: { error: "The inspection tool arguments are invalid." },
+            response: {
+              error: "The inspection tool arguments are invalid.",
+              maximum_byte_count: MAX_READ_BYTES,
+            },
           };
         }
         return await coverageTools.readFile({
@@ -2582,6 +2614,25 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         (this.finalizationAttempts + this.continuationAttempts);
     let attempt = 1;
     let pageSpools: ResultSpool[] = [];
+    const recorded = new WeakSet<ResultSpool>();
+    const pageIndices = new WeakMap<ResultSpool, number>();
+    const retain = async (spool: ResultSpool): Promise<string | undefined> => {
+      try {
+        if (recorded.has(spool)) return undefined;
+        const ref = await recordInvalidResultSpool({
+          spool,
+          runId: input.runId,
+          reviewerId: input.reviewer.id,
+          pageIndex: pageIndices.get(spool) ?? 0,
+          checkpointId: collector.nextRequest().resultId,
+          reason: "result_production_abandoned",
+        });
+        recorded.add(spool);
+        return ref;
+      } finally {
+        await spool.lifecycle().abandoned();
+      }
+    };
     while (attempt <= this.finalizationAttempts) {
       let activePageSpool: ResultSpool | undefined;
       try {
@@ -2609,7 +2660,22 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           });
           let pageSpool: ResultSpool | undefined;
           let continuation = 0;
+          let repairs = 0;
           for (;;) {
+            throwIfAborted(input.signal);
+            if (this.now() >= deadline)
+              throw new ProviderRequestError(
+                adapterFailure.timeout(
+                  "Structured result page production exceeded its bounded deadline.",
+                  true,
+                  {
+                    diagnostics: {
+                      failure_stage: "structured_result_deadline",
+                      scope: "provider",
+                    },
+                  },
+                ),
+              );
             const messages = structuredClone(pageMessages);
             if (pageSpool !== undefined) {
               messages.push({
@@ -2662,10 +2728,10 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
             const fragment = normalizedAssistantContent(
               response.message.content,
             );
-            if (typeof fragment !== "string") {
+            if (response.diagnostics.finish_reason === "content_filter") {
               throw new ProviderRequestError(
                 adapterFailure.invalidResult(
-                  "The OpenAI-compatible endpoint returned an empty result page.",
+                  "The provider filtered the structured result page (finish_reason=content_filter).",
                   false,
                   {
                     fallback_eligible: true,
@@ -2675,6 +2741,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
                       failure_code: "provider_response_invalid",
                       failure_stage: "structured_result_page",
                       scope: "model",
+                      checkpoint_id: request.resultId,
                     },
                   },
                 ),
@@ -2690,7 +2757,10 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               maximumBytes: MAX_RESULT_PAGE_BYTES,
             });
             activePageSpool = pageSpool;
-            await pageSpool.append(fragment);
+            pageIndices.set(pageSpool, request.pageIndex);
+            await pageSpool.append(
+              typeof fragment === "string" ? fragment : "",
+            );
             if (response.diagnostics.finish_reason === "length") {
               if (continuation >= this.continuationAttempts) {
                 throw new ProviderRequestError(
@@ -2708,7 +2778,55 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               continue;
             }
             const raw = await pageSpool.readText();
-            collector.addPage(raw);
+            try {
+              collector.addPage(raw);
+            } catch (error) {
+              if (error instanceof ResultPageError) {
+                error.artifactRef = await recordInvalidResultSpool({
+                  spool: pageSpool,
+                  runId: input.runId,
+                  reviewerId: input.reviewer.id,
+                  pageIndex: request.pageIndex,
+                  checkpointId: request.resultId,
+                  reason: error.reason,
+                  validationIssues: error.validationIssues,
+                });
+                recorded.add(pageSpool);
+              }
+              if (isRepairablePageError(error)) {
+                if (repairs >= MAX_PAGE_SCHEMA_REPAIRS) {
+                  throw new ProviderRequestError(
+                    failedPageRepair(
+                      error,
+                      "OpenAI-compatible",
+                      repairs,
+                      request.resultId,
+                    ),
+                  );
+                }
+                repairs += 1;
+                await pageSpool.lifecycle().abandoned();
+                pageSpool = undefined;
+                activePageSpool = undefined;
+                continuation = 0;
+                pageMessages.push({ role: "assistant", content: raw });
+                pageMessages.push({
+                  role: "user",
+                  content: pageRepairMessage(
+                    error,
+                    resultPageRequestMessage(request, resultKind),
+                  ),
+                });
+                yield {
+                  type: "progress",
+                  phase: "schema_repair",
+                  message: `Repairing result page ${request.pageIndex + 1} (attempt ${repairs} of ${MAX_PAGE_SCHEMA_REPAIRS}).`,
+                  identity: `${request.resultId}:page:${request.pageIndex}:repair:${repairs}`,
+                };
+                continue;
+              }
+              throw error;
+            }
             pageSpools.push(pageSpool);
             pageSpool = undefined;
             activePageSpool = undefined;
@@ -2747,28 +2865,21 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               );
             },
             async abandoned() {
-              await Promise.all(
-                storage.map((spool) => spool.lifecycle().abandoned()),
-              );
+              await Promise.all(storage.map((spool) => retain(spool)));
             },
           },
         };
         return;
       } catch (error) {
-        await activePageSpool
-          ?.lifecycle()
-          .abandoned()
-          .catch(() => undefined);
-        await Promise.all(
-          pageSpools.map((spool) =>
-            spool
-              .lifecycle()
-              .abandoned()
-              .catch(() => undefined),
-          ),
+        const retainedRefs = await Promise.all(
+          [
+            ...pageSpools,
+            ...(activePageSpool === undefined ? [] : [activePageSpool]),
+          ].map((spool) => retain(spool).catch(() => undefined)),
         );
+        const artifactRef = retainedRefs.find((ref) => ref !== undefined);
         pageSpools = [];
-        const failure =
+        let failure =
           error instanceof ResultPageError
             ? pageFailure(error)
             : error instanceof ResultSpoolError
@@ -2798,10 +2909,20 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               : error instanceof ProviderRequestError
                 ? error.failure
                 : undefined;
+        if (failure !== undefined && artifactRef !== undefined)
+          failure = {
+            ...failure,
+            diagnostics: {
+              ...failure.diagnostics,
+              artifact_ref: failure.diagnostics?.artifact_ref ?? artifactRef,
+              checkpoint_id: collector.nextRequest().resultId,
+            },
+          };
         if (
           failure !== undefined &&
           attempt < this.finalizationAttempts &&
           retryableResultProductionFailure(failure) &&
+          failure.diagnostics?.repair_outcome !== "failed" &&
           configuredPages !== undefined
         ) {
           collector = createResultPageCollector(configuredPages);
@@ -2858,7 +2979,9 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     const system = [
       input.prompt.system,
       "# TRUSTED TOOL POLICY",
-      "Use only list_files, read_file, and search_text.",
+      coverageTools === undefined
+        ? "Use only list_files, read_file, and search_text."
+        : "Use only list_files, read_file, search_text, and coverage_status. Check coverage_status before finalization and read every required missing byte range.",
       "Never execute shell commands, command-line tools, programs, scripts, builds, tests, Git commands, or code.",
       "Never write, edit, create, delete, rename, or change permissions on files.",
       "Never request any other capability.",
@@ -2894,7 +3017,10 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     try {
       let inspectionBudgetReached = false;
       let initialRequestAdmitted = false;
+      let coverageRepairRounds = 0;
+      let coverageRepairTurns = 0;
       for (let turn = 0; turn < this.maxTurns; turn += 1) {
+        if (coverageRepairRounds > 0) coverageRepairTurns += 1;
         const exchange = this.observableChat(
           configuration,
           input.signal,
@@ -2929,21 +3055,8 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         const chatResponse = await exchange.response;
         if (!initialRequestAdmitted) {
           initialRequestAdmitted = true;
-          const git = input.context.git;
-          const rawDiff = git.is_repository ? git.raw_diff : undefined;
-          if (
-            input.coverage !== undefined &&
-            rawDiff !== undefined &&
-            git.is_repository &&
-            !git.truncated.diff &&
-            input.prompt.user.includes(git.diff)
-          ) {
-            input.coverage.recordDiffDelivery(
-              git.changed_paths?.map((entry) => entry.path) ??
-                git.changed_files,
-              { byteCount: rawDiff.byte_count, sha256: rawDiff.sha256 },
-            );
-          }
+          if (messages[1]?.content === input.prompt.user)
+            acknowledgeInitialDiffDelivery(input);
         }
         const message = chatResponse.message;
         const reserve = finalizationReserve(this.maxConversationBytes);
@@ -3028,7 +3141,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               "The reviewer completed a bounded read-only inspection step.",
             identity: `${sessionId}:tools:${turn}`,
           };
-          if (!inspectionBudgetReached) continue;
+          if (!inspectionBudgetReached && coverageRepairTurns < 8) continue;
           messages.push({
             role: "user",
             content:
@@ -3036,6 +3149,37 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           });
         }
 
+        const coverageStatus = input.coverage?.status();
+        if (
+          !inspectionBudgetReached &&
+          coverageRepairTurns < 8 &&
+          coverageRepairRounds < 2 &&
+          coverageStatus?.proof_kind === "observed" &&
+          !coverageStatus.complete &&
+          coverageStatus.deficits.some(
+            (entry) => entry.missing_byte_ranges.length > 0,
+          )
+        ) {
+          coverageRepairRounds += 1;
+          const repair = {
+            role: "user",
+            content: `Before finalization, repair the remaining observed coverage using only targeted read_file calls. Preserve your review and findings. At most ${8 - coverageRepairTurns} inspection turns remain. Core coverage status: ${JSON.stringify(coverageStatus)}`,
+          };
+          if (
+            conversationBytes([...messages, repair]) <=
+            this.maxConversationBytes - reserve
+          ) {
+            messages.push(repair);
+            yield {
+              type: "progress",
+              phase: "coverage_repair",
+              message:
+                "Inspecting the remaining required snapshot ranges before finalization.",
+              identity: `${sessionId}:coverage-repair:${coverageRepairRounds}`,
+            };
+            continue;
+          }
+        }
         if (!inspectionBudgetReached)
           messages.push({
             role: "user",

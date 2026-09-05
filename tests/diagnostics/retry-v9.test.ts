@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -15,6 +15,11 @@ import type { ReviewerResultV4 } from "../../src/protocol/v9.js";
 import { roundInput, resolvedContext } from "../helpers/fixtures.js";
 import { runV9Review } from "../../src/orchestrator/run-v9.js";
 import { AdapterRegistry } from "../../src/adapters/registry.js";
+import { readRetryRunPlan } from "../../src/diagnostics/run-report.js";
+import {
+  createChangeCoverageLedger,
+  releaseRunSnapshot,
+} from "../../src/context/change-coverage.js";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -76,6 +81,8 @@ async function parentFixture(options: {
     result: ReviewerResultV4;
   }>;
   incompleteLensIds?: string[];
+  legacySnapshot?: boolean;
+  incompleteSummaryLensIds?: string[];
 }) {
   const root = await mkdtemp(join(tmpdir(), "review-mesh-v9-retry-"));
   roots.push(root);
@@ -83,6 +90,20 @@ async function parentFixture(options: {
   const runId = "parent-run";
   const path = join(runsDirectory, `${runId}.jsonl`);
   const writer = await createRunArtifact({ path, runId, toolVersion: "9.0.0" });
+  let snapshotIdentity;
+  if (!options.legacySnapshot) {
+    const ledger = await createChangeCoverageLedger({
+      context: options.context,
+      policy: {
+        relevantPaths: ["**"],
+        minimumInspection: "full_file",
+        proof: "observed",
+      },
+    });
+    snapshotIdentity = ledger.snapshotIdentity();
+    await ledger.close();
+    releaseRunSnapshot(options.context);
+  }
   await writer.record({
     record: "request",
     request: {
@@ -111,6 +132,9 @@ async function parentFixture(options: {
       reviewer_id: completed.reviewerId,
       data: {
         index: 0,
+        ...(snapshotIdentity === undefined
+          ? {}
+          : { snapshot_identity: snapshotIdentity }),
         entries: [
           {
             path: "worker.ts",
@@ -211,7 +235,10 @@ async function parentFixture(options: {
       artifact: "complete",
       planned_public_stream: "references_only",
     },
-    lens_summaries: [],
+    lens_summaries: (options.incompleteSummaryLensIds ?? []).map((lens_id) => ({
+      lens_id,
+      outcome: "incomplete",
+    })),
     exclusions: [],
     warnings: [],
     deficit_samples: [],
@@ -221,6 +248,215 @@ async function parentFixture(options: {
 }
 
 describe("v9 retry inheritance", () => {
+  async function realContext(overrides: Partial<ResolvedContext> = {}) {
+    const workspace = await mkdtemp(
+      join(tmpdir(), "review-mesh-retry-source-"),
+    );
+    roots.push(workspace);
+    await writeFile(join(workspace, "worker.ts"), "initial worker");
+    await writeFile(join(workspace, "support.ts"), "initial support");
+    return resolvedContext({ ...overrides, workspace });
+  }
+
+  it("selects an incomplete logical quorum even when all model runs completed", async () => {
+    const base = roundInput();
+    const reviewer = base.config.reviewers[0]!;
+    const context = await realContext();
+    const lensId = reviewer.agentId ?? reviewer.id;
+    const parent = await parentFixture({
+      context,
+      config: base.config,
+      incompleteSummaryLensIds: [lensId],
+      completed: [{ reviewerId: reviewer.id, lensId, result: result("pass") }],
+    });
+    expect(
+      (
+        await readRetryRunPlan({
+          runsDirectory: parent.runsDirectory,
+          runId: parent.runId,
+        })
+      ).incomplete_lenses,
+    ).toEqual([lensId]);
+  });
+
+  it.each(["worker.ts", "support.ts", "added.ts"])(
+    "rejects stale %s bytes before inheriting a completed result",
+    async (path) => {
+      const base = roundInput();
+      const reviewer = base.config.reviewers[0]!;
+      const context = await realContext({
+        review_scope: { mode: "full", source: "request" },
+      });
+      const parent = await parentFixture({
+        context,
+        config: base.config,
+        completed: [
+          {
+            reviewerId: reviewer.id,
+            lensId: reviewer.agentId ?? reviewer.id,
+            result: result("pass"),
+          },
+        ],
+      });
+      await writeFile(join(context.workspace, path), "changed since review");
+      await expect(
+        prepareV9Retry({
+          runsDirectory: parent.runsDirectory,
+          parentRunId: parent.runId,
+          selectedLensIds: [reviewer.agentId ?? reviewer.id],
+          config: base.config,
+          context,
+        }),
+      ).rejects.toMatchObject({ code: "retry_evidence_changed" });
+    },
+  );
+
+  it("reruns legacy parents without complete captured snapshot evidence", async () => {
+    const base = roundInput();
+    const reviewer = base.config.reviewers[0]!;
+    const context = await realContext();
+    const parent = await parentFixture({
+      context,
+      config: base.config,
+      legacySnapshot: true,
+      completed: [
+        {
+          reviewerId: reviewer.id,
+          lensId: reviewer.agentId ?? reviewer.id,
+          result: result("pass"),
+        },
+      ],
+    });
+    expect(
+      await prepareV9Retry({
+        runsDirectory: parent.runsDirectory,
+        parentRunId: parent.runId,
+        selectedLensIds: [reviewer.agentId ?? reviewer.id],
+        config: base.config,
+        context,
+      }),
+    ).toMatchObject({
+      inherited: [],
+      inheritance: "rerun_all",
+      evidenceReason: "snapshot_identity_unavailable",
+    });
+  });
+
+  it("rejects changed untracked bytes even when the Git diff identity is unchanged", async () => {
+    const base = roundInput();
+    const reviewer = base.config.reviewers[0]!;
+    const context = await realContext();
+    context.git = {
+      is_repository: true,
+      root: context.workspace,
+      branch: "main",
+      head: "a".repeat(40),
+      merge_base: "a".repeat(40),
+      status_entries: ["?? worker.ts"],
+      changed_files: ["worker.ts"],
+      changed_paths: [{ path: "worker.ts", kind: "untracked" }],
+      diff_stat: "",
+      diff: "",
+      raw_diff: {
+        byte_count: 0,
+        sha256:
+          "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      },
+      truncated: {
+        status_entries: false,
+        changed_files: false,
+        diff_stat: false,
+        diff: false,
+      },
+    };
+    const parent = await parentFixture({
+      context,
+      config: base.config,
+      completed: [
+        {
+          reviewerId: reviewer.id,
+          lensId: reviewer.agentId ?? reviewer.id,
+          result: result("pass"),
+        },
+      ],
+    });
+    await writeFile(
+      join(context.workspace, "worker.ts"),
+      "new untracked bytes",
+    );
+    await expect(
+      prepareV9Retry({
+        runsDirectory: parent.runsDirectory,
+        parentRunId: parent.runId,
+        selectedLensIds: [reviewer.agentId ?? reviewer.id],
+        config: base.config,
+        context,
+      }),
+    ).rejects.toMatchObject({ code: "retry_evidence_changed" });
+  });
+  it("reuses a completed model inside an incomplete lens with sanitized diff narrative", async () => {
+    const base = roundInput();
+    const first = base.config.reviewers[0]!;
+    first.id = "security::0";
+    first.agentId = "security";
+    const second = structuredClone(first);
+    second.id = "security::1";
+    base.config.reviewers = [first, second];
+    const context = await realContext({
+      git: {
+        is_repository: true,
+        root: "C:/fixture",
+        branch: "main",
+        head: "abc",
+        merge_base: "abc",
+        status_entries: [],
+        changed_files: ["worker.ts"],
+        diff_stat: "",
+        truncated: {
+          changed_files: false,
+          diff: false,
+          diff_stat: false,
+          status_entries: false,
+        },
+        diff: "-password=old\n+password=credential-value\n",
+        raw_diff: { byte_count: 50, sha256: "b".repeat(64) },
+      },
+    });
+    const parent = await parentFixture({
+      context,
+      config: base.config,
+      completed: [
+        { reviewerId: first.id, lensId: "security", result: result("pass") },
+      ],
+      incompleteLensIds: ["security"],
+    });
+    const retry = await prepareV9Retry({
+      runsDirectory: parent.runsDirectory,
+      parentRunId: parent.runId,
+      selectedLensIds: ["security"],
+      config: base.config,
+      context,
+    });
+    expect(retry.inheritance).toBe("exact");
+    expect(retry.inherited.map((item) => item.reviewerId)).toEqual([first.id]);
+    expect(retry.runLensIds).toEqual(["security"]);
+    await expect(
+      prepareV9Retry({
+        runsDirectory: parent.runsDirectory,
+        parentRunId: parent.runId,
+        selectedLensIds: ["security"],
+        config: base.config,
+        context: {
+          ...context,
+          git: {
+            ...context.git,
+            is_repository: true,
+            head: "changed",
+          } as ResolvedContext["git"],
+        },
+      }),
+    ).rejects.toThrow(/head|evidence/i);
+  });
   it("inherits digest-verified completed parent results and preserves known findings", async () => {
     const base = roundInput();
     const security = structuredClone(base.config.reviewers[0]!);
@@ -238,7 +474,7 @@ describe("v9 retry inheritance", () => {
     readiness.agentId = "readiness";
     readiness.policy = structuredClone(security.policy);
     const config = { ...base.config, reviewers: [security, readiness] };
-    const context = resolvedContext({
+    const context = await realContext({
       review_scope: { mode: "full", source: "request" },
     });
     const parent = await parentFixture({
@@ -288,7 +524,7 @@ describe("v9 retry inheritance", () => {
       gateMinimumSeverity: "medium",
       gateMinimumConfidence: "medium",
     };
-    const context = resolvedContext({
+    const context = await realContext({
       review_scope: { mode: "full", source: "request" },
     });
     const parent = await parentFixture({
@@ -319,7 +555,7 @@ describe("v9 retry inheritance", () => {
 
   it("rejects a selected lens that no longer exists instead of allowing a zero-run success", async () => {
     const base = roundInput();
-    const context = resolvedContext({
+    const context = await realContext({
       review_scope: { mode: "full", source: "request" },
     });
     const parent = await parentFixture({
@@ -349,7 +585,7 @@ describe("v9 retry inheritance", () => {
     readiness.id = "readiness::0";
     readiness.agentId = "readiness";
     base.config.reviewers = [reviewer, readiness];
-    const context = resolvedContext({
+    const context = await realContext({
       review_scope: { mode: "full", source: "request" },
     });
     const parent = await parentFixture({

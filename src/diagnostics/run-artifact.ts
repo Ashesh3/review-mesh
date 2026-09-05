@@ -5,6 +5,10 @@ import { resolve } from "node:path";
 import { z } from "zod";
 import {
   artifactResolutionV1Schema,
+  artifactResolutionV2Schema,
+  artifactAttemptV1Schema,
+  artifactTerminalV1Schema,
+  artifactCoverageV1Schema,
   privatePayloadSchemas,
 } from "./artifact-payloads.js";
 import { runFindingsRecordSchema } from "./artifact-record-schemas.js";
@@ -45,17 +49,17 @@ const MAX_NARRATIVE_CHUNKS = Math.ceil(
   MAX_REVIEWER_RESULT_BYTES / NARRATIVE_CHUNK_BYTES,
 );
 const PRIVATE_VERSIONS = {
-  resolution: "2",
+  resolution: "3",
   request: "3",
   context: "1",
-  "reviewer.attempt": "1",
+  "reviewer.attempt": "2",
   "reviewer.activity": "1",
   "reviewer.activity_summary": "1",
-  "reviewer.coverage": "1",
+  "reviewer.coverage": "2",
   "reviewer.result_page": "1",
   "reviewer.narrative": "1",
   "reviewer.result": "1",
-  "reviewer.terminal": "1",
+  "reviewer.terminal": "2",
   "run.findings": "1",
   "run.terminal_summary": "1",
   "run.artifact_terminal": "1",
@@ -71,7 +75,13 @@ const headerSchema = z.strictObject({
       Object.fromEntries(
         Object.entries(PRIVATE_VERSIONS).map(([key, value]) => [
           key,
-          key === "resolution" ? z.enum(["1", "2"]) : z.literal(value),
+          key === "resolution"
+            ? z.enum(["1", "2", "3"])
+            : key === "reviewer.attempt" ||
+                key === "reviewer.terminal" ||
+                key === "reviewer.coverage"
+              ? z.enum(["1", "2"])
+              : z.literal(value),
         ]),
       ),
     )
@@ -119,7 +129,7 @@ const genericRecords: Record<string, z.ZodType> = {
   "run.findings": runFindingsRecordSchema,
   resolution: z.strictObject({
     record: z.literal("resolution"),
-    schema_version: z.enum(["1", "2"]),
+    schema_version: z.enum(["1", "2", "3"]),
     run_id: id,
     resolution: z.record(z.string(), z.unknown()),
   }),
@@ -146,7 +156,12 @@ for (const record of [
 ] as const) {
   genericRecords[record] = z.strictObject({
     record: z.literal(record),
-    schema_version: z.literal("1"),
+    schema_version:
+      record === "reviewer.attempt" ||
+      record === "reviewer.terminal" ||
+      record === "reviewer.coverage"
+        ? z.enum(["1", "2"])
+        : z.literal("1"),
     run_id: id,
     reviewer_id: id,
     data: z.record(z.string(), z.unknown()),
@@ -177,7 +192,15 @@ function validatePayload(record: Record<string, unknown>): void {
   const schema =
     kind === "resolution" && record.schema_version === "1"
       ? artifactResolutionV1Schema
-      : privatePayloadSchemas[kind];
+      : kind === "resolution" && record.schema_version === "2"
+        ? artifactResolutionV2Schema
+        : kind === "reviewer.attempt" && record.schema_version === "1"
+          ? artifactAttemptV1Schema
+          : kind === "reviewer.terminal" && record.schema_version === "1"
+            ? artifactTerminalV1Schema
+            : kind === "reviewer.coverage" && record.schema_version === "1"
+              ? artifactCoverageV1Schema
+              : privatePayloadSchemas[kind];
   if (schema)
     parseRecord(
       schema,
@@ -201,7 +224,12 @@ function validateHeaderManifest(record: Record<string, unknown>): void {
     if (
       typeof declared === "string" &&
       declared !== expected &&
-      !(kind === "resolution" && declared === "1")
+      !(kind === "resolution" && ["1", "2"].includes(declared)) &&
+      !(
+        ["reviewer.attempt", "reviewer.terminal", "reviewer.coverage"].includes(
+          kind,
+        ) && declared === "1"
+      )
     )
       throw new RunArtifactError(
         "unsupported_schema_version",

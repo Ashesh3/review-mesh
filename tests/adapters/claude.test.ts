@@ -346,6 +346,7 @@ describe("Claude Agent SDK adapter", () => {
       "mcp__review_mesh__list_files",
       "mcp__review_mesh__read_file",
       "mcp__review_mesh__search_text",
+      "mcp__review_mesh__coverage_status",
     ]);
     expect(options.mcpServers).toHaveProperty("review_mesh");
     expect(prepared.query.calls[0]!.prompt).toContain(
@@ -449,6 +450,8 @@ describe("Claude Agent SDK adapter", () => {
       recordDiffDelivery: vi.fn(),
       reconcileAttestation: vi.fn(),
       summary: vi.fn(),
+      status: vi.fn(),
+      snapshotIdentity: vi.fn(),
       entries: vi.fn(),
       snapshotFiles: vi.fn(() => []),
       close: vi.fn(async () => undefined),
@@ -459,22 +462,28 @@ describe("Claude Agent SDK adapter", () => {
       diff,
       changed_files: ["src/a.ts"],
       changed_paths: [{ path: "src/a.ts", status: "modified" }],
-      raw_diff: { byte_count: Buffer.byteLength(diff), sha256: "c".repeat(64) },
+      raw_diff: {
+        byte_count: Buffer.byteLength(diff),
+        sha256: createHash("sha256").update(diff).digest("hex"),
+      },
       truncated: {
         diff_stat: false,
         diff: false,
         changed_files: false,
       },
     });
-    prepared.input.prompt = {
-      ...prepared.input.prompt,
-      user: `${prepared.input.prompt.user}\n${diff}`,
-    };
+    prepared.input.prompt = buildReviewerPrompt({
+      reviewer: prepared.input.reviewer,
+      context: prepared.input.context,
+    });
 
     await collect(prepared.adapter.run(prepared.input));
     expect(prepared.input.coverage.recordDiffDelivery).toHaveBeenCalledWith(
       ["src/a.ts"],
-      { byteCount: Buffer.byteLength(diff), sha256: "c".repeat(64) },
+      {
+        byteCount: Buffer.byteLength(diff),
+        sha256: createHash("sha256").update(diff).digest("hex"),
+      },
     );
     const server = prepared.query.calls[0]!.options.mcpServers!
       .review_mesh as unknown as {
@@ -562,74 +571,122 @@ describe("Claude Agent SDK adapter", () => {
     await collect(admitted.adapter.run(admitted.input));
     expect(acknowledgeDelivered).toHaveBeenCalledOnce();
   });
-  it("continues v9 pages by resuming the same Claude session", async () => {
-    const first = {
-      schema_version: "1",
-      kind: "review-mesh.result-page",
-      result_id: "claude-two",
-      result_kind: "reviewer",
-      result_schema_version: "4",
-      page_index: 0,
-      page_count: 2,
-      page_kind: "header",
-      previous_page_digest: null,
-      payload: {
-        verdict: "pass",
-        summary: "clean",
-        informational_notes: [],
-        narrative_byte_count: 1,
-        narrative_fragment_count: 1,
-        actionable_finding_count: 0,
-        coverage_attestation: null,
-      },
-    };
-    const firstRaw = JSON.stringify(first);
-    const second = {
-      schema_version: "1",
-      kind: "review-mesh.result-page",
-      result_id: "claude-two",
-      result_kind: "reviewer",
-      result_schema_version: "4",
-      page_index: 1,
-      page_count: 2,
-      page_kind: "narrative",
-      previous_page_digest: createHash("sha256").update(firstRaw).digest("hex"),
-      payload: { text_fragment: "x" },
-    };
-    const prepared = setup([
-      messages(successResult(first)),
-      messages(successResult(second)),
-    ]);
-    prepared.input.resultPages = createResultPageCollector({
-      resultId: "claude-two",
-      resultKind: "reviewer",
-    });
+  it.each(["none", "schema", "coverage"])(
+    "continues v9 pages by resuming the same Claude session (repair=%s)",
+    async (repairKind) => {
+      const repair = repairKind === "schema";
+      const repairCoverage = repairKind === "coverage";
+      const first = {
+        schema_version: "1",
+        kind: "review-mesh.result-page",
+        result_id: "claude-two",
+        result_kind: "reviewer",
+        result_schema_version: "4",
+        page_index: 0,
+        page_count: 2,
+        page_kind: "header",
+        previous_page_digest: null,
+        payload: {
+          verdict: "pass",
+          summary: "clean",
+          informational_notes: [],
+          narrative_byte_count: 1,
+          narrative_fragment_count: 1,
+          actionable_finding_count: 0,
+          coverage_attestation: null,
+        },
+      };
+      const firstRaw = JSON.stringify(first);
+      const second = {
+        schema_version: "1",
+        kind: "review-mesh.result-page",
+        result_id: "claude-two",
+        result_kind: "reviewer",
+        result_schema_version: "4",
+        page_index: 1,
+        page_count: 2,
+        page_kind: "narrative",
+        previous_page_digest: createHash("sha256")
+          .update(firstRaw)
+          .digest("hex"),
+        payload: { text_fragment: "x" },
+      };
+      const prepared = setup([
+        ...(repair
+          ? [
+              messages(
+                successResult({
+                  ...first,
+                  payload: { ...first.payload, summary: "é".repeat(514) },
+                }),
+              ),
+            ]
+          : []),
+        ...(repairCoverage ? [messages(successResult(first))] : []),
+        messages(successResult(first)),
+        messages(successResult(second)),
+      ]);
+      prepared.input.resultPages = createResultPageCollector({
+        resultId: "claude-two",
+        resultKind: "reviewer",
+      });
+      if (repairCoverage)
+        prepared.input.coverage = {
+          status: vi
+            .fn()
+            .mockReturnValueOnce({
+              proof_kind: "observed",
+              complete: false,
+              deficits: [
+                {
+                  path: "src/a.ts",
+                  missing_byte_ranges: [{ offset: 0, byte_count: 2 }],
+                },
+              ],
+            })
+            .mockReturnValue({
+              proof_kind: "observed",
+              complete: true,
+              deficits: [],
+            }),
+        } as unknown as NonNullable<AdapterReviewInput["coverage"]>;
 
-    const output = await collect(prepared.adapter.run(prepared.input));
+      const output = await collect(prepared.adapter.run(prepared.input));
 
-    expect(terminalResult(output).result).toMatchObject({
-      review_markdown: "x",
-    });
-    expect(prepared.query.calls).toHaveLength(2);
-    expect(prepared.query.calls[0]!.options.persistSession).toBe(true);
-    expect(prepared.query.calls[0]!.options.env?.CLAUDE_CONFIG_DIR).toMatch(
-      /review-mesh-claude-session-/,
-    );
-    expect(prepared.query.calls[1]!.options.resume).toBe(
-      "00000000-0000-4000-8000-000000000002",
-    );
-    expect(prepared.query.calls[1]!.options.env?.CLAUDE_CONFIG_DIR).toBe(
-      prepared.query.calls[0]!.options.env?.CLAUDE_CONFIG_DIR,
-    );
-    expect(
-      output
-        .filter(
-          (event): event is Extract<AdapterEvent, { type: "progress" }> =>
-            event.type === "progress" && event.phase === "result_page",
-        )
-        .map((event) => event.identity),
-    ).toEqual(["claude-two:page:0", "claude-two:page:1"]);
-  });
+      expect(terminalResult(output).result).toMatchObject({
+        review_markdown: "x",
+      });
+      expect(prepared.query.calls).toHaveLength(
+        repair || repairCoverage ? 3 : 2,
+      );
+      if (repair)
+        expect(prepared.query.calls[1]!.prompt).toContain(
+          '"actual_bytes":1028',
+        );
+      if (repairCoverage)
+        expect(prepared.query.calls[1]!.prompt).toContain(
+          "missing_byte_ranges",
+        );
+      expect(prepared.query.calls[0]!.options.persistSession).toBe(true);
+      expect(prepared.query.calls[0]!.options.env?.CLAUDE_CONFIG_DIR).toMatch(
+        /review-mesh-claude-session-/,
+      );
+      expect(prepared.query.calls[1]!.options.resume).toBe(
+        "00000000-0000-4000-8000-000000000002",
+      );
+      expect(prepared.query.calls[1]!.options.env?.CLAUDE_CONFIG_DIR).toBe(
+        prepared.query.calls[0]!.options.env?.CLAUDE_CONFIG_DIR,
+      );
+      expect(
+        output
+          .filter(
+            (event): event is Extract<AdapterEvent, { type: "progress" }> =>
+              event.type === "progress" && event.phase === "result_page",
+          )
+          .map((event) => event.identity),
+      ).toEqual(["claude-two:page:0", "claude-two:page:1"]);
+    },
+  );
   it("classifies a Claude max-token page as output truncation", async () => {
     const prepared = setup([messages(truncatedResult({ partial: true }))]);
     prepared.input.resultPages = createResultPageCollector({

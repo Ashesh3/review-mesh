@@ -103,7 +103,8 @@ describe("buildReviewerPrompt", () => {
     });
 
     expect(prompt.system).toContain("result-7");
-    expect(prompt.system).toContain("page index 2");
+    expect(prompt.system).not.toContain("page index 2");
+    expect(prompt.system).toContain("latest core page assignment");
     expect(prompt.system).toContain("attested proof");
     expect(prompt.system).toContain("must never be labelled observed");
     expect(prompt.system).toContain("src/missing.ts");

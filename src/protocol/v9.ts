@@ -733,6 +733,10 @@ const v6ActiveHeartbeatEntrySchema = z.strictObject({
   attempt_deadline_remaining_ms: nonNegativeInteger,
   last_progress_age_ms: nonNegativeInteger,
   coalesced_activity_count: nonNegativeInteger,
+  admitted_at: timestampSchema.optional(),
+  queue_reason: z.enum(["provider_limit", "execution_limit"]).optional(),
+  queue_wait_ms: nonNegativeInteger.optional(),
+  probe_elapsed_ms: nonNegativeInteger.optional(),
 });
 const v6GenericEventDataSchema = z.strictObject({
   detail_ref: boundedId.optional(),
@@ -748,6 +752,8 @@ const progressData = z.strictObject({
   attempt: positiveInteger.optional(),
   maximum_attempts: positiveInteger.optional(),
   message: utf8String(1000).optional(),
+  queue_reason: z.enum(["provider_limit", "execution_limit"]).optional(),
+  queued_at: timestampSchema.optional(),
 });
 const publicEventV6BaseSchema = z.discriminatedUnion("event", [
   z.strictObject({
@@ -777,6 +783,7 @@ const publicEventV6BaseSchema = z.discriminatedUnion("event", [
       mode: z.enum(["full_review", "adjudication"]).optional(),
       message: utf8String(1000).optional(),
       elapsed_ms: nonNegativeInteger.optional(),
+      expired_boundary: v9IncompleteReasonSchema.optional(),
     }),
   }),
   z.strictObject({
@@ -849,6 +856,9 @@ const publicEventV6BaseSchema = z.discriminatedUnion("event", [
       lens_deadline_remaining_ms: nonNegativeInteger,
       progress_observable: z.boolean(),
       proof: v9CoverageProofKindSchema,
+      admitted_at: timestampSchema.optional(),
+      queue_wait_ms: nonNegativeInteger.optional(),
+      probe_elapsed_ms: nonNegativeInteger.optional(),
     }),
   }),
   z.strictObject({

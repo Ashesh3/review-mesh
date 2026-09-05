@@ -31,6 +31,7 @@ import { createDefaultRegistry, type ReviewApplicationOptions } from "./app.js";
 import { sanitizePublicText } from "./adapters/errors.js";
 import { prepareV9Retry, V9RetryError } from "./diagnostics/retry-v9.js";
 import { reviewMeshVersion } from "./discovery/help.js";
+import { createRunControl } from "./diagnostics/run-control.js";
 
 export async function runV9Application(
   options: ReviewApplicationOptions,
@@ -260,13 +261,19 @@ export async function runV9Application(
         outcome,
       }),
   });
+  const controlAbort = new AbortController();
+  const abortRun = () => controlAbort.abort(options.signal.reason);
+  options.signal.addEventListener("abort", abortRun, { once: true });
+  if (options.signal.aborted) abortRun();
+  let control: Awaited<ReturnType<typeof createRunControl>> | undefined;
   try {
+    control = await createRunControl(paths.runsDirectory, runId, controlAbort);
     const result = await runV9Review({
       runId,
       config,
       context,
       registry: options.adapterRegistry ?? createDefaultRegistry(),
-      signal: options.signal,
+      signal: controlAbort.signal,
       writer,
       record: (record) => artifact.record(record),
       recordResult: (id, result) => artifact.result(id, result),
@@ -281,6 +288,8 @@ export async function runV9Application(
     );
     return options.signal.aborted ? 4 : 3;
   } finally {
+    options.signal.removeEventListener("abort", abortRun);
+    await control?.close();
     await writer.close().catch(() => undefined);
     await artifact.close().catch(() => undefined);
     await detailsHandle?.close();

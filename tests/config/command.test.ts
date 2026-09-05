@@ -340,6 +340,54 @@ describe("config command", () => {
     });
   });
 
+  it("bootstraps a missing config through export, apply and effective", async () => {
+    const { directory, file } = await fixture();
+    const missing = join(directory, "fresh", "config.toml");
+    const source = streams();
+    await runConfigCommand({
+      args: ["export", "--json"],
+      configFile: file,
+      ...source,
+    });
+    const exportedIo = streams();
+    expect(
+      await runConfigCommand({
+        args: ["export", "--json"],
+        configFile: missing,
+        ...exportedIo,
+      }),
+    ).toBe(0);
+    const exported = JSON.parse(exportedIo.stdout());
+    expect(exported).toMatchObject({
+      exists: false,
+      revision: "missing",
+      config_schema_version: "7",
+    });
+    const applied = streams();
+    inputJson(applied, {
+      schema_version: "1",
+      expected_revision: exported.revision,
+      config: JSON.parse(source.stdout()).config,
+    });
+    expect(
+      await runConfigCommand({
+        args: ["apply", "--json"],
+        configFile: missing,
+        ...applied,
+      }),
+    ).toBe(0);
+    expect(JSON.parse(applied.stdout()).status).toBe("applied");
+    const effective = streams();
+    expect(
+      await runConfigCommand({
+        args: ["effective", directory, "--json"],
+        configFile: missing,
+        ...effective,
+      }),
+    ).toBe(0);
+    expect(JSON.parse(effective.stdout())).toMatchObject({ valid: true });
+  });
+
   it("applies a full config with revision CAS and is idempotent", async () => {
     const { file } = await fixture();
     const exportedIo = streams();

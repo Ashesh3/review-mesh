@@ -1,5 +1,6 @@
 import { dirname, join } from "node:path";
 import type { AdapterRegistration } from "../config/schemas.js";
+import { MAX_READ_BYTES } from "../context/read-limits.js";
 import { getAppPaths } from "../config/paths.js";
 import {
   loadCopilotSdkModule,
@@ -12,10 +13,15 @@ import {
   acknowledgeInitialDiffDelivery,
   assembleResultPages,
   createResultPageStorageBridge,
+  coverageRepairMessage,
   nextPageAssignment,
   outputTruncatedFailure,
   pageCollectorFor,
   pageFailure,
+  isRepairablePageError,
+  pageRepairMessage,
+  failedPageRepair,
+  MAX_PAGE_SCHEMA_REPAIRS,
 } from "./sdk-pages.js";
 import {
   buildAllowlistedEnvironment,
@@ -622,7 +628,20 @@ class CopilotAdapter implements ReviewAdapter {
       {
         name: "read_file",
         description: "Read exact bytes from the pinned Review Mesh snapshot.",
-        parameters: { type: "object", required: ["path"] },
+        parameters: {
+          type: "object",
+          required: ["path"],
+          additionalProperties: false,
+          properties: {
+            path: { type: "string" },
+            offset: { type: "integer", minimum: 0 },
+            byte_count: {
+              type: "integer",
+              minimum: 0,
+              maximum: MAX_READ_BYTES,
+            },
+          },
+        },
         skipPermission: true,
         defer: "never" as const,
         handler: async (
@@ -651,6 +670,22 @@ class CopilotAdapter implements ReviewAdapter {
           }
           return serialized;
         },
+      },
+      {
+        name: "coverage_status",
+        description:
+          "List exact missing snapshot byte ranges and diff obligations before finalization.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          properties: {},
+        },
+        skipPermission: true,
+        defer: "never" as const,
+        handler: async () =>
+          coverageTools === undefined
+            ? { error: "unavailable" }
+            : coverageTools.coverageStatus(),
       },
       {
         name: "search_text",
@@ -752,7 +787,12 @@ class CopilotAdapter implements ReviewAdapter {
         enableHostGitOperations: false,
         availableTools:
           pages !== undefined
-            ? ["custom:list_files", "custom:read_file", "custom:search_text"]
+            ? [
+                "custom:list_files",
+                "custom:read_file",
+                "custom:search_text",
+                "custom:coverage_status",
+              ]
             : allowShell
               ? [...READ_ONLY_TOOLS, ...SHELL_TOOLS]
               : [...READ_ONLY_TOOLS],
@@ -791,6 +831,9 @@ class CopilotAdapter implements ReviewAdapter {
       if (pages !== undefined) {
         pageStorage = createResultPageStorageBridge(input);
         let initialRequestAdmitted = false;
+        let repairPrompt: string | undefined;
+        let pageRepairs = 0;
+        let coverageRepairs = 0;
         while (!pages.collector.complete) {
           const assignment = nextPageAssignment(
             pages.collector,
@@ -801,9 +844,10 @@ class CopilotAdapter implements ReviewAdapter {
             .sendAndWait(
               {
                 prompt:
-                  assignment.request.pageIndex === 0
+                  repairPrompt ??
+                  (assignment.request.pageIndex === 0
                     ? `${input.prompt.user}\n\n${assignment.prompt}`
-                    : assignment.prompt,
+                    : assignment.prompt),
                 agentMode: "interactive",
               },
               input.reviewer.timeoutMs,
@@ -859,6 +903,22 @@ class CopilotAdapter implements ReviewAdapter {
             acknowledgeInitialDiffDelivery(input);
             initialRequestAdmitted = true;
           }
+          if (assignment.request.pageIndex === 0 && coverageRepairs < 2) {
+            const coveragePrompt = coverageRepairMessage(
+              input,
+              assignment.prompt,
+            );
+            if (coveragePrompt !== undefined) {
+              coverageRepairs += 1;
+              repairPrompt = coveragePrompt;
+              yield {
+                type: "progress",
+                phase: "coverage_repair",
+                identity: `${assignment.request.resultId}:coverage-repair:${coverageRepairs}`,
+              };
+              continue;
+            }
+          }
           try {
             await pageStorage.addPage(
               pages.collector,
@@ -866,14 +926,34 @@ class CopilotAdapter implements ReviewAdapter {
               assignment.request.pageIndex,
             );
           } catch (error) {
+            if (
+              isRepairablePageError(error) &&
+              pageRepairs < MAX_PAGE_SCHEMA_REPAIRS
+            ) {
+              pageRepairs += 1;
+              repairPrompt = pageRepairMessage(error, assignment.prompt);
+              yield {
+                type: "progress",
+                phase: "schema_repair",
+                identity: `${assignment.request.resultId}:page:${assignment.request.pageIndex}:repair:${pageRepairs}`,
+              };
+              continue;
+            }
             await pageStorage.abandon();
             yield {
               type: "failure",
-              failure: pageFailure(error, "Copilot"),
+              failure: failedPageRepair(
+                error,
+                "Copilot",
+                pageRepairs,
+                assignment.request.resultId,
+              ),
               isolation,
             };
             return;
           }
+          pageRepairs = 0;
+          repairPrompt = undefined;
           yield {
             type: "progress",
             phase: "result_page",

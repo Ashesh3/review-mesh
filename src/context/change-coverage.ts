@@ -18,10 +18,9 @@ import type {
 } from "../protocol/v9.js";
 import { canonicalJson } from "../results/digest.js";
 import type { ResolvedContext } from "./resolve.js";
+import { MAX_FILE_BYTES, MAX_READ_BYTES } from "./read-limits.js";
 
-const MAX_FILE_BYTES = 512 * 1024;
 const MAX_SNAPSHOT_BYTES = 32 * 1024 * 1024;
-const MAX_READ_BYTES = 128 * 1024;
 const MAX_ATTESTED_PATHS = 256;
 const MAX_LIST_ENTRIES = 20_000;
 const SKIPPED_DIRECTORIES = new Set([".git", "node_modules", ".review-mesh"]);
@@ -84,7 +83,38 @@ export type CoverageReadResult =
       eof: boolean;
       acknowledgeDelivered(): void;
     }
-  | { ok: false; path: string; reason: CoverageReadFailureReason };
+  | {
+      ok: false;
+      path: string;
+      reason: CoverageReadFailureReason;
+      maximumByteCount?: number;
+      totalByteCount?: number;
+    };
+
+export interface CoverageByteRange {
+  offset: number;
+  byte_count: number;
+}
+
+export interface ChangeCoverageStatusEntry extends ChangeCoverageEntry {
+  snapshot_required: boolean;
+  diff_required: boolean;
+  attestation_required: boolean;
+  attestation_received: boolean;
+  delivered_byte_ranges: CoverageByteRange[];
+  missing_byte_ranges: CoverageByteRange[];
+  snapshot_content_delivered: boolean;
+}
+
+export interface ChangeCoverageStatus {
+  complete: boolean;
+  scope_digest: string;
+  proof_kind: ChangeCoveragePolicy["proof"];
+  maximum_read_bytes: number;
+  summary: ChangeCoverageResult;
+  entries: ChangeCoverageStatusEntry[];
+  deficits: ChangeCoverageStatusEntry[];
+}
 
 interface SnapshotFile {
   path: string;
@@ -101,6 +131,15 @@ interface MutableEntry extends ChangeCoverageEntry {
 
 interface SharedSnapshot {
   files: Map<string, SnapshotFile>;
+  failures: Map<string, CoverageReadFailureReason>;
+  complete: boolean;
+}
+
+export interface RunSnapshotIdentity {
+  schema_version: "1";
+  sha256: string;
+  file_count: number;
+  complete: boolean;
 }
 
 const sharedSnapshots = new WeakMap<ResolvedContext, Promise<SharedSnapshot>>();
@@ -127,6 +166,8 @@ export interface ChangeCoverageLedger {
   ): void;
   reconcileAttestation(attestation: CoverageAttestation): ChangeCoverageResult;
   summary(): ChangeCoverageResult;
+  status(): ChangeCoverageStatus;
+  snapshotIdentity(): RunSnapshotIdentity;
   entries(): ChangeCoverageEntry[];
   snapshotFiles(): Array<{
     path: string;
@@ -289,11 +330,14 @@ async function capture(
 async function captureWorkspace(
   root: string,
   includedPaths: readonly string[] | undefined,
+  changedPaths: readonly string[],
   signal?: AbortSignal,
-): Promise<Map<string, SnapshotFile>> {
+): Promise<SharedSnapshot> {
   const snapshots = new Map<string, SnapshotFile>();
+  const failures = new Map<string, CoverageReadFailureReason>();
   let entries = 0;
   let bytes = 0;
+  let complete = true;
   const included = (path: string): boolean =>
     includedPaths === undefined ||
     includedPaths.some(
@@ -311,13 +355,35 @@ async function captureWorkspace(
         path.startsWith(`${scopePath}/`) ||
         scopePath.startsWith(`${path}/`),
     );
+  const capturePath = async (path: string): Promise<void> => {
+    if (!included(path) || snapshots.has(path) || failures.has(path)) return;
+    if (signal?.aborted) throw signal.reason;
+    let snapshot = await capture(root, path);
+    // Windows can settle metadata on the first open after a write. Retry only
+    // during initial capture, and require the complete stable-read checks again.
+    if (snapshot === "unavailable") snapshot = await capture(root, path);
+    if (typeof snapshot === "string") {
+      failures.set(path, snapshot);
+    } else if (bytes + snapshot.bytes.length > MAX_SNAPSHOT_BYTES) {
+      failures.set(path, "oversize");
+    } else {
+      bytes += snapshot.bytes.length;
+      snapshots.set(path, snapshot);
+    }
+  };
+  // Pin changed evidence before optional support files consume the run budget.
+  // Failed captures are pinned too, so later reviewers cannot read newer bytes.
+  for (const path of changedPaths) await capturePath(path);
   const walk = async (directory: string): Promise<void> => {
     const stream = await opendir(directory);
     try {
       for await (const item of stream) {
         if (signal?.aborted) throw signal.reason;
         entries += 1;
-        if (entries > MAX_LIST_ENTRIES || bytes > MAX_SNAPSHOT_BYTES) return;
+        if (entries > MAX_LIST_ENTRIES || bytes > MAX_SNAPSHOT_BYTES) {
+          complete = false;
+          return;
+        }
         if (SKIPPED_DIRECTORIES.has(item.name.toLocaleLowerCase("en-US")))
           continue;
         const absolute = resolve(directory, item.name);
@@ -325,9 +391,13 @@ async function captureWorkspace(
         try {
           metadata = await lstat(absolute);
         } catch {
+          complete = false;
           continue;
         }
-        if (metadata.isSymbolicLink()) continue;
+        if (metadata.isSymbolicLink()) {
+          complete = false;
+          continue;
+        }
         const path = relative(root, absolute)
           .split(sep)
           .join("/")
@@ -336,16 +406,13 @@ async function captureWorkspace(
           if (canContainIncludedPath(path)) await walk(absolute);
         } else if (metadata.isFile()) {
           if (!included(path)) continue;
-          let snapshot: SnapshotFile | CoverageReadFailureReason;
           try {
-            snapshot = await capture(root, canonicalPath(path));
+            await capturePath(canonicalPath(path));
           } catch {
+            if (signal?.aborted) throw signal.reason;
+            complete = false;
             continue;
           }
-          if (typeof snapshot === "string") continue;
-          if (bytes + snapshot.bytes.length > MAX_SNAPSHOT_BYTES) return;
-          bytes += snapshot.bytes.length;
-          snapshots.set(path, snapshot);
         }
       }
     } finally {
@@ -353,7 +420,11 @@ async function captureWorkspace(
     }
   };
   await walk(root);
-  return snapshots;
+  return {
+    files: snapshots,
+    failures,
+    complete: complete && failures.size === 0,
+  };
 }
 
 function requiredMethod(
@@ -391,6 +462,50 @@ function intervalsCover(
   return false;
 }
 
+function deliveredRanges(
+  intervals: Array<[number, number]>,
+): CoverageByteRange[] {
+  const ranges: CoverageByteRange[] = [];
+  for (const [start, end] of intervals.slice().sort((a, b) => a[0] - b[0])) {
+    const previous = ranges.at(-1);
+    if (
+      previous !== undefined &&
+      start <= previous.offset + previous.byte_count
+    ) {
+      previous.byte_count =
+        Math.max(previous.offset + previous.byte_count, end) - previous.offset;
+    } else {
+      ranges.push({ offset: start, byte_count: end - start });
+    }
+  }
+  return ranges;
+}
+
+function missingRanges(entry: MutableEntry): CoverageByteRange[] {
+  if (!snapshotRequired(entry) || entry.snapshot_byte_count === undefined)
+    return [];
+  const total = entry.snapshot_byte_count;
+  if (total === 0)
+    return intervalsCover(entry.intervals, 0)
+      ? []
+      : [{ offset: 0, byte_count: 0 }];
+  const missing: CoverageByteRange[] = [];
+  const append = (start: number, end: number): void => {
+    for (let offset = start; offset < end; offset += MAX_READ_BYTES)
+      missing.push({
+        offset,
+        byte_count: Math.min(MAX_READ_BYTES, end - offset),
+      });
+  };
+  let offset = 0;
+  for (const range of deliveredRanges(entry.intervals)) {
+    append(offset, range.offset);
+    offset = Math.max(offset, range.offset + range.byte_count);
+  }
+  append(offset, total);
+  return missing;
+}
+
 function exposed(entry: MutableEntry): ChangeCoverageEntry {
   const {
     snapshot: _snapshot,
@@ -410,7 +525,6 @@ export async function createChangeCoverageLedger(input: {
   const root = await realpath(input.context.workspace);
   if (input.signal?.aborted) throw input.signal.reason;
   let closed = false;
-  let totalSnapshotBytes = 0;
   const paths = input.context.git.is_repository
     ? (input.context.git.changed_paths ??
       input.context.git.changed_files.map((path) => ({
@@ -430,13 +544,34 @@ export async function createChangeCoverageLedger(input: {
       : undefined;
   let snapshotPromise = sharedSnapshots.get(input.context);
   if (snapshotPromise === undefined) {
-    snapshotPromise = captureWorkspace(root, fullScopePaths, input.signal).then(
-      (files) => ({ files }),
+    snapshotPromise = captureWorkspace(
+      root,
+      fullScopePaths,
+      normalized
+        .filter((entry) => entry.kind !== "deleted")
+        .map((entry) => entry.path),
+      input.signal,
     );
     sharedSnapshots.set(input.context, snapshotPromise);
   }
   const sharedSnapshot = await snapshotPromise;
   const snapshots = sharedSnapshot.files;
+  const snapshotIdentity: RunSnapshotIdentity = {
+    schema_version: "1",
+    sha256: digest(
+      canonicalJson(
+        [...snapshots.values()]
+          .sort((a, b) => compareCodePoints(a.path, b.path))
+          .map((snapshot) => ({
+            path: snapshot.path,
+            byte_count: snapshot.bytes.length,
+            sha256: snapshot.digest,
+          })),
+      ),
+    ),
+    file_count: snapshots.size,
+    complete: sharedSnapshot.complete,
+  };
   const entries = new Map<string, MutableEntry>();
   const authoritativePaths = new Set(normalized.map((entry) => entry.path));
   const changedFilesTruncated =
@@ -471,26 +606,19 @@ export async function createChangeCoverageLedger(input: {
       intervals: [],
       attested: false,
     };
-    if (relevant && snapshotRequired(entry)) {
-      const snapshot =
-        snapshots.get(changed.path) ?? (await capture(root, changed.path));
-      if (typeof snapshot === "string") {
-        entry.snapshot_read =
-          snapshot === "oversize" || snapshot === "binary"
-            ? snapshot
-            : "unavailable";
-        entry.stickyFailure = entry.snapshot_read;
-      } else if (
-        totalSnapshotBytes + snapshot.bytes.length >
-        MAX_SNAPSHOT_BYTES
-      ) {
-        entry.snapshot_read = "oversize";
-        entry.stickyFailure = "oversize";
-      } else {
-        totalSnapshotBytes += snapshot.bytes.length;
+    if (changed.kind !== "deleted") {
+      const snapshot = snapshots.get(changed.path);
+      if (snapshot !== undefined) {
         entry.snapshot = snapshot;
         entry.snapshot_digest = snapshot.digest;
         entry.snapshot_byte_count = snapshot.bytes.length;
+      } else if (relevant && snapshotRequired(entry)) {
+        const failure = sharedSnapshot.failures.get(changed.path);
+        entry.snapshot_read =
+          failure === "oversize" || failure === "binary"
+            ? failure
+            : "unavailable";
+        entry.stickyFailure = entry.snapshot_read;
       }
     }
     entries.set(changed.path, entry);
@@ -638,18 +766,10 @@ export async function createChangeCoverageLedger(input: {
       }
       const entry = entries.get(path);
       if (entry === undefined || entry.snapshot === undefined) {
-        if (entry?.relevant === true && entry.stickyFailure === undefined) {
-          entry.stickyFailure = "unavailable";
-          entry.snapshot_read = "unavailable";
-        }
         return {
           ok: false,
           path,
-          reason:
-            entry?.snapshot_read === "binary" ||
-            entry?.snapshot_read === "oversize"
-              ? entry.snapshot_read
-              : "unavailable",
+          reason: sharedSnapshot.failures.get(path) ?? "unavailable",
         };
       }
       const offset = request.offset ?? 0;
@@ -664,8 +784,13 @@ export async function createChangeCoverageLedger(input: {
         byteCount < 0 ||
         byteCount > MAX_READ_BYTES
       ) {
-        entry.stickyFailure = "invalid_range";
-        return { ok: false, path, reason: "invalid_range" };
+        return {
+          ok: false,
+          path,
+          reason: "invalid_range",
+          maximumByteCount: MAX_READ_BYTES,
+          totalByteCount: entry.snapshot.bytes.length,
+        };
       }
       const bytes = Buffer.from(
         entry.snapshot.bytes.subarray(
@@ -689,7 +814,7 @@ export async function createChangeCoverageLedger(input: {
         acknowledgeDelivered() {
           if (acknowledged) return;
           acknowledged = true;
-          if (closed || input.policy.proof !== "observed") return;
+          if (closed) return;
           if (!bytes.equals(delivered) || digest(bytes) !== deliveredDigest) {
             entry.stickyFailure ??= "response_bytes_changed";
             refresh(entry);
@@ -765,6 +890,37 @@ export async function createChangeCoverageLedger(input: {
       return summary();
     },
     summary,
+    snapshotIdentity() {
+      return { ...snapshotIdentity };
+    },
+    status() {
+      const currentSummary = summary();
+      const currentEntries = relevantEntries.map(
+        (entry): ChangeCoverageStatusEntry => ({
+          ...exposed(entry),
+          snapshot_required: snapshotRequired(entry),
+          diff_required: diffRequired(entry),
+          attestation_required: input.policy.proof === "attested",
+          attestation_received: entry.attested,
+          delivered_byte_ranges: deliveredRanges(entry.intervals),
+          missing_byte_ranges: missingRanges(entry),
+          snapshot_content_delivered:
+            entry.snapshot_byte_count !== undefined &&
+            intervalsCover(entry.intervals, entry.snapshot_byte_count),
+        }),
+      );
+      return {
+        complete: currentSummary.status !== "incomplete",
+        scope_digest: scopeDigest,
+        proof_kind: input.policy.proof,
+        maximum_read_bytes: MAX_READ_BYTES,
+        summary: currentSummary,
+        entries: currentEntries,
+        deficits: currentEntries.filter(
+          (entry) => entry.disposition === "deficit",
+        ),
+      };
+    },
     entries() {
       for (const entry of entries.values()) refresh(entry);
       return [...entries.values()].map(exposed);

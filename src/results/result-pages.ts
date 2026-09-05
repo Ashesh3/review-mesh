@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { z } from "zod";
+import type { AdapterValidationIssue } from "../adapters/errors.js";
 import {
   adjudicationResultV2Schema,
   coverageAttestationSchema,
@@ -30,6 +32,8 @@ export class ResultPageError extends Error {
   readonly reason: ResultPageErrorReason;
   readonly receivedRaw: string | undefined;
   readonly receivedBytes: number | undefined;
+  readonly validationIssues: AdapterValidationIssue[];
+  artifactRef?: string;
 
   constructor(
     reason: ResultPageErrorReason,
@@ -45,7 +49,81 @@ export class ResultPageError extends Error {
     this.reason = reason;
     this.receivedRaw = options.receivedRaw;
     this.receivedBytes = options.receivedBytes;
+    this.validationIssues = pageValidationIssues(
+      options.cause,
+      options.receivedRaw,
+    );
+    const envelopePaths: Record<string, string> = {
+      "unexpected result ID": "result_id",
+      "unexpected result kind": "result_kind",
+      "unexpected page index": "page_index",
+      "broken previous page digest": "previous_page_digest",
+      "page count changed": "page_count",
+      "page index exceeds declared count": "page_index",
+      "page zero must be a header": "page_kind",
+    };
+    const path = envelopePaths[message];
+    if (this.validationIssues.length === 0 && path !== undefined)
+      this.validationIssues.push({ path, code: reason, message });
   }
+}
+
+/** Publish structural facts only; provider values never enter diagnostics. */
+function pageValidationIssues(
+  cause: unknown,
+  raw: string | undefined,
+): AdapterValidationIssue[] {
+  if (!(cause instanceof z.ZodError) || raw === undefined) return [];
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  function atPath(path: readonly PropertyKey[]): unknown {
+    return path.reduce<unknown>(
+      (item, key) =>
+        typeof item === "object" && item !== null
+          ? (item as Record<PropertyKey, unknown>)[key]
+          : undefined,
+      value,
+    );
+  }
+  function flatten(issues: readonly z.core.$ZodIssue[]): z.core.$ZodIssue[] {
+    return issues.flatMap((issue) => {
+      if (issue.code !== "invalid_union") return [issue];
+      // Select the closest schema branch; unrelated union alternatives obscure
+      // the actionable header/narrative/finding violation.
+      const alternatives = issue.errors.map((errors) => flatten(errors));
+      alternatives.sort((a, b) => a.length - b.length);
+      return alternatives[0] ?? [];
+    });
+  }
+  return flatten(cause.issues)
+    .slice(0, 12)
+    .map((issue) => {
+      const actual = atPath(issue.path);
+      const maximum = /at most (\d+) UTF-8 bytes/u.exec(issue.message);
+      const unknownKeys =
+        issue.code === "unrecognized_keys" ? issue.keys : undefined;
+      return {
+        path: issue.path.join(".") || "$",
+        code: issue.code,
+        message:
+          unknownKeys !== undefined
+            ? "Unexpected object keys."
+            : maximum !== null
+              ? "UTF-8 byte limit exceeded."
+              : `Schema constraint failed (${issue.code}).`,
+        ...(maximum === null || typeof actual !== "string"
+          ? {}
+          : {
+              expected_max_bytes: Number(maximum[1]),
+              actual_bytes: Buffer.byteLength(actual, "utf8"),
+            }),
+        ...(unknownKeys === undefined ? {} : { unknown_keys: unknownKeys }),
+      };
+    });
 }
 
 export interface ResultPageRequest {
@@ -136,6 +214,9 @@ export function createResultPageCollector(
   const seenDecisionIds = new Set<string>();
   let acceptedCoverageEntries = 0;
   let acceptedNarrativeFragments = 0;
+  let retainedFindingCount = 0;
+  const retainedPageFindingIds = new Set<string>();
+  let retainedVerdictFail = false;
 
   function assignedCandidateIds(pageIndex: number): readonly string[] {
     if (options.resultKind !== "adjudication" || pageIndex === 0) return [];
@@ -238,6 +319,44 @@ export function createResultPageCollector(
         error,
       );
     }
+    if (typeof parsedJson === "object" && parsedJson !== null) {
+      const candidate = parsedJson as Record<string, unknown>;
+      const payload = candidate.payload as Record<string, unknown> | undefined;
+      if (
+        candidate.result_id === options.resultId &&
+        candidate.page_index === accepted.length &&
+        payload !== undefined &&
+        payload !== null
+      ) {
+        if (candidate.page_kind === "header" && payload.verdict === "fail")
+          retainedVerdictFail = true;
+        if (
+          candidate.page_kind === "header" &&
+          typeof payload.actionable_finding_count === "number" &&
+          Number.isSafeInteger(payload.actionable_finding_count) &&
+          payload.actionable_finding_count >= 0 &&
+          payload.actionable_finding_count <= 16
+        )
+          retainedFindingCount = Math.max(
+            retainedFindingCount,
+            payload.actionable_finding_count,
+          );
+        if (
+          candidate.page_kind === "findings" &&
+          Array.isArray(payload.actionable_findings)
+        ) {
+          for (const finding of payload.actionable_findings.slice(0, 2)) {
+            if (
+              typeof finding === "object" &&
+              finding !== null &&
+              typeof finding.id === "string" &&
+              finding.id.length <= 256
+            )
+              retainedPageFindingIds.add(finding.id);
+          }
+        }
+      }
+    }
     const parsed = resultPageSchema.safeParse(parsedJson);
     if (!parsed.success) {
       fail(
@@ -248,6 +367,43 @@ export function createResultPageCollector(
       );
     }
     const page = parsed.data;
+    if (
+      page.result_kind === "reviewer" &&
+      page.page_kind === "header" &&
+      retainedVerdictFail &&
+      page.payload.verdict !== "fail"
+    )
+      fail(
+        "protocol_violation",
+        "Repairs must preserve previously declared candidate findings and failing verdict",
+        raw,
+      );
+    if (
+      page.result_kind === "reviewer" &&
+      page.page_kind === "header" &&
+      page.payload.actionable_finding_count < retainedFindingCount
+    )
+      fail(
+        "protocol_violation",
+        "Repairs must preserve previously declared candidate findings",
+        raw,
+      );
+    if (
+      page.result_kind === "reviewer" &&
+      page.page_kind === "findings" &&
+      retainedPageFindingIds.size > 0 &&
+      [...retainedPageFindingIds].some(
+        (id) =>
+          !page.payload.actionable_findings.some(
+            (finding) => finding.id === id,
+          ),
+      )
+    )
+      fail(
+        "protocol_violation",
+        "Repairs must preserve previously returned candidate finding IDs",
+        raw,
+      );
     const request = nextRequest();
     if (page.result_id !== options.resultId)
       fail("protocol_violation", "unexpected result ID", raw);
@@ -326,6 +482,7 @@ export function createResultPageCollector(
     for (const id of findingIds) seenFindingIds.add(id);
     for (const id of decisionIds) seenDecisionIds.add(id);
     accepted.push({ raw, page });
+    if (page.page_kind === "findings") retainedPageFindingIds.clear();
   }
 
   function assembleReviewer(): ProviderReviewerResultV4 {

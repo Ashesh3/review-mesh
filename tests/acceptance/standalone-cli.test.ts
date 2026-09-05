@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import packageMetadata from "../../package.json" with { type: "json" };
 import { spawn } from "node:child_process";
 import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -351,7 +352,7 @@ describe.skipIf(!verifyStandalone)("standalone release executables", () => {
       const version = await runner.run(fixture, ["--version"]);
       expect(version, runner.name).toEqual({
         exitCode: 0,
-        stdout: "review-mesh 9.1.0\n",
+        stdout: `review-mesh ${packageMetadata.version}\n`,
         stderr: "",
       });
 
@@ -434,6 +435,7 @@ describe.skipIf(!verifyStandalone)("standalone release executables", () => {
         "status",
         completed.run_id,
         "--json",
+        "--details",
       ]);
       const report = await runner.run(fixture, [
         "report",

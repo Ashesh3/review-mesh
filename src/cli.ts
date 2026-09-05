@@ -589,7 +589,9 @@ export async function runCli(
             provider_group: reviewer.providerGroup ?? reviewer.adapterId,
             ...(result === undefined
               ? {
-                  ready: capabilities!.available,
+                  ready: false,
+                  probe_ready: capabilities!.available,
+                  readiness_scope: "credentials_and_model",
                   checks: [
                     {
                       name: "readiness",
@@ -598,6 +600,17 @@ export async function runCli(
                         ? {}
                         : { message: capabilities!.message }),
                     },
+                    ...[
+                      "tool_invocation",
+                      "changed_snapshot_access",
+                      "coverage_completion",
+                      "result_page_production",
+                      "retry",
+                    ].map((name) => ({
+                      name,
+                      passed: false,
+                      status: "not_tested",
+                    })),
                   ],
                 }
               : result),
@@ -610,10 +623,26 @@ export async function runCli(
             kind: "review-mesh.doctor",
             workspace: loaded.workspace,
             ready: results.every((result) => result.ready),
+            readiness_scope: structuredOutput
+              ? "end_to_end"
+              : "credentials_and_model",
+            ...(structuredOutput
+              ? {}
+              : {
+                  probe_ready: results.every(
+                    (result) => "probe_ready" in result && result.probe_ready,
+                  ),
+                }),
             reviewers: results,
           })}\n`,
         );
-        process.exitCode = results.every((result) => result.ready) ? 0 : 3;
+        process.exitCode = results.every((result) =>
+          structuredOutput
+            ? result.ready
+            : "probe_ready" in result && result.probe_ready,
+        )
+          ? 0
+          : 3;
       } catch {
         await writeDiagnostic(
           "doctor_failed",
@@ -717,14 +746,19 @@ export async function runCli(
     if (argv[0] === "status") {
       const argumentsWithoutJson = argv
         .slice(1)
-        .filter((argument) => argument !== "--json");
+        .filter(
+          (argument) => argument !== "--json" && argument !== "--details",
+        );
       if (
         argumentsWithoutJson.length < 1 ||
         argumentsWithoutJson.length > 2 ||
         argv
           .slice(1)
           .some(
-            (argument) => argument.startsWith("--") && argument !== "--json",
+            (argument) =>
+              argument.startsWith("--") &&
+              argument !== "--json" &&
+              argument !== "--details",
           )
       ) {
         await writeUsageDiagnostic(
@@ -739,6 +773,7 @@ export async function runCli(
         const status = await readRunStatus({
           runsDirectory: (runtime.appPaths ?? getAppPaths()).runsDirectory,
           runId: argumentsWithoutJson[0]!,
+          details: argv.includes("--details"),
           ...(argumentsWithoutJson[1] === undefined
             ? {}
             : { reviewerId: argumentsWithoutJson[1] }),
@@ -869,12 +904,94 @@ export async function runCli(
       }
       return;
     }
-    if (argv[0] === "retry") {
+    if (argv[0] === "diagnostics") {
+      const [operation, runId, artifactRef, destination] = argv.slice(1);
+      if (
+        !runId ||
+        !["list", "export", "cleanup"].includes(operation ?? "") ||
+        (operation === "list" && argv.length !== 3) ||
+        (operation === "cleanup" && argv.length !== 3 && argv.length !== 4) ||
+        (operation === "export" &&
+          (!artifactRef || !destination || argv.length !== 5))
+      ) {
+        await writeUsageDiagnostic(
+          "Expected: review-mesh diagnostics list RUN_ID | export RUN_ID ARTIFACT_REF DESTINATION | cleanup RUN_ID [ARTIFACT_REF]",
+          "review-mesh help diagnostics",
+          errorOutput,
+        );
+        process.exitCode = 2;
+        return;
+      }
+      try {
+        const spool = await import("./adapters/result-spool.js");
+        const options = {
+          directory: join(tmpdir(), "review-mesh-result-spools"),
+          runId,
+        };
+        const result =
+          operation === "list"
+            ? await spool.listResultSpoolDiagnostics(options)
+            : operation === "export"
+              ? await spool.exportResultSpoolDiagnostic({
+                  ...options,
+                  artifactRef: artifactRef!,
+                  destination: resolve(
+                    runtime.cwd ?? process.cwd(),
+                    destination!,
+                  ),
+                })
+              : await spool.cleanupResultSpoolDiagnostics({
+                  ...options,
+                  ...(artifactRef ? { artifactRef } : {}),
+                });
+        await writeText(output, `${JSON.stringify(result)}\n`);
+        process.exitCode = 0;
+      } catch {
+        await writeDiagnostic(
+          "diagnostic_artifact_unavailable",
+          "The diagnostic reference is invalid, no longer retained, or its private file identity changed.",
+          errorOutput,
+        );
+        process.exitCode = 2;
+      }
+      return;
+    }
+    if (argv[0] === "cancel" || argv[0] === "pause") {
+      if (!argv[1] || argv.length !== 2) {
+        await writeUsageDiagnostic(
+          "Expected: review-mesh cancel|pause RUN_ID",
+          "review-mesh help cancel",
+          errorOutput,
+        );
+        process.exitCode = 2;
+        return;
+      }
+      try {
+        const { requestRunStop } = await import("./diagnostics/run-control.js");
+        const result = await requestRunStop(
+          (runtime.appPaths ?? getAppPaths()).runsDirectory,
+          argv[1],
+          argv[0],
+        );
+        await writeText(output, `${JSON.stringify(result)}\n`);
+        process.exitCode = 0;
+      } catch {
+        await writeDiagnostic(
+          "run_control_unavailable",
+          "The run is not active or its local control lease is unavailable; inspect status for the final artifact.",
+          errorOutput,
+        );
+        process.exitCode = 2;
+      }
+      return;
+    }
+    if (argv[0] === "retry" || argv[0] === "resume") {
       const runId = argv[1];
       if (
         runId === undefined ||
-        argv.length !== 3 ||
-        argv[2] !== "--only-incomplete"
+        (argv[0] === "resume"
+          ? argv.length !== 2
+          : argv.length !== 3 || argv[2] !== "--only-incomplete")
       ) {
         await writeUsageDiagnostic(
           "Expected: review-mesh retry RUN_ID --only-incomplete",

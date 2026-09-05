@@ -27,6 +27,8 @@ import type {
   ReviewAdapter,
 } from "../../src/adapters/types.js";
 import { reviewerResultJsonSchema } from "../../src/protocol/json-schema.js";
+import { buildReviewerPrompt } from "../../src/protocol/prompt.js";
+import { listResultSpoolDiagnostics } from "../../src/adapters/result-spool.js";
 import { createChangeCoverageLedger } from "../../src/context/change-coverage.js";
 import {
   passResult,
@@ -302,6 +304,332 @@ const nodeIdentity: FileSystemIdentityFacade = {
 };
 
 describe("OpenAI-compatible adapter", () => {
+  it("reports provider-filtered pages without retrying the filtered response", async () => {
+    let calls = 0;
+    const prepared = setup(
+      process.cwd(),
+      {
+        fetch: fetchMock(async () =>
+          ++calls === 1
+            ? assistantResponse({
+                role: "assistant",
+                content: "Inspection complete.",
+              })
+            : assistantResponse(
+                { role: "assistant", content: null },
+                "content_filter",
+              ),
+        ),
+      },
+      { resultPages: { resultId: "filtered", resultKind: "reviewer" } },
+    );
+    expect(
+      terminal(await collect(prepared.adapter, prepared.input)),
+    ).toMatchObject({
+      type: "failure",
+      failure: {
+        reason: "invalid_result",
+        message: expect.stringContaining("provider filtered"),
+        diagnostics: {
+          finish_reason: "content_filter",
+          checkpoint_id: "filtered",
+        },
+      },
+    });
+    expect(calls).toBe(2);
+  });
+
+  it("repairs an ordinary empty page twice at the same checkpoint", async () => {
+    const pages = pagedReviewerResult("empty-page");
+    const bodies: any[] = [];
+    const responses = [
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      assistantResponse({ role: "assistant", content: null }, "stop"),
+      assistantResponse({ role: "assistant", content: null }, "stop"),
+      ...pages.map((content) =>
+        assistantResponse({ role: "assistant", content }, "stop"),
+      ),
+    ];
+    const prepared = setup(
+      process.cwd(),
+      {
+        finalizationAttempts: 1,
+        fetch: fetchMock(async (_url, init) => {
+          bodies.push(JSON.parse(String(init?.body)));
+          return responses.shift()!;
+        }),
+      },
+      { resultPages: { resultId: "empty-page", resultKind: "reviewer" } },
+    );
+    const output = await collect(prepared.adapter, prepared.input);
+    expect(terminal(output)).toMatchObject({
+      type: "result",
+      result: {
+        actionable_findings: expect.arrayContaining([
+          expect.objectContaining({ id: "f-6" }),
+        ]),
+      },
+    });
+    expect(
+      output.filter(
+        (event) => event.type === "progress" && event.phase === "schema_repair",
+      ),
+    ).toHaveLength(2);
+    expect(bodies.filter((body) => body.tools !== undefined)).toHaveLength(1);
+  });
+  it("offers exact missing ranges before finalization and accepts maximum-size reads", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mesh-coverage-repair-"));
+    const count = 128 * 1024;
+    await writeFile(join(root, "changed.txt"), "x".repeat(count));
+    const diff = "diff --git a/changed.txt b/changed.txt\n+changed\n";
+    const context = resolvedContext({
+      workspace: root,
+      review_scope: { mode: "changes", source: "request" },
+      git: {
+        is_repository: true,
+        root,
+        branch: "main",
+        head: "a".repeat(40),
+        merge_base: "b".repeat(40),
+        status_entries: [" M changed.txt"],
+        changed_files: ["changed.txt"],
+        changed_paths: [{ path: "changed.txt", kind: "tracked" }],
+        diff_stat: "",
+        diff,
+        raw_diff: {
+          byte_count: Buffer.byteLength(diff),
+          sha256: pageDigest(diff),
+        },
+        truncated: {
+          status_entries: false,
+          changed_files: false,
+          diff_stat: false,
+          diff: false,
+        },
+      },
+    });
+    const coverage = await createChangeCoverageLedger({
+      context,
+      policy: {
+        relevantPaths: ["**"],
+        proof: "observed",
+        minimumInspection: "full_file",
+      },
+    });
+    const bodies: any[] = [];
+    const responses = [
+      assistantResponse({ role: "assistant", content: "Ready to finalize." }),
+      assistantResponse({
+        role: "assistant",
+        tool_calls: [
+          {
+            id: "read",
+            type: "function",
+            function: {
+              name: "read_file",
+              arguments: JSON.stringify({
+                path: "changed.txt",
+                byte_count: count,
+              }),
+            },
+          },
+        ],
+      }),
+      assistantResponse({ role: "assistant", content: "Coverage repaired." }),
+      assistantResponse({
+        role: "assistant",
+        content: JSON.stringify(passResult()),
+      }),
+    ];
+    const prepared = setup(
+      root,
+      {
+        fetch: fetchMock(async (_url, init) => {
+          bodies.push(JSON.parse(String(init?.body)));
+          return responses.shift()!;
+        }),
+      },
+      {
+        context,
+        coverage,
+        prompt: buildReviewerPrompt({ context, reviewer: resolvedReviewer() }),
+      },
+    );
+    try {
+      const output = await collect(prepared.adapter, prepared.input);
+      expect(terminal(output).type).toBe("result");
+      expect(
+        coverage.status().complete,
+        JSON.stringify({
+          status: coverage.status(),
+          bodies: bodies.map((body) => ({
+            tools: !!body.tools,
+            last: body.messages.at(-1),
+          })),
+        }),
+      ).toBe(true);
+      expect(
+        bodies[0].tools.find(
+          (entry: any) => entry.function.name === "read_file",
+        ).function.parameters.properties.byte_count.maximum,
+      ).toBe(count);
+      expect(
+        bodies[0].tools.some(
+          (entry: any) => entry.function.name === "coverage_status",
+        ),
+      ).toBe(true);
+      expect(bodies[1].messages.at(-1).content).toContain(
+        '"missing_byte_ranges":[{"offset":0,"byte_count":131072}]',
+      );
+      expect(
+        output.some(
+          (event) =>
+            event.type === "progress" && event.phase === "coverage_repair",
+        ),
+      ).toBe(true);
+    } finally {
+      await coverage.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  it("repairs a tiny header overflow at the retained checkpoint and keeps every finding", async () => {
+    const resultId = "repair-header";
+    const pages = pagedReviewerResult(resultId);
+    const invalid = JSON.parse(pages[0]!);
+    invalid.payload.summary = "é".repeat(514);
+    const bodies: any[] = [];
+    const responses = [
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      assistantResponse({
+        role: "assistant",
+        content: JSON.stringify(invalid),
+      }),
+      ...pages.map((content) =>
+        assistantResponse({ role: "assistant", content }),
+      ),
+    ];
+    const prepared = setup(
+      process.cwd(),
+      {
+        fetch: fetchMock(async (_url, init) => {
+          bodies.push(JSON.parse(String(init?.body)));
+          return responses.shift()!;
+        }),
+      },
+      { resultPages: { resultId, resultKind: "reviewer" } },
+    );
+    const events = await collect(prepared.adapter, prepared.input);
+    const result = terminal(events);
+    expect(result.type).toBe("result");
+    if (result.type === "result")
+      expect(result.result.actionable_findings).toHaveLength(6);
+    expect(bodies[2].messages.at(-1).content).toContain(
+      '"expected_max_bytes":1024',
+    );
+    expect(bodies[2].messages.at(-1).content).toContain('"actual_bytes":1028');
+    expect(bodies[2].messages.at(-1).content).toContain(
+      "Preserve every candidate finding",
+    );
+    expect(bodies.filter((body) => body.tools !== undefined)).toHaveLength(1);
+    expect(
+      events.filter(
+        (event) => event.type === "progress" && event.phase === "schema_repair",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("stops after two page schema repair attempts with precise diagnostics", async () => {
+    const resultId = "unrepairable-header";
+    const invalid = JSON.parse(pagedReviewerResult(resultId)[0]!);
+    invalid.payload.summary = "é".repeat(514);
+    let calls = 0;
+    const prepared = setup(
+      process.cwd(),
+      {
+        fetch: fetchMock(async () =>
+          ++calls === 1
+            ? assistantResponse({
+                role: "assistant",
+                content: "Inspection complete.",
+              })
+            : assistantResponse({
+                role: "assistant",
+                content: JSON.stringify(invalid),
+              }),
+        ),
+      },
+      { resultPages: { resultId, resultKind: "reviewer" } },
+    );
+    prepared.input.runId = `schema-repair-${Date.now()}`;
+    const failure = terminal(await collect(prepared.adapter, prepared.input));
+    expect(failure).toMatchObject({
+      type: "failure",
+      failure: {
+        reason: "provider_response_invalid",
+        diagnostics: {
+          repair_attempted: true,
+          repair_outcome: "failed",
+          attempt_count: 3,
+          artifact_ref: expect.any(String),
+          checkpoint_id: resultId,
+          validation_issues: [
+            expect.objectContaining({
+              path: "payload.summary",
+              actual_bytes: 1028,
+            }),
+          ],
+        },
+      },
+    });
+    const retained = await listResultSpoolDiagnostics({
+      directory: join(tmpdir(), "review-mesh-result-spools"),
+      runId: prepared.input.runId,
+    });
+    expect(retained.artifacts).toHaveLength(3);
+    expect(calls).toBe(4);
+  });
+
+  it("enforces the finalization deadline inside a page repair loop", async () => {
+    const resultId = "repair-deadline";
+    const invalid = JSON.parse(pagedReviewerResult(resultId)[0]!);
+    invalid.payload.summary = "é".repeat(514);
+    let now = 0;
+    let calls = 0;
+    const prepared = setup(
+      process.cwd(),
+      {
+        now: () => now,
+        requestTimeoutMs: 60_000,
+        finalizationAttempts: 1,
+        continuationAttempts: 1,
+        fetch: fetchMock(async () => {
+          calls += 1;
+          if (calls === 1)
+            return assistantResponse({
+              role: "assistant",
+              content: "Inspection done.",
+            });
+          now = 1_000_000;
+          return assistantResponse({
+            role: "assistant",
+            content: JSON.stringify(invalid),
+          });
+        }),
+      },
+      { resultPages: { resultId, resultKind: "reviewer" } },
+    );
+    expect(
+      terminal(await collect(prepared.adapter, prepared.input)),
+    ).toMatchObject({
+      type: "failure",
+      failure: {
+        reason: "timeout",
+        diagnostics: { failure_stage: "structured_result_deadline" },
+      },
+    });
+    expect(calls).toBe(2);
+  });
+
   it("produces exact semantic result pages from one inspection checkpoint", async () => {
     const resultId = "result-pages-1";
     const pages = pagedReviewerResult(resultId);
@@ -335,6 +663,16 @@ describe("OpenAI-compatible adapter", () => {
         resultPages: { resultId, resultKind: "reviewer" },
       },
     );
+    prepared.input.prompt = buildReviewerPrompt({
+      reviewer: prepared.reviewer,
+      context: prepared.input.context,
+      resultPage: {
+        resultId,
+        pageIndex: 0,
+        previousPageDigest: null,
+        candidateIds: [],
+      },
+    });
 
     const events = await collect(prepared.adapter, prepared.input);
     expect(terminal(events)).toMatchObject({
@@ -356,6 +694,10 @@ describe("OpenAI-compatible adapter", () => {
     expect(pageBodies).toHaveLength(6);
     expect(pageBodies.every((body) => body.tools === undefined)).toBe(true);
     const request = JSON.parse(pageBodies[2].messages.at(-1).content);
+    expect(pageBodies[2].messages[0].content).not.toContain("page index 0");
+    expect(pageBodies[2].messages[0].content).toContain(
+      "latest core page assignment",
+    );
     expect(request.page_index).toBe(1);
     expect(request.previous_page_digest).toBe(pageDigest(pages[0]!));
     expect(events).toContainEqual(
@@ -376,6 +718,8 @@ describe("OpenAI-compatible adapter", () => {
     const responses = [
       assistantResponse({ role: "assistant", content: "Inspection complete." }),
       assistantResponse({ role: "assistant", content: pages[0] }),
+      assistantResponse({ role: "assistant", content: JSON.stringify(broken) }),
+      assistantResponse({ role: "assistant", content: JSON.stringify(broken) }),
       assistantResponse({ role: "assistant", content: JSON.stringify(broken) }),
     ];
     const prepared = setup(
@@ -599,82 +943,94 @@ describe("OpenAI-compatible adapter", () => {
     }
   });
 
-  it("records exact initial diff delivery only after provider request admission", async () => {
-    const root = await mkdtemp(join(tmpdir(), "mesh-oai-diff-"));
-    await writeFile(join(root, "changed.txt"), "changed\n");
-    const diff = "diff --git a/changed.txt b/changed.txt\n";
-    const context = resolvedContext({
-      workspace: root,
-      review_scope: { mode: "changes", source: "request" },
-      git: {
-        is_repository: true,
-        root,
-        branch: "main",
-        head: "a".repeat(40),
-        merge_base: "b".repeat(40),
-        status_entries: [" M changed.txt"],
-        changed_files: ["changed.txt"],
-        changed_paths: [{ path: "changed.txt", kind: "tracked" }],
-        diff_stat: "",
-        diff,
-        raw_diff: {
-          byte_count: Buffer.byteLength(diff),
-          sha256: pageDigest(diff),
+  it.each([false, true])(
+    "records exact initial diff delivery only after provider request admission (bounded=%s)",
+    async (bounded) => {
+      const root = await mkdtemp(join(tmpdir(), "mesh-oai-diff-"));
+      await writeFile(join(root, "changed.txt"), "changed\n");
+      const diff =
+        "diff --git a/changed.txt b/changed.txt\n+Unicode café 東京 🐈\n".repeat(
+          100,
+        );
+      const context = resolvedContext({
+        workspace: root,
+        review_scope: { mode: "changes", source: "request" },
+        git: {
+          is_repository: true,
+          root,
+          branch: "main",
+          head: "a".repeat(40),
+          merge_base: "b".repeat(40),
+          status_entries: [" M changed.txt"],
+          changed_files: ["changed.txt"],
+          changed_paths: [{ path: "changed.txt", kind: "tracked" }],
+          diff_stat: "",
+          diff,
+          raw_diff: {
+            byte_count: Buffer.byteLength(diff),
+            sha256: pageDigest(diff),
+          },
+          truncated: {
+            status_entries: false,
+            changed_files: false,
+            diff_stat: false,
+            diff: false,
+          },
         },
-        truncated: {
-          status_entries: false,
-          changed_files: false,
-          diff_stat: false,
-          diff: false,
-        },
-      },
-    });
-    const coverage = await createChangeCoverageLedger({
-      context,
-      policy: {
-        relevantPaths: ["**"],
-        proof: "observed",
-        minimumInspection: "diff",
-      },
-    });
-    const responses = [
-      assistantResponse({ role: "assistant", content: "Inspection complete." }),
-      assistantResponse({
-        role: "assistant",
-        content: JSON.stringify(passResult("Diff admitted.")),
-      }),
-    ];
-    const prepared = setup(
-      root,
-      {
-        fetch: fetchMock(async () => responses.shift()!),
-      },
-      {
+      });
+      const coverage = await createChangeCoverageLedger({
         context,
-        coverage,
-        prompt: {
-          system: "Trusted.",
-          user: diff,
-          combined: `Trusted.\n\n${diff}`,
+        policy: {
+          relevantPaths: ["**"],
+          proof: "observed",
+          minimumInspection: "diff",
         },
-      },
-    );
-
-    try {
-      expect(
-        terminal(await collect(prepared.adapter, prepared.input)).type,
-      ).toBe("result");
-      expect(coverage.entries()).toContainEqual(
-        expect.objectContaining({
-          path: "changed.txt",
-          diff_delivery: "satisfied",
+      });
+      const responses = [
+        assistantResponse({
+          role: "assistant",
+          content: "Inspection complete.",
         }),
+        assistantResponse({
+          role: "assistant",
+          content: JSON.stringify(passResult("Diff admitted.")),
+        }),
+      ];
+      const prepared = setup(
+        root,
+        {
+          ...(bounded ? { maxConversationBytes: 12000 } : {}),
+          fetch: fetchMock(async () => responses.shift()!),
+        },
+        {
+          context,
+          coverage,
+          prompt: buildReviewerPrompt({
+            reviewer: resolvedReviewer(),
+            context,
+          }),
+        },
       );
-    } finally {
-      await coverage.close();
-      await rm(root, { recursive: true, force: true });
-    }
-  });
+
+      try {
+        const terminalEvent = terminal(
+          await collect(prepared.adapter, prepared.input),
+        );
+        expect(terminalEvent.type, JSON.stringify(terminalEvent)).toBe(
+          "result",
+        );
+        expect(coverage.entries()).toContainEqual(
+          expect.objectContaining({
+            path: "changed.txt",
+            diff_delivery: bounded ? "not_inspected" : "satisfied",
+          }),
+        );
+      } finally {
+        await coverage.close();
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("emits response-boundary progress before a non-streaming body completes", async () => {
     const page = pagedReviewerResult("slow-response")[0]!;
@@ -1050,9 +1406,10 @@ describe("OpenAI-compatible adapter", () => {
     );
 
     try {
-      expect(
-        terminal(await collect(prepared.adapter, prepared.input)).type,
-      ).toBe("result");
+      const terminalEvent = terminal(
+        await collect(prepared.adapter, prepared.input),
+      );
+      expect(terminalEvent.type, JSON.stringify(terminalEvent)).toBe("result");
       const toolMessage = bodies[1].messages.find(
         (message: any) => message.role === "tool",
       );
@@ -2337,9 +2694,10 @@ describe("OpenAI-compatible adapter", () => {
     );
 
     try {
-      expect(
-        terminal(await collect(prepared.adapter, prepared.input)).type,
-      ).toBe("result");
+      const terminalEvent = terminal(
+        await collect(prepared.adapter, prepared.input),
+      );
+      expect(terminalEvent.type, JSON.stringify(terminalEvent)).toBe("result");
       const toolMessage = bodies[1].messages.find(
         (message: { role: string }) => message.role === "tool",
       );
@@ -2521,9 +2879,10 @@ describe("OpenAI-compatible adapter", () => {
     });
 
     try {
-      expect(
-        terminal(await collect(prepared.adapter, prepared.input)).type,
-      ).toBe("result");
+      const terminalEvent = terminal(
+        await collect(prepared.adapter, prepared.input),
+      );
+      expect(terminalEvent.type, JSON.stringify(terminalEvent)).toBe("result");
       const toolMessage = bodies[1].messages.find(
         (message: { role: string }) => message.role === "tool",
       );
@@ -2581,9 +2940,10 @@ describe("OpenAI-compatible adapter", () => {
     });
 
     try {
-      expect(
-        terminal(await collect(prepared.adapter, prepared.input)).type,
-      ).toBe("result");
+      const terminalEvent = terminal(
+        await collect(prepared.adapter, prepared.input),
+      );
+      expect(terminalEvent.type, JSON.stringify(terminalEvent)).toBe("result");
       const tool = bodies[1].messages.find(
         (message: { role: string }) => message.role === "tool",
       );
@@ -2631,9 +2991,10 @@ describe("OpenAI-compatible adapter", () => {
     });
 
     try {
-      expect(
-        terminal(await collect(prepared.adapter, prepared.input)).type,
-      ).toBe("result");
+      const terminalEvent = terminal(
+        await collect(prepared.adapter, prepared.input),
+      );
+      expect(terminalEvent.type, JSON.stringify(terminalEvent)).toBe("result");
       const tool = bodies[1].messages.find(
         (message: { role: string }) => message.role === "tool",
       );
@@ -2703,9 +3064,10 @@ describe("OpenAI-compatible adapter", () => {
     });
 
     try {
-      expect(
-        terminal(await collect(prepared.adapter, prepared.input)).type,
-      ).toBe("result");
+      const terminalEvent = terminal(
+        await collect(prepared.adapter, prepared.input),
+      );
+      expect(terminalEvent.type, JSON.stringify(terminalEvent)).toBe("result");
       const childrenDuringReview = bodies[2].messages.filter(
         (message: { role: string }) => message.role === "tool",
       );
@@ -2751,9 +3113,10 @@ describe("OpenAI-compatible adapter", () => {
     });
 
     try {
-      expect(
-        terminal(await collect(prepared.adapter, prepared.input)).type,
-      ).toBe("result");
+      const terminalEvent = terminal(
+        await collect(prepared.adapter, prepared.input),
+      );
+      expect(terminalEvent.type, JSON.stringify(terminalEvent)).toBe("result");
       const listing = JSON.parse(
         bodies[1].messages.find(
           (message: { role: string }) => message.role === "tool",
@@ -3416,9 +3779,10 @@ describe("OpenAI-compatible adapter", () => {
     });
 
     try {
-      expect(
-        terminal(await collect(prepared.adapter, prepared.input)).type,
-      ).toBe("result");
+      const terminalEvent = terminal(
+        await collect(prepared.adapter, prepared.input),
+      );
+      expect(terminalEvent.type, JSON.stringify(terminalEvent)).toBe("result");
       const tools = bodies[1].messages.filter(
         (message: { role: string }) => message.role === "tool",
       );

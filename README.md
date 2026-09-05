@@ -1,5 +1,11 @@
 # Review Mesh
 
+The [v9.2.0 pilot fixes](docs/releases/v9.2.0.md) add recoverable coverage reads,
+admission-based execution budgets, retained-conversation page repair, compact
+status, cancel/pause/resume, and private diagnostic export/cleanup. Run
+`review-mesh help diagnostics` for retention controls and `review-mesh doctor
+--structured-output` for a real changed-Git readiness check.
+
 Review Mesh v9 is the current protocol. It adds finite run deadlines, per-reviewer
 changed-file coverage, bounded result pages, and coverage-first outcomes. See
 [the v9 contract and migration guide](docs/releases/v9.0.0.md) for the current

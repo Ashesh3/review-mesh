@@ -1,3 +1,4 @@
+import packageMetadata from "../../package.json" with { type: "json" };
 import { createHash } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import {
@@ -267,7 +268,7 @@ describe("compiled CLI acceptance", () => {
     expect(result).toMatchObject({
       exitCode: 0,
       signal: null,
-      stdout: "review-mesh 9.1.0\n",
+      stdout: `review-mesh ${packageMetadata.version}\n`,
       stderr: "",
     });
   });
@@ -345,7 +346,14 @@ describe("compiled CLI acceptance", () => {
     }
 
     const [statusOutput, reportOutput, findingsOutput] = await Promise.all([
-      collect(startArguments(fixture, ["status", completed.run_id, "--json"])),
+      collect(
+        startArguments(fixture, [
+          "status",
+          completed.run_id,
+          "--json",
+          "--details",
+        ]),
+      ),
       collect(
         startArguments(fixture, [
           "report",

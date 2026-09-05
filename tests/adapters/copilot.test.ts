@@ -295,11 +295,13 @@ describe("Copilot adapter", () => {
       "custom:list_files",
       "custom:read_file",
       "custom:search_text",
+      "custom:coverage_status",
     ]);
     expect(config.excludedTools).toContain("builtin:view");
     expect(config.tools?.map((tool) => tool.name)).toEqual([
       "list_files",
       "read_file",
+      "coverage_status",
       "search_text",
     ]);
     expect(JSON.stringify(fake.capture.sendCalls[0]!.options)).toContain(
@@ -395,6 +397,8 @@ describe("Copilot adapter", () => {
       recordDiffDelivery: vi.fn(),
       reconcileAttestation: vi.fn(),
       summary: vi.fn(),
+      status: vi.fn(),
+      snapshotIdentity: vi.fn(),
       entries: vi.fn(),
       snapshotFiles: vi.fn(() => []),
       close: vi.fn(async () => undefined),
@@ -405,22 +409,28 @@ describe("Copilot adapter", () => {
       diff,
       changed_files: ["src/a.ts"],
       changed_paths: [{ path: "src/a.ts", status: "modified" }],
-      raw_diff: { byte_count: Buffer.byteLength(diff), sha256: "c".repeat(64) },
+      raw_diff: {
+        byte_count: Buffer.byteLength(diff),
+        sha256: createHash("sha256").update(diff).digest("hex"),
+      },
       truncated: {
         diff_stat: false,
         diff: false,
         changed_files: false,
       },
     });
-    prepared.input.prompt = {
-      ...prepared.input.prompt,
-      user: `${prepared.input.prompt.user}\n${diff}`,
-    };
+    prepared.input.prompt = buildReviewerPrompt({
+      reviewer: prepared.input.reviewer,
+      context: prepared.input.context,
+    });
 
     await collect(prepared.adapter.run(prepared.input));
     expect(prepared.input.coverage.recordDiffDelivery).toHaveBeenCalledWith(
       ["src/a.ts"],
-      { byteCount: Buffer.byteLength(diff), sha256: "c".repeat(64) },
+      {
+        byteCount: Buffer.byteLength(diff),
+        sha256: createHash("sha256").update(diff).digest("hex"),
+      },
     );
     const tool = fake.capture.sessionConfigs[0]!.tools!.find(
       (entry) => entry.name === "read_file",
@@ -449,64 +459,113 @@ describe("Copilot adapter", () => {
     );
     expect(acknowledgeDelivered).toHaveBeenCalledOnce();
   });
-  it("continues v9 pages on the same Copilot session", async () => {
-    const first = JSON.stringify({
-      schema_version: "1",
-      kind: "review-mesh.result-page",
-      result_id: "copilot-two",
-      result_kind: "reviewer",
-      result_schema_version: "4",
-      page_index: 0,
-      page_count: 2,
-      page_kind: "header",
-      previous_page_digest: null,
-      payload: {
-        verdict: "pass",
-        summary: "clean",
-        informational_notes: [],
-        narrative_byte_count: 1,
-        narrative_fragment_count: 1,
-        actionable_finding_count: 0,
-        coverage_attestation: null,
-      },
-    });
-    const second = JSON.stringify({
-      schema_version: "1",
-      kind: "review-mesh.result-page",
-      result_id: "copilot-two",
-      result_kind: "reviewer",
-      result_schema_version: "4",
-      page_index: 1,
-      page_count: 2,
-      page_kind: "narrative",
-      previous_page_digest: createHash("sha256").update(first).digest("hex"),
-      payload: { text_fragment: "x" },
-    });
-    let call = 0;
-    const fake = fakeFactory({ response: finalMessage(first) });
-    const clientFactory: CopilotClientFactory = (options) => {
-      const client = fake.createClient(options);
-      const session = fake.sessions.at(-1)!;
-      session.sendAndWait = vi.fn(async (messageOptions, timeout) => {
-        fake.capture.sendCalls.push({ options: messageOptions, timeout });
-        return finalMessage(call++ === 0 ? first : second);
+  it.each(["none", "schema", "coverage"])(
+    "continues v9 pages on the same Copilot session (repair=%s)",
+    async (repairKind) => {
+      const repair = repairKind === "schema";
+      const repairCoverage = repairKind === "coverage";
+      const first = JSON.stringify({
+        schema_version: "1",
+        kind: "review-mesh.result-page",
+        result_id: "copilot-two",
+        result_kind: "reviewer",
+        result_schema_version: "4",
+        page_index: 0,
+        page_count: 2,
+        page_kind: "header",
+        previous_page_digest: null,
+        payload: {
+          verdict: "pass",
+          summary: "clean",
+          informational_notes: [],
+          narrative_byte_count: 1,
+          narrative_fragment_count: 1,
+          actionable_finding_count: 0,
+          coverage_attestation: null,
+        },
       });
-      return client;
-    };
-    const prepared = setup({ createClient: clientFactory });
-    prepared.input.resultPages = createResultPageCollector({
-      resultId: "copilot-two",
-      resultKind: "reviewer",
-    });
+      const second = JSON.stringify({
+        schema_version: "1",
+        kind: "review-mesh.result-page",
+        result_id: "copilot-two",
+        result_kind: "reviewer",
+        result_schema_version: "4",
+        page_index: 1,
+        page_count: 2,
+        page_kind: "narrative",
+        previous_page_digest: createHash("sha256").update(first).digest("hex"),
+        payload: { text_fragment: "x" },
+      });
+      let call = 0;
+      const invalid = JSON.parse(first);
+      invalid.payload.informational_notes = [
+        {
+          title: "note",
+          description: "safe",
+          description_note: "Bearer secret-not-diagnostic",
+        },
+      ];
+      const responses = [
+        ...(repair ? [JSON.stringify(invalid)] : []),
+        ...(repairCoverage ? [first] : []),
+        first,
+        second,
+      ];
+      const fake = fakeFactory({ response: finalMessage(first) });
+      const clientFactory: CopilotClientFactory = (options) => {
+        const client = fake.createClient(options);
+        const session = fake.sessions.at(-1)!;
+        session.sendAndWait = vi.fn(async (messageOptions, timeout) => {
+          fake.capture.sendCalls.push({ options: messageOptions, timeout });
+          return finalMessage(responses[call++]!);
+        });
+        return client;
+      };
+      const prepared = setup({ createClient: clientFactory });
+      prepared.input.resultPages = createResultPageCollector({
+        resultId: "copilot-two",
+        resultKind: "reviewer",
+      });
+      if (repairCoverage)
+        prepared.input.coverage = {
+          status: vi
+            .fn()
+            .mockReturnValueOnce({
+              proof_kind: "observed",
+              complete: false,
+              deficits: [
+                {
+                  path: "src/a.ts",
+                  missing_byte_ranges: [{ offset: 0, byte_count: 2 }],
+                },
+              ],
+            })
+            .mockReturnValue({
+              proof_kind: "observed",
+              complete: true,
+              deficits: [],
+            }),
+        } as unknown as NonNullable<AdapterReviewInput["coverage"]>;
 
-    const output = await collect(prepared.adapter.run(prepared.input));
+      const output = await collect(prepared.adapter.run(prepared.input));
 
-    expect(terminalResult(output).result).toMatchObject({
-      review_markdown: "x",
-    });
-    expect(fake.capture.sessionConfigs).toHaveLength(1);
-    expect(fake.capture.sendCalls).toHaveLength(2);
-  });
+      expect(terminalResult(output).result).toMatchObject({
+        review_markdown: "x",
+      });
+      expect(fake.capture.sessionConfigs).toHaveLength(1);
+      expect(fake.capture.sendCalls).toHaveLength(
+        repair || repairCoverage ? 3 : 2,
+      );
+      if (repair)
+        expect(JSON.stringify(fake.capture.sendCalls[1]!.options)).toContain(
+          "description_note",
+        );
+      if (repairCoverage)
+        expect(JSON.stringify(fake.capture.sendCalls[1]!.options)).toContain(
+          "missing_byte_ranges",
+        );
+    },
+  );
   it("classifies a Copilot length finish as output truncation before page parsing", async () => {
     let fake!: ReturnType<typeof fakeFactory>;
     fake = fakeFactory({

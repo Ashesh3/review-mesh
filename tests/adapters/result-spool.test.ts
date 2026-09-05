@@ -15,6 +15,10 @@ import {
   MAX_RESULT_SPOOL_BYTES,
   ResultSpoolError,
   createResultSpool,
+  recordInvalidResultSpool,
+  listResultSpoolDiagnostics,
+  exportResultSpoolDiagnostic,
+  cleanupResultSpoolDiagnostics,
   wipeStaleResultSpools,
 } from "../../src/adapters/result-spool.js";
 import { createResultPageStorageBridge } from "../../src/adapters/sdk-pages.js";
@@ -36,6 +40,245 @@ afterEach(async () => {
 });
 
 describe("result spool", () => {
+  it("indexes rejected pages per run with safe metadata and exports exact private bytes", async () => {
+    const directory = await root();
+    const spool = await createResultSpool({ directory, id: "rejected" });
+    const raw = '{"summary":"password=supersecret source code"}';
+    await spool.append(raw);
+    const artifactRef = await recordInvalidResultSpool({
+      spool,
+      runId: "run-diagnostic",
+      reviewerId: "reviewer-a",
+      pageIndex: 0,
+      checkpointId: "checkpoint-a",
+      reason: "provider_response_invalid",
+      validationIssues: [
+        {
+          path: "payload.summary",
+          code: "too_big",
+          message: "password=supersecret",
+          expected_max_bytes: 1024,
+          actual_bytes: 1028,
+        },
+      ],
+    });
+    await spool.lifecycle().abandoned();
+    const diagnostics = await listResultSpoolDiagnostics({
+      directory,
+      runId: "run-diagnostic",
+    });
+    expect(diagnostics).toMatchObject({
+      run_id: "run-diagnostic",
+      retention: {
+        minimum_age_ms: 86400000,
+        cleanup_trigger: "spool_creation_or_explicit_cleanup",
+        raw_content: "private_until_wiped",
+      },
+      artifacts: [
+        {
+          artifact_ref: artifactRef,
+          reviewer_id: "reviewer-a",
+          page_index: 0,
+          checkpoint_id: "checkpoint-a",
+          reason: "provider_response_invalid",
+          byte_count: Buffer.byteLength(raw),
+          state: "retained",
+          validation_issues: [{ expected_max_bytes: 1024, actual_bytes: 1028 }],
+        },
+      ],
+    });
+    expect(JSON.stringify(diagnostics)).not.toContain("supersecret");
+    expect(
+      (await listResultSpoolDiagnostics({ directory, runId: "another-run" }))
+        .artifacts,
+    ).toEqual([]);
+    const destination = join(directory, "exported.raw.json");
+    expect(
+      await exportResultSpoolDiagnostic({
+        directory,
+        runId: "run-diagnostic",
+        artifactRef,
+        destination,
+      }),
+    ).toMatchObject({
+      artifact_ref: artifactRef,
+      path: destination,
+      byte_count: Buffer.byteLength(raw),
+    });
+    expect(await readFile(destination, "utf8")).toBe(raw);
+    await expect(
+      exportResultSpoolDiagnostic({
+        directory,
+        runId: "run-diagnostic",
+        artifactRef,
+        destination,
+      }),
+    ).rejects.toThrow();
+    expect(await readFile(destination, "utf8")).toBe(raw);
+  });
+
+  it("explicitly wipes only selected retained run diagnostics and keeps manifests discoverable", async () => {
+    const directory = await root();
+    const spools = await Promise.all(
+      ["first", "second"].map((id) => createResultSpool({ directory, id })),
+    );
+    const references: string[] = [];
+    for (const spool of spools) {
+      await spool.append("private bytes");
+      references.push(
+        await recordInvalidResultSpool({
+          spool,
+          runId: "run-cleanup",
+          reviewerId: "reviewer",
+          pageIndex: references.length,
+          checkpointId: "checkpoint",
+          reason: "invalid_result",
+        }),
+      );
+      await spool.lifecycle().abandoned();
+    }
+    expect(
+      await cleanupResultSpoolDiagnostics({
+        directory,
+        runId: "run-cleanup",
+        artifactRef: references[0]!,
+      }),
+    ).toEqual({ inspected: 1, wiped: 1, unavailable: 0 });
+    expect(await readFile(spools[0]!.path)).toHaveLength(0);
+    expect(await readFile(spools[1]!.path, "utf8")).toBe("private bytes");
+    expect(
+      (
+        await listResultSpoolDiagnostics({ directory, runId: "run-cleanup" })
+      ).artifacts
+        .map((entry) => entry.state)
+        .sort(),
+    ).toEqual(["retained", "wiped"]);
+  });
+
+  it("refuses replaced diagnostic spools without exporting or wiping foreign bytes", async () => {
+    const directory = await root();
+    const spool = await createResultSpool({ directory, id: "diagnostic-race" });
+    await spool.append("private original");
+    const artifactRef = await recordInvalidResultSpool({
+      spool,
+      runId: "run-race",
+      reviewerId: "reviewer",
+      pageIndex: 0,
+      checkpointId: "checkpoint",
+      reason: "invalid_result",
+    });
+    await spool.lifecycle().abandoned();
+    await rename(spool.path, `${spool.path}.original`);
+    await writeFile(spool.path, "foreign replacement");
+    expect(
+      (await listResultSpoolDiagnostics({ directory, runId: "run-race" }))
+        .artifacts[0]?.state,
+    ).toBe("unavailable");
+    await expect(
+      exportResultSpoolDiagnostic({
+        directory,
+        runId: "run-race",
+        artifactRef,
+        destination: join(directory, "export.json"),
+      }),
+    ).rejects.toMatchObject({ code: "identity_changed" });
+    expect(
+      await cleanupResultSpoolDiagnostics({ directory, runId: "run-race" }),
+    ).toEqual({ inspected: 1, wiped: 0, unavailable: 1 });
+    expect(await readFile(spool.path, "utf8")).toBe("foreign replacement");
+    expect(await readFile(`${spool.path}.original`, "utf8")).toBe(
+      "private original",
+    );
+  });
+
+  it("retains diagnostics for a day and discovers automatic stale wipes", async () => {
+    const directory = await root();
+    const spool = await createResultSpool({ directory, id: "retention" });
+    await spool.append("private retained");
+    await recordInvalidResultSpool({
+      spool,
+      runId: "run-retention",
+      reviewerId: "reviewer",
+      pageIndex: 0,
+      checkpointId: "checkpoint",
+      reason: "invalid_result",
+    });
+    await spool.lifecycle().abandoned();
+    expect((await wipeStaleResultSpools({ directory })).wiped).toBe(0);
+    expect(
+      (
+        await wipeStaleResultSpools({
+          directory,
+          now: () => Date.now() + 86400001,
+        })
+      ).wiped,
+    ).toBe(1);
+    expect(
+      (await listResultSpoolDiagnostics({ directory, runId: "run-retention" }))
+        .artifacts[0]?.state,
+    ).toBe("wiped");
+  });
+
+  it("does not accept a manifest moved into a different run", async () => {
+    const directory = await root();
+    const spool = await createResultSpool({ directory, id: "scope" });
+    await spool.append("scoped private bytes");
+    await recordInvalidResultSpool({
+      spool,
+      runId: "run-owner",
+      reviewerId: "reviewer",
+      pageIndex: 0,
+      checkpointId: "checkpoint",
+      reason: "invalid_result",
+    });
+    await spool.lifecycle().abandoned();
+    const { createHash } = await import("node:crypto");
+    const digest = (value: string) =>
+      createHash("sha256").update(value).digest("hex");
+    await rename(
+      join(directory, ".diagnostics", digest("run-owner")),
+      join(directory, ".diagnostics", digest("run-other")),
+    );
+    expect(
+      (await listResultSpoolDiagnostics({ directory, runId: "run-other" }))
+        .artifacts,
+    ).toEqual([]);
+    expect(
+      await cleanupResultSpoolDiagnostics({ directory, runId: "run-other" }),
+    ).toEqual({ inspected: 0, wiped: 0, unavailable: 0 });
+    expect(await readFile(spool.path, "utf8")).toBe("scoped private bytes");
+  });
+
+  it("refuses diagnostics directory symlinks without creating manifests outside the root", async () => {
+    const directory = await root();
+    const outside = await root();
+    const spool = await createResultSpool({
+      directory,
+      id: "manifest-symlink",
+    });
+    await spool.append("private content");
+    await symlink(
+      outside,
+      join(directory, ".diagnostics"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    try {
+      await expect(
+        recordInvalidResultSpool({
+          spool,
+          runId: "run-link",
+          reviewerId: "reviewer",
+          pageIndex: 0,
+          checkpointId: "checkpoint",
+          reason: "invalid_result",
+        }),
+      ).rejects.toMatchObject({ code: "unsafe_directory" });
+      expect(await readdir(outside)).toEqual([]);
+    } finally {
+      await spool.cleanup();
+    }
+  });
+
   it("exposes exact accepted pages and digests until persistence wipes them", async () => {
     const page = JSON.stringify({
       schema_version: "1",

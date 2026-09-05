@@ -437,12 +437,18 @@ export const adapterFailureDiagnosticsSchema = z.strictObject({
         path: z.string().max(256),
         code: nonEmptyString.max(64),
         message: nonEmptyString.max(256),
+        expected_max_bytes: nonNegativeInteger.optional(),
+        actual_bytes: nonNegativeInteger.optional(),
+        unknown_keys: z.array(z.string().max(128)).max(32).optional(),
       }),
     )
     .max(12)
     .optional(),
   truncated: z.boolean().optional(),
   repair_attempted: z.boolean().optional(),
+  checkpoint_id: z.string().max(256).optional(),
+  artifact_ref: z.string().max(4096).optional(),
+  recommended_action: z.string().max(256).optional(),
   repair_outcome: z.enum(["not_attempted", "succeeded", "failed"]).optional(),
   attempt_count: positiveInteger.optional(),
   retry_outcome: z.enum(["not_attempted", "succeeded", "exhausted"]).optional(),

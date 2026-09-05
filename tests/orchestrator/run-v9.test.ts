@@ -3,10 +3,11 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { runV9Review } from "../../src/orchestrator/run-v9.js";
+import { runV9Review, type V9RunInput } from "../../src/orchestrator/run-v9.js";
 import { AdapterRegistry } from "../../src/adapters/registry.js";
 import { roundInput, resolvedContext } from "../helpers/fixtures.js";
 import type { ReviewerResultV4 } from "../../src/protocol/v9.js";
+import type { ReviewAdapter } from "../../src/adapters/types.js";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -14,7 +15,247 @@ afterEach(async () => {
     await rm(root, { recursive: true, force: true });
 });
 
+async function schedulerFixture(
+  members: Array<{
+    id: string;
+    lens: string;
+    provider: string;
+    timeout?: number;
+    attemptTimeout?: number;
+    lensDeadline?: number;
+    after?: string;
+  }>,
+  runAdapter: ReviewAdapter["run"],
+  options: {
+    concurrency?: number;
+    runDeadline?: number;
+    probe?: ReviewAdapter["probe"];
+    passQuorum?: number;
+    minimumProviderGroups?: number;
+    sourceFiles?: number;
+    retry?: V9RunInput["retry"];
+  } = {},
+) {
+  const workspace = await mkdtemp(join(tmpdir(), "review-mesh-v9-scheduler-"));
+  roots.push(workspace);
+  for (let index = 0; index < (options.sourceFiles ?? 0); index++)
+    await writeFile(join(workspace, `source-${index}.ts`), "stable source");
+  const base = roundInput();
+  base.config.execution.deadline_mode = "fixed";
+  base.config.execution.run_deadline_ms = options.runDeadline ?? 10_000;
+  base.config.execution.max_concurrency = options.concurrency ?? 2;
+  base.config.execution.default_provider_concurrency = 1;
+  base.config.execution.provider_limits = {};
+  base.config.execution.retry_attempts = 1;
+  base.config.reviewers = members.map((member) => ({
+    ...structuredClone(base.config.reviewers[0]!),
+    id: member.id,
+    agentId: member.lens,
+    providerGroup: member.provider,
+    timeoutMs: member.timeout ?? 8_000,
+    attemptTimeoutMs: member.attemptTimeout ?? member.timeout ?? 8_000,
+    policy: {
+      applicability: { mode: "always" as const },
+      requiredCallerContext: [],
+      passQuorum: options.passQuorum ?? 1,
+      minimumProviderGroups: options.minimumProviderGroups ?? 1,
+      adjudication: "off" as const,
+      gateMinimumSeverity: "medium" as const,
+      gateMinimumConfidence: "medium" as const,
+      lensDeadlineMs: member.lensDeadline ?? 10_000,
+      changeCoverage: {
+        relevantPaths: ["**"],
+        minimumInspection: "diff" as const,
+        proof: "observed" as const,
+      },
+    },
+  }));
+  const admitted = new Map<
+    string,
+    { promise: Promise<void>; resolve(): void }
+  >();
+  for (const member of members) {
+    let resolve!: () => void;
+    const promise = new Promise<void>((done) => {
+      resolve = done;
+    });
+    admitted.set(member.id, { promise, resolve });
+  }
+  const registry = new AdapterRegistry();
+  registry.register("command", () => ({
+    id: "scheduler-fixture",
+    probe:
+      options.probe ??
+      (async (reviewer) => {
+        const prerequisite = members.find(
+          (member) => member.id === reviewer.id,
+        )?.after;
+        if (prerequisite !== undefined)
+          await admitted.get(prerequisite)!.promise;
+        return {
+          available: true,
+          authenticated: true,
+          model_available: true,
+          streaming: false,
+          cancellation: true,
+          maximumIsolation: "runtime_read_only",
+          observed_file_access: true,
+          progress_observable: false,
+        };
+      }),
+    async *run(input) {
+      admitted.get(input.reviewer.id)!.resolve();
+      yield* runAdapter(input);
+    },
+  }));
+  const events: Array<{
+    event?: string;
+    reviewer_id?: string | undefined;
+    data?: Record<string, unknown>;
+  }> = [];
+  const records: Array<Record<string, unknown>> = [];
+  const caller = new AbortController();
+  const run = runV9Review({
+    runId: "scheduler-regression",
+    config: base.config,
+    context: resolvedContext({
+      workspace,
+      review_scope: { mode: "full", source: "request" },
+    }),
+    registry,
+    signal: caller.signal,
+    writer: {
+      emit: async (event) => {
+        events.push(event);
+      },
+      finish: async () => ({
+        path: "/artifact",
+        sha256: "a".repeat(64),
+        byte_count: 1,
+        completed_results: 0,
+      }),
+      outputFailed: () => false,
+      close: async () => undefined,
+    },
+    record: async (record) => {
+      records.push(record);
+    },
+    recordResult: async () => undefined,
+    now: () => Date.now(),
+    ...(options.retry === undefined ? {} : { retry: options.retry }),
+  });
+  return { run, events, records, caller };
+}
+
+const schedulerPass = {
+  type: "result" as const,
+  isolation: "runtime_read_only" as const,
+  result: {
+    schema_version: "4" as const,
+    verdict: "pass" as const,
+    summary: "done",
+    review_markdown: "done",
+    actionable_findings: [],
+    informational_notes: [],
+  },
+};
+
+async function waitForScheduler(predicate: () => boolean) {
+  for (let index = 0; index < 1_000 && !predicate(); index += 1)
+    await vi.advanceTimersByTimeAsync(0);
+  expect(predicate()).toBe(true);
+}
+
+function adapterDelay(ms: number, signal: AbortSignal) {
+  return new Promise<void>((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    if (signal.aborted) finish();
+    else signal.addEventListener("abort", finish, { once: true });
+  });
+}
+
 describe("v9 run orchestration", () => {
+  it("keeps a run snapshot capture alive after its first candidate probe expires", async () => {
+    const executed: string[] = [];
+    const fixture = await schedulerFixture(
+      [
+        {
+          id: "short",
+          lens: "snapshot",
+          provider: "first",
+          attemptTimeout: 25,
+          timeout: 1000,
+        },
+        {
+          id: "fallback",
+          lens: "snapshot",
+          provider: "second",
+          attemptTimeout: 8000,
+          timeout: 8000,
+        },
+      ],
+      async function* (input) {
+        executed.push(input.reviewer.id);
+        yield schedulerPass;
+      },
+      { sourceFiles: 300 },
+    );
+    const completion = await fixture.run;
+    expect(executed).toContain("fallback");
+    expect(completion.exitCode).toBe(0);
+  });
+  it("retains an unsatisfied provider quorum when every model is inherited", async () => {
+    const inherited = ["first", "second"].map((reviewerId) => ({
+      reviewerId,
+      lensId: "quorum",
+      result: {
+        ...schedulerPass.result,
+        change_coverage: {
+          status: "not_applicable" as const,
+          inspected_count: 0,
+          deficit_count: 0,
+          deficit_sample: [],
+        },
+      },
+      resultDigest: "a".repeat(64),
+      resultByteCount: 1,
+      coverageEntries: [],
+      terminal: { status: "completed", lens_id: "quorum", mode: "full_review" },
+    }));
+    const fixture = await schedulerFixture(
+      [
+        { id: "first", lens: "quorum", provider: "same" },
+        { id: "second", lens: "quorum", provider: "same" },
+      ],
+      async function* () {
+        throw new Error("inherited models must not rerun");
+      },
+      {
+        passQuorum: 2,
+        minimumProviderGroups: 2,
+        retry: {
+          parentRunId: "parent",
+          runLensIds: [],
+          inherited,
+          inheritance: "exact",
+          rawFindings: [],
+          proofBySourceRef: {},
+          adjudicationOutcomes: [],
+        },
+      },
+    );
+    const completion = await fixture.run;
+    expect(completion.exitCode).toBe(3);
+    expect(completion.summary.lens_summaries).toContainEqual({
+      lens_id: "quorum",
+      outcome: "incomplete",
+    });
+  });
   const findingResult = (): Omit<ReviewerResultV4, "change_coverage"> => ({
     schema_version: "4",
     verdict: "fail",
@@ -610,6 +851,7 @@ describe("v9 run orchestration", () => {
       },
     }));
     let providerCalls = 0;
+    let admittedReviewerId: string | undefined;
     const registry = new AdapterRegistry();
     registry.register("command", () => ({
       id: "circuit",
@@ -625,8 +867,9 @@ describe("v9 run orchestration", () => {
           progress_observable: false,
         };
       },
-      async *run() {
+      async *run(input) {
         providerCalls += 1;
+        admittedReviewerId = input.reviewer.id;
         yield {
           type: "failure" as const,
           failure: {
@@ -670,11 +913,11 @@ describe("v9 run orchestration", () => {
     expect(records).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          reviewer_id: "second",
           data: expect.objectContaining({
             failure: expect.objectContaining({
               diagnostics: expect.objectContaining({
                 retry_blocked_by_circuit: true,
+                circuit_caused_by_reviewer_id: admittedReviewerId,
               }),
             }),
           }),
@@ -1318,6 +1561,388 @@ describe("v9 run orchestration", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("gives a fallback its execution budget after a busy provider admits it", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    try {
+      const starts: Record<string, number> = {};
+      const fixture = await schedulerFixture(
+        [
+          { id: "busy", lens: "busy", provider: "astra" },
+          {
+            id: "primary",
+            lens: "fallback-lens",
+            provider: "opus",
+            after: "busy",
+          },
+          {
+            id: "fallback",
+            lens: "fallback-lens",
+            provider: "astra",
+            timeout: 1_000,
+          },
+        ],
+        async function* (input) {
+          const id = input.reviewer.id;
+          starts[id] = Date.now();
+          if (id === "primary") {
+            yield {
+              type: "failure",
+              failure: {
+                reason: "invalid_result",
+                message: "Use the fallback",
+                retryable: false,
+                fallback_eligible: true,
+                circuit_qualifying: false,
+              },
+            };
+            return;
+          }
+          await adapterDelay(id === "busy" ? 2_000 : 700, input.signal);
+          if (!input.signal.aborted) yield schedulerPass;
+        },
+      );
+      await waitForScheduler(() => starts.busy !== undefined);
+      await waitForScheduler(() =>
+        fixture.events.some(
+          (event) =>
+            event.reviewer_id === "fallback" && event.data?.phase === "queued",
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(3_000);
+      const completion = await fixture.run;
+      expect(completion.exitCode).toBe(0);
+      expect(starts.fallback).toBeGreaterThanOrEqual(2_000);
+      expect(fixture.events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            event: "reviewer.started",
+            reviewer_id: "fallback",
+            data: expect.objectContaining({ timeout_ms: 1_000 }),
+          }),
+          expect.objectContaining({
+            event: "reviewer.completed",
+            reviewer_id: "fallback",
+          }),
+        ]),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("admits another provider while an earlier fallback waits for capacity", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    try {
+      const starts: Record<string, number> = {};
+      const fixture = await schedulerFixture(
+        [
+          { id: "busy", lens: "busy", provider: "astra" },
+          { id: "primary", lens: "chain", provider: "opus", after: "busy" },
+          { id: "fallback", lens: "chain", provider: "astra" },
+          { id: "ready", lens: "ready", provider: "opus", after: "primary" },
+        ],
+        async function* (input) {
+          starts[input.reviewer.id] = Date.now();
+          if (input.reviewer.id === "primary") {
+            yield {
+              type: "failure",
+              failure: {
+                reason: "invalid_result",
+                message: "Use the fallback",
+                retryable: false,
+                fallback_eligible: true,
+                circuit_qualifying: false,
+              },
+            };
+            return;
+          }
+          if (input.reviewer.id === "busy")
+            await adapterDelay(5_000, input.signal);
+          if (!input.signal.aborted) yield schedulerPass;
+        },
+      );
+      await waitForScheduler(() => starts.primary !== undefined);
+      await waitForScheduler(() =>
+        fixture.events.some(
+          (event) =>
+            event.reviewer_id === "fallback" && event.data?.phase === "queued",
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(6_000);
+      await fixture.run;
+      expect(starts.ready).toBeLessThan(5_000);
+      expect(starts.fallback).toBeGreaterThanOrEqual(5_000);
+      expect(fixture.events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            event: "reviewer.progress",
+            reviewer_id: "fallback",
+            data: expect.objectContaining({
+              phase: "queued",
+              queue_reason: "provider_limit",
+            }),
+          }),
+        ]),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    {
+      runDeadline: 1_000,
+      lensDeadline: 5_000,
+      boundary: "run_deadline_exceeded",
+    },
+    {
+      runDeadline: 5_000,
+      lensDeadline: 1_000,
+      boundary: "lens_deadline_exceeded",
+    },
+  ])(
+    "identifies $boundary while a reviewer waits in the provider queue",
+    async (item) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(0);
+      try {
+        const starts: string[] = [];
+        const fixture = await schedulerFixture(
+          [
+            { id: "busy", lens: "busy", provider: "astra" },
+            {
+              id: "queued",
+              lens: "queued",
+              provider: "astra",
+              lensDeadline: item.lensDeadline,
+              timeout: 10_000,
+              after: "busy",
+            },
+          ],
+          async function* (input) {
+            starts.push(input.reviewer.id);
+            await adapterDelay(2_000, input.signal);
+            if (!input.signal.aborted) yield schedulerPass;
+          },
+          { runDeadline: item.runDeadline },
+        );
+        await waitForScheduler(() => starts.includes("busy"));
+        await waitForScheduler(() =>
+          fixture.events.some(
+            (event) =>
+              event.reviewer_id === "queued" && event.data?.phase === "queued",
+          ),
+        );
+        await vi.advanceTimersByTimeAsync(2_100);
+        await fixture.run;
+        expect(starts).not.toContain("queued");
+        expect(fixture.events).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              event: "reviewer.incomplete",
+              reviewer_id: "queued",
+              data: expect.objectContaining({
+                reason: "queue_deadline_exceeded",
+                failure_stage: "queued",
+                expired_boundary: item.boundary,
+              }),
+            }),
+          ]),
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("separates probe time from admitted attempt time and reconciles timestamps", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    try {
+      let probing = false;
+      let admitted = false;
+      const fixture = await schedulerFixture(
+        [
+          {
+            id: "timed",
+            lens: "timed",
+            provider: "opus",
+            timeout: 2_000,
+            attemptTimeout: 1_000,
+          },
+        ],
+        async function* (input) {
+          admitted = true;
+          await adapterDelay(5_000, input.signal);
+          if (!input.signal.aborted) yield schedulerPass;
+        },
+        {
+          probe: async (_reviewer, signal) => {
+            probing = true;
+            await adapterDelay(500, signal!);
+            return {
+              available: true,
+              authenticated: true,
+              model_available: true,
+              streaming: false,
+              cancellation: true,
+              maximumIsolation: "runtime_read_only",
+              observed_file_access: true,
+              progress_observable: false,
+            };
+          },
+        },
+      );
+      await waitForScheduler(() => probing);
+      await vi.advanceTimersByTimeAsync(500);
+      await waitForScheduler(() => admitted);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await fixture.run;
+      expect(fixture.records).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            record: "reviewer.attempt",
+            reviewer_id: "timed",
+            data: expect.objectContaining({
+              started_at: "1970-01-01T00:00:00.500Z",
+              admitted_at: "1970-01-01T00:00:00.500Z",
+              ended_at: "1970-01-01T00:00:01.500Z",
+              elapsed_ms: 1_000,
+              execution_elapsed_ms: 1_000,
+              probe_elapsed_ms: 500,
+              queue_wait_ms: 0,
+              failure: expect.objectContaining({
+                reason: "attempt_deadline_exceeded",
+              }),
+            }),
+          }),
+        ]),
+      );
+      expect(fixture.events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            event: "reviewer.started",
+            data: expect.objectContaining({
+              admitted_at: "1970-01-01T00:00:00.500Z",
+              timeout_ms: 1_000,
+              probe_elapsed_ms: 500,
+            }),
+          }),
+        ]),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("preserves a completed model slot when retrying a lens with an unmet quorum", async () => {
+    const executed: string[] = [];
+    const inheritedResult = {
+      ...schedulerPass.result,
+      change_coverage: {
+        status: "not_applicable" as const,
+        inspected_count: 0,
+        deficit_count: 0,
+        deficit_sample: [],
+      },
+    };
+    const fixture = await schedulerFixture(
+      [
+        { id: "retained", lens: "quorum", provider: "opus" },
+        { id: "remaining", lens: "quorum", provider: "astra" },
+      ],
+      async function* (input) {
+        executed.push(input.reviewer.id);
+        yield schedulerPass;
+      },
+      {
+        passQuorum: 2,
+        retry: {
+          parentRunId: "parent",
+          runLensIds: ["quorum"],
+          inherited: [
+            {
+              reviewerId: "retained",
+              lensId: "quorum",
+              result: inheritedResult,
+              resultDigest: "a".repeat(64),
+              resultByteCount: 1,
+              coverageEntries: [],
+              terminal: {
+                status: "completed",
+                lens_id: "quorum",
+                mode: "full_review",
+              },
+            },
+          ],
+          inheritance: "exact",
+          rawFindings: [],
+          proofBySourceRef: {},
+          adjudicationOutcomes: [],
+        },
+      },
+    );
+    const completion = await fixture.run;
+    expect(executed).toEqual(["remaining"]);
+    expect(completion.exitCode).toBe(0);
+    expect(completion.summary.model_runs).toMatchObject({
+      total: 2,
+      completed: 2,
+    });
+  });
+
+  it("publishes schema and coverage repair progress with their bounded messages", async () => {
+    const fixture = await schedulerFixture(
+      [{ id: "repairing", lens: "repairing", provider: "opus" }],
+      async function* () {
+        yield {
+          type: "progress",
+          phase: "schema_repair",
+          message: "Repairing result page 1 (attempt 1 of 2).",
+        };
+        yield {
+          type: "progress",
+          phase: "schema_repair",
+          message: "Repairing result page 1 (attempt 2 of 2).",
+        };
+        yield {
+          type: "progress",
+          phase: "coverage_repair",
+          message: "Inspecting remaining snapshot ranges.",
+        };
+        yield schedulerPass;
+      },
+    );
+    await fixture.run;
+    const progress = fixture.events.filter(
+      (event) => event.event === "reviewer.progress",
+    );
+    expect(progress).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          data: expect.objectContaining({
+            phase: "validating",
+            message: "Repairing result page 1 (attempt 1 of 2).",
+          }),
+        }),
+        expect.objectContaining({
+          data: expect.objectContaining({
+            phase: "validating",
+            message: "Repairing result page 1 (attempt 2 of 2).",
+          }),
+        }),
+        expect.objectContaining({
+          data: expect.objectContaining({
+            phase: "reviewing",
+            message: "Inspecting remaining snapshot ranges.",
+          }),
+        }),
+      ]),
+    );
   });
 
   it("reports run, lens, candidate, and attempt boundaries in scheduler precedence", async () => {

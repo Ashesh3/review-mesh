@@ -193,6 +193,7 @@ const schemas = {
         kind: z.literal("review-mesh.run-status"),
         run_id: z.string().min(1),
         active: z.boolean().optional(),
+        terminal: z.boolean().optional(),
         run_outcome: v9RunOutcomeSchema.optional(),
         gate_outcome: v9GateOutcomeSchema.optional(),
         coverage_outcome: z.enum(["complete", "partial"]).optional(),
@@ -201,7 +202,17 @@ const schemas = {
             z
               .object({
                 reviewer_id: z.string().min(1),
-                state: z.enum(["completed", "incomplete", "skipped"]),
+                state: z.enum([
+                  "deferred",
+                  "queued",
+                  "running",
+                  "probing",
+                  "reviewing",
+                  "validating",
+                  "completed",
+                  "incomplete",
+                  "skipped",
+                ]),
                 complete_result: z
                   .union([reviewerResultV4Schema, adjudicationResultV2Schema])
                   .optional(),

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
 import {
   lstat,
@@ -12,9 +12,23 @@ import {
   writeFile,
   type FileHandle,
 } from "node:fs/promises";
-import { basename, isAbsolute, relative, resolve, sep } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
+import { z } from "zod";
+import {
+  sanitizeAdapterFailure,
+  sanitizePublicText,
+  type AdapterValidationIssue,
+} from "./errors.js";
 
 export const MAX_RESULT_SPOOL_BYTES = 16 * 1024 * 1024;
+export const RESULT_SPOOL_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 export type ResultSpoolErrorCode =
   "identity_changed" | "invalid_utf8" | "result_too_large" | "unsafe_directory";
@@ -66,6 +80,19 @@ const SCAN_CURSOR = ".scan-cursor";
 const SCAN_INDEX = ".scan-index";
 const MAX_SCAN_RECORD_BYTES = 256;
 const MAX_SCAN_INDEX_BYTES = 16 * 1024 * 1024;
+const DIAGNOSTICS_DIRECTORY = ".diagnostics";
+const MAX_DIAGNOSTIC_MANIFESTS = 4096;
+const MAX_MANIFEST_BYTES = 64 * 1024;
+const SPOOL_ARTIFACT_REF = /^result-spool:([0-9a-f-]{36})$/u;
+const ownedSpools = new WeakMap<
+  ResultSpool,
+  {
+    root: string;
+    rootIdentity: BigIntStats;
+    directoryIdentity: BigIntStats;
+    fileIdentity: BigIntStats;
+  }
+>();
 
 async function readScanCursor(root: string): Promise<number> {
   const path = resolve(root, SCAN_CURSOR);
@@ -220,7 +247,7 @@ export async function wipeStaleResultSpools(
   options: WipeStaleResultSpoolsOptions,
 ): Promise<{ inspected: number; wiped: number }> {
   const now = options.now ?? Date.now;
-  const minimumAgeMs = options.minimumAgeMs ?? 24 * 60 * 60 * 1_000;
+  const minimumAgeMs = options.minimumAgeMs ?? RESULT_SPOOL_RETENTION_MS;
   const maximumEntries = options.maximumEntries ?? 64;
   if (minimumAgeMs < 0 || !Number.isSafeInteger(minimumAgeMs)) {
     throw new Error("minimumAgeMs must be a non-negative safe integer");
@@ -666,7 +693,7 @@ export async function createResultSpool(
         "The result spool path changed while opening.",
       );
     }
-    return new FileResultSpool(
+    const spool = new FileResultSpool(
       path,
       ownedDirectory,
       ownedDirectoryIdentity,
@@ -675,10 +702,499 @@ export async function createResultSpool(
       options.beforeCleanupWipe,
       options.maximumBytes ?? MAX_RESULT_SPOOL_BYTES,
     );
+    ownedSpools.set(spool, {
+      root: canonicalDirectory,
+      rootIdentity: canonicalMetadata,
+      directoryIdentity: ownedDirectoryIdentity,
+      fileIdentity,
+    });
+    return spool;
   } catch (error) {
     if (createdIdentity !== undefined) {
       await wipeOwnedHandle(handle, createdIdentity).catch(() => undefined);
     } else await handle.close().catch(() => undefined);
     throw error;
   }
+}
+
+const IdentitySchema = z.object({
+  dev: z.string().regex(/^\d+$/u),
+  ino: z.string().regex(/^\d+$/u),
+});
+const DiagnosticManifestSchema = z.object({
+  schema_version: z.literal("1"),
+  artifact_ref: z.string().regex(SPOOL_ARTIFACT_REF),
+  run_id: z.string().max(256),
+  run_digest: z.string().regex(/^[a-f0-9]{64}$/u),
+  reviewer_id: z.string().max(256),
+  page_index: z.number().int().nonnegative(),
+  checkpoint_id: z.string().max(256),
+  reason: z.string().max(256),
+  byte_count: z.number().int().min(0).max(MAX_RESULT_SPOOL_BYTES),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/u),
+  created_at: z.string().datetime(),
+  eligible_for_cleanup_at: z.string().datetime(),
+  validation_issues: z
+    .array(
+      z.object({
+        path: z.string().max(256),
+        code: z.string().max(64),
+        message: z.string().max(256),
+        expected_max_bytes: z.number().int().nonnegative().optional(),
+        actual_bytes: z.number().int().nonnegative().optional(),
+        unknown_keys: z.array(z.string()).optional(),
+      }),
+    )
+    .max(12)
+    .optional(),
+  spool_directory: z.string().regex(OWNED_DIRECTORY),
+  root_identity: IdentitySchema,
+  directory_identity: IdentitySchema,
+  file_identity: IdentitySchema,
+});
+type DiagnosticManifest = z.infer<typeof DiagnosticManifestSchema>;
+export type ResultSpoolDiagnostic = Omit<
+  DiagnosticManifest,
+  | "spool_directory"
+  | "root_identity"
+  | "directory_identity"
+  | "file_identity"
+  | "schema_version"
+  | "run_digest"
+> & {
+  state: "retained" | "wiped" | "unavailable";
+};
+
+function digestBytes(bytes: string | Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function savedIdentity(identity: BigIntStats): z.infer<typeof IdentitySchema> {
+  return { dev: identity.dev.toString(), ino: identity.ino.toString() };
+}
+
+function matchesSavedIdentity(
+  identity: BigIntStats,
+  saved: z.infer<typeof IdentitySchema>,
+): boolean {
+  return (
+    identity.dev !== 0n &&
+    identity.ino !== 0n &&
+    identity.dev.toString() === saved.dev &&
+    identity.ino.toString() === saved.ino
+  );
+}
+
+async function stableDirectory(path: string): Promise<BigIntStats> {
+  const before = await lstat(path, { bigint: true });
+  const canonical = await realpath(path);
+  const after = await lstat(canonical, { bigint: true });
+  if (
+    before.isSymbolicLink() ||
+    !before.isDirectory() ||
+    !after.isDirectory() ||
+    !sameIdentity(before, after)
+  )
+    throw new ResultSpoolError(
+      "unsafe_directory",
+      "The diagnostic directory is unsafe.",
+    );
+  return before;
+}
+
+async function diagnosticDirectory(
+  directory: string,
+  runId: string,
+  create: boolean,
+): Promise<{ root: string; path: string }> {
+  if (runId.length === 0 || runId.length > 256)
+    throw new Error("runId must contain 1 to 256 characters");
+  const root = resolve(directory);
+  const rootIdentity = await stableDirectory(root);
+  const diagnostics = resolve(root, DIAGNOSTICS_DIRECTORY);
+  if (create)
+    await mkdir(diagnostics, { mode: 0o700 }).catch(
+      (error: NodeJS.ErrnoException) => {
+        if (error.code !== "EEXIST") throw error;
+      },
+    );
+  await stableDirectory(diagnostics);
+  const path = resolve(diagnostics, digestBytes(runId));
+  if (create)
+    await mkdir(path, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "EEXIST") throw error;
+    });
+  await stableDirectory(path);
+  if (!sameIdentity(rootIdentity, await stableDirectory(root)))
+    throw new ResultSpoolError(
+      "identity_changed",
+      "The diagnostic root changed identity.",
+    );
+  return { root, path };
+}
+
+/** Records sanitized metadata only; rejected response bytes remain in the private spool. */
+export async function recordInvalidResultSpool(input: {
+  spool: ResultSpool;
+  runId: string;
+  reviewerId: string;
+  pageIndex: number;
+  checkpointId: string;
+  reason: string;
+  validationIssues?: AdapterValidationIssue[];
+}): Promise<string> {
+  const owner = ownedSpools.get(input.spool);
+  if (owner === undefined)
+    throw new ResultSpoolError(
+      "identity_changed",
+      "The diagnostic spool is not owned.",
+    );
+  const bytes = await input.spool.read();
+  if (!sameIdentity(owner.rootIdentity, await stableDirectory(owner.root)))
+    throw new ResultSpoolError(
+      "identity_changed",
+      "The diagnostic spool root changed identity.",
+    );
+  const target = await diagnosticDirectory(owner.root, input.runId, true);
+  const artifactRef = `result-spool:${randomUUID()}`;
+  const issues = sanitizeAdapterFailure(
+    "invalid_result",
+    "Invalid result page.",
+    false,
+    {
+      diagnostics: {
+        ...(input.validationIssues === undefined
+          ? {}
+          : { validation_issues: input.validationIssues }),
+      },
+    },
+  ).diagnostics?.validation_issues;
+  const createdAt = Date.now();
+  const safe = (value: string) =>
+    (sanitizePublicText(value) ?? "unavailable").slice(0, 256);
+  const manifest = DiagnosticManifestSchema.parse({
+    schema_version: "1",
+    artifact_ref: artifactRef,
+    run_id: safe(input.runId),
+    run_digest: digestBytes(input.runId),
+    reviewer_id: safe(input.reviewerId),
+    page_index: input.pageIndex,
+    checkpoint_id: safe(input.checkpointId),
+    reason: safe(input.reason),
+    byte_count: bytes.length,
+    sha256: digestBytes(bytes),
+    created_at: new Date(createdAt).toISOString(),
+    eligible_for_cleanup_at: new Date(
+      createdAt + RESULT_SPOOL_RETENTION_MS,
+    ).toISOString(),
+    ...(issues === undefined ? {} : { validation_issues: issues }),
+    spool_directory: basename(dirname(input.spool.path)),
+    root_identity: savedIdentity(owner.rootIdentity),
+    directory_identity: savedIdentity(owner.directoryIdentity),
+    file_identity: savedIdentity(owner.fileIdentity),
+  });
+  const path = resolve(
+    target.path,
+    `${artifactRef.slice("result-spool:".length)}.json`,
+  );
+  const handle = await open(
+    path,
+    constants.O_CREAT |
+      constants.O_EXCL |
+      constants.O_RDWR |
+      ((constants as unknown as Record<string, number>).O_NOFOLLOW ?? 0),
+    0o600,
+  );
+  const identity = await handle.stat({ bigint: true });
+  try {
+    if (!sameIdentity(identity, await lstat(path, { bigint: true })))
+      throw new ResultSpoolError(
+        "identity_changed",
+        "The diagnostic manifest changed identity.",
+      );
+    await handle.writeFile(JSON.stringify(manifest), "utf8");
+    await handle.sync();
+    await diagnosticDirectory(owner.root, input.runId, false);
+  } catch (error) {
+    await wipeOwnedHandle(handle, identity).catch(() => undefined);
+    throw error;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+  return artifactRef;
+}
+
+async function readDiagnosticManifests(input: {
+  directory: string;
+  runId: string;
+}): Promise<{ root: string; manifests: DiagnosticManifest[] }> {
+  let target: { root: string; path: string };
+  try {
+    target = await diagnosticDirectory(input.directory, input.runId, false);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT")
+      return { root: resolve(input.directory), manifests: [] };
+    throw error;
+  }
+  const manifests: DiagnosticManifest[] = [];
+  const stream = await opendir(target.path);
+  let inspected = 0;
+  for await (const entry of stream) {
+    if (++inspected > MAX_DIAGNOSTIC_MANIFESTS)
+      throw new Error("The run diagnostic manifest limit was exceeded.");
+    if (!entry.isFile() || !/^[0-9a-f-]{36}\.json$/u.test(entry.name)) continue;
+    const path = resolve(target.path, entry.name);
+    const before = await lstat(path, { bigint: true }).catch(() => undefined);
+    if (
+      before === undefined ||
+      before.isSymbolicLink() ||
+      !before.isFile() ||
+      before.size > BigInt(MAX_MANIFEST_BYTES)
+    )
+      continue;
+    const handle = await open(
+      path,
+      constants.O_RDONLY |
+        ((constants as unknown as Record<string, number>).O_NOFOLLOW ?? 0),
+    ).catch(() => undefined);
+    if (handle === undefined) continue;
+    try {
+      const opened = await handle.stat({ bigint: true });
+      if (
+        !sameIdentity(before, opened) ||
+        opened.size > BigInt(MAX_MANIFEST_BYTES)
+      )
+        continue;
+      const parsed = DiagnosticManifestSchema.safeParse(
+        JSON.parse(await handle.readFile("utf8")),
+      );
+      if (
+        !parsed.success ||
+        parsed.data.run_digest !== digestBytes(input.runId) ||
+        `${parsed.data.artifact_ref.slice("result-spool:".length)}.json` !==
+          entry.name
+      )
+        continue;
+      await diagnosticDirectory(input.directory, input.runId, false);
+      if (!sameIdentity(opened, await lstat(path, { bigint: true }))) continue;
+      manifests.push(parsed.data);
+    } catch (error) {
+      if (error instanceof ResultSpoolError) throw error;
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+  }
+  return {
+    root: target.root,
+    manifests: manifests.sort(
+      (a, b) =>
+        a.created_at.localeCompare(b.created_at) ||
+        a.artifact_ref.localeCompare(b.artifact_ref),
+    ),
+  };
+}
+
+async function openDiagnosticSpool(
+  root: string,
+  manifest: DiagnosticManifest,
+  writable: boolean,
+): Promise<{ handle: FileHandle; identity: BigIntStats }> {
+  const directory = resolve(root, manifest.spool_directory);
+  const match = OWNED_DIRECTORY.exec(manifest.spool_directory)!;
+  const path = resolve(directory, `${match[1]}.spool`);
+  let handle: FileHandle | undefined;
+  try {
+    const rootIdentity = await stableDirectory(root);
+    const directoryIdentity = await stableDirectory(directory);
+    const before = await lstat(path, { bigint: true });
+    if (
+      before.isSymbolicLink() ||
+      !before.isFile() ||
+      before.nlink !== 1n ||
+      !matchesSavedIdentity(rootIdentity, manifest.root_identity) ||
+      !matchesSavedIdentity(directoryIdentity, manifest.directory_identity) ||
+      !matchesSavedIdentity(before, manifest.file_identity)
+    )
+      throw new Error("identity");
+    handle = await open(
+      path,
+      (writable ? constants.O_RDWR : constants.O_RDONLY) |
+        ((constants as unknown as Record<string, number>).O_NOFOLLOW ?? 0),
+    );
+    const identity = await handle.stat({ bigint: true });
+    const currentPath = await lstat(path, { bigint: true });
+    if (
+      !sameIdentity(before, identity) ||
+      !sameIdentity(before, currentPath) ||
+      currentPath.isSymbolicLink() ||
+      !sameIdentity(rootIdentity, await stableDirectory(root)) ||
+      !sameIdentity(directoryIdentity, await stableDirectory(directory)) ||
+      (identity.size !== 0n && identity.size !== BigInt(manifest.byte_count))
+    )
+      throw new Error("identity");
+    return { handle, identity };
+  } catch {
+    await handle?.close().catch(() => undefined);
+    throw new ResultSpoolError(
+      "identity_changed",
+      "The diagnostic spool is unavailable or changed identity.",
+    );
+  }
+}
+
+export async function listResultSpoolDiagnostics(input: {
+  directory: string;
+  runId: string;
+}): Promise<{
+  run_id: string;
+  retention: {
+    minimum_age_ms: number;
+    cleanup_trigger: "spool_creation_or_explicit_cleanup";
+    raw_content: "private_until_wiped";
+  };
+  artifacts: ResultSpoolDiagnostic[];
+}> {
+  const { root, manifests } = await readDiagnosticManifests(input);
+  const artifacts: ResultSpoolDiagnostic[] = [];
+  for (const manifest of manifests) {
+    let state: ResultSpoolDiagnostic["state"] = "unavailable";
+    try {
+      const opened = await openDiagnosticSpool(root, manifest, false);
+      state = opened.identity.size === 0n ? "wiped" : "retained";
+      await opened.handle.close();
+    } catch {
+      /* Never expose filesystem errors or raw content in listings. */
+    }
+    const {
+      spool_directory: _path,
+      root_identity: _root,
+      directory_identity: _directory,
+      file_identity: _file,
+      schema_version: _version,
+      run_digest: _runDigest,
+      ...metadata
+    } = manifest;
+    artifacts.push({ ...metadata, state });
+  }
+  return {
+    run_id: input.runId,
+    retention: {
+      minimum_age_ms: RESULT_SPOOL_RETENTION_MS,
+      cleanup_trigger: "spool_creation_or_explicit_cleanup",
+      raw_content: "private_until_wiped",
+    },
+    artifacts,
+  };
+}
+
+async function diagnosticBytes(
+  opened: { handle: FileHandle; identity: BigIntStats },
+  manifest: DiagnosticManifest,
+): Promise<Buffer> {
+  const bytes = await opened.handle.readFile();
+  if (
+    bytes.length !== manifest.byte_count ||
+    digestBytes(bytes) !== manifest.sha256 ||
+    !sameIdentity(opened.identity, await opened.handle.stat({ bigint: true }))
+  )
+    throw new ResultSpoolError(
+      "identity_changed",
+      "The diagnostic bytes changed or were wiped.",
+    );
+  return bytes;
+}
+
+export async function exportResultSpoolDiagnostic(input: {
+  directory: string;
+  runId: string;
+  artifactRef: string;
+  destination: string;
+}): Promise<{ artifact_ref: string; path: string; byte_count: number }> {
+  const { root, manifests } = await readDiagnosticManifests(input);
+  const manifest = manifests.find(
+    (entry) => entry.artifact_ref === input.artifactRef,
+  );
+  if (manifest === undefined)
+    throw new ResultSpoolError(
+      "identity_changed",
+      "The diagnostic artifact is unavailable.",
+    );
+  const opened = await openDiagnosticSpool(root, manifest, false);
+  let bytes: Buffer;
+  try {
+    bytes = await diagnosticBytes(opened, manifest);
+  } finally {
+    await opened.handle.close().catch(() => undefined);
+  }
+  const path = resolve(input.destination);
+  const parent = await stableDirectory(dirname(path));
+  const handle = await open(
+    path,
+    constants.O_CREAT |
+      constants.O_EXCL |
+      constants.O_RDWR |
+      ((constants as unknown as Record<string, number>).O_NOFOLLOW ?? 0),
+    0o600,
+  );
+  const identity = await handle.stat({ bigint: true });
+  try {
+    if (
+      !sameIdentity(parent, await stableDirectory(dirname(path))) ||
+      !sameIdentity(identity, await lstat(path, { bigint: true }))
+    )
+      throw new ResultSpoolError(
+        "identity_changed",
+        "The diagnostic export path changed identity.",
+      );
+    await handle.writeFile(bytes);
+    await handle.sync();
+    if (
+      !sameIdentity(parent, await stableDirectory(dirname(path))) ||
+      !sameIdentity(identity, await lstat(path, { bigint: true }))
+    )
+      throw new ResultSpoolError(
+        "identity_changed",
+        "The diagnostic export path changed identity.",
+      );
+  } catch (error) {
+    await wipeOwnedHandle(handle, identity).catch(() => undefined);
+    throw error;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+  return {
+    artifact_ref: manifest.artifact_ref,
+    path,
+    byte_count: bytes.length,
+  };
+}
+
+export async function cleanupResultSpoolDiagnostics(input: {
+  directory: string;
+  runId: string;
+  artifactRef?: string;
+}): Promise<{ inspected: number; wiped: number; unavailable: number }> {
+  const { root, manifests } = await readDiagnosticManifests(input);
+  const selected = manifests.filter(
+    (entry) =>
+      input.artifactRef === undefined ||
+      entry.artifact_ref === input.artifactRef,
+  );
+  let wiped = 0;
+  let unavailable = 0;
+  for (const manifest of selected) {
+    let opened: { handle: FileHandle; identity: BigIntStats } | undefined;
+    try {
+      opened = await openDiagnosticSpool(root, manifest, true);
+      if (opened.identity.size === 0n) continue;
+      await diagnosticBytes(opened, manifest);
+      await wipeOwnedHandle(opened.handle, opened.identity);
+      wiped += 1;
+    } catch {
+      unavailable += 1;
+    } finally {
+      await opened?.handle.close().catch(() => undefined);
+    }
+  }
+  return { inspected: selected.length, wiped, unavailable };
 }

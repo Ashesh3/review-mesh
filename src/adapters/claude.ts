@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 import type { AdapterRegistration } from "../config/schemas.js";
+import { MAX_READ_BYTES } from "../context/read-limits.js";
 import { currentReviewerOutputSchema } from "../protocol/schemas.js";
 import { adapterFailure, type AdapterFailure } from "./errors.js";
 import { createReadOnlyFileTools } from "./file-tools.js";
@@ -22,10 +23,15 @@ import {
   acknowledgeInitialDiffDelivery,
   assembleResultPages,
   createResultPageStorageBridge,
+  coverageRepairMessage,
   nextPageAssignment,
   outputTruncatedFailure,
   pageCollectorFor,
   pageFailure,
+  isRepairablePageError,
+  pageRepairMessage,
+  failedPageRepair,
+  MAX_PAGE_SCHEMA_REPAIRS,
 } from "./sdk-pages.js";
 import {
   buildAllowlistedEnvironment,
@@ -51,6 +57,7 @@ const CORE_INSPECTION_TOOLS = new Set([
   "mcp__review_mesh__list_files",
   "mcp__review_mesh__read_file",
   "mcp__review_mesh__search_text",
+  "mcp__review_mesh__coverage_status",
 ]);
 const TOOL_DENIAL = "Review Mesh denied this tool for a read-only review.";
 const SANDBOX_UNAVAILABLE =
@@ -464,7 +471,12 @@ class ClaudeAdapter implements ReviewAdapter {
               {
                 path: z.string(),
                 offset: z.number().int().nonnegative().optional(),
-                byte_count: z.number().int().positive().optional(),
+                byte_count: z
+                  .number()
+                  .int()
+                  .nonnegative()
+                  .max(MAX_READ_BYTES)
+                  .optional(),
               },
               async (args, extra) => {
                 const delivered = await coverageTools.readFile({
@@ -490,6 +502,19 @@ class ClaudeAdapter implements ReviewAdapter {
                 }
                 return { content: [{ type: "text", text }] };
               },
+            ),
+            tool(
+              "coverage_status",
+              "List exact missing snapshot byte ranges and diff obligations before finalization.",
+              {},
+              async () => ({
+                content: [
+                  {
+                    type: "text",
+                    text: JSON.stringify(coverageTools.coverageStatus()),
+                  },
+                ],
+              }),
             ),
             tool(
               "search_text",
@@ -549,6 +574,7 @@ class ClaudeAdapter implements ReviewAdapter {
               "mcp__review_mesh__list_files",
               "mcp__review_mesh__read_file",
               "mcp__review_mesh__search_text",
+              "mcp__review_mesh__coverage_status",
             ],
           }),
       disallowedTools: [...DISALLOWED_TOOLS],
@@ -771,6 +797,9 @@ class ClaudeAdapter implements ReviewAdapter {
       >();
       let initialRequestAdmitted = false;
       let resumeSessionId: string | undefined;
+      let repairPrompt: string | undefined;
+      let pageRepairs = 0;
+      let coverageRepairs = 0;
       sessionDirectory =
         pages === undefined
           ? undefined
@@ -789,9 +818,10 @@ class ClaudeAdapter implements ReviewAdapter {
                   prompt: {
                     ...input.prompt,
                     user:
-                      assignment.request.pageIndex === 0
+                      repairPrompt ??
+                      (assignment.request.pageIndex === 0
                         ? `${input.prompt.user}\n\n${assignment.prompt}`
-                        : assignment.prompt,
+                        : assignment.prompt),
                   },
                   resultJsonSchema: assignment.schema,
                 };
@@ -905,6 +935,22 @@ class ClaudeAdapter implements ReviewAdapter {
         }
         if (pages !== undefined) {
           const assignment = pages.collector.nextRequest();
+          if (assignment.pageIndex === 0 && coverageRepairs < 2) {
+            const coveragePrompt = coverageRepairMessage(
+              input,
+              nextPageAssignment(pages.collector, pages.resultKind).prompt,
+            );
+            if (coveragePrompt !== undefined) {
+              coverageRepairs += 1;
+              repairPrompt = coveragePrompt;
+              yield {
+                type: "progress",
+                phase: "coverage_repair",
+                identity: `${assignment.resultId}:coverage-repair:${coverageRepairs}`,
+              };
+              continue;
+            }
+          }
           const raw = JSON.stringify(message.structured_output);
           try {
             await pageStorage!.addPage(
@@ -913,14 +959,37 @@ class ClaudeAdapter implements ReviewAdapter {
               assignment.pageIndex,
             );
           } catch (error) {
+            if (
+              isRepairablePageError(error) &&
+              pageRepairs < MAX_PAGE_SCHEMA_REPAIRS
+            ) {
+              pageRepairs += 1;
+              repairPrompt = pageRepairMessage(
+                error,
+                nextPageAssignment(pages.collector, pages.resultKind).prompt,
+              );
+              yield {
+                type: "progress",
+                phase: "schema_repair",
+                identity: `${assignment.resultId}:page:${assignment.pageIndex}:repair:${pageRepairs}`,
+              };
+              continue;
+            }
             await pageStorage!.abandon();
             yield {
               type: "failure",
-              failure: pageFailure(error, "Claude"),
+              failure: failedPageRepair(
+                error,
+                "Claude",
+                pageRepairs,
+                resumeSessionId ?? assignment.resultId,
+              ),
               isolation: sandboxed ? "enforced_read_only" : "prompt_only",
             };
             return;
           }
+          pageRepairs = 0;
+          repairPrompt = undefined;
           yield {
             type: "progress",
             phase: "result_page",

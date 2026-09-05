@@ -7,6 +7,100 @@ import {
 
 const digest = (value: string): string =>
   createHash("sha256").update(value, "utf8").digest("hex");
+
+it("reports byte bounds and unknown keys without including rejected values", () => {
+  const page = JSON.parse(reviewerPages()[0]!);
+  page.payload.summary = "é".repeat(514);
+  page.payload.informational_notes = [
+    {
+      title: "note",
+      description: "safe",
+      description_note: "Bearer do-not-publish",
+    },
+  ];
+  const collector = createResultPageCollector({
+    resultId: "result-1",
+    resultKind: "reviewer",
+  });
+  let failure: ResultPageError | undefined;
+  try {
+    collector.addPage(JSON.stringify(page));
+  } catch (error) {
+    failure = error as ResultPageError;
+  }
+  expect(failure?.validationIssues).toContainEqual(
+    expect.objectContaining({
+      path: "payload.summary",
+      expected_max_bytes: 1024,
+      actual_bytes: 1028,
+    }),
+  );
+  expect(failure?.validationIssues).toContainEqual(
+    expect.objectContaining({
+      path: "payload.informational_notes.0",
+      unknown_keys: ["description_note"],
+    }),
+  );
+  expect(JSON.stringify(failure?.validationIssues)).not.toContain(
+    "do-not-publish",
+  );
+  expect(collector.nextRequest().pageIndex).toBe(0);
+});
+
+it.each(["schema", "envelope"])(
+  "does not accept a %s repair that silently drops previously declared findings",
+  (kind) => {
+    const collector = createResultPageCollector({
+      resultId: "result-1",
+      resultKind: "reviewer",
+    });
+    const invalid = JSON.parse(reviewerPages()[0]!);
+    if (kind === "schema") invalid.payload.summary = "é".repeat(514);
+    else invalid.previous_page_digest = "a".repeat(64);
+    expect(() => collector.addPage(JSON.stringify(invalid))).toThrow(
+      ResultPageError,
+    );
+    const dropped = {
+      ...invalid,
+      previous_page_digest: null,
+      payload: {
+        ...invalid.payload,
+        summary: "clean",
+        actionable_finding_count: 0,
+        verdict: "pass",
+      },
+    };
+    expect(() => collector.addPage(JSON.stringify(dropped))).toThrow(
+      "preserve previously declared candidate findings",
+    );
+    expect(collector.nextRequest().pageIndex).toBe(0);
+    collector.addPage(reviewerPages()[0]!);
+    expect(collector.nextRequest().pageIndex).toBe(1);
+  },
+);
+
+it("names a rejected envelope field without including its provider value", () => {
+  const page = JSON.parse(reviewerPages()[0]!);
+  page.result_id = "Bearer sensitive-provider-value";
+  const collector = createResultPageCollector({
+    resultId: "result-1",
+    resultKind: "reviewer",
+  });
+  let failure: ResultPageError | undefined;
+  try {
+    collector.addPage(JSON.stringify(page));
+  } catch (error) {
+    failure = error as ResultPageError;
+  }
+  expect(failure?.validationIssues).toContainEqual({
+    path: "result_id",
+    code: "protocol_violation",
+    message: "unexpected result ID",
+  });
+  expect(JSON.stringify(failure?.validationIssues)).not.toContain(
+    "sensitive-provider-value",
+  );
+});
 const finding = (id: string) => ({
   id,
   severity: "high",

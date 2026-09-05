@@ -8,6 +8,11 @@ export interface ReviewerPromptBundle {
   system: string;
   user: string;
   combined: string;
+  /** Core-owned evidence bound to the exact rendered user message. */
+  delivery?: {
+    userSha256: string;
+    diff: { byteCount: number; sha256: string; paths: readonly string[] };
+  };
 }
 
 export interface BuildReviewerPromptInput {
@@ -93,14 +98,14 @@ export function buildReviewerPrompt({
     ...(resultPage === undefined
       ? []
       : [
-          `Return only the core-assigned result page for result ID ${JSON.stringify(resultPage.resultId)}, page index ${resultPage.pageIndex}, and previous page digest ${resultPage.previousPageDigest ?? "null"}. Preserve these exact identifiers and use only the assigned candidate IDs.`,
+          `Return only the core-assigned result page for result ID ${JSON.stringify(resultPage.resultId)}. The latest core page assignment supplies the authoritative page index, previous page digest, schema, and assigned candidate IDs. Earlier page assignments describe earlier pages only. Preserve the current assignment exactly.`,
         ]),
     ...(coverage === undefined || reviewer.policy?.changeCoverage === undefined
       ? []
       : [
           `Changed-file coverage uses ${reviewer.policy.changeCoverage.proof} proof and requires ${reviewer.policy.changeCoverage.minimumInspection} inspection for every relevant path. The scope digest and path list are core-owned obligations.`,
           reviewer.policy.changeCoverage.proof === "observed"
-            ? "Use Review Mesh-mediated reads for every required snapshot. Do not emit a coverage attestation or a provider-owned change_coverage field."
+            ? "Use Review Mesh-mediated reads for every required snapshot. Call coverage_status before finalizing and read its outstanding byte ranges, at most maximum_read_bytes per call. Do not emit a coverage attestation or a provider-owned change_coverage field."
             : "Emit an exact coverage attestation for attested proof. Attested evidence must never be labelled observed.",
           coverage.unavailablePaths?.length
             ? `These files are explicitly unavailable and must remain coverage deficits: ${coverage.unavailablePaths.join(", ")}. Do not claim they were inspected.`
@@ -148,5 +153,30 @@ export function buildReviewerPrompt({
         ]),
   ];
   const user = userSections.join("\n\n");
-  return { system, user, combined: `${system}\n\n${user}` };
+  const git = context.git;
+  const deliveredDiff =
+    git.is_repository &&
+    git.raw_diff !== undefined &&
+    !git.truncated.diff &&
+    Buffer.byteLength(git.diff, "utf8") === git.raw_diff.byte_count &&
+    createHash("sha256").update(git.diff, "utf8").digest("hex") ===
+      git.raw_diff.sha256
+      ? {
+          userSha256: createHash("sha256").update(user, "utf8").digest("hex"),
+          diff: {
+            byteCount: git.raw_diff.byte_count,
+            sha256: git.raw_diff.sha256,
+            paths:
+              git.changed_paths?.map((entry) => entry.path) ??
+              git.changed_files,
+          },
+        }
+      : undefined;
+  return {
+    system,
+    user,
+    combined: `${system}\n\n${user}`,
+    ...(deliveredDiff === undefined ? {} : { delivery: deliveredDiff }),
+  };
 }
+import { createHash } from "node:crypto";

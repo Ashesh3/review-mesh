@@ -305,6 +305,8 @@ describe("generic command adapter", () => {
       recordDiffDelivery: vi.fn(),
       reconcileAttestation: vi.fn(),
       summary: vi.fn(),
+      status: vi.fn(),
+      snapshotIdentity: vi.fn(),
       entries: vi.fn(),
       snapshotFiles: vi.fn(() => []),
       close: vi.fn(async () => undefined),
