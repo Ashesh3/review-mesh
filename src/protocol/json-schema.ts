@@ -1,5 +1,11 @@
 import { z } from "zod";
-import { adjudicationResultSchema, reviewerResultV3Schema } from "./schemas.js";
+import {
+  adjudicationResultSchema,
+  adjudicationResultV2Schema,
+  providerReviewerResultV4Schema,
+  resultPageSchema,
+  reviewerResultV3Schema,
+} from "./schemas.js";
 
 export const reviewerResultJsonSchema = z.toJSONSchema(reviewerResultV3Schema, {
   target: "draft-07",
@@ -9,6 +15,20 @@ export const adjudicationResultJsonSchema = z.toJSONSchema(
   adjudicationResultSchema,
   { target: "draft-07" },
 );
+
+export const providerReviewerResultV4JsonSchema = z.toJSONSchema(
+  providerReviewerResultV4Schema,
+  { target: "draft-07" },
+);
+
+export const adjudicationResultV2JsonSchema = z.toJSONSchema(
+  adjudicationResultV2Schema,
+  { target: "draft-07" },
+);
+
+export const resultPageJsonSchema = z.toJSONSchema(resultPageSchema, {
+  target: "draft-07",
+});
 
 export function adjudicationResultJsonSchemaFor(
   candidateFindingIds: readonly string[],

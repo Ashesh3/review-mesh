@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   lstat,
   mkdtemp,
@@ -13,7 +14,7 @@ import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createOpenAICompatibleAdapter,
   type OpenAICompatibleAdapterDependencies,
@@ -26,6 +27,7 @@ import type {
   ReviewAdapter,
 } from "../../src/adapters/types.js";
 import { reviewerResultJsonSchema } from "../../src/protocol/json-schema.js";
+import { createChangeCoverageLedger } from "../../src/context/change-coverage.js";
 import {
   passResult,
   resolvedContext,
@@ -84,6 +86,142 @@ function sseAssistant(content: string, finishReason = "stop"): Response {
   ]);
 }
 
+const pageDigest = (raw: string): string =>
+  createHash("sha256").update(raw, "utf8").digest("hex");
+
+function pagedReviewerResult(resultId: string): string[] {
+  const finding = (id: string) => ({
+    id,
+    severity: "high",
+    title: `Finding ${id}`,
+    description: "A defect is present.",
+    evidence: [
+      { path: "src/index.ts", start_line: 1, end_line: 1, detail: "Evidence." },
+    ],
+    suggested_direction: "Fix it.",
+    confidence: "high",
+    classification: "confirmed_defect",
+    external_assumptions: [],
+    category: "correctness",
+    verification: "Run the regression test.",
+    claim: {
+      trigger: "The path runs.",
+      affected_behavior: "The value is wrong.",
+      outcome: "The operation fails.",
+    },
+  });
+  const pages: string[] = [];
+  pages.push(
+    JSON.stringify({
+      schema_version: "1",
+      kind: "review-mesh.result-page",
+      result_id: resultId,
+      result_kind: "reviewer",
+      result_schema_version: "4",
+      page_index: 0,
+      page_count: 5,
+      page_kind: "header",
+      previous_page_digest: null,
+      payload: {
+        verdict: "fail",
+        summary: "Six findings.",
+        informational_notes: [],
+        narrative_byte_count: 18,
+        narrative_fragment_count: 1,
+        actionable_finding_count: 6,
+        coverage_attestation: null,
+      },
+    }),
+  );
+  pages.push(
+    JSON.stringify({
+      schema_version: "1",
+      kind: "review-mesh.result-page",
+      result_id: resultId,
+      result_kind: "reviewer",
+      result_schema_version: "4",
+      page_index: 1,
+      page_count: 5,
+      page_kind: "narrative",
+      previous_page_digest: pageDigest(pages[0]!),
+      payload: { text_fragment: "Original narrative" },
+    }),
+  );
+  for (let index = 0; index < 3; index += 1) {
+    pages.push(
+      JSON.stringify({
+        schema_version: "1",
+        kind: "review-mesh.result-page",
+        result_id: resultId,
+        result_kind: "reviewer",
+        result_schema_version: "4",
+        page_index: index + 2,
+        page_count: 5,
+        page_kind: "findings",
+        previous_page_digest: pageDigest(pages[index + 1]!),
+        payload: {
+          actionable_findings: [
+            finding(`f-${index * 2 + 1}`),
+            finding(`f-${index * 2 + 2}`),
+          ],
+        },
+      }),
+    );
+  }
+  return pages;
+}
+
+function pagedAdjudicationResult(
+  resultId: string,
+  candidateIds: string[],
+): string[] {
+  const pages: string[] = [];
+  pages.push(
+    JSON.stringify({
+      schema_version: "1",
+      kind: "review-mesh.result-page",
+      result_id: resultId,
+      result_kind: "adjudication",
+      result_schema_version: "2",
+      page_index: 0,
+      page_count: 2,
+      page_kind: "header",
+      previous_page_digest: null,
+      payload: {
+        verdict: "pass",
+        review_markdown: "Candidates rejected.",
+        summary: "No confirmed defects.",
+        informational_notes: [],
+        candidate_count: candidateIds.length,
+        candidate_ids_digest: pageDigest(JSON.stringify(candidateIds)),
+      },
+    }),
+  );
+  pages.push(
+    JSON.stringify({
+      schema_version: "1",
+      kind: "review-mesh.result-page",
+      result_id: resultId,
+      result_kind: "adjudication",
+      result_schema_version: "2",
+      page_index: 1,
+      page_count: 2,
+      page_kind: "decisions",
+      previous_page_digest: pageDigest(pages[0]!),
+      payload: {
+        decisions: candidateIds.map((id) => ({
+          source_finding_id: id,
+          decision: "rejected",
+          rationale: "Evidence is insufficient.",
+          cited_evidence: [],
+          unverified_assumptions: [],
+        })),
+      },
+    }),
+  );
+  return pages;
+}
+
 function fetchMock(
   implementation: (
     input: string | URL | Request,
@@ -95,9 +233,20 @@ function fetchMock(
 
 async function collect(adapter: ReviewAdapter, input: AdapterReviewInput) {
   const events: AdapterEvent[] = [];
-  for await (const event of adapter.run(input)) events.push(event);
+  for await (const event of adapter.run(input)) {
+    events.push(event);
+    if (event.type === "result" && event.resultStorage)
+      pendingStorage.push(event.resultStorage);
+  }
   return events;
 }
+
+const pendingStorage: Array<{ abandoned(): void | Promise<void> }> = [];
+afterEach(async () => {
+  await Promise.all(
+    pendingStorage.splice(0).map((storage) => storage.abandoned()),
+  );
+});
 
 function terminal(events: AdapterEvent[]) {
   const event = events.find(
@@ -153,6 +302,455 @@ const nodeIdentity: FileSystemIdentityFacade = {
 };
 
 describe("OpenAI-compatible adapter", () => {
+  it("produces exact semantic result pages from one inspection checkpoint", async () => {
+    const resultId = "result-pages-1";
+    const pages = pagedReviewerResult(resultId);
+    const firstSplit = Math.floor(pages[0]!.length / 2);
+    const bodies: any[] = [];
+    const responses = [
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      assistantResponse(
+        { role: "assistant", content: pages[0]!.slice(0, firstSplit) },
+        "length",
+      ),
+      assistantResponse(
+        { role: "assistant", content: pages[0]!.slice(firstSplit) },
+        "stop",
+      ),
+      ...pages
+        .slice(1)
+        .map((page) =>
+          assistantResponse({ role: "assistant", content: page }, "stop"),
+        ),
+    ];
+    const prepared = setup(
+      "C:\\workspace",
+      {
+        fetch: fetchMock(async (_input, init) => {
+          bodies.push(JSON.parse(String(init?.body)));
+          return responses.shift()!;
+        }),
+      },
+      {
+        resultPages: { resultId, resultKind: "reviewer" },
+      },
+    );
+
+    const events = await collect(prepared.adapter, prepared.input);
+    expect(terminal(events)).toMatchObject({
+      type: "result",
+      result: {
+        schema_version: "4",
+        review_markdown: "Original narrative",
+        actionable_findings: [
+          { id: "f-1" },
+          { id: "f-2" },
+          { id: "f-3" },
+          { id: "f-4" },
+          { id: "f-5" },
+          { id: "f-6" },
+        ],
+      },
+    });
+    const pageBodies = bodies.slice(1);
+    expect(pageBodies).toHaveLength(6);
+    expect(pageBodies.every((body) => body.tools === undefined)).toBe(true);
+    const request = JSON.parse(pageBodies[2].messages.at(-1).content);
+    expect(request.page_index).toBe(1);
+    expect(request.previous_page_digest).toBe(pageDigest(pages[0]!));
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "progress",
+        phase: "result_page",
+        identity: `${resultId}:page:0`,
+        byteCount: Buffer.byteLength(pages[0]!, "utf8"),
+      }),
+    );
+  });
+
+  it("rejects a malformed page chain with typed bounded diagnostics", async () => {
+    const resultId = "broken-pages";
+    const pages = pagedReviewerResult(resultId);
+    const broken = JSON.parse(pages[1]!) as Record<string, unknown>;
+    broken.previous_page_digest = "f".repeat(64);
+    const responses = [
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      assistantResponse({ role: "assistant", content: pages[0] }),
+      assistantResponse({ role: "assistant", content: JSON.stringify(broken) }),
+    ];
+    const prepared = setup(
+      "C:\\workspace",
+      {
+        finalizationAttempts: 1,
+        fetch: fetchMock(async () => responses.shift()!),
+      },
+      { resultPages: { resultId, resultKind: "reviewer" } },
+    );
+
+    const events = await collect(prepared.adapter, prepared.input);
+    expect(terminal(events)).toMatchObject({
+      type: "failure",
+      failure: {
+        reason: "protocol_violation",
+        fallback_eligible: true,
+        diagnostics: {
+          failure_code: "provider_response_invalid",
+          failure_stage: "structured_result_page",
+          response_bytes: Buffer.byteLength(JSON.stringify(broken), "utf8"),
+        },
+      },
+    });
+  });
+
+  it("pins adjudication candidate assignment into each page request and schema", async () => {
+    const resultId = "adjudication-pages";
+    const candidateIds = ["candidate-a", "candidate-b"];
+    const pages = pagedAdjudicationResult(resultId, candidateIds);
+    const bodies: any[] = [];
+    const responses = [
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      ...pages.map((page) =>
+        assistantResponse({ role: "assistant", content: page }),
+      ),
+    ];
+    const prepared = setup(
+      "C:\\workspace",
+      {
+        fetch: fetchMock(async (_input, init) => {
+          bodies.push(JSON.parse(String(init?.body)));
+          return responses.shift()!;
+        }),
+      },
+      { resultPages: { resultId, resultKind: "adjudication", candidateIds } },
+    );
+
+    const events = await collect(prepared.adapter, prepared.input);
+    expect(terminal(events)).toMatchObject({
+      type: "result",
+      result: {
+        schema_version: "2",
+        kind: "review-mesh.adjudication-result",
+        decisions: [
+          { source_finding_id: "candidate-a" },
+          { source_finding_id: "candidate-b" },
+        ],
+      },
+    });
+    const request = JSON.parse(bodies[2].messages.at(-1).content);
+    expect(request.candidate_ids).toEqual(candidateIds);
+    expect(
+      JSON.stringify(bodies[2].response_format.json_schema.schema),
+    ).toContain("candidate-a");
+  });
+
+  it("credits an exact observed read only after its full tool response is admitted", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mesh-oai-coverage-"));
+    await writeFile(join(root, "observed.txt"), "complete bytes\n");
+    const context = resolvedContext({
+      workspace: root,
+      review_scope: { mode: "changes", source: "request" },
+      git: {
+        is_repository: true,
+        root,
+        branch: "main",
+        head: "a".repeat(40),
+        merge_base: "b".repeat(40),
+        status_entries: [" M observed.txt"],
+        changed_files: ["observed.txt"],
+        changed_paths: [{ path: "observed.txt", kind: "tracked" }],
+        diff_stat: " observed.txt | 1 +",
+        diff: "diff --git a/observed.txt b/observed.txt\n",
+        raw_diff: { byte_count: 45, sha256: "c".repeat(64) },
+        truncated: {
+          status_entries: false,
+          changed_files: false,
+          diff_stat: false,
+          diff: false,
+        },
+      },
+    });
+    const coverage = await createChangeCoverageLedger({
+      context,
+      policy: {
+        relevantPaths: ["**"],
+        proof: "observed",
+        minimumInspection: "full_file",
+      },
+    });
+    const responses = [
+      assistantResponse({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "read-exact",
+            type: "function",
+            function: {
+              name: "read_file",
+              arguments: JSON.stringify({ path: "observed.txt" }),
+            },
+          },
+        ],
+      }),
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      assistantResponse({
+        role: "assistant",
+        content: JSON.stringify(passResult("Legacy completion.")),
+      }),
+    ];
+    const prepared = setup(
+      root,
+      {
+        fetch: fetchMock(async () => responses.shift()!),
+      },
+      { context, coverage },
+    );
+
+    try {
+      expect(
+        terminal(await collect(prepared.adapter, prepared.input)).type,
+      ).toBe("result");
+      expect(coverage.entries()).toContainEqual(
+        expect.objectContaining({
+          path: "observed.txt",
+          snapshot_read: "satisfied",
+        }),
+      );
+    } finally {
+      await coverage.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not credit an exact observed read dropped by the conversation budget", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mesh-oai-coverage-drop-"));
+    await writeFile(join(root, "observed.txt"), "x".repeat(8_000));
+    const context = resolvedContext({
+      workspace: root,
+      review_scope: { mode: "changes", source: "request" },
+      git: {
+        is_repository: true,
+        root,
+        branch: "main",
+        head: "a".repeat(40),
+        merge_base: "b".repeat(40),
+        status_entries: [" M observed.txt"],
+        changed_files: ["observed.txt"],
+        changed_paths: [{ path: "observed.txt", kind: "tracked" }],
+        diff_stat: " observed.txt | 1 +",
+        diff: "diff --git a/observed.txt b/observed.txt\n",
+        raw_diff: { byte_count: 45, sha256: "c".repeat(64) },
+        truncated: {
+          status_entries: false,
+          changed_files: false,
+          diff_stat: false,
+          diff: false,
+        },
+      },
+    });
+    const coverage = await createChangeCoverageLedger({
+      context,
+      policy: {
+        relevantPaths: ["**"],
+        proof: "observed",
+        minimumInspection: "full_file",
+      },
+    });
+    const responses = [
+      assistantResponse({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "read-drop",
+            type: "function",
+            function: {
+              name: "read_file",
+              arguments: JSON.stringify({ path: "observed.txt" }),
+            },
+          },
+        ],
+      }),
+      assistantResponse({
+        role: "assistant",
+        content: JSON.stringify(passResult("Bounded.")),
+      }),
+    ];
+    const prepared = setup(
+      root,
+      {
+        maxConversationBytes: 5_000,
+        fetch: fetchMock(async () => responses.shift()!),
+      },
+      { context, coverage },
+    );
+
+    try {
+      await collect(prepared.adapter, prepared.input);
+      expect(coverage.entries()).toContainEqual(
+        expect.objectContaining({
+          path: "observed.txt",
+          snapshot_read: "not_inspected",
+        }),
+      );
+    } finally {
+      await coverage.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("records exact initial diff delivery only after provider request admission", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mesh-oai-diff-"));
+    await writeFile(join(root, "changed.txt"), "changed\n");
+    const diff = "diff --git a/changed.txt b/changed.txt\n";
+    const context = resolvedContext({
+      workspace: root,
+      review_scope: { mode: "changes", source: "request" },
+      git: {
+        is_repository: true,
+        root,
+        branch: "main",
+        head: "a".repeat(40),
+        merge_base: "b".repeat(40),
+        status_entries: [" M changed.txt"],
+        changed_files: ["changed.txt"],
+        changed_paths: [{ path: "changed.txt", kind: "tracked" }],
+        diff_stat: "",
+        diff,
+        raw_diff: {
+          byte_count: Buffer.byteLength(diff),
+          sha256: pageDigest(diff),
+        },
+        truncated: {
+          status_entries: false,
+          changed_files: false,
+          diff_stat: false,
+          diff: false,
+        },
+      },
+    });
+    const coverage = await createChangeCoverageLedger({
+      context,
+      policy: {
+        relevantPaths: ["**"],
+        proof: "observed",
+        minimumInspection: "diff",
+      },
+    });
+    const responses = [
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      assistantResponse({
+        role: "assistant",
+        content: JSON.stringify(passResult("Diff admitted.")),
+      }),
+    ];
+    const prepared = setup(
+      root,
+      {
+        fetch: fetchMock(async () => responses.shift()!),
+      },
+      {
+        context,
+        coverage,
+        prompt: {
+          system: "Trusted.",
+          user: diff,
+          combined: `Trusted.\n\n${diff}`,
+        },
+      },
+    );
+
+    try {
+      expect(
+        terminal(await collect(prepared.adapter, prepared.input)).type,
+      ).toBe("result");
+      expect(coverage.entries()).toContainEqual(
+        expect.objectContaining({
+          path: "changed.txt",
+          diff_delivery: "satisfied",
+        }),
+      );
+    } finally {
+      await coverage.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("emits response-boundary progress before a non-streaming body completes", async () => {
+    const page = pagedReviewerResult("slow-response")[0]!;
+    let releaseBody!: () => void;
+    const released = new Promise<void>((resolve) => {
+      releaseBody = resolve;
+    });
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        async start(controller) {
+          await released;
+          controller.enqueue(
+            new TextEncoder().encode(
+              JSON.stringify({
+                choices: [
+                  {
+                    message: { role: "assistant", content: page },
+                    finish_reason: "stop",
+                  },
+                ],
+              }),
+            ),
+          );
+          controller.close();
+        },
+      }),
+      {
+        headers: {
+          "content-type": "application/json",
+          "x-request-id": "slow-1",
+        },
+      },
+    );
+    const responses = [
+      assistantResponse({ role: "assistant", content: "Inspection complete." }),
+      response,
+    ];
+    const prepared = setup(
+      "C:\\workspace",
+      {
+        finalizationAttempts: 1,
+        fetch: fetchMock(async () => responses.shift()!),
+      },
+      { resultPages: { resultId: "slow-response", resultKind: "reviewer" } },
+    );
+    const iterator = prepared.adapter
+      .run(prepared.input)
+      [Symbol.asyncIterator]();
+    let boundaryPromise = iterator.next();
+    for (;;) {
+      const candidate = await boundaryPromise;
+      if (
+        candidate.value?.type === "progress" &&
+        candidate.value.phase === "response"
+      ) {
+        boundaryPromise = Promise.resolve(candidate);
+        break;
+      }
+      boundaryPromise = iterator.next();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const boundary = await Promise.race([
+      boundaryPromise,
+      new Promise<never>((_resolve, reject) =>
+        setTimeout(() => reject(new Error("no boundary")), 100),
+      ),
+    ]);
+    expect(boundary.value).toMatchObject({
+      type: "progress",
+      phase: "response",
+      identity: expect.stringContaining(":response:"),
+      byteCount: 0,
+    });
+    releaseBody();
+    await iterator.return?.();
+  });
   it("uses SSE transport in auto mode and accepts a complete streamed result", async () => {
     const requests: any[] = [];
     const responses = [

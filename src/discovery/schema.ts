@@ -1,5 +1,14 @@
 import { z } from "zod";
 import {
+  reviewRequestV3Schema,
+  publicEventV6Schema,
+  reviewerResultV4Schema,
+  adjudicationResultV2Schema,
+  resultPageSchema,
+  v9RunOutcomeSchema,
+  v9GateOutcomeSchema,
+} from "../protocol/v9.js";
+import {
   configApplyRequestSchema,
   trustedConfigSchema,
 } from "../config/schemas.js";
@@ -174,10 +183,36 @@ export const schemaNames = [
 export type SchemaName = (typeof schemaNames)[number];
 
 const schemas = {
-  request: reviewRequestV2Schema,
-  events: publicEventSchema,
-  "run-status": runStatusSchema,
-  result: reviewerResultSchema,
+  request: z.union([reviewRequestV3Schema, reviewRequestV2Schema]),
+  events: publicEventV6Schema,
+  "run-status": z.union([
+    runStatusSchema,
+    z
+      .object({
+        schema_version: z.literal("3"),
+        kind: z.literal("review-mesh.run-status"),
+        run_id: z.string().min(1),
+        active: z.boolean().optional(),
+        run_outcome: v9RunOutcomeSchema.optional(),
+        gate_outcome: v9GateOutcomeSchema.optional(),
+        coverage_outcome: z.enum(["complete", "partial"]).optional(),
+        reviewers: z
+          .array(
+            z
+              .object({
+                reviewer_id: z.string().min(1),
+                state: z.enum(["completed", "incomplete", "skipped"]),
+                complete_result: z
+                  .union([reviewerResultV4Schema, adjudicationResultV2Schema])
+                  .optional(),
+              })
+              .passthrough(),
+          )
+          .optional(),
+      })
+      .passthrough(),
+  ]),
+  result: z.union([reviewerResultV4Schema, adjudicationResultV2Schema]),
   config: trustedConfigSchema,
   "config-apply": configApplyRequestSchema,
   diagnostic: diagnosticSchema,

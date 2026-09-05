@@ -107,6 +107,135 @@ afterEach(async () => {
 });
 
 describe("managed configuration", () => {
+  it("migrates to v7 while preserving explicit heartbeat, roster, order, quorum, and acknowledgements", () => {
+    const legacy = legacyConfig("5") as {
+      execution: Record<string, unknown>;
+      agents: Record<string, Record<string, unknown>>;
+      defaults: { agents: string[] };
+    };
+    legacy.execution.heartbeat_interval_ms = 15_000;
+    legacy.agents.gemini = {
+      adapter: "gateway",
+      model_runs: [
+        { id: "first", model: "one", provider_group: "a" },
+        { id: "second", model: "two", provider_group: "b" },
+      ],
+      purpose: "Strict legacy review",
+      instructions: "Review.",
+      isolation: "prefer_enforced",
+      timeout_ms: 60_000,
+      applicability: { any_changed_paths: ["src/**"] },
+      required_context: ["/ticket"],
+      pass_quorum: 2,
+      minimum_provider_groups: 2,
+    };
+    legacy.defaults.agents = ["gemini"];
+
+    const migrated = parseManagedConfig(`${stringify(legacy)}\n`);
+    expect(migrated.config).toMatchObject({
+      schema_version: "7",
+      execution: {
+        heartbeat_interval_ms: 15_000,
+        deadline_mode: "adaptive",
+        no_progress_timeout_ms: 300_000,
+      },
+      defaults: { agents: ["gemini"] },
+      agents: {
+        gemini: {
+          kind: "generic",
+          model_runs: [{ id: "first" }, { id: "second" }],
+          pass_quorum: 2,
+          minimum_provider_groups: 2,
+          allow_zero_outage_tolerance: true,
+          required_input: ["/context/ticket"],
+          change_coverage: {
+            relevant_paths: ["src/**"],
+            minimum_inspection: "full_file",
+            proof: "observed",
+          },
+        },
+      },
+    });
+    expect(migrated.warnings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: "implicit_v9_deadline" }),
+        expect.objectContaining({
+          code: "implicit_v9_change_coverage",
+          lens_ids: ["gemini"],
+        }),
+      ]),
+    );
+  });
+
+  it("derives one attested policy when any candidate adapter is opaque", () => {
+    const legacy = legacyConfig("5") as {
+      adapters: Record<string, unknown>;
+      agents: Record<string, Record<string, unknown>>;
+    };
+    legacy.adapters.opaque = {
+      type: "command",
+      command: "reviewer",
+      protocol: "review-mesh-command-v1",
+    };
+    legacy.agents.gemini = {
+      adapter: "gateway",
+      model_runs: [
+        { id: "mediated", model: "one" },
+        { id: "opaque", adapter: "opaque", model: "two" },
+      ],
+      purpose: "Mixed adapters",
+      instructions: "Review.",
+      isolation: "prefer_enforced",
+      timeout_ms: 60_000,
+    };
+    const migrated = parseManagedConfig(`${stringify(legacy)}\n`);
+    expect(migrated.config.agents.gemini?.change_coverage?.proof).toBe(
+      "attested",
+    );
+    expect(migrated.warnings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "attested_coverage_requires_adapter_upgrade",
+          lens_ids: ["gemini"],
+        }),
+      ]),
+    );
+  });
+
+  it("preserves v6 five-model defaults, applicability, continuation, and selector meaning", () => {
+    const current = config();
+    current.schema_version = "6";
+    current.execution.continuation_attempts = 5;
+    current.agents.gemini = {
+      adapter: "gateway",
+      model_runs: ["a", "b", "c", "d", "e"].map((id) => ({
+        id,
+        model: id,
+        provider_group: id,
+      })),
+      purpose: "V6 defaults",
+      instructions: "Review.",
+      isolation: "prefer_enforced",
+      timeout_ms: 60_000,
+      applicability: {
+        mode: "changed_paths",
+        any_changed_paths: ["src/**"],
+      },
+      required_context: ["legacy_key"],
+    };
+    const migrated = parseManagedConfig(`${stringify(current)}\n`).config;
+    expect(migrated.execution.continuation_attempts).toBe(5);
+    expect(migrated.agents.gemini).toMatchObject({
+      pass_quorum: 3,
+      minimum_provider_groups: 3,
+      applicability: {
+        mode: "changed_paths",
+        any_changed_paths: ["src/**"],
+      },
+      required_input: ["/context/legacy_key"],
+      change_coverage: { relevant_paths: ["src/**"] },
+    });
+  });
   it("migrates v5 lenses to explicit v6 policy without inventing prerequisites", () => {
     const legacy = legacyConfig("5") as {
       agents: Record<string, Record<string, unknown>>;
@@ -117,13 +246,13 @@ describe("managed configuration", () => {
     const result = parseManagedConfig(`${stringify(legacy)}\n`);
 
     expect(result.migrated).toBe(true);
-    expect(result.config.schema_version).toBe("6");
+    expect(result.config.schema_version).toBe("7");
     expect(result.config.agents.gemini).toMatchObject({
       applicability: {
         mode: "changed_paths",
         any_changed_paths: ["deploy/**"],
       },
-      required_context: [],
+      required_input: [],
     });
     expect(result.config.adapters.gateway).toMatchObject({
       type: "openai_compatible",
@@ -158,30 +287,30 @@ describe("managed configuration", () => {
       minimum_provider_groups: 5,
       allow_zero_outage_tolerance: true,
       applicability: { mode: "always" },
-      required_context: [],
+      required_input: [],
     });
   });
 
-  it("normalizes managed saves to schema v6", () => {
+  it("normalizes managed saves to schema v7", () => {
     const serialized = serializeManagedConfig(
       legacyConfig("5") as unknown as ManagedConfig,
     );
     expect(parseManagedConfig(serialized)).toMatchObject({
       migrated: false,
       config: {
-        schema_version: "6",
+        schema_version: "7",
         execution: { allow_provider_concentration: false },
         agents: {
           gemini: {
             applicability: { mode: "always" },
-            required_context: [],
+            required_input: [],
           },
         },
       },
     });
   });
 
-  it("round-trips a native v6 configuration", () => {
+  it("migrates and round-trips a native v6 configuration as v7", () => {
     const configured = config();
     configured.adapters.gateway = {
       type: "openai_compatible",
@@ -190,9 +319,10 @@ describe("managed configuration", () => {
       streaming: "required",
     };
     const serialized = serializeManagedConfig(configured);
-    expect(parseManagedConfig(serialized)).toEqual({
-      config: configured,
+    expect(parseManagedConfig(serialized)).toMatchObject({
+      config: { schema_version: "7" },
       migrated: false,
+      warnings: [],
     });
     expect(serialized).toContain('streaming = "required"');
   });
@@ -221,7 +351,12 @@ describe("managed configuration", () => {
     };
 
     const parsed = parseManagedConfig(serializeManagedConfig(multi));
-    expect(parsed.config.agents.gemini).toEqual(multi.agents.gemini);
+    expect(parsed.config.agents.gemini).toMatchObject({
+      adapter: "gateway",
+      model_runs: multi.agents.gemini.model_runs,
+      required_input: [],
+      change_coverage: { proof: "observed" },
+    });
   });
 
   it("rejects invalid model-run shapes and expanded reviewer id collisions", () => {
@@ -311,7 +446,7 @@ describe("managed configuration", () => {
     const legacy = `schema_version = "1"
 [execution]
 max_concurrency = 1
-heartbeat_interval_ms = 100
+heartbeat_interval_ms = 1000
 shutdown_grace_period_ms = 100
 [diagnostics]
 persist_runs = false
@@ -339,18 +474,26 @@ append_instructions = "extra"
     expect(result.config.agents["agent-one"]?.instructions).toBe(
       "base\n\nextra",
     );
+    expect(result.warnings.map(({ code }) => code)).toEqual([
+      "implicit_v9_deadline",
+      "implicit_v9_change_coverage",
+    ]);
   });
 
   it("reads scalar v2 configuration and promotes it to managed v4", () => {
     const legacyV2 = `${stringify(legacyConfig("2"))}\n`;
     const result = parseManagedConfig(legacyV2);
     expect(result.migrated).toBe(true);
-    expect(result.config.schema_version).toBe("6");
+    expect(result.config.schema_version).toBe("7");
     expect(result.config.execution.distribute_primaries).toBe(false);
     expect(result.config.agents.gemini).toMatchObject({
       model: "gemini-flash",
       effort: "high",
     });
+    expect(result.warnings.map(({ code }) => code)).toEqual([
+      "implicit_v9_deadline",
+      "implicit_v9_change_coverage",
+    ]);
   });
 
   it("preserves configured primary order when promoting v4 to v6", () => {
@@ -407,9 +550,13 @@ agents = ["gemini"]
     const file = join(directory, "nested", "config.toml");
     const loaded = await loadManagedConfig(file, true);
     const saved = await saveManagedConfig(file, config(), loaded.snapshot);
-    expect(parseManagedConfig(await readFile(file, "utf8")).config).toEqual(
-      config(),
-    );
+    expect(
+      parseManagedConfig(await readFile(file, "utf8")).config,
+    ).toMatchObject({
+      schema_version: "7",
+      execution: { heartbeat_interval_ms: 15_000 },
+      defaults: { agents: ["gemini"] },
+    });
     if (process.platform !== "win32") {
       expect((await stat(file)).mode & 0o777).toBe(0o600);
     }

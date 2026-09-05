@@ -1,7 +1,13 @@
 import {
+  adjudicationResultV2Schema,
   currentReviewerOutputSchema,
+  providerReviewerResultV4Schema,
+  reviewerResultV4Schema,
   reviewerResultV3Schema,
+  type AdjudicationResultV2,
   type CurrentReviewerOutput,
+  type ProviderReviewerResultV4,
+  type ReviewerResultV4,
   type ReviewerResultV3,
 } from "../protocol/schemas.js";
 
@@ -167,6 +173,11 @@ function sanitizeValue(value: unknown): unknown {
   return null;
 }
 
+/** Lossless credential redaction for private metadata; never truncates text. */
+export function sanitizeRunMetadata(value: unknown): unknown {
+  return sanitizeValue(value);
+}
+
 export function sanitizeReviewerResult(value: unknown): ReviewerResultV3 {
   const sanitized = reviewerResultV3Schema.parse(sanitizeValue(value));
   const byteLength = Buffer.byteLength(JSON.stringify(sanitized), "utf8");
@@ -180,6 +191,24 @@ export function sanitizeCurrentReviewerOutput(
   value: unknown,
 ): CurrentReviewerOutput {
   const sanitized = currentReviewerOutputSchema.parse(sanitizeValue(value));
+  const byteLength = Buffer.byteLength(JSON.stringify(sanitized), "utf8");
+  if (byteLength > MAX_REVIEWER_RESULT_BYTES) {
+    throw new ResultSanitizationError(byteLength);
+  }
+  return sanitized;
+}
+
+export type V9ReviewerOutput =
+  ProviderReviewerResultV4 | ReviewerResultV4 | AdjudicationResultV2;
+
+export function sanitizeReviewerOutput(value: unknown): V9ReviewerOutput {
+  const sanitizedValue = sanitizeValue(value);
+  const parsed = providerReviewerResultV4Schema.safeParse(sanitizedValue);
+  const sanitized = parsed.success
+    ? parsed.data
+    : reviewerResultV4Schema
+        .or(adjudicationResultV2Schema)
+        .parse(sanitizedValue);
   const byteLength = Buffer.byteLength(JSON.stringify(sanitized), "utf8");
   if (byteLength > MAX_REVIEWER_RESULT_BYTES) {
     throw new ResultSanitizationError(byteLength);

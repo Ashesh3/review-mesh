@@ -24,6 +24,16 @@ import {
   validateChangedPathGlob,
 } from "../orchestrator/lens-policy.js";
 
+const CHANGE_READINESS_SELECTORS = [
+  "/request/pull_request/id",
+  "/request/pull_request/url",
+  "/request/pull_request/title",
+  "/request/pull_request/description",
+  "/request/pull_request/work_items",
+  "/request/pull_request/validation",
+  "/request/pull_request/contract_impact",
+] as const;
+
 export interface ConfigPrompter {
   ask(question: string, signal?: AbortSignal): Promise<string>;
   close(): void;
@@ -32,6 +42,7 @@ export interface ConfigPrompter {
 export interface ConfigMenuOptions {
   configFile: string;
   config: ManagedConfig;
+  pendingMigrationConfirmation?: boolean;
   snapshot: ConfigSnapshot;
   prompt: ConfigPrompter;
   output: NodeJS.WritableStream;
@@ -620,7 +631,21 @@ async function addAgent(options: ConfigMenuOptions): Promise<void> {
       : "prefer_enforced",
     timeout_ms: timeout,
     applicability: { mode: "always" },
-    required_context: [],
+    kind: "generic",
+    required_input: [],
+    change_coverage: {
+      relevant_paths: ["**"],
+      minimum_inspection: "full_file",
+      proof: ("model_runs" in selection
+        ? selection.model_runs.map((run) => run.adapter ?? adapter)
+        : [adapter]
+      ).some((adapterId) => {
+        const type = config.adapters[adapterId]?.type;
+        return type === "codex" || type === "command";
+      })
+        ? "attested"
+        : "observed",
+    },
   };
   if (agent.model_runs !== undefined) {
     agent.pass_quorum = defaultAgentPassQuorum(agent);
@@ -703,9 +728,16 @@ async function editAgent(options: ConfigMenuOptions): Promise<void> {
     ...(current.applicability === undefined
       ? { applicability: { mode: "always" } as const }
       : { applicability: current.applicability }),
-    ...(current.required_context === undefined
-      ? { required_context: [] }
-      : { required_context: current.required_context }),
+    kind: current.kind ?? "generic",
+    required_input: [...(current.required_input ?? [])],
+    ...(current.lens_deadline_ms === undefined
+      ? {}
+      : { lens_deadline_ms: current.lens_deadline_ms }),
+    change_coverage: current.change_coverage ?? {
+      relevant_paths: ["**"],
+      minimum_inspection: "full_file",
+      proof: "attested",
+    },
     ...(current.pass_quorum === undefined
       ? {}
       : { pass_quorum: current.pass_quorum }),
@@ -770,6 +802,17 @@ async function editAgentPolicy(options: ConfigMenuOptions): Promise<void> {
   const id = await answer(options.prompt, "Agent id for policy: ");
   const agent = options.config.agents[id];
   if (agent === undefined) throw new Error(`unknown agent: ${id}`);
+  const kind = (
+    await answer(
+      options.prompt,
+      `Lens kind (generic or change_readiness) [${agent.kind ?? "generic"}]: `,
+      agent.kind ?? "generic",
+    )
+  ).toLowerCase();
+  if (kind !== "generic" && kind !== "change_readiness") {
+    throw new Error("lens kind must be generic or change_readiness");
+  }
+  agent.kind = kind;
   const currentApplicability = agent.applicability ?? {
     mode: "always" as const,
   };
@@ -818,15 +861,67 @@ async function editAgentPolicy(options: ConfigMenuOptions): Promise<void> {
       case_sensitive: caseSensitive,
     };
   }
-  agent.required_context = commaSeparatedValues(
+  if (kind === "change_readiness") {
+    agent.required_input = [...CHANGE_READINESS_SELECTORS];
+  } else {
+    agent.required_input = commaSeparatedValues(
+      await answer(
+        options.prompt,
+        `Required input selectors [${(agent.required_input ?? []).join(",")}]: `,
+        (agent.required_input ?? []).join(","),
+      ),
+      "caller-context selector",
+      validateCallerContextRequirement,
+    );
+  }
+  const lensDeadline = await answer(
+    options.prompt,
+    `Lens deadline milliseconds [${agent.lens_deadline_ms ?? "run deadline"}; '-' clears]: `,
+    agent.lens_deadline_ms === undefined ? "-" : String(agent.lens_deadline_ms),
+  );
+  if (lensDeadline === "-") delete agent.lens_deadline_ms;
+  else
+    agent.lens_deadline_ms = timerMilliseconds(lensDeadline, "lens deadline");
+  const coverage = agent.change_coverage ?? {
+    relevant_paths: ["**"],
+    minimum_inspection: "full_file" as const,
+    proof: "attested" as const,
+  };
+  coverage.relevant_paths = commaSeparatedValues(
     await answer(
       options.prompt,
-      `Required caller-context selectors [${(agent.required_context ?? []).join(",")}]: `,
-      (agent.required_context ?? []).join(","),
+      `Coverage relevant paths [${coverage.relevant_paths.join(",")}]: `,
+      coverage.relevant_paths.join(","),
     ),
-    "caller-context selector",
-    validateCallerContextRequirement,
+    "coverage path",
+    validateChangedPathGlob,
   );
+  if (coverage.relevant_paths.length === 0) {
+    throw new Error("change coverage requires at least one relevant path");
+  }
+  const minimumInspection = (
+    await answer(
+      options.prompt,
+      `Minimum inspection (full_file or diff) [${coverage.minimum_inspection}]: `,
+      coverage.minimum_inspection,
+    )
+  ).toLowerCase();
+  if (minimumInspection !== "full_file" && minimumInspection !== "diff") {
+    throw new Error("minimum inspection must be full_file or diff");
+  }
+  coverage.minimum_inspection = minimumInspection;
+  const proof = (
+    await answer(
+      options.prompt,
+      `Coverage proof (observed or attested) [${coverage.proof}]: `,
+      coverage.proof,
+    )
+  ).toLowerCase();
+  if (proof !== "observed" && proof !== "attested") {
+    throw new Error("coverage proof must be observed or attested");
+  }
+  coverage.proof = proof;
+  agent.change_coverage = coverage;
   if (agent.model_runs !== undefined) {
     agent.pass_quorum = positiveInteger(
       await answer(
@@ -1185,6 +1280,26 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
 
         if (changed) {
           const normalized = normalizeManagedConfig(options.config);
+          const derivedAttested = Object.entries(normalized.agents)
+            .filter(
+              ([id, agent]) =>
+                agent.change_coverage?.proof === "attested" &&
+                (options.pendingMigrationConfirmation === true ||
+                  before.agents[id]?.change_coverage?.proof !== "attested"),
+            )
+            .map(([id]) => id);
+          if (
+            derivedAttested.length > 0 &&
+            !yes(
+              await answer(
+                options.prompt,
+                `Save weaker attested coverage for ${derivedAttested.join(", ")}? [y/N]: `,
+                "n",
+              ),
+            )
+          ) {
+            throw new Error("attested coverage save was not confirmed");
+          }
           for (const key of Object.keys(options.config) as Array<
             keyof ManagedConfig
           >) {
@@ -1196,6 +1311,7 @@ export async function runConfigMenu(options: ConfigMenuOptions): Promise<void> {
             options.config,
             snapshot,
           );
+          options.pendingMigrationConfirmation = false;
           await write(options.output, "Configuration saved.\n");
         }
       } catch (error) {

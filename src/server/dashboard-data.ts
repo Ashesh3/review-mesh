@@ -1,6 +1,13 @@
 import { constants, type Dirent } from "node:fs";
 import { lstat, open, readdir, realpath, stat } from "node:fs/promises";
-import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+} from "node:path";
 import {
   configRevision,
   listConfig,
@@ -18,7 +25,7 @@ import {
   canonicalizeFindings,
   type CanonicalGatePolicy,
   type CanonicalRawFinding,
-} from "../findings/canonical.js";
+} from "../findings/canonical-legacy.js";
 import {
   failClosedAdjudicationOutcome,
   validateAdjudication,
@@ -141,7 +148,7 @@ interface ReviewerRuntime {
 }
 
 export interface DashboardSnapshot {
-  schema_version: "1";
+  schema_version: "1" | "2";
   generated_at: string;
   server: {
     version: string;
@@ -1125,6 +1132,11 @@ async function readRunSummary(
   candidate: RunFileCandidate,
 ): Promise<DashboardRunSummary> {
   try {
+    const { loadV9Run, v9RunSummary } =
+      await import("../diagnostics/v9-views.js");
+    const current = await loadV9Run(dirname(candidate.path), candidate.runId);
+    if (current)
+      return v9RunSummary(current, candidate.modifiedAt) as DashboardRunSummary;
     const parsed = await parseCandidate(candidate);
     const summary = runSummaryFromParsed(parsed);
     parsed.records.length = 0;
@@ -1343,6 +1355,25 @@ export async function readDashboardSnapshot(input: {
     DASHBOARD_READ_CONCURRENCY,
     readRunSummary,
   );
+  const { listV9Runs, loadV9Run, v9RunSummary } =
+    await import("../diagnostics/v9-views.js");
+  for (const runId of await listV9Runs(input.appPaths.runsDirectory)) {
+    if (runs.some((run) => run.run_id === runId)) continue;
+    try {
+      const current = await loadV9Run(input.appPaths.runsDirectory, runId);
+      if (current) runs.push(v9RunSummary(current) as DashboardRunSummary);
+    } catch (error) {
+      runs.push({
+        run_id: runId,
+        active: false,
+        status: "unreadable",
+        unreadable: true,
+        findings: 0,
+        updated_at: new Date().toISOString(),
+        error: error instanceof Error ? error.message : "Artifact unavailable",
+      });
+    }
+  }
   runs.push(
     ...candidates.omitted.map((candidate) => ({
       run_id: candidate.runId,
@@ -1357,7 +1388,7 @@ export async function readDashboardSnapshot(input: {
   runs.sort((left, right) => right.updated_at.localeCompare(left.updated_at));
   const active = runs.filter((run) => run.active && !run.unreadable);
   return {
-    schema_version: "1",
+    schema_version: "2",
     generated_at: new Date().toISOString(),
     server: {
       version: reviewMeshVersion,
@@ -1627,6 +1658,10 @@ export async function readDashboardRun(input: {
   afterOpen?: () => void | Promise<void>;
 }): Promise<Record<string, unknown>> {
   requireSafeRunId(input.runId);
+  const { loadV9Run, v9DashboardRun } =
+    await import("../diagnostics/v9-views.js");
+  const current = await loadV9Run(input.appPaths.runsDirectory, input.runId);
+  if (current) return v9DashboardRun(current);
   const candidate = (
     await listRunFiles(input.appPaths.runsDirectory, Number.MAX_SAFE_INTEGER)
   ).selected.find((item) => item.runId === input.runId);

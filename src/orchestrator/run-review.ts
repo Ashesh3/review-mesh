@@ -4,6 +4,10 @@ import {
   sanitizePublicText,
   type AdapterFailure,
 } from "../adapters/errors.js";
+import {
+  legacyIncompleteReason,
+  legacyFailureDiagnostics,
+} from "../protocol/legacy-reason.js";
 import type {
   AdapterCapabilities,
   AdapterEvent,
@@ -739,7 +743,7 @@ export async function runReviewRound({
         provider_group: providerGroup(reviewer),
         ...(isolation === undefined ? {} : { isolation }),
         elapsed_ms: terminal.elapsed_ms,
-        reason: failure.reason,
+        reason: legacyIncompleteReason(failure.reason),
         message: failure.message,
         retryable: failure.retryable,
         fallback_eligible: failure.fallback_eligible === true,
@@ -748,7 +752,7 @@ export async function runReviewRound({
           : { circuit_qualifying: failure.circuit_qualifying }),
         ...(failure.diagnostics === undefined
           ? {}
-          : { diagnostics: failure.diagnostics }),
+          : { diagnostics: legacyFailureDiagnostics(failure.diagnostics) }),
         attempt_count: Math.max(1, current.attemptCount),
       },
     });

@@ -3,7 +3,17 @@ import type {
   AdjudicationResult,
   ReviewerResultV3,
 } from "../protocol/schemas.js";
+import type {
+  AdjudicationDecisionV2,
+  AdjudicationResultV2,
+  ReviewerResultV4,
+} from "../protocol/v9.js";
 import type { AdjudicationEvidenceVerification } from "./evidence-verifier.js";
+
+type CandidateResult = ReviewerResultV3 | ReviewerResultV4;
+type CandidateFinding = CandidateResult["actionable_findings"][number];
+type JudgeResult = AdjudicationResult | AdjudicationResultV2;
+type JudgeDecision = AdjudicationDecision | AdjudicationDecisionV2;
 
 export interface AdjudicationValidationContext {
   reviewScope: "changes" | "full";
@@ -37,25 +47,25 @@ export type AdjudicationValidationIssue =
 
 export interface EffectiveAdjudicationDecision {
   source_finding_id: string;
-  requested_decision: AdjudicationDecision["decision"] | "missing";
-  effective_decision: AdjudicationDecision["decision"] | "needs_verification";
+  requested_decision: JudgeDecision["decision"] | "missing";
+  effective_decision: JudgeDecision["decision"] | "needs_verification";
   gate_eligible: boolean;
   issues: AdjudicationValidationIssue[];
-  decision?: AdjudicationDecision;
-  effective_finding?: ReviewerResultV3["actionable_findings"][number];
+  decision?: JudgeDecision;
+  effective_finding?: CandidateFinding;
 }
 
 export interface AdjudicationOutcome {
   complete: boolean;
-  candidate_result: ReviewerResultV3;
-  adjudication_result: AdjudicationResult;
+  candidate_result: CandidateResult;
+  adjudication_result: JudgeResult;
   decisions: EffectiveAdjudicationDecision[];
   unknown_source_finding_ids: string[];
 }
 
 export function failClosedAdjudicationOutcome(
-  candidateResult: ReviewerResultV3,
-  adjudicationResult: AdjudicationResult,
+  candidateResult: CandidateResult,
+  adjudicationResult: JudgeResult,
 ): AdjudicationOutcome {
   const decisionsById = new Map(
     adjudicationResult.decisions.map((decision) => [
@@ -99,7 +109,7 @@ const orderedProofCategories = new Set([
   "cleanup",
 ]);
 
-function validOrderedProof(decision: AdjudicationDecision): {
+function validOrderedProof(decision: JudgeDecision): {
   ordered: boolean;
   citations: boolean;
   failurePoint: boolean;
@@ -219,7 +229,7 @@ function withinCandidateEvidence(
     start_line?: number | undefined;
     end_line?: number | undefined;
   },
-  candidate: ReviewerResultV3["actionable_findings"][number],
+  candidate: CandidateFinding,
 ): boolean {
   if (!concreteCitation(citation)) return false;
   const end = citation.end_line ?? citation.start_line!;
@@ -237,7 +247,7 @@ function contextBoundCitation(
     start_line?: number | undefined;
     end_line?: number | undefined;
   },
-  candidate: ReviewerResultV3["actionable_findings"][number],
+  candidate: CandidateFinding,
   context: AdjudicationValidationContext,
 ): boolean {
   if (!concreteCitation(citation)) return false;
@@ -252,9 +262,9 @@ function contextBoundCitation(
 }
 
 function adjustedFinding(
-  candidate: ReviewerResultV3["actionable_findings"][number],
-  decision: AdjudicationDecision,
-): ReviewerResultV3["actionable_findings"][number] | undefined {
+  candidate: CandidateFinding,
+  decision: JudgeDecision,
+): CandidateFinding | undefined {
   const adjusted = decision.adjusted_finding;
   if (adjusted === undefined) return undefined;
   return {
@@ -265,14 +275,14 @@ function adjustedFinding(
 }
 
 export function validateAdjudication(
-  candidateResult: ReviewerResultV3,
-  adjudicationResult: AdjudicationResult,
+  candidateResult: CandidateResult,
+  adjudicationResult: JudgeResult,
   context: AdjudicationValidationContext,
 ): AdjudicationOutcome {
   const candidateIds = new Set(
     candidateResult.actionable_findings.map((finding) => finding.id),
   );
-  const decisionsById = new Map<string, AdjudicationDecision[]>();
+  const decisionsById = new Map<string, JudgeDecision[]>();
   for (const decision of adjudicationResult.decisions) {
     decisionsById.set(decision.source_finding_id, [
       ...(decisionsById.get(decision.source_finding_id) ?? []),

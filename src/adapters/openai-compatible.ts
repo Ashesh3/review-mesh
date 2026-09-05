@@ -17,13 +17,25 @@ import {
 } from "../protocol/schemas.js";
 import { MAX_REVIEWER_RESULT_BYTES } from "../results/sanitize.js";
 import {
+  createResultPageCollector,
+  MAX_RESULT_PAGE_BYTES,
+  ResultPageError,
+  type ResultPageCollector,
+} from "../results/result-pages.js";
+import { createReadOnlyFileTools } from "./file-tools.js";
+import {
   adapterFailure,
+  sanitizeAdapterFailure,
   type AdapterFailure,
   type AdapterFailureDiagnostics,
   type AdapterResponseStructure,
   type AdapterValidationIssue,
 } from "./errors.js";
 import { OpenAIStreamError, parseOpenAIChatStream } from "./openai-stream.js";
+import {
+  resultPageRequestMessage,
+  resultPageSchemaFor,
+} from "./openai-pages.js";
 import {
   createResultSpool,
   ResultSpoolError,
@@ -197,6 +209,12 @@ const readFileArgumentsSchema = z
     "end_line must be greater than or equal to start_line",
   );
 
+const exactReadFileArgumentsSchema = z.strictObject({
+  path: z.string().min(1).max(MAX_PATH_LENGTH),
+  offset: z.number().int().nonnegative().optional(),
+  byte_count: z.number().int().positive().max(MAX_FILE_BYTES).optional(),
+});
+
 const searchTextArgumentsSchema = z.strictObject({
   query: z.string().min(1).max(MAX_QUERY_LENGTH),
   path: z.string().max(MAX_PATH_LENGTH).optional(),
@@ -253,6 +271,34 @@ const READ_ONLY_TOOLS = [
     },
   },
 ] as const;
+
+const EXACT_READ_ONLY_TOOLS = [
+  READ_ONLY_TOOLS[0],
+  {
+    type: "function",
+    function: {
+      name: "read_file",
+      description:
+        "Read an exact byte range from the pinned workspace snapshot. Content is base64 and earns observed coverage only when the complete response is admitted unchanged.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["path"],
+        properties: {
+          path: { type: "string", minLength: 1, maxLength: MAX_PATH_LENGTH },
+          offset: { type: "integer", minimum: 0 },
+          byte_count: { type: "integer", minimum: 1, maximum: MAX_FILE_BYTES },
+        },
+      },
+    },
+  },
+  READ_ONLY_TOOLS[2],
+] as const;
+
+interface ExecutedToolResult {
+  response: unknown;
+  acknowledgeDelivered?(serializedResponse: string): boolean;
+}
 
 class ProviderRequestError extends Error {
   constructor(readonly failure: AdapterFailure) {
@@ -913,6 +959,27 @@ function exhaustedResultProductionFailure(
   return failure.retryable ? { ...failure, retryable: false } : failure;
 }
 
+function pageFailure(error: ResultPageError): AdapterFailure {
+  const failureCode =
+    error.reason === "result_page_too_large"
+      ? "result_page_too_large"
+      : error.reason === "structured_page_limit_exceeded"
+        ? "structured_page_limit_exceeded"
+        : "provider_response_invalid";
+  return sanitizeAdapterFailure(error.reason, error.message, false, {
+    fallback_eligible: true,
+    circuit_qualifying: false,
+    diagnostics: {
+      failure_code: failureCode,
+      failure_stage: "structured_result_page",
+      scope: "model",
+      ...(error.receivedBytes === undefined
+        ? {}
+        : { response_bytes: error.receivedBytes }),
+    },
+  });
+}
+
 function outputTruncationFailure(
   diagnostics: AdapterFailureDiagnostics,
   repairAttempted: boolean,
@@ -945,6 +1012,39 @@ interface ProviderJsonResponse {
 interface ChatResponse {
   message: z.infer<typeof assistantMessageSchema>;
   diagnostics: AdapterFailureDiagnostics;
+}
+
+interface ChatProgress {
+  identity: string;
+  byteCount: number;
+}
+
+class ChatProgressChannel implements AsyncIterable<ChatProgress> {
+  private readonly queued: ChatProgress[] = [];
+  private readonly waiting: Array<() => void> = [];
+  private closed = false;
+
+  push(progress: ChatProgress): void {
+    if (this.closed) return;
+    this.queued.push(progress);
+    this.waiting.shift()?.();
+  }
+
+  close(): void {
+    this.closed = true;
+    for (const wake of this.waiting.splice(0)) wake();
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<ChatProgress> {
+    while (!this.closed || this.queued.length > 0) {
+      const next = this.queued.shift();
+      if (next !== undefined) {
+        yield next;
+        continue;
+      }
+      await new Promise<void>((resolve) => this.waiting.push(resolve));
+    }
+  }
 }
 
 interface ProviderHttpResponse {
@@ -1483,6 +1583,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
   private readonly activeRequests = new Set<AbortController>();
   private readonly activeWorkspaces = new Set<ReadOnlyWorkspace>();
   private readonly nonStreamingSessions = new Set<string>();
+  private progressSequence = 0;
 
   constructor(
     private readonly registration: OpenAICompatibleRegistration,
@@ -1686,6 +1787,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     operation: "probe" | "chat",
     signal: AbortSignal,
     init: Omit<RequestInit, "signal">,
+    onProgress?: (progress: ChatProgress) => void,
   ): Promise<ProviderJsonResponse> {
     const request = await this.request(
       configuration,
@@ -1695,12 +1797,17 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
       init,
     );
     const responseDiagnostics = request.diagnostics;
+    onProgress?.({
+      identity: `response:${responseDiagnostics.provider_request_id ?? "http"}`,
+      byteCount: 0,
+    });
     try {
       return await this.readJsonResponse(
         request.response,
         responseDiagnostics,
         signal,
         request.timedOut,
+        onProgress,
       );
     } finally {
       request.dispose();
@@ -1712,6 +1819,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     responseDiagnostics: AdapterFailureDiagnostics,
     signal: AbortSignal,
     timedOut: () => boolean,
+    onProgress?: (progress: ChatProgress) => void,
   ): Promise<ProviderJsonResponse> {
     let responseBytes = 0;
     try {
@@ -1767,6 +1875,10 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           const chunk = await reader.read();
           if (chunk.done) break;
           responseBytes += chunk.value.byteLength;
+          onProgress?.({
+            identity: "response-body",
+            byteCount: chunk.value.byteLength,
+          });
           if (responseBytes > MAX_PROVIDER_RESPONSE_BYTES) {
             await reader.cancel();
             throw new ProviderRequestError(
@@ -1925,6 +2037,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     signal: AbortSignal,
     sessionId: string,
     body: Record<string, unknown>,
+    onProgress?: (progress: ChatProgress) => void,
   ): Promise<ProviderJsonResponse> {
     const configuredStreamingMode = this.registration.streaming ?? "disabled";
     const streamingMode = this.nonStreamingSessions.has(sessionId)
@@ -1943,12 +2056,13 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
       body: JSON.stringify(requestBody),
     } as const;
     if (streamingMode === "disabled") {
-      return this.requestJson(
+      return await this.requestJson(
         configuration,
         "/chat/completions",
         "chat",
         signal,
         requestInit,
+        onProgress,
       );
     } else {
       try {
@@ -1960,6 +2074,10 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           requestInit,
         );
         try {
+          onProgress?.({
+            identity: `response:${providerRequestId(streamed.response.headers) ?? "http"}`,
+            byteCount: 0,
+          });
           const contentType =
             streamed.response.headers.get("content-type")?.toLowerCase() ?? "";
           if (!contentType.includes("text/event-stream")) {
@@ -1968,6 +2086,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               streamed.diagnostics,
               signal,
               streamed.timedOut,
+              onProgress,
             );
           } else if (streamed.response.body === null) {
             throw new OpenAIStreamError(
@@ -1978,6 +2097,11 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
             const parsed = await parseOpenAIChatStream(streamed.response.body, {
               signal: streamed.controller.signal,
               maximumBytes: MAX_PROVIDER_RESPONSE_BYTES,
+              onProgress: ({ byteCount, totalBytes }) =>
+                onProgress?.({
+                  identity: `stream:${providerRequestId(streamed.response.headers) ?? "response"}:${totalBytes}`,
+                  byteCount,
+                }),
             });
             const value = {
               choices: [
@@ -2051,6 +2175,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               ...requestInit,
               body: JSON.stringify(body),
             },
+            onProgress,
           );
         } else if (unsupported) {
           throw new ProviderRequestError(
@@ -2084,6 +2209,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     sessionId: string,
     body: Record<string, unknown>,
     failureDiagnostics: Partial<AdapterFailureDiagnostics> = {},
+    onProgress?: (progress: ChatProgress) => void,
   ): Promise<ChatResponse> {
     if (
       "messages" in body &&
@@ -2105,6 +2231,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         signal,
         sessionId,
         body,
+        onProgress,
       );
     } catch (error) {
       if (
@@ -2122,6 +2249,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           signal,
           sessionId,
           body,
+          onProgress,
         );
         response.diagnostics = {
           ...response.diagnostics,
@@ -2157,6 +2285,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           signal,
           sessionId,
           body,
+          onProgress,
         );
         parsed = chatResponseSchema.safeParse(response.value);
         if (parsed.success) {
@@ -2220,6 +2349,38 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     };
   }
 
+  private observableChat(
+    configuration: ProviderConfiguration,
+    signal: AbortSignal,
+    sessionId: string,
+    body: Record<string, unknown>,
+    failureDiagnostics: Partial<AdapterFailureDiagnostics> = {},
+  ): {
+    response: Promise<ChatResponse>;
+    progress: AsyncIterable<ChatProgress>;
+  } {
+    const progress = new ChatProgressChannel();
+    const responseIdentity = `${sessionId}:response:${++this.progressSequence}`;
+    let streamProgress = 0;
+    const response = this.chat(
+      configuration,
+      signal,
+      sessionId,
+      body,
+      failureDiagnostics,
+      (event) =>
+        progress.push({
+          ...event,
+          identity:
+            event.byteCount === 0
+              ? responseIdentity
+              : `${responseIdentity}:bytes:${++streamProgress}`,
+        }),
+    ).finally(() => progress.close());
+    void response.catch(() => undefined);
+    return { response, progress };
+  }
+
   async probe(
     reviewer: AdapterReviewInput["reviewer"],
     signal: AbortSignal,
@@ -2230,6 +2391,8 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
       streaming: (this.registration.streaming ?? "disabled") !== "disabled",
       cancellation: true,
       maximumIsolation: "runtime_read_only",
+      observed_file_access: true,
+      progress_observable: true,
     };
     const configuration = this.configuration();
     if ("reason" in configuration) {
@@ -2309,46 +2472,351 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
 
   private async runTool(
     workspace: ReadOnlyWorkspace,
+    coverageTools: ReturnType<typeof createReadOnlyFileTools> | undefined,
     name: string,
     encodedArguments: string,
     signal: AbortSignal,
-  ): Promise<unknown> {
+  ): Promise<ExecutedToolResult> {
     let argumentsValue: unknown;
     try {
       argumentsValue = JSON.parse(encodedArguments || "{}");
     } catch {
-      return { error: "The inspection tool arguments are invalid." };
+      return {
+        response: { error: "The inspection tool arguments are invalid." },
+      };
     }
 
     if (name === "list_files") {
       const parsed = listFilesArgumentsSchema.safeParse(argumentsValue);
-      return parsed.success
-        ? workspace.listFiles(parsed.data.path, signal)
-        : { error: "The inspection tool arguments are invalid." };
+      return {
+        response: parsed.success
+          ? coverageTools === undefined
+            ? await workspace.listFiles(parsed.data.path, signal)
+            : await coverageTools.listFiles(
+                parsed.data.path === undefined
+                  ? {}
+                  : { path: parsed.data.path },
+              )
+          : { error: "The inspection tool arguments are invalid." },
+      };
     }
     if (name === "read_file") {
+      if (coverageTools !== undefined) {
+        const parsed = exactReadFileArgumentsSchema.safeParse(argumentsValue);
+        if (!parsed.success) {
+          return {
+            response: { error: "The inspection tool arguments are invalid." },
+          };
+        }
+        return await coverageTools.readFile({
+          path: parsed.data.path,
+          ...(parsed.data.offset === undefined
+            ? {}
+            : { offset: parsed.data.offset }),
+          ...(parsed.data.byte_count === undefined
+            ? {}
+            : { byteCount: parsed.data.byte_count }),
+        });
+      }
       const parsed = readFileArgumentsSchema.safeParse(argumentsValue);
-      return parsed.success
-        ? workspace.readText(
-            parsed.data.path,
-            parsed.data.start_line,
-            parsed.data.end_line,
-            signal,
-          )
-        : { error: "The inspection tool arguments are invalid." };
+      return {
+        response: parsed.success
+          ? await workspace.readText(
+              parsed.data.path,
+              parsed.data.start_line,
+              parsed.data.end_line,
+              signal,
+            )
+          : { error: "The inspection tool arguments are invalid." },
+      };
     }
     if (name === "search_text") {
       const parsed = searchTextArgumentsSchema.safeParse(argumentsValue);
-      return parsed.success
-        ? workspace.searchText(
-            parsed.data.query,
-            parsed.data.path,
-            parsed.data.case_sensitive === true,
-            signal,
-          )
-        : { error: "The inspection tool arguments are invalid." };
+      return {
+        response: parsed.success
+          ? coverageTools === undefined
+            ? await workspace.searchText(
+                parsed.data.query,
+                parsed.data.path,
+                parsed.data.case_sensitive === true,
+                signal,
+              )
+            : await coverageTools.searchText({
+                query: parsed.data.query,
+                ...(parsed.data.path === undefined
+                  ? {}
+                  : { path: parsed.data.path }),
+                ...(parsed.data.case_sensitive === undefined
+                  ? {}
+                  : { caseSensitive: parsed.data.case_sensitive }),
+              })
+          : { error: "The inspection tool arguments are invalid." },
+      };
     }
-    return { error: "The requested inspection tool is unsupported." };
+    return {
+      response: { error: "The requested inspection tool is unsupported." },
+    };
+  }
+
+  private async *producePagedResult(options: {
+    input: AdapterReviewInput;
+    configuration: ProviderConfiguration;
+    sessionId: string;
+    checkpoint: ChatMessage[];
+    collector: ResultPageCollector;
+  }): AsyncIterable<AdapterEvent> {
+    const { input, configuration, sessionId, checkpoint } = options;
+    let collector = options.collector;
+    const configuredPages =
+      input.resultPages !== undefined && "resultKind" in input.resultPages
+        ? input.resultPages
+        : undefined;
+    const resultKind =
+      configuredPages?.resultKind ??
+      (input.reviewer.policy?.mode === "adjudication"
+        ? "adjudication"
+        : "reviewer");
+    const deadline =
+      this.now() +
+      this.requestTimeoutMs *
+        (this.finalizationAttempts + this.continuationAttempts);
+    let attempt = 1;
+    let pageSpools: ResultSpool[] = [];
+    while (attempt <= this.finalizationAttempts) {
+      let activePageSpool: ResultSpool | undefined;
+      try {
+        while (!collector.complete) {
+          throwIfAborted(input.signal);
+          if (this.now() >= deadline) {
+            throw new ProviderRequestError(
+              adapterFailure.timeout(
+                "Structured result page production exceeded its bounded deadline.",
+                true,
+                {
+                  diagnostics: {
+                    failure_stage: "structured_result_deadline",
+                    scope: "provider",
+                  },
+                },
+              ),
+            );
+          }
+          const request = collector.nextRequest();
+          const pageMessages = structuredClone(checkpoint);
+          pageMessages.push({
+            role: "user",
+            content: resultPageRequestMessage(request, resultKind),
+          });
+          let pageSpool: ResultSpool | undefined;
+          let continuation = 0;
+          for (;;) {
+            const messages = structuredClone(pageMessages);
+            if (pageSpool !== undefined) {
+              messages.push({
+                role: "assistant",
+                content: await pageSpool.readText(),
+              });
+              messages.push({
+                role: "user",
+                content: EXACT_CONTINUATION_PROMPT,
+              });
+            }
+            const exchange = this.observableChat(
+              configuration,
+              input.signal,
+              sessionId,
+              {
+                model: input.reviewer.model,
+                ...(input.reviewer.effort === undefined
+                  ? {}
+                  : { reasoning_effort: input.reviewer.effort }),
+                messages,
+                response_format: {
+                  type: "json_schema",
+                  json_schema: {
+                    name: "review_mesh_result_page",
+                    strict: false,
+                    schema: resultPageSchemaFor(request, resultKind),
+                  },
+                },
+                max_tokens: DEFAULT_FINALIZATION_MAX_TOKENS,
+              },
+              {
+                failure_stage: "structured_result_page_envelope",
+                scope: "provider",
+              },
+            );
+            for await (const event of exchange.progress) {
+              yield {
+                type: "progress",
+                phase: event.byteCount === 0 ? "response" : "transport",
+                message:
+                  event.byteCount === 0
+                    ? "The provider admitted a response boundary."
+                    : "The provider streamed new result bytes.",
+                identity: event.identity,
+                byteCount: event.byteCount,
+              };
+            }
+            const response = await exchange.response;
+            const fragment = normalizedAssistantContent(
+              response.message.content,
+            );
+            if (typeof fragment !== "string") {
+              throw new ProviderRequestError(
+                adapterFailure.invalidResult(
+                  "The OpenAI-compatible endpoint returned an empty result page.",
+                  false,
+                  {
+                    fallback_eligible: true,
+                    circuit_qualifying: false,
+                    diagnostics: {
+                      ...response.diagnostics,
+                      failure_code: "provider_response_invalid",
+                      failure_stage: "structured_result_page",
+                      scope: "model",
+                    },
+                  },
+                ),
+              );
+            }
+            pageSpool ??= await createResultSpool({
+              directory: join(tmpdir(), "review-mesh-result-spools"),
+              id: `${input.runId}-${input.reviewer.id}-${request.pageIndex}-${randomUUID()}`.replace(
+                /[^A-Za-z0-9_-]/gu,
+                "-",
+              ),
+              reviewedWorkspace: input.context.workspace,
+              maximumBytes: MAX_RESULT_PAGE_BYTES,
+            });
+            activePageSpool = pageSpool;
+            await pageSpool.append(fragment);
+            if (response.diagnostics.finish_reason === "length") {
+              if (continuation >= this.continuationAttempts) {
+                throw new ProviderRequestError(
+                  outputTruncationFailure(response.diagnostics, false),
+                );
+              }
+              continuation += 1;
+              yield {
+                type: "progress",
+                phase: "validating",
+                message: `Continuing the exact result page from its stopping point (fragment ${continuation} of ${this.continuationAttempts}).`,
+                identity: `${request.resultId}:page:${request.pageIndex}:fragment:${continuation}`,
+                byteCount: pageSpool.byteLength,
+              };
+              continue;
+            }
+            const raw = await pageSpool.readText();
+            collector.addPage(raw);
+            pageSpools.push(pageSpool);
+            pageSpool = undefined;
+            activePageSpool = undefined;
+            yield {
+              type: "progress",
+              phase: "result_page",
+              message: `Accepted result page ${request.pageIndex + 1}.`,
+              identity: `${request.resultId}:page:${request.pageIndex}`,
+              byteCount: Buffer.byteLength(raw, "utf8"),
+            };
+            break;
+          }
+        }
+        const result = collector.assemble();
+        const storage = pageSpools;
+        pageSpools = [];
+        yield {
+          type: "result",
+          result,
+          isolation: "runtime_read_only",
+          resultStorage: {
+            async *pages() {
+              for (const spool of storage) {
+                const raw = await spool.readText();
+                yield {
+                  raw,
+                  sha256: createHash("sha256")
+                    .update(raw, "utf8")
+                    .digest("hex"),
+                };
+              }
+            },
+            async persisted() {
+              await Promise.all(
+                storage.map((spool) => spool.lifecycle().persisted()),
+              );
+            },
+            async abandoned() {
+              await Promise.all(
+                storage.map((spool) => spool.lifecycle().abandoned()),
+              );
+            },
+          },
+        };
+        return;
+      } catch (error) {
+        await activePageSpool
+          ?.lifecycle()
+          .abandoned()
+          .catch(() => undefined);
+        await Promise.all(
+          pageSpools.map((spool) =>
+            spool
+              .lifecycle()
+              .abandoned()
+              .catch(() => undefined),
+          ),
+        );
+        pageSpools = [];
+        const failure =
+          error instanceof ResultPageError
+            ? pageFailure(error)
+            : error instanceof ResultSpoolError
+              ? error.code === "result_too_large"
+                ? sanitizeAdapterFailure(
+                    "result_page_too_large",
+                    error.message,
+                    false,
+                    {
+                      fallback_eligible: true,
+                      circuit_qualifying: false,
+                      diagnostics: {
+                        failure_code: "result_page_too_large",
+                        failure_stage: "structured_result_page",
+                        scope: "model",
+                      },
+                    },
+                  )
+                : adapterFailure.invalidResult(error.message, false, {
+                    fallback_eligible: true,
+                    circuit_qualifying: false,
+                    diagnostics: {
+                      failure_stage: "structured_result_spool",
+                      scope: "adapter",
+                    },
+                  })
+              : error instanceof ProviderRequestError
+                ? error.failure
+                : undefined;
+        if (
+          failure !== undefined &&
+          attempt < this.finalizationAttempts &&
+          retryableResultProductionFailure(failure) &&
+          configuredPages !== undefined
+        ) {
+          collector = createResultPageCollector(configuredPages);
+          attempt += 1;
+          yield {
+            type: "progress",
+            phase: "validating",
+            message: `Retrying paged result production from the retained inspection checkpoint (attempt ${attempt} of ${this.finalizationAttempts}).`,
+          };
+          continue;
+        }
+        if (failure !== undefined) throw new ProviderRequestError(failure);
+        throw error;
+      }
+    }
   }
 
   async *run(input: AdapterReviewInput): AsyncIterable<AdapterEvent> {
@@ -2382,6 +2850,10 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
       this.maxSnapshotBytes,
     );
     this.activeWorkspaces.add(workspace);
+    const coverageTools =
+      input.coverage === undefined
+        ? undefined
+        : createReadOnlyFileTools({ ledger: input.coverage });
     const sessionId = this.sessionIdFactory();
     const system = [
       input.prompt.system,
@@ -2421,8 +2893,9 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
 
     try {
       let inspectionBudgetReached = false;
+      let initialRequestAdmitted = false;
       for (let turn = 0; turn < this.maxTurns; turn += 1) {
-        const chatResponse = await this.chat(
+        const exchange = this.observableChat(
           configuration,
           input.signal,
           sessionId,
@@ -2432,11 +2905,46 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               ? {}
               : { reasoning_effort: input.reviewer.effort }),
             messages,
-            tools: READ_ONLY_TOOLS,
+            tools:
+              coverageTools === undefined
+                ? READ_ONLY_TOOLS
+                : EXACT_READ_ONLY_TOOLS,
             tool_choice: turn === 0 ? "required" : "auto",
             max_tokens: 8_192,
           },
+          {},
         );
+        for await (const event of exchange.progress) {
+          yield {
+            type: "progress",
+            phase: event.byteCount === 0 ? "response" : "transport",
+            message:
+              event.byteCount === 0
+                ? "The provider admitted an inspection response boundary."
+                : "The provider streamed new inspection bytes.",
+            identity: event.identity,
+            byteCount: event.byteCount,
+          };
+        }
+        const chatResponse = await exchange.response;
+        if (!initialRequestAdmitted) {
+          initialRequestAdmitted = true;
+          const git = input.context.git;
+          const rawDiff = git.is_repository ? git.raw_diff : undefined;
+          if (
+            input.coverage !== undefined &&
+            rawDiff !== undefined &&
+            git.is_repository &&
+            !git.truncated.diff &&
+            input.prompt.user.includes(git.diff)
+          ) {
+            input.coverage.recordDiffDelivery(
+              git.changed_paths?.map((entry) => entry.path) ??
+                git.changed_files,
+              { byteCount: rawDiff.byte_count, sha256: rawDiff.sha256 },
+            );
+          }
+        }
         const message = chatResponse.message;
         const reserve = finalizationReserve(this.maxConversationBytes);
         const assistant = boundedAssistantMessage(
@@ -2474,22 +2982,29 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               });
               continue;
             }
-            const result = !entry.executable
+            const result: ExecutedToolResult = !entry.executable
               ? {
-                  error:
-                    "The inspection tool arguments exceeded the safe input limit.",
-                  truncated: true,
+                  response: {
+                    error:
+                      "The inspection tool arguments exceeded the safe input limit.",
+                    truncated: true,
+                  },
                 }
               : await this.runTool(
                   workspace,
+                  coverageTools,
                   call.function.name,
                   call.function.arguments,
                   input.signal,
                 );
+            const exactContent = JSON.stringify(result.response);
             const toolMessage = {
               role: "tool",
               tool_call_id: call.id,
-              content: boundedToolResult(result, this.maxToolResultBytes),
+              content:
+                result.acknowledgeDelivered === undefined
+                  ? boundedToolResult(result.response, this.maxToolResultBytes)
+                  : exactContent,
             };
             if (
               conversationBytes([...messages, toolMessage]) >
@@ -2503,11 +3018,15 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               });
             }
             messages.push(toolMessage);
+            if (toolMessage.content === exactContent) {
+              result.acknowledgeDelivered?.(toolMessage.content);
+            }
           }
           yield {
             type: "activity",
             message:
               "The reviewer completed a bounded read-only inspection step.",
+            identity: `${sessionId}:tools:${turn}`,
           };
           if (!inspectionBudgetReached) continue;
           messages.push({
@@ -2561,6 +3080,22 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         // transport/envelope/schema failures can retry from it without
         // repeating any repository tool calls or inspection turns.
         const finalizationCheckpoint = structuredClone(messages);
+        if (input.resultPages !== undefined) {
+          const collector =
+            "nextRequest" in input.resultPages
+              ? input.resultPages
+              : createResultPageCollector(input.resultPages);
+          for await (const event of this.producePagedResult({
+            input,
+            configuration,
+            sessionId,
+            checkpoint: finalizationCheckpoint,
+            collector,
+          })) {
+            yield event;
+          }
+          return;
+        }
         const finalizationDeadline =
           this.now() +
           this.requestTimeoutMs *

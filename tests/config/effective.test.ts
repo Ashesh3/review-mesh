@@ -134,7 +134,7 @@ describe("effective configuration description", () => {
     });
     expect(effective).toMatchObject({
       valid: true,
-      config_schema_version: "6",
+      config_schema_version: "7",
       execution: { allow_provider_concentration: false },
       reviewers: [
         {
@@ -157,7 +157,7 @@ describe("effective configuration description", () => {
     expect(configSchema).toContain("required_context");
     expect(configSchema).toContain("changed_paths");
     const help = `${renderHelp("config")}\n${renderHelp("schema")}\n${renderHelp("adapters")}`;
-    expect(help).toContain("schema-v6");
+    expect(help).toContain("schema-v7");
     expect(help).toContain("allow_provider_concentration");
     expect(help).toContain("allow_zero_outage_tolerance");
     expect(help).toContain("applicability.mode");
@@ -231,7 +231,7 @@ describe("effective configuration description", () => {
     expect(result.warnings).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          code: "zero_outage_tolerance_quorum",
+          code: "zero_outage_tolerance",
           lens_ids: ["reviewer"],
         }),
       ]),

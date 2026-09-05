@@ -45,6 +45,7 @@ export function renderDescription(
     `Reviewers: ${configuration.reviewers.length}`,
     `Concurrency: ${configuration.execution.max_concurrency}`,
     `Heartbeat: every ${configuration.execution.heartbeat_interval_ms} ms`,
+    `Deadline: ${configuration.execution.deadline_mode}${configuration.execution.run_deadline_ms === undefined ? "" : ` (${configuration.execution.run_deadline_ms} ms)`}`,
     "",
   );
   configuration.reviewers.forEach((reviewer, index) => {
@@ -55,6 +56,9 @@ export function renderDescription(
       `   isolation=${reviewer.isolation_policy} timeout_ms=${reviewer.timeout_ms}`,
     );
   });
+  for (const warning of configuration.warnings) {
+    lines.push(`Warning ${warning.code}: ${warning.message}`);
+  }
   lines.push(
     "",
     "Next actions:",

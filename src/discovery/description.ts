@@ -119,10 +119,10 @@ export async function describeTool(options: DescribeToolOptions = {}) {
     },
     streams: {
       review: {
-        stdin: "empty-or-review-request-json-v2" as const,
-        stdout: "public-events-jsonl-v5" as const,
-        default_output_mode: "full-jsonl" as const,
-        output_modes: ["full-jsonl", "compact-jsonl"] as const,
+        stdin: "empty-or-review-request-json-v2-or-v3" as const,
+        stdout: "public-events-jsonl-v6" as const,
+        default_output_mode: "concise-jsonl" as const,
+        output_modes: ["concise-jsonl", "full-jsonl", "compact-jsonl"] as const,
         stderr: "diagnostic-jsonl-v1" as const,
         final_event: "run.completed" as const,
         status_query: "review-mesh status RUN_ID [REVIEWER_ID] --json" as const,
@@ -148,11 +148,11 @@ export async function describeTool(options: DescribeToolOptions = {}) {
         "Configuration and workspace selection are valid; adapters, credentials, models, and isolation are probed when review starts.",
     },
     protocol: {
-      version: "5" as const,
-      request_version: "2" as const,
+      version: "6" as const,
+      request_version: "3" as const,
       consistency_mode: "live_worktree" as const,
       maximum_request_bytes: 8 * 1024 * 1024,
-      outcomes: ["gate_outcome", "coverage_outcome"] as const,
+      outcomes: ["run_outcome", "gate_outcome", "coverage_outcome"] as const,
       model_fallback: {
         parallelism: "across_agents" as const,
         order: "effective_cyclic_model_runs" as const,
@@ -187,6 +187,14 @@ export async function describeTool(options: DescribeToolOptions = {}) {
             : undefined,
         },
       },
+      deadlines: configuration.valid
+        ? {
+            mode: configuration.execution.deadline_mode,
+            run_deadline_ms: configuration.execution.run_deadline_ms,
+            no_progress_timeout_ms:
+              configuration.execution.no_progress_timeout_ms,
+          }
+        : undefined,
       provider_transport: {
         openai_compatible_streaming_modes: [
           "auto",

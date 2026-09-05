@@ -1,5 +1,11 @@
 # Review Mesh
 
+Review Mesh v9 is the current protocol. It adds finite run deadlines, per-reviewer
+changed-file coverage, bounded result pages, and coverage-first outcomes. See
+[the v9 contract and migration guide](docs/releases/v9.0.0.md) for the current
+configuration and output contract. Examples below using older schema versions
+remain migration inputs; new configuration saves use schema 7.
+
 Review Mesh is an agent-first code-review gate. One command runs every logical
 agent in a trusted suite, streams machine-readable JSONL progress, and succeeds
 with independent gate and coverage outcomes. Operational failures advance to
@@ -9,10 +15,10 @@ options are exhausted.
 Transient failures use bounded same-model retry with jittered exponential
 backoff and bounded provider `Retry-After` guidance. Provider-group circuits
 count only qualifying outages, cool down before one half-open probe, and reset
-after success. Review Mesh v8 defaults to `full-jsonl`: every complete sanitized
-reviewer result is returned during the original invocation, with the same digest
-and byte count used by the immutable artifact. `compact-jsonl` remains an
-explicit operations/compatibility mode.
+after success. Review Mesh v9 defaults to `concise-jsonl`, with complete sanitized
+reviewer results in the immutable artifact. Explicit `full-jsonl` returns those
+same results, digests, and byte counts during the original invocation.
+`compact-jsonl` remains an explicit operations mode.
 
 ```text
 current directory or request JSON -> review-mesh review -> trusted project/default roster -> live JSONL -> run.completed
@@ -24,7 +30,7 @@ It is designed for automation, coding agents, CI, and local review loops:
 - Trusted global/default or project-specific agent rosters; callers cannot override them through review input.
 - Parallel logical agents with ordered per-agent model fallback across runtimes.
 - Strict structured findings with evidence and optional file/line locations.
-- Complete reviewer-result v3 Markdown and structured findings on default stdout.
+- Lossless reviewer-result v4 Markdown and structured findings in the immutable artifact and explicit full stdout.
 - Independent `gate_outcome` and `coverage_outcome` dimensions.
 - Configurable diverse pass quorum, provider concurrency, and cooldown/half-open circuit breaking.
 - Safe failure diagnostics, persisted attempt causality, and best-effort artifact salvage.
@@ -116,10 +122,10 @@ For an AI caller, identity and scope are separate:
 
 ### Download a standalone executable
 
-Release `v8.0.0` is a breaking review-delivery and configuration release. The
-default review output is now lossless `full-jsonl`; live reviewer results use
-schema v3; current configuration is schema v6; length-limited provider output
-uses exact continuation; OpenAI-compatible streaming is configurable; strict
+Release `v9.0.0` is a breaking review-delivery and configuration release. The
+default review output is now bounded `concise-jsonl`; live reviewer results use
+schema v4; current configuration is schema v7; bounded result pages and
+length-limited provider output use exact continuation; streaming is configurable; strict
 artifacts reproduce the public digests and canonical counts; and structured
 doctor runs the real reviewer path. The self-contained Bun executables do not
 require Node.js or Bun:
@@ -130,14 +136,14 @@ require Node.js or Bun:
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v8.0.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
+Invoke-WebRequest https://github.com/Ashesh3/review-mesh/releases/download/v9.0.0/review-mesh-windows-x64.exe -OutFile review-mesh.exe
 .\review-mesh.exe review
 ```
 
 Linux:
 
 ```bash
-curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v8.0.0/review-mesh-linux-x64
+curl -LO https://github.com/Ashesh3/review-mesh/releases/download/v9.0.0/review-mesh-linux-x64
 chmod +x ./review-mesh-linux-x64
 ./review-mesh-linux-x64 review
 ```
@@ -146,7 +152,7 @@ Each executable contains Review Mesh and its JavaScript dependencies. Git, trust
 
 Release binaries are built with Bun 1.4.0. Download and verify the exact checksum
 manifest from
-`https://github.com/Ashesh3/review-mesh/releases/download/v8.0.0/SHA256SUMS.txt`.
+`https://github.com/Ashesh3/review-mesh/releases/download/v9.0.0/SHA256SUMS.txt`.
 
 ### Build the portable Node.js file
 
@@ -798,14 +804,14 @@ completed, incomplete, and skipped model runs without inventing percentages.
 | `reviewer.skipped`    | A later model was bypassed after prior findings/failure.      |
 | `run.completed`       | Outcomes, canonical counts, result manifest, and artifact.    |
 
-`review-mesh review` defaults to `--output-mode full-jsonl`. Full mode emits
+`review-mesh review` defaults to `--output-mode concise-jsonl`. Full mode emits
 the exact sanitized result in `reviewer.result` during the original invocation;
 stdout honors backpressure and never substitutes the 1,000-character lifecycle
-summary. `--output-mode compact-jsonl` suppresses that public payload for
-operations compatibility, but the terminal manifest still identifies every
-digest, byte count, and authoritative immutable artifact. A completed full run
-asserts `results_complete: true`; a closed or failed output stream cannot claim
-completeness.
+summary. Concise and compact modes reference the detailed results. The v6
+terminal carries one finalized artifact path, digest, byte count, and explicit
+`result_delivery` channel status. Historical v5 examples below use the former
+manifest and `results_complete` fields; new v9 runs use the migration guide's
+coverage-first outcome and delivery contract.
 
 `reviewer.progress` is phase-level. High-frequency adapter activity is retained
 as sanitized private `reviewer.activity` records for the dashboard and latest
@@ -908,7 +914,9 @@ coverage without findings.
 
 ## Reviewer result shape
 
-Each completed reviewer returns:
+The historical v3 result below remains readable. Current v4 results add atomic
+`claim` fields and core-owned `change_coverage`, with bounded semantic pages as
+described in the [v9 guide](docs/releases/v9.0.0.md).
 
 ```json
 {

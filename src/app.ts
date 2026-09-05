@@ -127,6 +127,14 @@ function resolvedRunHeader(config: ReturnType<typeof resolveConfig>) {
 export async function runReviewApplication(
   options: ReviewApplicationOptions,
 ): Promise<number> {
+  const { runV9Application } = await import("./app-v9.js");
+  return runV9Application(options);
+}
+
+/** Preserved only for historical compatibility fixtures. */
+export async function runLegacyReviewApplication(
+  options: ReviewApplicationOptions,
+): Promise<number> {
   let request: ReturnType<typeof reviewRequestSchema.parse>;
   try {
     request = reviewRequestSchema.parse(JSON.parse(options.requestText));

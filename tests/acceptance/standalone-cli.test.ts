@@ -4,6 +4,11 @@ import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import {
+  v9AcceptanceNarrative,
+  v9CommandConfig,
+  v9ReviewerResult,
+} from "../helpers/v9-command-fixture.js";
 
 const projectRoot = resolve(import.meta.dirname, "../..");
 const windowsExecutable = join(
@@ -93,80 +98,42 @@ function quoteToml(value: string): string {
 }
 
 function config(command: string, args: readonly string[]): string {
-  return `schema_version = "1"
-[execution]
-max_concurrency = 1
-heartbeat_interval_ms = 100
-shutdown_grace_period_ms = 100
-[diagnostics]
-persist_runs = true
-max_runs = 1
-[adapters.release]
-type = "command"
-command = ${quoteToml(command)}
-args = [${args.map(quoteToml).join(", ")}]
-protocol = "review-mesh-command-v1"
-[reviewer_profiles.release_0]
-adapter = "release"
-model = "fixture-0"
-purpose = "Standalone release acceptance 0"
-instructions = "Review read-only."
-isolation = "prefer_enforced"
-timeout_ms = 10000
-[reviewer_profiles.release_1]
-adapter = "release"
-model = "fixture-1"
-purpose = "Standalone release acceptance 1"
-instructions = "Review read-only."
-isolation = "prefer_enforced"
-timeout_ms = 10000
-[[reviewers]]
-id = "release-0"
-profile = "release_0"
-[[reviewers]]
-id = "release-1"
-profile = "release_1"
-`;
+  const base = v9CommandConfig({
+    scriptPath: args.at(-1)!,
+    entries: [
+      { id: "release_0", mode: "large-fail", result: expectedResult },
+      { id: "release_1", mode: "large-fail", result: secondResult },
+    ],
+    persistRuns: true,
+  });
+  return base.replace(
+    /command = .*\nargs = \[[^\n]*\]/gu,
+    `command = ${quoteToml(command)}\nargs = [${args.map(quoteToml).join(", ")}]`,
+  );
 }
 
-const expectedReview = `# Standalone review\n\nThe release executable returned this complete cross-platform review.\n\n${"Complete standalone evidence. ".repeat(4_096)}`;
-const expectedResult = {
-  schema_version: "3",
+const expectedReview = v9AcceptanceNarrative("# Standalone review");
+const expectedResult = v9ReviewerResult({
   verdict: "fail",
-  review_markdown: expectedReview,
+  reviewMarkdown: expectedReview,
   summary: "one standalone finding",
-  actionable_findings: [
-    {
-      id: "standalone-medium",
-      severity: "medium",
-      title: "Standalone finding",
-      description: "The release fixture found a controlled defect.",
-      evidence: [{ path: "source.txt", detail: "Controlled evidence." }],
-      suggested_direction: "Correct the controlled defect.",
-      confidence: "high",
-      classification: "confirmed_defect",
-      external_assumptions: [],
-      root_issue_id: "standalone-shared-root",
-      category: "correctness",
-      verification: "The copied fixture emitted deterministic evidence.",
-    },
-  ],
-  informational_notes: [],
-};
-const secondResult = {
-  ...expectedResult,
-  actionable_findings: [
-    {
-      ...expectedResult.actionable_findings[0],
-      id: "standalone-medium-second",
-      evidence: [{ path: "source.txt", detail: "Controlled evidence B." }],
-    },
-  ],
-};
+  findingId: "standalone-medium",
+  rootIssueId: "standalone-shared-root",
+  evidencePath: "source.txt",
+});
+const secondResult = v9ReviewerResult({
+  verdict: "fail",
+  reviewMarkdown: expectedReview,
+  summary: "one standalone finding",
+  findingId: "standalone-medium-second",
+  rootIssueId: "standalone-shared-root",
+  evidencePath: "source.txt",
+  evidenceDetail: "Controlled evidence B.",
+});
 
 function request(workspace: string): string {
   return JSON.stringify({
-    schema_version: "2",
+    schema_version: "3",
     request_id: "standalone-release-acceptance",
     project_name: "workspace",
     workspace,
@@ -203,7 +170,35 @@ async function windowsRunner(): Promise<PlatformRunner | undefined> {
       await writeFile(join(workspace, "source.txt"), "controlled\n");
       await writeFile(
         reviewer,
-        `$null = [Console]::In.ReadToEnd()\n$results = @('${Buffer.from(JSON.stringify(expectedResult), "utf8").toString("base64")}', '${Buffer.from(JSON.stringify(secondResult), "utf8").toString("base64")}')\n$index = if ($env:REVIEW_MESH_MODEL.EndsWith('-1')) { 1 } else { 0 }\n$json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($results[$index]))\n[Console]::Out.WriteLine('{"type":"result","result":' + $json + '}')\n`,
+        `$results = @('${Buffer.from(JSON.stringify(expectedResult), "utf8").toString("base64")}', '${Buffer.from(JSON.stringify(secondResult), "utf8").toString("base64")}')
+$index = if ($env:REVIEW_MESH_MODEL.EndsWith('-1')) { 1 } else { 0 }
+$result = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($results[$index])) | ConvertFrom-Json
+$null = [Console]::In.ReadLine()
+[Console]::Out.WriteLine('{"type":"activity","message":"fixture page delivery","identity":"fixture-activity"}')
+$chunks = @()
+$text = [string]$result.review_markdown
+for ($offset = 0; $offset -lt $text.Length; $offset += 24576) { $chunks += $text.Substring($offset, [Math]::Min(24576, $text.Length - $offset)) }
+$findings = @($result.actionable_findings)
+$pageCount = 1 + $chunks.Count + [Math]::Ceiling($findings.Count / 2)
+while ($true) {
+  $line = [Console]::In.ReadLine()
+  if ($null -eq $line) { break }
+  $assignment = $line | ConvertFrom-Json
+  if ($assignment.type -ne 'request_page') { continue }
+  $pageIndex = [int]$assignment.request.page_index
+  if ($pageIndex -eq 0) {
+    $pageKind = 'header'
+    $payload = [ordered]@{ verdict=$result.verdict; summary=$result.summary; informational_notes=@($result.informational_notes); narrative_byte_count=[Text.Encoding]::UTF8.GetByteCount($text); narrative_fragment_count=$chunks.Count; actionable_finding_count=$findings.Count; coverage_attestation=$null }
+  } elseif ($pageIndex -le $chunks.Count) {
+    $pageKind = 'narrative'; $payload = [ordered]@{ text_fragment=$chunks[$pageIndex - 1] }
+  } else {
+    $pageKind = 'findings'; $findingIndex = ($pageIndex - $chunks.Count - 1) * 2; $payload = [ordered]@{ actionable_findings=@($findings[$findingIndex..([Math]::Min($findingIndex + 1, $findings.Count - 1))]) }
+  }
+  $page = [ordered]@{ schema_version='1'; kind='review-mesh.result-page'; result_id=$assignment.request.result_id; result_kind='reviewer'; result_schema_version='4'; page_index=$pageIndex; page_count=[int]$pageCount; page_kind=$pageKind; previous_page_digest=$assignment.request.previous_page_digest; payload=$payload } | ConvertTo-Json -Compress -Depth 20
+  [Console]::Out.WriteLine((@{type='result_page';page=$page} | ConvertTo-Json -Compress))
+  if ($pageIndex + 1 -eq $pageCount) { break }
+}
+`,
       );
       await writeFile(
         configFile,
@@ -277,7 +272,30 @@ async function linuxRunner(): Promise<PlatformRunner | undefined> {
       await writeFile(join(workspace, "source.txt"), "controlled\n");
       await writeFile(
         reviewer,
-        `import json,os,sys\nsys.stdin.buffer.read()\nresults=${JSON.stringify([expectedResult, secondResult])}\nindex=1 if os.environ.get("REVIEW_MESH_MODEL", "").endswith("-1") else 0\nprint(json.dumps({"type":"result","result":results[index]}))\n`,
+        `import json,os,sys
+results=${JSON.stringify([expectedResult, secondResult])}
+index=1 if os.environ.get("REVIEW_MESH_MODEL", "").endswith("-1") else 0
+result=results[index]
+sys.stdin.readline()
+print(json.dumps({"type":"activity","message":"fixture page delivery","identity":"fixture-activity"}),flush=True)
+text=result["review_markdown"]
+chunks=[text[i:i+24576] for i in range(0,len(text),24576)]
+findings=result["actionable_findings"]
+page_count=1+len(chunks)+(len(findings)+1)//2
+for line in sys.stdin:
+    assignment=json.loads(line)
+    if assignment.get("type")!="request_page": continue
+    request=assignment["request"]; page_index=request["page_index"]
+    if page_index==0:
+        page_kind="header"; payload={"verdict":result["verdict"],"summary":result["summary"],"informational_notes":result["informational_notes"],"narrative_byte_count":len(text.encode()),"narrative_fragment_count":len(chunks),"actionable_finding_count":len(findings),"coverage_attestation":None}
+    elif page_index<=len(chunks):
+        page_kind="narrative"; payload={"text_fragment":chunks[page_index-1]}
+    else:
+        page_kind="findings"; offset=(page_index-len(chunks)-1)*2; payload={"actionable_findings":findings[offset:offset+2]}
+    page={"schema_version":"1","kind":"review-mesh.result-page","result_id":request["result_id"],"result_kind":"reviewer","result_schema_version":"4","page_index":page_index,"page_count":page_count,"page_kind":page_kind,"previous_page_digest":request["previous_page_digest"],"payload":payload}
+    print(json.dumps({"type":"result_page","page":json.dumps(page,separators=(",",":"))}),flush=True)
+    if page_index+1==page_count: break
+`,
       );
       const [linuxRoot, linuxWorkspace, linuxHome, linuxReviewer] =
         await Promise.all([
@@ -321,43 +339,50 @@ afterEach(async () => {
 });
 
 describe.skipIf(!verifyStandalone)("standalone release executables", () => {
-  it("executes the exact Windows and Linux v8 binaries with the full artifact contract", async () => {
+  it("executes the exact Windows and Linux v9 binaries with the full artifact contract", async () => {
     const runners = await Promise.all([windowsRunner(), linuxRunner()]);
     expect(runners.every((runner) => runner !== undefined)).toBe(true);
 
     for (const runner of runners as PlatformRunner[]) {
       const fixture = await runner.createFixture();
-      expect(
-        Buffer.byteLength(expectedReview, "utf8"),
-        runner.name,
-      ).toBeGreaterThan(100 * 1_024);
+      expect(Buffer.byteLength(expectedReview, "utf8"), runner.name).toBe(
+        256 * 1_024,
+      );
       const version = await runner.run(fixture, ["--version"]);
       expect(version, runner.name).toEqual({
         exitCode: 0,
-        stdout: "review-mesh 8.0.0\n",
+        stdout: "review-mesh 9.0.0\n",
         stderr: "",
       });
 
       const review = await runner.run(
         fixture,
-        ["review"],
+        ["review", "--output-mode", "full-jsonl"],
         request(fixture.workspace),
       );
-      expect(review.exitCode, runner.name).toBe(1);
+      expect(review.exitCode, runner.name).toBe(0);
       expect(review.stderr, runner.name).toBe("");
       const events = parsedEvents(review.stdout);
-      const fullResults = events.filter(
-        (event): event is { run_id: string; data: Record<string, unknown> } =>
-          event.event === "reviewer.result",
-      );
+      const fullResults = events
+        .filter(
+          (event): event is { run_id: string; data: Record<string, unknown> } =>
+            event.event === "reviewer.result",
+        )
+        .sort((left, right) =>
+          String((left as Record<string, unknown>).reviewer_id).localeCompare(
+            String((right as Record<string, unknown>).reviewer_id),
+          ),
+        );
       const full = fullResults[0];
+      if (full === undefined) throw new Error(`${runner.name} omitted results`);
       const completed = events.at(-1) as {
         run_id: string;
         data: Record<string, unknown>;
       };
-      const expectedDigest = digest(expectedResult);
+      const acceptedResult = full.data.result as Record<string, unknown>;
+      const expectedDigest = digest(acceptedResult);
       const expectedBytes = Buffer.byteLength(
-        JSON.stringify(expectedResult),
+        JSON.stringify(acceptedResult),
         "utf8",
       );
       expect(fullResults, runner.name).toHaveLength(2);
@@ -367,40 +392,43 @@ describe.skipIf(!verifyStandalone)("standalone release executables", () => {
         data: {
           digest: expectedDigest,
           byte_count: expectedBytes,
-          result: expectedResult,
+          result: {
+            ...expectedResult,
+            change_coverage: { status: "not_applicable" },
+          },
         },
       });
       expect(fullResults[1], runner.name).toMatchObject({
         run_id: completed.run_id,
-        data: { result: secondResult },
+        data: {
+          result: {
+            ...secondResult,
+            change_coverage: { status: "not_applicable" },
+          },
+        },
       });
       expect(completed, runner.name).toMatchObject({
         event: "run.completed",
         data: {
-          report_path: expect.any(String),
-          raw_findings: 2,
-          unique_findings: 1,
-          gate_findings: 1,
-          advisory_findings: 0,
-          results_complete: true,
+          run_outcome: "clear",
+          gate_outcome: "no_gate_findings",
+          coverage_outcome: "complete",
+          raw_source_findings: 2,
+          atomic_subfindings: 1,
+          canonical_roots: 1,
+          gate_eligible_subfindings: 0,
+          result_delivery: {
+            completed_results: 2,
+            artifact: "complete",
+            planned_public_stream: "complete",
+          },
         },
       });
-      expect(completed.data.result_manifest, runner.name).toHaveLength(2);
-      for (const [index, event] of fullResults.entries()) {
-        expect(event.data.artifact_path, runner.name).toBe(
-          completed.data.report_path,
-        );
-        expect(
-          (completed.data.result_manifest as Array<Record<string, unknown>>)[
-            index
-          ],
-          runner.name,
-        ).toMatchObject({
-          digest: event.data.digest,
-          byte_count: event.data.byte_count,
-          artifact_path: completed.data.report_path,
-        });
-      }
+      expect(completed.data.artifact, runner.name).toMatchObject({
+        completed_results: 2,
+      });
+      for (const event of fullResults)
+        expect(event.data, runner.name).not.toHaveProperty("artifact_path");
 
       const status = await runner.run(fixture, [
         "status",
@@ -426,18 +454,52 @@ describe.skipIf(!verifyStandalone)("standalone release executables", () => {
       expect(JSON.parse(status.stdout), runner.name).toMatchObject({
         run_id: completed.run_id,
         reviewers: [
-          { complete_result: expectedResult, result_digest: expectedDigest },
-          { complete_result: secondResult },
+          {
+            complete_result: {
+              ...expectedResult,
+              change_coverage: { status: "not_applicable" },
+            },
+            result_digest: expectedDigest,
+          },
+          {
+            complete_result: {
+              ...secondResult,
+              change_coverage: { status: "not_applicable" },
+            },
+          },
         ],
       });
       expect(JSON.parse(report.stdout), runner.name).toMatchObject({
         run_id: completed.run_id,
-        reviewers: [{ result: expectedResult }, { result: secondResult }],
-        finding_counts: { raw: 2, unique: 1, gate: 1, advisory: 0 },
+        reviewers: [
+          {
+            result: {
+              ...expectedResult,
+              change_coverage: { status: "not_applicable" },
+            },
+          },
+          {
+            result: {
+              ...secondResult,
+              change_coverage: { status: "not_applicable" },
+            },
+          },
+        ],
+        finding_counts: {
+          raw_source_findings: 2,
+          atomic_subfindings: 1,
+          canonical_roots: 1,
+          gate_eligible_subfindings: 0,
+        },
       });
       expect(JSON.parse(findings.stdout), runner.name).toMatchObject({
         run_id: completed.run_id,
-        findings: [expect.objectContaining({ id: "standalone-medium" })],
+        findings: [
+          expect.objectContaining({
+            id: "standalone-shared-root",
+            subfindings: expect.any(Array),
+          }),
+        ],
       });
     }
   }, 120_000);

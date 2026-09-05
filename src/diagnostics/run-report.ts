@@ -19,7 +19,7 @@ import {
 import {
   canonicalizeFindings,
   type CanonicalRawFinding,
-} from "../findings/canonical.js";
+} from "../findings/canonical-legacy.js";
 import {
   failClosedAdjudicationOutcome,
   validateAdjudication,
@@ -2329,6 +2329,24 @@ export async function readRunReport({
   afterOpen,
 }: ReadRunReportOptions): Promise<RunReport> {
   requireSafeRunId(runId);
+  const { loadV9Run, v9Report } = await import("./v9-views.js");
+  const current = await loadV9Run(runsDirectory, runId);
+  if (current) return v9Report(current) as unknown as RunReport;
+  return readLegacyRunReport({
+    runsDirectory,
+    runId,
+    bestEffort,
+    ...(afterOpen === undefined ? {} : { afterOpen }),
+  });
+}
+
+export async function readLegacyRunReport({
+  runsDirectory,
+  runId,
+  bestEffort = false,
+  afterOpen,
+}: ReadRunReportOptions): Promise<RunReport> {
+  requireSafeRunId(runId);
   const recordPath = await resolveRunRecordPath(runsDirectory, runId);
   const opened = await openRunRecordFile(
     recordPath.path,
@@ -2468,6 +2486,17 @@ export async function readRunReport({
 export async function readRunFindings(
   options: ReadRunReportOptions,
 ): Promise<RunFindings> {
+  const { loadV9Run } = await import("./v9-views.js");
+  const current = await loadV9Run(options.runsDirectory, options.runId);
+  if (current)
+    return {
+      run_id: current.run_id,
+      raw: current.canonical.raw,
+      deduplicated: current.canonical.roots,
+      atomics: current.canonical.atomics,
+      semantic_proposals: current.canonical.semantic_proposals,
+      counts: current.canonical.counts,
+    } as unknown as RunFindings;
   const report = await readRunReport(options);
   return {
     run_id: report.run_id,
@@ -2486,6 +2515,32 @@ export async function readRetryRunPlan(
   options: ReadRunReportOptions,
 ): Promise<RetryRunPlan> {
   requireSafeRunId(options.runId);
+  const { loadV9Run } = await import("./v9-views.js");
+  const current = await loadV9Run(options.runsDirectory, options.runId);
+  if (current) {
+    if (!current.request)
+      throw new RunReportError(
+        "invalid_run_record",
+        "The artifact has no retryable request.",
+      );
+    return {
+      schema_version: "1",
+      kind: "review-mesh.retry-plan",
+      parent_run_id: current.run_id,
+      request: current.request,
+      incomplete_lenses: [
+        ...new Set(
+          current.reviewers
+            .filter(
+              (reviewer) =>
+                reviewer.status === "incomplete" ||
+                reviewer.reason === "not_evaluated_missing_input",
+            )
+            .map((reviewer) => reviewer.lens_id),
+        ),
+      ],
+    };
+  }
   const recordPath = await resolveRunRecordPath(
     options.runsDirectory,
     options.runId,
@@ -2555,6 +2610,38 @@ function uppercaseLabel(value: string): string {
 }
 
 export function renderRunReportMarkdown(report: RunReport): string {
+  if ((report.schema_version as string) === "2") {
+    const current =
+      report as unknown as import("./normalize-run.js").NormalizedRun;
+    const { canonical, reviewers } = current;
+    const headline =
+      current.run_outcome === "inconclusive"
+        ? "Inconclusive"
+        : current.run_outcome === "cancelled"
+          ? "Cancelled"
+          : current.run_outcome === "gate_findings"
+            ? "Gate findings"
+            : "Clear";
+    return [
+      `# Review Mesh ${current.run_id}`,
+      "",
+      `${headline}: ${current.coverage_outcome} coverage; ${canonical.counts.gate_eligible_subfindings} gate findings; ${canonical.counts.non_gating_subfindings} non-gating subfindings; ${current.summary.incomplete_lenses ?? 0} lenses incomplete.`,
+      "",
+      `Artifact: ${current.artifact.path}`,
+      "",
+      ...canonical.atomics.flatMap((finding) => [
+        `## ${finding.title}`,
+        finding.description,
+        `Gate exclusion reasons: ${finding.gate_eligibility.reasons.join(", ") || "eligible"}`,
+        "",
+      ]),
+      ...reviewers.flatMap((reviewer) =>
+        reviewer.result
+          ? [`## ${reviewer.reviewer_id}`, reviewer.result.review_markdown, ""]
+          : [],
+      ),
+    ].join("\n");
+  }
   const lines = [
     "# Review Mesh Report",
     "",

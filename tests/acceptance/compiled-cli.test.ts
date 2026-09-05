@@ -16,19 +16,23 @@ import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
-  publicEventSchema,
-  type PublicEvent,
-  type ReviewerResultV3,
+  publicEventV6Schema,
+  type PublicEventV6,
+  type ReviewerResultV4,
 } from "../../src/protocol/schemas.js";
 import { reviewerResultDigest } from "../../src/results/digest.js";
+import {
+  defaultV9FixtureResult,
+  v9CommandConfig,
+  v9LargeNarrative,
+  v9ReviewerResult,
+  writeV9CommandFixture,
+} from "../helpers/v9-command-fixture.js";
 
 const projectRoot = resolve(import.meta.dirname, "../..");
 const require = createRequire(import.meta.url);
 const tscCli = require.resolve("typescript/bin/tsc");
 const compiledCli = join(projectRoot, "dist", "cli.js");
-const fixtureUrl = pathToFileURL(
-  join(projectRoot, "tests", "fixtures", "command-adapter.mjs"),
-).href;
 const temporaryRoots: string[] = [];
 
 interface ProcessResult {
@@ -68,70 +72,54 @@ function configPath(root: string): string {
   return join(root, "config", "review-mesh", "config.toml");
 }
 
-function script(mode: string): string {
-  return `process.env.REVIEW_MESH_FIXTURE_MODE=${JSON.stringify(mode)}; await import(${JSON.stringify(fixtureUrl)});`;
-}
-
 function trustedConfig(
   modes: readonly string[],
-  options: { persistRuns?: boolean } = {},
+  scriptPath: string,
+  options: { persistRuns?: boolean; timeoutMs?: number } = {},
 ): string {
-  const reviewers = modes
-    .map(
-      (mode, index) => `
-[adapters.fixture_${index}]
-type = "command"
-command = ${JSON.stringify(process.execPath)}
-args = ["--input-type=module", "-e", ${JSON.stringify(script(mode))}]
-env_allowlist = ["REVIEW_MESH_FIXTURE_CAPTURE"]
-protocol = "review-mesh-command-v1"
-
-[reviewer_profiles.fixture_${index}]
-adapter = "fixture_${index}"
-model = "fixture-model-${index}"
-purpose = "Acceptance reviewer ${index}"
-instructions = "Review without modifying the workspace."
-isolation = "prefer_enforced"
-timeout_ms = 5000
-
-[[reviewers]]
-id = "fixture-${index}"
-profile = "fixture_${index}"
-`,
-    )
-    .join("\n");
-  return `schema_version = "1"
-
-[execution]
-max_concurrency = 3
-heartbeat_interval_ms = 100
-shutdown_grace_period_ms = 100
-
-[diagnostics]
-persist_runs = ${options.persistRuns === true ? "true" : "false"}
-max_runs = 1
-${reviewers}`;
+  return v9CommandConfig({
+    scriptPath,
+    entries: modes.map((mode) => ({
+      mode: mode as Parameters<typeof defaultV9FixtureResult>[0],
+    })),
+    persistRuns: options.persistRuns !== false,
+    timeoutMs: options.timeoutMs ?? 20_000,
+  });
 }
 
 async function createFixture(
   modes: readonly string[],
-  options: { persistRuns?: boolean } = {},
+  options: {
+    persistRuns?: boolean;
+    timeoutMs?: number;
+    results?: readonly NonNullable<ReturnType<typeof defaultV9FixtureResult>>[];
+  } = {},
 ): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), "review-mesh-acceptance-"));
   temporaryRoots.push(root);
   const workspace = join(root, "workspace");
+  const reviewer = join(root, "v9-command-reviewer.mjs");
   const configFile = configPath(root);
   await mkdir(workspace, { recursive: true });
   await writeFile(join(workspace, "source.ts"), "export const value = 1;\n");
   await writeFile(join(workspace, "sentinel.txt"), "immutable-sentinel\n");
+  await writeV9CommandFixture(
+    reviewer,
+    modes.map((mode, index) => ({
+      mode: mode as Parameters<typeof defaultV9FixtureResult>[0],
+      ...(options.results?.[index] === undefined
+        ? {}
+        : { result: options.results[index] }),
+    })),
+  );
   await mkdir(dirname(configFile), { recursive: true });
-  await writeFile(configFile, trustedConfig(modes, options));
+  await writeFile(configFile, trustedConfig(modes, reviewer, options));
   return {
     root,
     workspace,
     env: isolatedEnvironment(root),
     request: JSON.stringify({
-      schema_version: "2",
+      schema_version: "3",
       request_id: "acceptance-request",
       project_name: "workspace",
       workspace,
@@ -141,8 +129,11 @@ async function createFixture(
   };
 }
 
-function start(fixture: Fixture): ChildProcessWithoutNullStreams {
-  const child = spawn(process.execPath, [compiledCli, "review"], {
+function start(
+  fixture: Fixture,
+  args: readonly string[] = [],
+): ChildProcessWithoutNullStreams {
+  const child = spawn(process.execPath, [compiledCli, "review", ...args], {
     cwd: projectRoot,
     env: fixture.env,
     stdio: "pipe",
@@ -190,11 +181,11 @@ async function collect(
   };
 }
 
-function events(stdout: string): PublicEvent[] {
+function events(stdout: string): PublicEventV6[] {
   const parsed = stdout
     .split(/\r?\n/)
     .filter(Boolean)
-    .map((line) => publicEventSchema.parse(JSON.parse(line)));
+    .map((line) => publicEventV6Schema.parse(JSON.parse(line)));
   expect(parsed.map((event) => event.seq)).toEqual(
     parsed.map((_, index) => index + 1),
   );
@@ -276,16 +267,25 @@ describe("compiled CLI acceptance", () => {
     expect(result).toMatchObject({
       exitCode: 0,
       signal: null,
-      stdout: "review-mesh 8.0.0\n",
+      stdout: "review-mesh 9.0.0\n",
       stderr: "",
     });
   });
 
-  it("defaults to a complete full result and strictly round-trips its artifact", async () => {
-    const fixture = await createFixture(["large-fail", "large-fail"], {
-      persistRuns: true,
+  it("explicitly delivers a complete 13 MiB full result and strictly round-trips its artifact", async () => {
+    const exactNarrative = v9LargeNarrative("# Complete acceptance finding");
+    const exactResult = v9ReviewerResult({
+      verdict: "fail",
+      reviewMarkdown: exactNarrative,
     });
-    const result = await collect(start(fixture));
+    const fixture = await createFixture(["large-fail"], {
+      persistRuns: true,
+      timeoutMs: 120_000,
+      results: [exactResult],
+    });
+    const result = await collect(
+      start(fixture, ["--output-mode", "full-jsonl"]),
+    );
     const parsed = events(result.stdout);
     const full = parsed.find((event) => event.event === "reviewer.result");
     const completed = parsed.at(-1);
@@ -293,23 +293,24 @@ describe("compiled CLI acceptance", () => {
       full?.event !== "reviewer.result" ||
       completed?.event !== "run.completed"
     ) {
-      throw new Error("missing full result contract");
+      throw new Error(
+        `missing full result contract ${JSON.stringify({ result, parsed })}`,
+      );
     }
     const fullResults = parsed.filter(
-      (event): event is Extract<PublicEvent, { event: "reviewer.result" }> =>
+      (event): event is Extract<PublicEventV6, { event: "reviewer.result" }> =>
         event.event === "reviewer.result",
     );
-    const accepted = full.data.result as ReviewerResultV3;
-    const expectedReview = `# Review\n\nOne actionable finding.\n\n${"Complete acceptance evidence. ".repeat(4_096)}`;
-    expect(Buffer.byteLength(expectedReview, "utf8")).toBeGreaterThan(
-      100 * 1_024,
-    );
+    const accepted = full.data.result as ReviewerResultV4;
+    const expectedReview = exactNarrative;
+    expect(Buffer.byteLength(expectedReview, "utf8")).toBe(13 * 1024 * 1024);
 
-    expect(result).toMatchObject({ exitCode: 1, signal: null, stderr: "" });
-    expect(fullResults).toHaveLength(2);
-    const secondAccepted = fullResults[1]!.data.result as ReviewerResultV3;
+    expect(result).toMatchObject({ exitCode: 0, signal: null, stderr: "" });
+    expect(fullResults).toHaveLength(1);
     for (const event of fullResults) {
-      const resultDigest = reviewerResultDigest(event.data.result);
+      const resultDigest = reviewerResultDigest(
+        event.data.result as ReviewerResultV4,
+      );
       const resultBytes = Buffer.byteLength(
         JSON.stringify(event.data.result),
         "utf8",
@@ -318,27 +319,29 @@ describe("compiled CLI acceptance", () => {
         digest: resultDigest,
         byte_count: resultBytes,
         result: {
-          schema_version: "3",
+          schema_version: "4",
           review_markdown: expectedReview,
         },
       });
     }
     expect(completed.data).toMatchObject({
-      raw_findings: 2,
-      unique_findings: 1,
-      gate_findings: 1,
-      advisory_findings: 0,
-      results_complete: true,
+      run_outcome: "clear",
+      gate_outcome: "no_gate_findings",
+      coverage_outcome: "complete",
+      raw_source_findings: 1,
+      atomic_subfindings: 1,
+      canonical_roots: 1,
+      gate_eligible_subfindings: 0,
+      result_delivery: {
+        completed_results: 1,
+        artifact: "complete",
+        planned_public_stream: "complete",
+      },
+      artifact: { completed_results: 1 },
     });
-    expect(completed.data.result_manifest).toHaveLength(2);
-    for (const [index, event] of fullResults.entries()) {
-      expect(event.data.artifact_path).toBe(completed.data.report_path);
-      expect(completed.data.result_manifest?.[index]).toMatchObject({
-        reviewer_id: event.reviewer_id,
-        digest: event.data.digest,
-        byte_count: event.data.byte_count,
-        artifact_path: completed.data.report_path,
-      });
+    expect(completed.data.artifact.path).toEqual(expect.any(String));
+    for (const event of fullResults) {
+      expect(event.data).not.toHaveProperty("artifact_path");
     }
 
     const [statusOutput, reportOutput, findingsOutput] = await Promise.all([
@@ -373,38 +376,48 @@ describe("compiled CLI acceptance", () => {
       run_id: completed.run_id,
       reviewers: [
         {
-          reviewer_id: "fixture-0",
+          reviewer_id: "fixture_0",
           complete_result: accepted,
           result_digest: fullResults[0]?.data.digest,
           result_byte_count: fullResults[0]?.data.byte_count,
         },
-        { reviewer_id: "fixture-1", complete_result: secondAccepted },
       ],
     });
     expect(report).toMatchObject({
       run_id: completed.run_id,
-      reviewers: [
-        { reviewer_id: "fixture-0", result: accepted },
-        { reviewer_id: "fixture-1", result: secondAccepted },
-      ],
-      finding_counts: { raw: 2, unique: 1, gate: 1, advisory: 0 },
+      reviewers: [{ reviewer_id: "fixture_0", result: accepted }],
+      finding_counts: {
+        raw_source_findings: 1,
+        atomic_subfindings: 1,
+        canonical_roots: 1,
+        gate_eligible_subfindings: 0,
+      },
     });
     expect(findings).toMatchObject({
       run_id: completed.run_id,
-      findings: [expect.objectContaining({ id: "fixture-medium" })],
+      findings: [
+        expect.objectContaining({
+          id: "fixture-shared-root",
+          subfindings: [expect.objectContaining({ id: "fixture-medium" })],
+        }),
+      ],
     });
-    expect((findings.findings as unknown[]).length).toBe(
-      completed.data.unique_findings,
-    );
-  }, 20_000);
+    expect((findings.findings as unknown[]).length).toBeGreaterThan(0);
+  }, 180_000);
 
   it.each([
-    [["pass", "pass"], 0, "passed"],
-    [["pass", "fail"], 1, "findings"],
-    [["fail", "crash"], 3, "incomplete"],
+    [["pass", "pass"], 0, "clear", "no_gate_findings", "complete"],
+    [["pass", "fail"], 0, "clear", "no_gate_findings", "complete"],
+    [["fail", "crash"], 3, "inconclusive", "no_gate_findings", "partial"],
   ] as const)(
     "returns the expected exit and status for %j",
-    async (modes, expectedExit, expectedStatus) => {
+    async (
+      modes,
+      expectedExit,
+      expectedOutcome,
+      expectedGateOutcome,
+      expectedCoverageOutcome,
+    ) => {
       const fixture = await createFixture(modes);
       const before = await workspaceDigest(fixture.workspace);
 
@@ -418,13 +431,10 @@ describe("compiled CLI acceptance", () => {
       expect(completed?.event).toBe("run.completed");
       if (completed?.event !== "run.completed")
         throw new Error("missing completion");
-      expect(completed.data.status).toBe(expectedStatus);
-      expect(completed.data.consistency_mode).toBe("live_worktree");
+      expect(completed.data.run_outcome).toBe(expectedOutcome);
+      expect(completed.data.gate_outcome).toBe(expectedGateOutcome);
+      expect(completed.data.coverage_outcome).toBe(expectedCoverageOutcome);
       expect(completed.data.model_runs?.total).toBe(modes.length);
-      if (expectedStatus === "incomplete") {
-        expect(completed.data.gate_outcome).toBe("findings");
-        expect(completed.data.coverage_outcome).toBe("partial");
-      }
       expect(await workspaceDigest(fixture.workspace)).toBe(before);
     },
     20_000,
@@ -452,7 +462,7 @@ describe("compiled CLI acceptance", () => {
     const parsed = result.stdout
       .split(/\r?\n/)
       .filter(Boolean)
-      .map((line) => publicEventSchema.parse(JSON.parse(line)));
+      .map((line) => publicEventV6Schema.parse(JSON.parse(line)));
     if (parsed.at(-1)?.event !== "run.completed") {
       throw new Error(
         `interrupted result ${JSON.stringify({ result, events: parsed })}`,
@@ -469,7 +479,7 @@ describe("compiled CLI acceptance", () => {
     if (completed?.event !== "run.completed")
       throw new Error("missing completion");
     expect(completed.data).toMatchObject({
-      status: "incomplete",
+      run_outcome: "cancelled",
       exit_code: 4,
       coverage_outcome: "partial",
       model_runs: { incomplete: 1 },

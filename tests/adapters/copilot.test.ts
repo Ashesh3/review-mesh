@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createCopilotAdapter,
   type CopilotClientFacade,
@@ -23,6 +24,7 @@ import {
   resolvedReviewer,
 } from "../helpers/fixtures.js";
 import type { ReasoningEffort } from "../../src/config/schemas.js";
+import { createResultPageCollector } from "../../src/results/result-pages.js";
 
 const model = {
   id: "gpt-5.6-copilot",
@@ -58,9 +60,20 @@ function sdkEvent(value: object): CopilotSessionEvent {
   return value as CopilotSessionEvent;
 }
 
+const pendingStorage: Array<{ abandoned(): void | Promise<void> }> = [];
+afterEach(async () => {
+  await Promise.all(
+    pendingStorage.splice(0).map((storage) => storage.abandoned()),
+  );
+});
+
 async function collect(iterable: AsyncIterable<AdapterEvent>) {
   const values: AdapterEvent[] = [];
-  for await (const value of iterable) values.push(value);
+  for await (const value of iterable) {
+    values.push(value);
+    if (value.type === "result" && value.resultStorage)
+      pendingStorage.push(value.resultStorage);
+  }
   return values;
 }
 
@@ -238,6 +251,288 @@ function permission(
 }
 
 describe("Copilot adapter", () => {
+  it("registers only core handlers and requests a v9 result page on the same session", async () => {
+    const page = JSON.stringify({
+      schema_version: "1",
+      kind: "review-mesh.result-page",
+      result_id: "copilot-pages",
+      result_kind: "reviewer",
+      result_schema_version: "4",
+      page_index: 0,
+      page_count: 1,
+      page_kind: "header",
+      previous_page_digest: null,
+      payload: {
+        verdict: "pass",
+        summary: "clean",
+        informational_notes: [],
+        narrative_byte_count: 0,
+        narrative_fragment_count: 0,
+        actionable_finding_count: 0,
+        coverage_attestation: null,
+      },
+    });
+    const fake = fakeFactory({ response: finalMessage(page) });
+    const prepared = setup({ createClient: fake.createClient });
+    prepared.input.resultPages = createResultPageCollector({
+      resultId: "copilot-pages",
+      resultKind: "reviewer",
+    });
+
+    const output = await collect(prepared.adapter.run(prepared.input));
+
+    const terminal = terminalResult(output);
+    expect(terminal.result).toMatchObject({
+      schema_version: "4",
+      verdict: "pass",
+    });
+    const stored = [];
+    for await (const entry of terminal.resultStorage!.pages!())
+      stored.push(entry);
+    expect(stored[0]?.raw).toBe(page);
+    const config = fake.capture.sessionConfigs[0]!;
+    expect(config.availableTools).toEqual([
+      "custom:list_files",
+      "custom:read_file",
+      "custom:search_text",
+    ]);
+    expect(config.excludedTools).toContain("builtin:view");
+    expect(config.tools?.map((tool) => tool.name)).toEqual([
+      "list_files",
+      "read_file",
+      "search_text",
+    ]);
+    expect(JSON.stringify(fake.capture.sendCalls[0]!.options)).toContain(
+      "copilot-pages",
+    );
+  });
+  it("preserves an assembly-only invalid-result failure", async () => {
+    const page = JSON.stringify({
+      schema_version: "1",
+      kind: "review-mesh.result-page",
+      result_id: "copilot-false-count",
+      result_kind: "reviewer",
+      result_schema_version: "4",
+      page_index: 0,
+      page_count: 1,
+      page_kind: "header",
+      previous_page_digest: null,
+      payload: {
+        verdict: "pass",
+        summary: "clean",
+        informational_notes: [],
+        narrative_byte_count: 1,
+        narrative_fragment_count: 1,
+        actionable_finding_count: 0,
+        coverage_attestation: null,
+      },
+    });
+    const fake = fakeFactory({ response: finalMessage(page) });
+    const prepared = setup({ createClient: fake.createClient });
+    prepared.input.resultPages = createResultPageCollector({
+      resultId: "copilot-false-count",
+      resultKind: "reviewer",
+    });
+
+    const terminal = terminalFailure(
+      await collect(prepared.adapter.run(prepared.input)),
+    );
+
+    expect(terminal.failure).toMatchObject({
+      reason: "invalid_result",
+      diagnostics: {
+        failure_code: "provider_response_invalid",
+        failure_stage: "structured_result_page",
+      },
+    });
+  });
+  it("credits a serialized body only after Copilot reports the same model-facing tool result", async () => {
+    const acknowledgeDelivered = vi.fn(() => true);
+    const fake = fakeFactory({
+      response: finalMessage(
+        JSON.stringify({
+          schema_version: "1",
+          kind: "review-mesh.result-page",
+          result_id: "copilot-read",
+          result_kind: "reviewer",
+          result_schema_version: "4",
+          page_index: 0,
+          page_count: 1,
+          page_kind: "header",
+          previous_page_digest: null,
+          payload: {
+            verdict: "pass",
+            summary: "clean",
+            informational_notes: [],
+            narrative_byte_count: 0,
+            narrative_fragment_count: 0,
+            actionable_finding_count: 0,
+            coverage_attestation: null,
+          },
+        }),
+      ),
+    });
+    const prepared = setup({ createClient: fake.createClient });
+    prepared.input.resultPages = createResultPageCollector({
+      resultId: "copilot-read",
+      resultKind: "reviewer",
+    });
+    prepared.input.coverage = {
+      scopeDigest: "a".repeat(64),
+      readFile: vi.fn(async () => ({
+        ok: true as const,
+        path: "src/a.ts",
+        bytes: Buffer.from("ok"),
+        offset: 0,
+        byteCount: 2,
+        totalByteCount: 2,
+        sha256: "b".repeat(64),
+        snapshotDigest: "b".repeat(64),
+        eof: true,
+        acknowledgeDelivered,
+      })),
+      observedFile: vi.fn(),
+      recordDiffDelivery: vi.fn(),
+      reconcileAttestation: vi.fn(),
+      summary: vi.fn(),
+      entries: vi.fn(),
+      snapshotFiles: vi.fn(() => []),
+      close: vi.fn(async () => undefined),
+    };
+    const diff = "diff --git a/src/a.ts b/src/a.ts\n+ok\n";
+    Object.assign(prepared.input.context.git, {
+      is_repository: true,
+      diff,
+      changed_files: ["src/a.ts"],
+      changed_paths: [{ path: "src/a.ts", status: "modified" }],
+      raw_diff: { byte_count: Buffer.byteLength(diff), sha256: "c".repeat(64) },
+      truncated: {
+        diff_stat: false,
+        diff: false,
+        changed_files: false,
+      },
+    });
+    prepared.input.prompt = {
+      ...prepared.input.prompt,
+      user: `${prepared.input.prompt.user}\n${diff}`,
+    };
+
+    await collect(prepared.adapter.run(prepared.input));
+    expect(prepared.input.coverage.recordDiffDelivery).toHaveBeenCalledWith(
+      ["src/a.ts"],
+      { byteCount: Buffer.byteLength(diff), sha256: "c".repeat(64) },
+    );
+    const tool = fake.capture.sessionConfigs[0]!.tools!.find(
+      (entry) => entry.name === "read_file",
+    )!;
+    const returned = await tool.handler!(
+      { path: "src/a.ts" },
+      { toolCallId: "tool-call-1" },
+    );
+
+    expect(typeof returned).toBe("string");
+    expect(JSON.parse(returned as string)).toMatchObject({
+      path: "src/a.ts",
+      content: "b2s=",
+    });
+    expect(acknowledgeDelivered).not.toHaveBeenCalled();
+    fake.emit(
+      sdkEvent({
+        type: "tool.execution_complete",
+        id: "tool-complete-1",
+        data: {
+          toolCallId: "tool-call-1",
+          success: true,
+          result: { content: returned },
+        },
+      }),
+    );
+    expect(acknowledgeDelivered).toHaveBeenCalledOnce();
+  });
+  it("continues v9 pages on the same Copilot session", async () => {
+    const first = JSON.stringify({
+      schema_version: "1",
+      kind: "review-mesh.result-page",
+      result_id: "copilot-two",
+      result_kind: "reviewer",
+      result_schema_version: "4",
+      page_index: 0,
+      page_count: 2,
+      page_kind: "header",
+      previous_page_digest: null,
+      payload: {
+        verdict: "pass",
+        summary: "clean",
+        informational_notes: [],
+        narrative_byte_count: 1,
+        narrative_fragment_count: 1,
+        actionable_finding_count: 0,
+        coverage_attestation: null,
+      },
+    });
+    const second = JSON.stringify({
+      schema_version: "1",
+      kind: "review-mesh.result-page",
+      result_id: "copilot-two",
+      result_kind: "reviewer",
+      result_schema_version: "4",
+      page_index: 1,
+      page_count: 2,
+      page_kind: "narrative",
+      previous_page_digest: createHash("sha256").update(first).digest("hex"),
+      payload: { text_fragment: "x" },
+    });
+    let call = 0;
+    const fake = fakeFactory({ response: finalMessage(first) });
+    const clientFactory: CopilotClientFactory = (options) => {
+      const client = fake.createClient(options);
+      const session = fake.sessions.at(-1)!;
+      session.sendAndWait = vi.fn(async (messageOptions, timeout) => {
+        fake.capture.sendCalls.push({ options: messageOptions, timeout });
+        return finalMessage(call++ === 0 ? first : second);
+      });
+      return client;
+    };
+    const prepared = setup({ createClient: clientFactory });
+    prepared.input.resultPages = createResultPageCollector({
+      resultId: "copilot-two",
+      resultKind: "reviewer",
+    });
+
+    const output = await collect(prepared.adapter.run(prepared.input));
+
+    expect(terminalResult(output).result).toMatchObject({
+      review_markdown: "x",
+    });
+    expect(fake.capture.sessionConfigs).toHaveLength(1);
+    expect(fake.capture.sendCalls).toHaveLength(2);
+  });
+  it("classifies a Copilot length finish as output truncation before page parsing", async () => {
+    let fake!: ReturnType<typeof fakeFactory>;
+    fake = fakeFactory({
+      response: finalMessage('{"partial":'),
+      onSend: () =>
+        fake.emit(
+          sdkEvent({
+            type: "assistant.usage",
+            id: "usage-length",
+            data: { finishReason: "length" },
+          }),
+        ),
+    });
+    const prepared = setup({ createClient: fake.createClient });
+    prepared.input.resultPages = createResultPageCollector({
+      resultId: "copilot-truncated",
+      resultKind: "reviewer",
+    });
+    expect(
+      terminalFailure(await collect(prepared.adapter.run(prepared.input)))
+        .failure,
+    ).toMatchObject({
+      reason: "output_truncated",
+      retryable: true,
+    });
+  });
   it("probes a fresh client and checks status, auth, and model membership concurrently", async () => {
     const status = deferred<{ version: string; protocolVersion: number }>();
     const auth = deferred<{ isAuthenticated: boolean }>();
@@ -281,6 +576,8 @@ describe("Copilot adapter", () => {
       cancellation: true,
       maximumIsolation: "prompt_only",
       runtime_version: "1.0.11",
+      observed_file_access: true,
+      progress_observable: true,
     });
     expect(fake.capture.lifecycle).toEqual(["start", "stop"]);
     expect(fake.capture.clientOptions).toEqual([
@@ -517,12 +814,14 @@ describe("Copilot adapter", () => {
         fake.emit(
           sdkEvent({
             type: "assistant.turn_start",
+            id: "turn-start-1",
             data: { turnId: "turn-1", raw: "private prompt" },
           }),
         );
         fake.emit(
           sdkEvent({
             type: "tool.execution_start",
+            id: "tool-start-1",
             data: {
               toolCallId: "tool-1",
               toolName: "grep",
@@ -533,6 +832,7 @@ describe("Copilot adapter", () => {
         fake.emit(
           sdkEvent({
             type: "tool.execution_complete",
+            id: "tool-complete-1",
             data: {
               toolCallId: "tool-1",
               success: true,
@@ -543,10 +843,13 @@ describe("Copilot adapter", () => {
         fake.emit(
           sdkEvent({
             type: "assistant.message",
+            id: "assistant-message-1",
             data: { content: "private model text" },
           }),
         );
-        fake.emit(sdkEvent({ type: "session.idle", data: {} }));
+        fake.emit(
+          sdkEvent({ type: "session.idle", id: "session-idle-1", data: {} }),
+        );
       },
     });
     const prepared = setup({ createClient: fake.createClient });
@@ -558,14 +861,28 @@ describe("Copilot adapter", () => {
         type: "progress",
         phase: "reviewing",
         message: "Copilot started the review turn.",
+        identity: expect.any(String),
       },
-      { type: "activity", message: "Copilot started an inspection tool." },
-      { type: "activity", message: "Copilot completed an inspection tool." },
-      { type: "activity", message: "Copilot produced a response message." },
+      {
+        type: "activity",
+        message: "Copilot started an inspection tool.",
+        identity: expect.any(String),
+      },
+      {
+        type: "activity",
+        message: "Copilot completed an inspection tool.",
+        identity: expect.any(String),
+      },
+      {
+        type: "activity",
+        message: "Copilot produced a response message.",
+        identity: expect.any(String),
+      },
       {
         type: "progress",
         phase: "validating",
         message: "Copilot completed the review turn.",
+        identity: expect.any(String),
       },
     ]);
     expect(JSON.stringify(output)).not.toContain("private");

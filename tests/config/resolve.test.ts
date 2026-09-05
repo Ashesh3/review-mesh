@@ -84,6 +84,49 @@ function v5(projectName: string): TrustedConfigV5 {
 }
 
 describe("global configuration", () => {
+  it("resolves v7 execution and lens prerequisite and coverage policies", () => {
+    const legacy = v5("demo");
+    const config = {
+      ...legacy,
+      schema_version: "7" as const,
+      execution: {
+        ...legacy.execution,
+        deadline_mode: "adaptive" as const,
+        no_progress_timeout_ms: 300_000,
+      },
+      agents: {
+        readiness: {
+          ...Object.values(legacy.agents)[0]!,
+          kind: "generic" as const,
+          applicability: { mode: "always" as const },
+          required_input: ["/context/ticket"],
+          lens_deadline_ms: 600_000,
+          change_coverage: {
+            relevant_paths: ["**"],
+            minimum_inspection: "full_file" as const,
+            proof: "observed" as const,
+          },
+        },
+      },
+      defaults: { agents: ["readiness"] },
+      projects: {},
+    };
+    const resolved = resolveConfig({ trusted: config });
+    expect(resolved.execution).toMatchObject({
+      deadline_mode: "adaptive",
+      no_progress_timeout_ms: 300_000,
+    });
+    expect(resolved.reviewers[0]?.policy).toMatchObject({
+      kind: "generic",
+      lensDeadlineMs: 600_000,
+      requiredInput: ["/context/ticket"],
+      changeCoverage: {
+        relevantPaths: ["**"],
+        minimumInspection: "full_file",
+        proof: "observed",
+      },
+    });
+  });
   it("resolves explicit continuation attempts and preserves the legacy default of two", () => {
     const legacyBase = v5("demo");
     const legacyAgent = Object.values(legacyBase.agents)[0]!;
@@ -782,8 +825,15 @@ profile = "second"
         configFile: join(root, "config.toml"),
         workspace,
       });
-      expect(loaded.trusted.schema_version).toBe("6");
+      expect(loaded.trusted.schema_version).toBe("7");
+      expect(loaded.migrated).toBe(true);
+      expect(loaded.migrationWarnings.map(({ code }) => code)).toEqual([
+        "implicit_v9_deadline",
+        "implicit_v9_change_coverage",
+      ]);
       const resolved = resolveConfig(loaded);
+      expect(resolved.sourceSchemaVersion).toBe("1");
+      expect(resolved.migrationWarnings).toEqual(loaded.migrationWarnings);
       expect(resolved.execution.distribute_primaries).toBe(false);
       expect(resolved.reviewers.map(({ id }) => id)).toEqual([
         "first",
@@ -849,7 +899,15 @@ instructions_file = "project.md"
         configFile: join(configDirectory, "config.toml"),
         workspace,
       });
-      expect(loaded.trusted.schema_version).toBe("6");
+      expect(loaded.trusted.schema_version).toBe("7");
+      expect(loaded.migrationWarnings).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            code: "attested_coverage_requires_adapter_upgrade",
+            lens_ids: ["agent"],
+          }),
+        ]),
+      );
       const resolved = resolveConfig(loaded);
       expect(resolved.reviewers[0]?.instruction_layers).toEqual([
         { source: "trusted", content: "Agent instructions." },

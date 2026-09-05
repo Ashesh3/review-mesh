@@ -1,4 +1,8 @@
 import type { AdapterFailure } from "../adapters/errors.js";
+import {
+  legacyIncompleteReason,
+  legacyFailureDiagnostics,
+} from "../protocol/legacy-reason.js";
 import type { AdapterCapabilities } from "../adapters/types.js";
 import type { ResolvedReviewer } from "../config/schemas.js";
 import type {
@@ -15,7 +19,7 @@ import type { AdjudicationOutcome } from "../findings/adjudication.js";
 import {
   canonicalizeFindings,
   type CanonicalRawFinding,
-} from "../findings/canonical.js";
+} from "../findings/canonical-legacy.js";
 import { DEFAULT_GATE_THRESHOLDS, meetsGateThresholds } from "./lens-policy.js";
 
 export type ReviewerLifecycleStatus =
@@ -208,7 +212,7 @@ function terminalRecord(state: ReviewerState): ReviewerTerminalRecord {
       ...common,
       status: "incomplete",
       ...(state.isolation === undefined ? {} : { isolation: state.isolation }),
-      reason: state.failure.reason,
+      reason: legacyIncompleteReason(state.failure.reason),
       message: state.failure.message,
       retryable: state.failure.retryable,
       fallback_eligible: state.failure.fallback_eligible === true,
@@ -217,7 +221,7 @@ function terminalRecord(state: ReviewerState): ReviewerTerminalRecord {
         : { circuit_qualifying: state.failure.circuit_qualifying }),
       ...(state.failure.diagnostics === undefined
         ? {}
-        : { diagnostics: clone(state.failure.diagnostics) }),
+        : { diagnostics: legacyFailureDiagnostics(state.failure.diagnostics) }),
     };
   }
   if (state.status === "skipped" && state.skipReason !== undefined) {

@@ -1,4 +1,5 @@
 import type { IncompleteReason } from "../protocol/schemas.js";
+import type { V9IncompleteReason } from "../protocol/v9.js";
 
 const MAX_MESSAGE_LENGTH = 1_000;
 const MAX_FAILURE_STAGE_LENGTH = 64;
@@ -21,6 +22,8 @@ const FAILURE_CODES = new Set<AdapterFailureCode>([
   "transport_error",
   "response_too_large",
   "streaming_unsupported",
+  "result_page_too_large",
+  "structured_page_limit_exceeded",
 ]);
 const CORRELATION_HEADER_NAMES = new Set([
   "x-request-id",
@@ -52,7 +55,9 @@ export type AdapterFailureCode =
   | "request_timeout"
   | "transport_error"
   | "response_too_large"
-  | "streaming_unsupported";
+  | "streaming_unsupported"
+  | "result_page_too_large"
+  | "structured_page_limit_exceeded";
 
 export type AdapterRetryOutcome = "not_attempted" | "succeeded" | "exhausted";
 
@@ -104,7 +109,7 @@ export interface AdapterFailureOptions {
 
 /** A provider-independent, safe-to-publish adapter failure. */
 export interface AdapterFailure {
-  reason: IncompleteReason;
+  reason: IncompleteReason | V9IncompleteReason;
   message: string;
   retryable: boolean;
   /** Whether another configured model/provider may recover this logical review. */
@@ -114,17 +119,31 @@ export interface AdapterFailure {
   diagnostics?: AdapterFailureDiagnostics;
 }
 
-const defaultFallbackEligibility: Record<IncompleteReason, boolean> = {
+const defaultFallbackEligibility: Partial<
+  Record<IncompleteReason | V9IncompleteReason, boolean>
+> = {
   adapter_unavailable: true,
   authentication_failed: true,
   model_unavailable: true,
   read_failure: false,
+  queue_deadline_exceeded: true,
+  probe_deadline_exceeded: true,
+  attempt_deadline_exceeded: true,
+  model_candidate_deadline_exceeded: true,
+  no_progress_timeout: true,
+  lens_deadline_exceeded: true,
+  run_deadline_exceeded: false,
+  structured_page_limit_exceeded: true,
+  result_page_too_large: true,
+  output_truncated: true,
+  provider_response_invalid: true,
   timeout: true,
   process_crashed: true,
   protocol_violation: true,
   invalid_result: true,
   result_too_large: true,
   persistence_failed: false,
+  change_coverage_incomplete: true,
   cancelled: false,
   unknown: true,
 };
@@ -382,7 +401,7 @@ function sanitizeResponseStructure(
  * this helper deliberately never classifies provider text.
  */
 export function sanitizeAdapterFailure(
-  reason: IncompleteReason,
+  reason: IncompleteReason | V9IncompleteReason,
   message: unknown,
   retryable = false,
   options: AdapterFailureOptions = {},

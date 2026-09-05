@@ -9,6 +9,7 @@ import {
 import { getAppPaths } from "./paths.js";
 import { resolveConfig } from "./resolve.js";
 import { providerOutageTolerance } from "../orchestrator/lens-policy.js";
+import { describeTopology } from "./topology.js";
 
 export interface DescribeEffectiveConfigInput {
   configFile?: string;
@@ -20,7 +21,7 @@ export interface DescribeEffectiveConfigInput {
 export interface DescribeResolvedConfigInput {
   configFile: string;
   revision: string;
-  configSchemaVersion: "1" | "2" | "3" | "4" | "5" | "6";
+  configSchemaVersion: "1" | "2" | "3" | "4" | "5" | "6" | "7";
   migrated: boolean;
   workspace: string;
   resolved: ReturnType<typeof resolveConfig>;
@@ -42,7 +43,7 @@ export interface EffectiveConfigDescription {
   valid: true;
   config_path: string;
   revision: string;
-  config_schema_version: "1" | "2" | "3" | "4" | "5" | "6";
+  config_schema_version: "1" | "2" | "3" | "4" | "5" | "6" | "7";
   migrated: boolean;
   workspace: string;
   selection: {
@@ -64,6 +65,9 @@ export interface EffectiveConfigDescription {
     retry_attempts: number;
     continuation_attempts: number;
     retry_backoff_ms: number;
+    deadline_mode?: "adaptive" | "fixed" | undefined;
+    run_deadline_ms?: number | undefined;
+    no_progress_timeout_ms?: number | undefined;
   };
   diagnostics: { persist_runs: boolean; max_runs: number };
   reviewers: Array<{
@@ -97,8 +101,16 @@ export interface EffectiveConfigDescription {
   }>;
   credential_environment: Array<{ name: string; present: boolean }>;
   warnings: Array<{
-    code: "provider_concentration" | "zero_outage_tolerance_quorum";
+    code:
+      | "provider_concentration"
+      | "zero_outage_tolerance"
+      | "single_failure_makes_quorum_unreachable"
+      | "provider_concurrency_amplification"
+      | "implicit_v9_deadline"
+      | "implicit_v9_change_coverage"
+      | "attested_coverage_requires_adapter_upgrade";
     message: string;
+    acknowledged?: boolean;
     lens_ids: string[];
     provider_groups: string[];
   }>;
@@ -151,60 +163,13 @@ export function describeResolvedConfig(
     members.push(reviewer);
     lenses.set(id, members);
   }
-  const primaryGroups = new Set(
-    [...lenses.values()].map((members) => {
-      const primary = members.find(
-        (reviewer) => (reviewer.modelIndex ?? 0) === 0,
-      );
-      return primary?.providerGroup ?? primary?.adapterId ?? "unknown";
-    }),
-  );
-  const warnings: EffectiveConfigDescription["warnings"] = [];
-  if (lenses.size > 1 && primaryGroups.size === 1) {
-    warnings.push({
-      code: "provider_concentration",
-      message:
-        "Every logical lens starts on the same provider group; one provider incident can amplify across the suite.",
-      lens_ids: [...lenses.keys()],
-      provider_groups: [...primaryGroups],
-    });
-  }
-  const zeroToleranceLenses = [...lenses.entries()]
-    .filter(([, members]) => {
-      if (members.length < 2) return false;
-      const policy = members[0]?.policy;
-      const providerGroups = members.map(
-        (reviewer) => reviewer.providerGroup ?? reviewer.adapterId,
-      );
-      return (
-        new Set(providerGroups).size > 1 &&
-        providerOutageTolerance(
-          {
-            passQuorum: policy?.passQuorum ?? members.length,
-            minimumProviderGroups: policy?.minimumProviderGroups ?? 1,
-          },
-          providerGroups,
-        ) === 0
-      );
-    })
-    .map(([id]) => id);
-  if (zeroToleranceLenses.length > 0) {
-    warnings.push({
-      code: "zero_outage_tolerance_quorum",
-      message:
-        "One or more multi-model lenses cannot tolerate one provider-group outage while still satisfying clean-pass quorum.",
-      lens_ids: zeroToleranceLenses,
-      provider_groups: [
-        ...new Set(
-          zeroToleranceLenses.flatMap((id) =>
-            (lenses.get(id) ?? []).map(
-              (reviewer) => reviewer.providerGroup ?? reviewer.adapterId,
-            ),
-          ),
-        ),
-      ],
-    });
-  }
+  const warnings: EffectiveConfigDescription["warnings"] = [
+    ...describeTopology(input.resolved),
+    ...(input.resolved.migrationWarnings ?? []).map((warning) => ({
+      ...warning,
+      provider_groups: [],
+    })),
+  ];
   return {
     valid: true,
     config_path: input.configFile,
@@ -360,6 +325,9 @@ export async function describeEffectiveConfig(
       workspace: loaded.workspace,
       projectName: loaded.projectName,
       projectNameSource: loaded.projectNameSource,
+      sourceSchemaVersion: loaded.sourceSchemaVersion,
+      migrated: loaded.migrated,
+      migrationWarnings: loaded.migrationWarnings,
     });
     const after = await loadManagedConfig(configFile);
     if (configRevision(after.snapshot) !== revision) {
@@ -369,7 +337,7 @@ export async function describeEffectiveConfig(
       configFile,
       revision,
       configSchemaVersion: loaded.trusted.schema_version,
-      migrated: managed.migrated,
+      migrated: loaded.migrated,
       workspace,
       resolved,
       ...(input.environment === undefined

@@ -1,5 +1,10 @@
 import { createHash } from "node:crypto";
-import type { ReviewerOutput } from "../protocol/schemas.js";
+import type {
+  AdjudicationResultV2,
+  ProviderReviewerResultV4,
+  ReviewerOutput,
+  ReviewerResultV4,
+} from "../protocol/schemas.js";
 import type { AdjudicationOutcome } from "../findings/adjudication.js";
 
 export function canonicalJson(value: unknown): string {
@@ -16,7 +21,13 @@ export function canonicalJson(value: unknown): string {
     .join(",")}}`;
 }
 
-export function reviewerResultDigest(result: ReviewerOutput): string {
+export function reviewerResultDigest(
+  result:
+    | ReviewerOutput
+    | ProviderReviewerResultV4
+    | ReviewerResultV4
+    | AdjudicationResultV2,
+): string {
   return createHash("sha256")
     .update(canonicalJson(result), "utf8")
     .digest("hex");

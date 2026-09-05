@@ -27,7 +27,7 @@ agent suite selected for a workspace, streams factual JSONL progress, waits for
 each agent's executed model chain, and exits only after run.completed.
 
 USAGE
-  review-mesh review [WORKSPACE] [--output-mode full-jsonl|compact-jsonl] [--no-ansi]
+  review-mesh review [WORKSPACE] [--output-mode concise-jsonl|full-jsonl|compact-jsonl] [--no-ansi]
       [--heartbeat aggregate] [--details-file PATH]
   review-mesh status RUN_ID [REVIEWER_ID] [--json]
   review-mesh report RUN_ID [--format markdown|json] [--best-effort]
@@ -84,7 +84,7 @@ const pages: Record<Exclude<HelpTopic, "overview">, string> = {
   review: `REVIEW-MESH REVIEW
 
 USAGE
-  review-mesh review [WORKSPACE] [--output-mode full-jsonl|compact-jsonl] [--no-ansi]
+  review-mesh review [WORKSPACE] [--output-mode concise-jsonl|full-jsonl|compact-jsonl] [--no-ansi]
       [--heartbeat aggregate] [--details-file PATH]
   <request.json review-mesh review
 
@@ -119,8 +119,8 @@ During a run, consume stdout as JSONL until run.completed. The caller cannot
 disable, replace, reorder, or select mandatory reviewers. A positional WORKSPACE
 and a piped non-empty JSON request are mutually exclusive.
 
-Full JSONL, no ANSI, and aggregate heartbeats are the defaults. Full mode emits
-reviewer.result with the complete sanitized v3 result, digest, and byte count in
+Concise JSONL, no ANSI, and aggregate heartbeats are the defaults. Explicit full mode emits
+reviewer.result with the complete sanitized v4 result, digest, and byte count in
 the original invocation. Select --output-mode compact-jsonl explicitly for the
 compatibility/operations stream; its terminal manifest still identifies the
 authoritative artifact. --details-file writes the sanitized detailed artifact
@@ -204,7 +204,7 @@ USAGE
 Preflights the resolved adapter/model roster before a long run. Structured mode
 runs the real reviewer execution mechanism against a Review Mesh-owned
 synthetic workspace. It verifies authentication/model readiness, streaming
-negotiation, read-tool execution, complete v3 result production, and schema
+negotiation, read-tool execution, bounded v4 result-page production, and schema
 validation with the selected model, effort, retry, continuation, and deadline
 rules. --adapter and --model are exact, case-sensitive filters. The command
 fails without contacting a provider when no reviewer matches the selection.
@@ -253,7 +253,7 @@ writers; do not run an external editor concurrently with config apply. Export
 includes trusted instruction and runtime fields, so treat it as sensitive;
 effective/describe redact them.
 
-Schema-v6 saves require every lens to declare applicability.mode as always or
+Schema-v7 saves require every lens to declare applicability.mode as always or
 changed_paths and to include required_context, even when it is empty. New
 OpenAI-compatible adapters default streaming to auto. Multi-lens suites that
 concentrate every primary on one provider require
@@ -298,7 +298,7 @@ Prints JSON Schema generated from the runtime Zod schemas:
   events   JSONL event object emitted by a valid review run
   run-status  Compact active or completed run/reviewer status snapshot
   result   Terminal result required from each reviewer
-  config   Trusted global configuration (v1-v5 legacy or schema-v6 current)
+  config   Trusted global configuration (v1-v5 legacy or schema-v7 current)
   config-apply  Revision-guarded full-config update request
   diagnostic    Stable public diagnostic fields
   command-adapter-event  External reviewer JSONL event union
@@ -316,7 +316,7 @@ validation as final authority.
 `,
   events: `REVIEW-MESH EVENTS
 
-Every non-empty review stdout line is one schema-version 5 JSON object. Events
+Every non-empty review stdout line is one schema-version 6 JSON object. Events
 share run_id, have strictly increasing seq values, and include timestamps.
 
 Sequence and meaning:
@@ -360,7 +360,7 @@ Every agent chooses a required default adapter plus either one exact model and
 optional effort, or ordered model_runs with explicit run ids, exact models,
 optional effort, and optional per-run adapter overrides. Multi-model agents
 expand to concrete reviewer ids such as architecture::opus and
-architecture::grok. Current schema-v6 configuration distributes primaries by default:
+architecture::grok. Current schema-v7 configuration distributes primaries by default:
 successive multi-model logical lenses rotate their configured model runs
 cyclically, while scalar lenses do not consume a rotation slot. Set
 execution.distribute_primaries=false to preserve declaration order for every
@@ -428,8 +428,8 @@ For autonomous changes, use export/apply with revision compare-and-swap:
 
 Export contains instruction and runtime fields and should be treated as
 sensitive. Readers/export migrate legacy v1-v5 documents in memory. Apply
-accepts one complete schema-v2 through schema-v6 document, not a patch; legacy
-inputs are migrated and saved canonically as v6 with behavior-preserving
+accepts one complete schema-v1 through schema-v7 document, not a patch; legacy
+inputs are migrated and saved canonically as v7 with behavior-preserving
 applicability, context, primary-order, and streaming defaults. Use
 'review-mesh schema config --json' and 'review-mesh config --help' for exact
 details.

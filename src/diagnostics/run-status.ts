@@ -574,6 +574,9 @@ export async function readRunStatus({
   afterOpen,
 }: ReadRunStatusOptions): Promise<Record<string, unknown>> {
   requireSafeRunId(runId);
+  const { loadV9Run, v9Status } = await import("./v9-views.js");
+  const current = await loadV9Run(runsDirectory, runId);
+  if (current) return v9Status(current, reviewerId);
   const location = await resolveRunRecord(runsDirectory, runId);
   const opened = await openRunRecord(location.path);
   await afterOpen?.();

@@ -1,11 +1,22 @@
 import { writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 
-const chunks = [];
-for await (const chunk of process.stdin) chunks.push(chunk);
-
-const request = JSON.parse(Buffer.concat(chunks).toString("utf8"));
 const mode = process.env.REVIEW_MESH_FIXTURE_MODE ?? "pass";
+const lines = (async function* () {
+  let buffered = "";
+  for await (const chunk of process.stdin) {
+    buffered += chunk.toString("utf8");
+    for (;;) {
+      const newline = buffered.indexOf("\n");
+      if (newline < 0) break;
+      yield JSON.parse(buffered.slice(0, newline));
+      buffered = buffered.slice(newline + 1);
+    }
+  }
+  if (buffered.trim() !== "") yield JSON.parse(buffered);
+})();
+const first = await lines.next();
+const request = first.value;
 const capturePath = process.env.REVIEW_MESH_FIXTURE_CAPTURE;
 const descendant =
   mode === "silent"
@@ -72,6 +83,86 @@ const largeFailResult = {
 const emit = (event) => process.stdout.write(`${JSON.stringify(event)}\n`);
 
 switch (mode) {
+  case "v2-page": {
+    emit({ type: "activity", message: "fixture page", identity: "activity-1" });
+    const next = await lines.next();
+    const assignment = next.value;
+    emit({
+      type: "result_page",
+      page: JSON.stringify({
+        schema_version: "1",
+        kind: "review-mesh.result-page",
+        result_id: assignment.request.result_id,
+        result_kind: "reviewer",
+        result_schema_version: "4",
+        page_index: assignment.request.page_index,
+        page_count: 1,
+        page_kind: "header",
+        previous_page_digest: assignment.request.previous_page_digest,
+        payload: {
+          verdict: "pass",
+          summary: "clean",
+          informational_notes: [],
+          narrative_byte_count: 0,
+          narrative_fragment_count: 0,
+          actionable_finding_count: 0,
+          coverage_attestation: null,
+        },
+      }),
+    });
+    break;
+  }
+  case "v2-duplicate-claim": {
+    const claim = {
+      type: "access_claim",
+      identity: "claim-1",
+      claim: {
+        path: "src/a.ts",
+        method: "full_file",
+        snapshot_digest: "b".repeat(64),
+      },
+    };
+    emit(claim);
+    emit(claim);
+    break;
+  }
+  case "v2-claim-page": {
+    emit({
+      type: "access_claim",
+      identity: "claim-1",
+      claim: {
+        path: "src/a.ts",
+        method: "full_file",
+        snapshot_digest: "b".repeat(64),
+      },
+    });
+    const next = await lines.next();
+    const assignment = next.value;
+    emit({
+      type: "result_page",
+      page: JSON.stringify({
+        schema_version: "1",
+        kind: "review-mesh.result-page",
+        result_id: assignment.request.result_id,
+        result_kind: "reviewer",
+        result_schema_version: "4",
+        page_index: assignment.request.page_index,
+        page_count: 1,
+        page_kind: "header",
+        previous_page_digest: assignment.request.previous_page_digest,
+        payload: {
+          verdict: "pass",
+          summary: "clean",
+          informational_notes: [],
+          narrative_byte_count: 0,
+          narrative_fragment_count: 0,
+          actionable_finding_count: 0,
+          coverage_attestation: null,
+        },
+      }),
+    });
+    break;
+  }
   case "pass":
     emit({ type: "progress", phase: "reviewing", message: "fixture active" });
     emit({ type: "result", result: passResult });

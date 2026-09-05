@@ -75,7 +75,7 @@ export const adapterRegistrationSchema = z.discriminatedUnion("type", [
     command: nonEmptyString,
     args: z.array(z.string()).optional(),
     env_allowlist: z.array(nonEmptyString).optional(),
-    protocol: z.literal("review-mesh-command-v1"),
+    protocol: z.enum(["review-mesh-command-v1", "review-mesh-command-v2"]),
   }),
 ]);
 
@@ -275,8 +275,18 @@ function v6DefaultProviderGroups(
   return modelCount === 5 ? 3 : Math.min(2, distinctProviderGroups);
 }
 
-function addV6MultiModelPolicyIssues(
-  profile: z.infer<typeof multiModelReviewerProfileV6BaseSchema>,
+function addMultiModelPolicyIssues(
+  profile: {
+    adapter: string;
+    model_runs: Array<{
+      adapter?: string | undefined;
+      provider_group?: string | undefined;
+    }>;
+    pass_quorum?: number | undefined;
+    minimum_provider_groups?: number | undefined;
+    adjudication?: "off" | "required" | undefined;
+    allow_zero_outage_tolerance?: boolean | undefined;
+  },
   ctx: z.RefinementCtx,
 ): void {
   const providerGroups = profileProviderGroups(profile);
@@ -376,7 +386,7 @@ const multiModelReviewerProfileV6BaseSchema = z.strictObject({
 
 const multiModelReviewerProfileV6Schema = multiModelReviewerProfileV6BaseSchema
   .superRefine(validateInstructionSource)
-  .superRefine(addV6MultiModelPolicyIssues);
+  .superRefine(addMultiModelPolicyIssues);
 
 export const agentProfileV6Schema = z.union([
   reviewerProfileV6Schema,
@@ -415,9 +425,141 @@ const executionV6Schema = executionV5Schema.extend({
   continuation_attempts: positiveInteger.max(10).optional(),
 });
 
+const requiredReadinessSelectors = [
+  "/request/pull_request/id",
+  "/request/pull_request/url",
+  "/request/pull_request/title",
+  "/request/pull_request/description",
+  "/request/pull_request/work_items",
+  "/request/pull_request/validation",
+  "/request/pull_request/contract_impact",
+] as const;
+
+const executionV7Schema = executionV6Schema
+  .extend({
+    heartbeat_interval_ms: positiveInteger.min(1_000).max(300_000),
+    deadline_mode: z.enum(["adaptive", "fixed"]),
+    run_deadline_ms: positiveInteger.min(60_000).max(14_400_000).optional(),
+    no_progress_timeout_ms: positiveInteger.min(1_000).max(3_600_000),
+  })
+  .superRefine((execution, ctx) => {
+    if (
+      execution.deadline_mode === "fixed" &&
+      execution.run_deadline_ms === undefined
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["run_deadline_ms"],
+        message: "fixed deadline mode requires run_deadline_ms",
+      });
+    }
+    if (
+      execution.deadline_mode === "adaptive" &&
+      execution.run_deadline_ms !== undefined
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["run_deadline_ms"],
+        message: "adaptive deadline mode does not accept run_deadline_ms",
+      });
+    }
+  });
+
+const changeCoveragePolicySchema = z.strictObject({
+  relevant_paths: z.array(nonEmptyString).min(1).max(256),
+  minimum_inspection: z.enum(["full_file", "diff"]),
+  proof: z.enum(["observed", "attested"]),
+});
+
+const lensPolicyV7Shape = {
+  applicability: applicabilityV6Schema,
+  kind: z.enum(["generic", "change_readiness"]),
+  required_input: z.array(nonEmptyString).max(256),
+  lens_deadline_ms: positiveInteger.min(1_000).max(14_400_000).optional(),
+  change_coverage: changeCoveragePolicySchema,
+  pass_quorum: positiveInteger.optional(),
+  minimum_provider_groups: positiveInteger.optional(),
+  allow_zero_outage_tolerance: z.boolean().optional(),
+  adjudication: z.enum(["off", "required"]).optional(),
+  gate_minimum_severity: z
+    .enum(["critical", "high", "medium", "low"])
+    .optional(),
+  gate_minimum_confidence: z.enum(["high", "medium", "low"]).optional(),
+};
+
+function validateV7Lens(
+  profile: {
+    kind: "generic" | "change_readiness";
+    required_input: string[];
+  },
+  ctx: z.RefinementCtx,
+): void {
+  if (profile.kind !== "change_readiness") return;
+  for (const selector of requiredReadinessSelectors) {
+    if (!profile.required_input.includes(selector)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["required_input"],
+        message: `change-readiness lens requires selector ${selector}`,
+      });
+    }
+  }
+}
+
+const reviewerProfileV7Schema = z
+  .strictObject({
+    ...reviewerProfileBaseShape,
+    ...lensPolicyV7Shape,
+    model: nonEmptyString,
+    effort: reasoningEffortSchema.optional(),
+    provider_group: z
+      .string()
+      .regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/)
+      .optional(),
+  })
+  .superRefine(validateInstructionSource)
+  .superRefine(validateV7Lens)
+  .superRefine((profile, ctx) => {
+    if ((profile.pass_quorum ?? 1) > 1)
+      ctx.addIssue({
+        code: "custom",
+        message: "pass quorum cannot exceed model run count",
+      });
+    if ((profile.minimum_provider_groups ?? 1) > 1)
+      ctx.addIssue({
+        code: "custom",
+        message:
+          "minimum provider groups exceeds the distinct configured provider groups",
+      });
+    if (profile.adjudication === "required")
+      ctx.addIssue({
+        code: "custom",
+        message: "required adjudication needs a multi-model agent",
+      });
+  });
+
+const multiModelReviewerProfileV7Schema = z
+  .strictObject({
+    ...reviewerProfileBaseShape,
+    ...lensPolicyV7Shape,
+    model_runs: modelRunsSchema,
+  })
+  .superRefine(validateInstructionSource)
+  .superRefine(validateV7Lens)
+  .superRefine(addMultiModelPolicyIssues);
+
+export const agentProfileV7Schema = z.union([
+  reviewerProfileV7Schema,
+  multiModelReviewerProfileV7Schema,
+]);
+
 const diagnosticsSchema = z.strictObject({
   persist_runs: z.boolean(),
   max_runs: positiveInteger,
+});
+
+const diagnosticsV7Schema = diagnosticsSchema.extend({
+  activity_detail: z.enum(["condensed", "full"]).optional(),
 });
 
 export const trustedConfigV1Schema = z.strictObject({
@@ -510,6 +652,73 @@ function assignedAgentRosters(config: {
   return [...unique.values()];
 }
 
+type ConcentrationConfig = {
+  execution: {
+    allow_provider_concentration?: boolean | undefined;
+    distribute_primaries?: boolean | undefined;
+  };
+  agents: Record<
+    string,
+    | { adapter: string; provider_group?: string | undefined }
+    | {
+        adapter: string;
+        model_runs: Array<{
+          adapter?: string | undefined;
+          provider_group?: string | undefined;
+        }>;
+      }
+  >;
+  defaults?: { agents: string[] } | undefined;
+  projects?: Record<string, { agents?: string[] | undefined }> | undefined;
+};
+
+function validateProviderConcentration(
+  config: ConcentrationConfig,
+  ctx: z.RefinementCtx,
+): void {
+  if (config.execution.allow_provider_concentration === true) return;
+  const distributePrimaries = config.execution.distribute_primaries ?? true;
+  for (const roster of assignedAgentRosters(config)) {
+    if (roster.length < 2) continue;
+    let rotatableLensIndex = 0;
+    const allProviderGroups = new Set<string>();
+    const primaryProviderGroups = new Set<string>();
+    let completeRoster = true;
+    for (const agentId of roster) {
+      const profile = config.agents[agentId];
+      if (profile === undefined) {
+        completeRoster = false;
+        break;
+      }
+      if ("model_runs" in profile) {
+        const providerGroups = profileProviderGroups(profile);
+        for (const group of providerGroups) allProviderGroups.add(group);
+        const primaryIndex = distributePrimaries
+          ? rotatableLensIndex++ % providerGroups.length
+          : 0;
+        primaryProviderGroups.add(providerGroups[primaryIndex]!);
+      } else {
+        const group = providerGroupForScalar(profile);
+        allProviderGroups.add(group);
+        primaryProviderGroups.add(group);
+      }
+    }
+    if (
+      completeRoster &&
+      allProviderGroups.size > 1 &&
+      primaryProviderGroups.size === 1
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["execution", "allow_provider_concentration"],
+        message:
+          "multi-lens, multi-provider suite concentrates every primary on one provider group; set allow_provider_concentration = true to acknowledge it",
+      });
+      return;
+    }
+  }
+}
+
 export const trustedConfigV6Schema = z
   .strictObject({
     schema_version: z.literal("6"),
@@ -520,46 +729,56 @@ export const trustedConfigV6Schema = z
     defaults: z.strictObject({ agents: uniqueAgentIds }).optional(),
     projects: z.record(projectNameSchema, projectConfigSchema).optional(),
   })
+  .superRefine(validateProviderConcentration);
+
+function adapterProvidesObservedReads(adapter: AdapterRegistration): boolean {
+  return (
+    adapter.type === "openai_compatible" ||
+    adapter.type === "claude" ||
+    adapter.type === "copilot"
+  );
+}
+
+export const trustedConfigV7Schema = z
+  .strictObject({
+    schema_version: z.literal("7"),
+    execution: executionV7Schema,
+    diagnostics: diagnosticsV7Schema,
+    adapters: z.record(nonEmptyString, adapterRegistrationSchema),
+    agents: z.record(nonEmptyString, agentProfileV7Schema),
+    defaults: z.strictObject({ agents: uniqueAgentIds }).optional(),
+    projects: z.record(projectNameSchema, projectConfigSchema).optional(),
+  })
   .superRefine((config, ctx) => {
-    if (config.execution.allow_provider_concentration === true) return;
-    const distributePrimaries = config.execution.distribute_primaries ?? true;
-    for (const roster of assignedAgentRosters(config)) {
-      if (roster.length < 2) continue;
-      let rotatableLensIndex = 0;
-      const allProviderGroups = new Set<string>();
-      const primaryProviderGroups = new Set<string>();
-      let completeRoster = true;
-      for (const agentId of roster) {
-        const profile = config.agents[agentId];
-        if (profile === undefined) {
-          completeRoster = false;
-          break;
-        }
-        if ("model_runs" in profile) {
-          const providerGroups = profileProviderGroups(profile);
-          for (const group of providerGroups) allProviderGroups.add(group);
-          const primaryIndex = distributePrimaries
-            ? rotatableLensIndex++ % providerGroups.length
-            : 0;
-          primaryProviderGroups.add(providerGroups[primaryIndex]!);
-        } else {
-          const group = providerGroupForScalar(profile);
-          allProviderGroups.add(group);
-          primaryProviderGroups.add(group);
-        }
-      }
-      if (
-        completeRoster &&
-        allProviderGroups.size > 1 &&
-        primaryProviderGroups.size === 1
-      ) {
+    validateProviderConcentration(config, ctx);
+    for (const [agentId, profile] of Object.entries(config.agents)) {
+      const candidateIds =
+        "model_runs" in profile
+          ? profile.model_runs.map((run) => `${agentId}::${run.id}`)
+          : [agentId];
+      if (candidateIds.some((id) => Buffer.byteLength(id, "utf8") > 128)) {
         ctx.addIssue({
           code: "custom",
-          path: ["execution", "allow_provider_concentration"],
-          message:
-            "multi-lens, multi-provider suite concentrates every primary on one provider group; set allow_provider_concentration = true to acknowledge it",
+          path: ["agents", agentId],
+          message: "expanded reviewer id exceeds 128 UTF-8 bytes",
         });
-        return;
+      }
+      if (profile.change_coverage.proof !== "observed") continue;
+      const adapterIds =
+        "model_runs" in profile
+          ? profile.model_runs.map((run) => run.adapter ?? profile.adapter)
+          : [profile.adapter];
+      for (const adapterId of adapterIds) {
+        const adapter = Object.hasOwn(config.adapters, adapterId)
+          ? config.adapters[adapterId]
+          : undefined;
+        if (adapter !== undefined && !adapterProvidesObservedReads(adapter)) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["agents", agentId, "change_coverage", "proof"],
+            message: `observed proof is unsupported by adapter ${adapterId}`,
+          });
+        }
       }
     }
   });
@@ -571,6 +790,7 @@ export const trustedConfigSchema = z.union([
   trustedConfigV4Schema,
   trustedConfigV5Schema,
   trustedConfigV6Schema,
+  trustedConfigV7Schema,
 ]);
 
 export type TrustedConfigV1 = z.infer<typeof trustedConfigV1Schema>;
@@ -579,6 +799,7 @@ export type TrustedConfigV3 = z.infer<typeof trustedConfigV3Schema>;
 export type TrustedConfigV4 = z.infer<typeof trustedConfigV4Schema>;
 export type TrustedConfigV5 = z.infer<typeof trustedConfigV5Schema>;
 export type TrustedConfigV6 = z.infer<typeof trustedConfigV6Schema>;
+export type TrustedConfigV7 = z.infer<typeof trustedConfigV7Schema>;
 export type ProjectConfig = z.infer<typeof projectConfigSchema>;
 export type TrustedConfig = z.infer<typeof trustedConfigSchema>;
 
@@ -592,7 +813,8 @@ export type ModelRun = z.infer<typeof modelRunSchema>;
 export type AgentProfile =
   | z.infer<typeof agentProfileSchema>
   | z.infer<typeof agentProfileV5Schema>
-  | z.infer<typeof agentProfileV6Schema>;
+  | z.infer<typeof agentProfileV6Schema>
+  | z.infer<typeof agentProfileV7Schema>;
 export type AgentProfileV5 = z.infer<typeof agentProfileV5Schema>;
 
 const adapterEffortSupport = {
@@ -651,6 +873,14 @@ export interface ResolvedReviewer {
   timeoutMs: number;
   runtime: Record<string, JsonValue>;
   policy?: {
+    kind?: "generic" | "change_readiness";
+    lensDeadlineMs?: number;
+    requiredInput?: string[];
+    changeCoverage?: {
+      relevantPaths: string[];
+      minimumInspection: "full_file" | "diff";
+      proof: "observed" | "attested";
+    };
     applicability?:
       | { mode: "always" }
       | {
@@ -672,6 +902,16 @@ export interface ResolvedReviewer {
 }
 
 export interface ResolvedConfig {
+  sourceSchemaVersion?: TrustedConfig["schema_version"];
+  migrated?: boolean;
+  migrationWarnings?: Array<{
+    code:
+      | "implicit_v9_deadline"
+      | "implicit_v9_change_coverage"
+      | "attested_coverage_requires_adapter_upgrade";
+    message: string;
+    lens_ids: string[];
+  }>;
   execution: TrustedConfigV1["execution"] & {
     distribute_primaries: boolean;
     allow_provider_concentration: boolean;
@@ -682,8 +922,13 @@ export interface ResolvedConfig {
     retry_attempts: number;
     continuation_attempts: number;
     retry_backoff_ms: number;
+    deadline_mode?: "adaptive" | "fixed" | undefined;
+    run_deadline_ms?: number | undefined;
+    no_progress_timeout_ms?: number | undefined;
   };
-  diagnostics: TrustedConfigV1["diagnostics"];
+  diagnostics: TrustedConfigV1["diagnostics"] & {
+    activity_detail?: "condensed" | "full" | undefined;
+  };
   selection?: {
     source: "legacy" | "defaults" | "project";
     projectName?: string;
@@ -703,11 +948,21 @@ export const configRevisionSchema = z.union([
 export const configApplyRequestSchema = z.strictObject({
   schema_version: z.literal("1"),
   expected_revision: configRevisionSchema,
+  confirm_attested_coverage: z.boolean().optional(),
   config: z.union([
+    trustedConfigV1Schema,
     trustedConfigV2Schema,
     trustedConfigV3Schema,
     trustedConfigV4Schema,
     trustedConfigV5Schema,
     trustedConfigV6Schema,
+    trustedConfigV7Schema,
   ]),
+});
+
+export const configApplyEnvelopeSchema = z.strictObject({
+  schema_version: z.literal("1"),
+  expected_revision: configRevisionSchema,
+  config: z.unknown(),
+  confirm_attested_coverage: z.boolean().optional(),
 });

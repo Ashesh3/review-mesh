@@ -7,8 +7,15 @@ import type {
   IsolationLevel,
   IsolationPolicy,
   ReviewerOutput,
+  ProviderReviewerResultV4,
+  AdjudicationResultV2,
 } from "../protocol/schemas.js";
 import type { ReviewerPromptBundle } from "../protocol/prompt.js";
+import type { ChangeCoverageLedger } from "../context/change-coverage.js";
+import type {
+  ResultPageCollector,
+  ResultPageCollectorOptions,
+} from "../results/result-pages.js";
 import type { AdapterFailure } from "./errors.js";
 
 export interface AdapterCapabilities {
@@ -23,6 +30,8 @@ export interface AdapterCapabilities {
   message?: string;
   /** Readiness failed transiently and may be probed once more. */
   retryable?: boolean;
+  observed_file_access?: boolean;
+  progress_observable?: boolean;
 }
 
 export interface AdapterReviewInput {
@@ -33,17 +42,27 @@ export interface AdapterReviewInput {
   resultJsonSchema: Record<string, unknown>;
   isolationPolicy: IsolationPolicy;
   signal: AbortSignal;
+  coverage?: ChangeCoverageLedger;
+  resultPages?: ResultPageCollector | ResultPageCollectorOptions;
 }
 
 export type AdapterEvent =
-  | { type: "progress"; phase: string; message?: string }
-  | { type: "activity"; message: string }
+  | {
+      type: "progress";
+      phase: string;
+      message?: string;
+      identity?: string;
+      byteCount?: number;
+    }
+  | { type: "activity"; message: string; identity?: string; byteCount?: number }
   | {
       type: "result";
-      result: ReviewerOutput;
+      result: ReviewerOutput | ProviderReviewerResultV4 | AdjudicationResultV2;
       isolation: IsolationLevel;
       /** Adapter-owned exact-result storage lifecycle. */
       resultStorage?: {
+        serializationBoundary?: "provider_raw" | "sdk_canonical_json";
+        pages?(): AsyncIterable<{ raw: string; sha256: string }>;
         persisted(): void | Promise<void>;
         abandoned(): void | Promise<void>;
       };

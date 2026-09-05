@@ -17,27 +17,43 @@ function finding(
     severity: "high",
     title: "Shared failure",
     description: `${reviewerId} observed the failure.`,
-    evidence: [{ detail: `${reviewerId} evidence.` }],
+    evidence: [
+      {
+        path: "src/shared.ts",
+        start_line: 10,
+        end_line: 14,
+        detail: `${reviewerId} evidence.`,
+      },
+    ],
     suggested_direction: "Restore the invariant.",
     confidence: "high",
     classification: "confirmed_defect",
     external_assumptions: [],
     source_findings: [{ reviewer_id: reviewerId, finding_id: findingId }],
     duplicate_finding_ids: [],
-    gate_eligible: true,
     adjudication: "unadjudicated",
+    category: "correctness",
+    claim: {
+      trigger: "The changed path executes",
+      affected_behavior: "The operation violates the invariant",
+      outcome: "The caller observes failure",
+    },
     ...overrides,
   };
 }
 
-describe("canonicalizeFindings", () => {
-  it("retains confirmed and rejected sources while excluding rejected candidates from derived counts", () => {
+describe("canonicalizeFindings historical aliases", () => {
+  it("retains rejected sources in explicit non-gating counts", () => {
     const confirmed = finding("reliability::source", "confirmed", {
       adjudication: "confirmed",
     });
     const rejected = finding("cleanup::source", "rejected", {
       adjudication: "rejected",
-      title: "Rejected candidate",
+      claim: {
+        trigger: "Cleanup runs",
+        affected_behavior: "Cleanup retains a temporary file",
+        outcome: "Disk usage leaks",
+      },
     });
 
     const result = canonicalizeFindings([rejected, confirmed]);
@@ -46,112 +62,79 @@ describe("canonicalizeFindings", () => {
       "rejected",
       "confirmed",
     ]);
-    expect(result.consolidated.map((item) => item.id)).toEqual(["confirmed"]);
-    expect(result.counts).toEqual({ raw: 2, unique: 1, gate: 1, advisory: 0 });
+    expect(result.consolidated).toHaveLength(2);
+    expect(result.counts).toMatchObject({
+      raw: 2,
+      unique: 2,
+      gate: 1,
+      advisory: 1,
+      rejected_subfindings: 1,
+    });
   });
 
-  it("merges explicit roots and preserves every source, description, evidence item, and direction", () => {
+  it("uses roots for grouping while preserving two distinct subfindings", () => {
     const result = canonicalizeFindings([
       finding("contract::one", "one", {
         root_issue_id: "published-nullability",
-        title: "First wording",
-        description: "First description.",
-        suggested_direction: "Repair producer typing.",
+        claim: {
+          trigger: "The producer publishes null",
+          affected_behavior: "The public type omits null",
+          outcome: "Consumers dereference null",
+        },
       }),
       finding("contract::two", "two", {
         root_issue_id: "published-nullability",
         severity: "critical",
-        title: "Second wording",
-        description: "Second description.",
-        suggested_direction: "Repair consumer mapping.",
+        claim: {
+          trigger: "The consumer receives null",
+          affected_behavior: "The mapper assumes a value",
+          outcome: "The request crashes",
+        },
       }),
     ]);
 
-    expect(result.consolidated).toHaveLength(1);
-    expect(result.consolidated[0]).toMatchObject({
-      id: "two",
-      severity: "critical",
-      descriptions: ["First description.", "Second description."],
-      suggested_directions: [
-        "Repair consumer mapping.",
-        "Repair producer typing.",
-      ],
-      source_findings: [
-        { reviewer_id: "contract::one", finding_id: "one" },
-        { reviewer_id: "contract::two", finding_id: "two" },
-      ],
-    });
-    expect(result.consolidated[0]?.evidence).toHaveLength(2);
+    expect(result.consolidated).toHaveLength(2);
+    expect(result.roots).toEqual([
+      expect.objectContaining({
+        id: "published-nullability",
+        subfindings: expect.arrayContaining([
+          expect.objectContaining({ severity: "critical" }),
+          expect.objectContaining({ severity: "high" }),
+        ]),
+      }),
+    ]);
   });
 
-  it("merges rootless findings by exact normalized title even when descriptions differ", () => {
+  it("does not collapse rootless legacy wording without concrete evidence anchors", () => {
     const result = canonicalizeFindings([
       finding("tests::one", "one", {
         title: "Enum mapping throws",
-        description: "The first description.",
+        evidence: [{ detail: "First prose-only assertion." }],
       }),
       finding("tests::two", "two", {
-        title: "  enum-mapping THROWS ",
-        description: "A materially different description.",
+        title: " enum-mapping THROWS ",
+        evidence: [{ detail: "Second prose-only assertion." }],
       }),
     ]);
 
-    expect(result.consolidated).toHaveLength(1);
-    expect(result.consolidated[0]?.descriptions).toEqual([
-      "A materially different description.",
-      "The first description.",
-    ]);
+    expect(result.consolidated).toHaveLength(2);
   });
 
-  it("does not use an ambiguous title to merge distinct explicit roots", () => {
-    const values = [
-      finding("runtime::one", "root-a", {
-        root_issue_id: "root-a",
-        title: "Generic failure",
-        description: "First rooted defect.",
-      }),
-      finding("runtime::two", "root-b", {
-        root_issue_id: "root-b",
-        title: "Generic failure",
-        description: "Second rooted defect.",
-      }),
-      finding("runtime::three", "rootless", {
-        title: "Generic failure",
-        description: "Legacy observation.",
-      }),
-    ];
+  it("requires structural compatibility for explicit duplicate references", () => {
+    const compatible = finding("financial::one", "root");
+    const duplicate = finding("contract::two", "duplicate", {
+      duplicate_of: compatible.source_ref,
+    });
+    const incompatible = finding("cleanup::one", "reference", {
+      duplicate_finding_ids: ["root"],
+      claim: {
+        trigger: "Cleanup runs",
+        affected_behavior: "Cleanup retains a temporary file",
+        outcome: "Disk usage leaks",
+      },
+    });
 
-    const result = canonicalizeFindings(values);
-
-    expect(result.consolidated).toHaveLength(3);
-    expect(result.consolidated.map((item) => item.source_findings)).toEqual(
-      expect.arrayContaining([
-        [{ reviewer_id: "runtime::one", finding_id: "root-a" }],
-        [{ reviewer_id: "runtime::two", finding_id: "root-b" }],
-        [{ reviewer_id: "runtime::three", finding_id: "rootless" }],
-      ]),
-    );
-  });
-
-  it("unions explicit duplicate references without merging ambiguous bare ids", () => {
-    const values = [
-      finding("financial::one", "root"),
-      finding("contract::two", "duplicate", {
-        duplicate_of: "financial::one#root",
-      }),
-      finding("tests::one", "ambiguous", {
-        title: "First unrelated issue",
-      }),
-      finding("design::one", "ambiguous", {
-        title: "Second unrelated issue",
-      }),
-      finding("cleanup::one", "reference", {
-        title: "Third unrelated issue",
-        duplicate_finding_ids: ["ambiguous"],
-      }),
-    ];
-
-    const result = canonicalizeFindings(values);
+    const result = canonicalizeFindings([incompatible, duplicate, compatible]);
 
     expect(
       result.consolidated.find((item) => item.source_findings.length === 2)
@@ -160,22 +143,28 @@ describe("canonicalizeFindings", () => {
       { reviewer_id: "contract::two", finding_id: "duplicate" },
       { reviewer_id: "financial::one", finding_id: "root" },
     ]);
-    expect(result.consolidated).toHaveLength(4);
+    expect(result.consolidated).toHaveLength(2);
   });
 
-  it("is stable across input order and separates gate-effective findings from advisory findings", () => {
+  it("is stable across input order and keeps gate/advisory aliases", () => {
     const values = [
       finding("zeta::one", "gate"),
       finding("alpha::one", "verify", {
-        title: "Needs proof",
         classification: "needs_verification",
-        gate_eligible: false,
+        claim: {
+          trigger: "Proof is incomplete",
+          affected_behavior: "The operation may violate the invariant",
+          outcome: "The outcome is uncertain",
+        },
       }),
       finding("beta::one", "advisory", {
-        title: "Advisory",
         severity: "low",
         classification: "advisory",
-        gate_eligible: false,
+        claim: {
+          trigger: "Formatting runs",
+          affected_behavior: "The output uses an old label",
+          outcome: "The label is stale",
+        },
       }),
     ];
 
@@ -183,12 +172,14 @@ describe("canonicalizeFindings", () => {
     const reverse = canonicalizeFindings([...values].reverse());
 
     expect(reverse).toEqual(forward);
-    expect(forward.gate_effective.map((item) => item.id)).toEqual(["gate"]);
-    expect(forward.advisory.map((item) => item.id)).toEqual([
-      "verify",
-      "advisory",
-    ]);
-    expect(forward.counts).toEqual({ raw: 3, unique: 3, gate: 1, advisory: 2 });
+    expect(forward.gate_effective).toHaveLength(1);
+    expect(forward.advisory).toHaveLength(2);
+    expect(forward.counts).toMatchObject({
+      raw: 3,
+      unique: 3,
+      gate: 1,
+      advisory: 2,
+    });
   });
 
   it("applies resolved per-lens severity and confidence thresholds", () => {
@@ -197,18 +188,31 @@ describe("canonicalizeFindings", () => {
         lens_id: "strict",
         severity: "medium",
         confidence: "high",
+        claim: {
+          trigger: "Medium issue runs",
+          affected_behavior: "Medium behavior changes",
+          outcome: "Medium impact occurs",
+        },
       }),
       finding("strict::uncertain", "uncertain", {
         lens_id: "strict",
         severity: "high",
         confidence: "medium",
-        title: "High but uncertain",
+        claim: {
+          trigger: "Uncertain issue runs",
+          affected_behavior: "Uncertain behavior changes",
+          outcome: "Uncertain impact occurs",
+        },
       }),
       finding("strict::gate", "gate", {
         lens_id: "strict",
         severity: "high",
         confidence: "high",
-        title: "High confidence defect",
+        claim: {
+          trigger: "Gate issue runs",
+          affected_behavior: "Gate behavior changes",
+          outcome: "Gate impact occurs",
+        },
       }),
     ];
 
@@ -218,18 +222,18 @@ describe("canonicalizeFindings", () => {
       },
     });
 
-    expect(result.gate_effective.map((item) => item.id)).toEqual(["gate"]);
-    expect(result.counts).toEqual({ raw: 3, unique: 3, gate: 1, advisory: 2 });
+    expect(result.gate_effective).toHaveLength(1);
+    expect(result.counts).toMatchObject({ gate: 1, advisory: 2 });
   });
 
-  it("allows a confirmed low-severity finding only when the lens threshold is low", () => {
+  it("allows low severity only when the resolved threshold is low", () => {
     const low = finding("configurable::primary", "low-defect", {
       lens_id: "configurable",
       severity: "low",
       confidence: "high",
     });
 
-    expect(canonicalizeFindings([low]).counts).toEqual({
+    expect(canonicalizeFindings([low]).counts).toMatchObject({
       raw: 1,
       unique: 1,
       gate: 0,
@@ -244,17 +248,16 @@ describe("canonicalizeFindings", () => {
           },
         },
       }).counts,
-    ).toEqual({ raw: 1, unique: 1, gate: 1, advisory: 0 });
+    ).toMatchObject({ raw: 1, unique: 1, gate: 1, advisory: 0 });
   });
 
-  it("never gates a needs-verification finding even with the lowest thresholds", () => {
+  it("never gates needs-verification at the lowest thresholds", () => {
     const uncertain = finding("configurable::primary", "uncertain", {
       lens_id: "configurable",
       severity: "low",
       confidence: "low",
       classification: "needs_verification",
     });
-    delete uncertain.gate_eligible;
 
     expect(
       canonicalizeFindings([uncertain], {
@@ -265,6 +268,6 @@ describe("canonicalizeFindings", () => {
           },
         },
       }).counts,
-    ).toEqual({ raw: 1, unique: 1, gate: 0, advisory: 1 });
+    ).toMatchObject({ raw: 1, unique: 1, gate: 0, advisory: 1 });
   });
 });

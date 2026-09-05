@@ -4,6 +4,8 @@ import {
   sanitizeAdapterFailure,
   sanitizePublicText,
 } from "../../src/adapters/errors.js";
+import { pageFailure } from "../../src/adapters/sdk-pages.js";
+import { ResultPageError } from "../../src/results/result-pages.js";
 
 describe("adapter failure diagnostics", () => {
   it("bounds and redacts optional diagnostic metadata", () => {
@@ -176,5 +178,23 @@ describe("adapter failure diagnostics", () => {
     });
 
     expect(failure.diagnostics).toBeUndefined();
+  });
+
+  it.each([
+    "result_page_too_large",
+    "structured_page_limit_exceeded",
+    "provider_response_invalid",
+    "protocol_violation",
+  ] as const)("preserves the typed result-page reason %s", (reason) => {
+    const failure = pageFailure(
+      new ResultPageError(reason, "typed page failure", {
+        receivedBytes: 123,
+      }),
+      "SDK",
+    );
+    expect(failure).toMatchObject({
+      reason,
+      diagnostics: { response_bytes: 123 },
+    });
   });
 });
