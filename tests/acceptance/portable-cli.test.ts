@@ -9,6 +9,12 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import {
+  v9AcceptanceNarrative,
+  v9CommandConfig,
+  v9ReviewerResult,
+  writeV9CommandFixture,
+} from "../helpers/v9-command-fixture.js";
 
 const projectRoot = resolve(import.meta.dirname, "../..");
 const sourceArtifact = join(projectRoot, "dist", "review-mesh.mjs");
@@ -53,13 +59,17 @@ function configPath(rootDirectory: string): string {
 async function run(
   file: string,
   request: object,
-  options: { cwd: string; env: NodeJS.ProcessEnv },
+  options: { cwd: string; env: NodeJS.ProcessEnv; args?: readonly string[] },
 ): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
-  const child = spawn(process.execPath, [file, "review"], {
-    ...options,
-    stdio: "pipe",
-    windowsHide: true,
-  });
+  const child = spawn(
+    process.execPath,
+    [file, "review", ...(options.args ?? [])],
+    {
+      ...options,
+      stdio: "pipe",
+      windowsHide: true,
+    },
+  );
   const stdout: Buffer[] = [];
   const stderr: Buffer[] = [];
   child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
@@ -253,111 +263,78 @@ describe("portable CLI", () => {
     await mkdir(workspace, { recursive: true });
     await mkdir(dirname(config), { recursive: true });
     await writeFile(join(workspace, "source.ts"), "export const value = 1;\n");
-    const expectedReview = `# Portable review\n\nThe copied artifact preserved this complete review.\n\n${"Complete portable evidence. ".repeat(4_096)}`;
-    expect(Buffer.byteLength(expectedReview, "utf8")).toBeGreaterThan(
-      100 * 1_024,
-    );
-    const expectedResult = {
-      schema_version: "3",
+    const largeReview = v9AcceptanceNarrative("# Portable review");
+    expect(Buffer.byteLength(largeReview, "utf8")).toBe(256 * 1024);
+    const expectedResult = v9ReviewerResult({
       verdict: "fail",
-      review_markdown: expectedReview,
+      reviewMarkdown: largeReview,
       summary: "portable command finding",
-      actionable_findings: [
-        {
-          id: "portable-root-a",
-          severity: "medium",
-          title: "Portable shared finding",
-          description: "The portable fixture found a controlled defect.",
-          evidence: [{ path: "source.ts", detail: "Controlled evidence A." }],
-          suggested_direction: "Correct the controlled defect.",
-          confidence: "high",
-          classification: "confirmed_defect",
-          external_assumptions: [],
-          root_issue_id: "portable-shared-root",
-          category: "correctness",
-          verification: "The copied fixture emitted deterministic evidence.",
-        },
-      ],
-      informational_notes: [],
-    };
-    const secondResult = {
-      ...expectedResult,
-      actionable_findings: [
-        {
-          ...expectedResult.actionable_findings[0],
-          id: "portable-root-b",
-          evidence: [{ path: "source.ts", detail: "Controlled evidence B." }],
-        },
-      ],
-    };
-    await writeFile(
-      reviewer,
-      `for await (const _ of process.stdin) {}\nconst index=process.env.REVIEW_MESH_MODEL.endsWith("-1")?1:0;const results=${JSON.stringify([expectedResult, secondResult])};process.stdout.write(JSON.stringify({type:"result",result:results[index]})+"\\n");\n`,
-    );
+      findingId: "portable-root-a",
+      rootIssueId: "portable-shared-root",
+      evidenceDetail: "Controlled evidence A.",
+    });
+    const secondResult = v9ReviewerResult({
+      verdict: "fail",
+      reviewMarkdown: largeReview,
+      summary: "portable command finding",
+      findingId: "portable-root-b",
+      rootIssueId: "portable-shared-root",
+      evidenceDetail: "Controlled evidence B.",
+    });
+    await writeV9CommandFixture(reviewer, [
+      { id: "portable_0", mode: "large-fail", result: expectedResult },
+      { id: "portable_1", mode: "large-fail", result: secondResult },
+    ]);
     await writeFile(
       config,
-      `schema_version = "1"
-[execution]
-max_concurrency = 1
-heartbeat_interval_ms = 100
-shutdown_grace_period_ms = 100
-[diagnostics]
-persist_runs = true
-max_runs = 1
-[adapters.portable]
-type = "command"
-command = ${JSON.stringify(process.execPath)}
-args = [${JSON.stringify(reviewer)}]
-protocol = "review-mesh-command-v1"
-[reviewer_profiles.portable_0]
-adapter = "portable"
-model = "fixture-0"
-purpose = "Portable command acceptance 0"
-instructions = "Review read-only."
-isolation = "prefer_enforced"
-timeout_ms = 5000
-[reviewer_profiles.portable_1]
-adapter = "portable"
-model = "fixture-1"
-purpose = "Portable command acceptance 1"
-instructions = "Review read-only."
-isolation = "prefer_enforced"
-timeout_ms = 5000
-[[reviewers]]
-id = "portable-0"
-profile = "portable_0"
-[[reviewers]]
-id = "portable-1"
-profile = "portable_1"
-`,
+      v9CommandConfig({
+        scriptPath: reviewer,
+        entries: [
+          { id: "portable_0", mode: "large-fail", result: expectedResult },
+          { id: "portable_1", mode: "large-fail", result: secondResult },
+        ],
+        persistRuns: true,
+      }),
     );
 
     const result = await run(
       artifact,
       {
-        schema_version: "2",
+        schema_version: "3",
         project_name: "command-workspace",
         workspace,
         instructions: "Review the portable command fixture.",
         review_scope: { mode: "full" },
       },
-      { cwd: root, env: isolatedEnvironment(join(root, "command-home")) },
+      {
+        cwd: root,
+        env: isolatedEnvironment(join(root, "command-home")),
+        args: ["--output-mode", "full-jsonl"],
+      },
     );
 
-    expect(result).toMatchObject({ exitCode: 1, stderr: "" });
+    expect(result).toMatchObject({ exitCode: 0, stderr: "" });
     const parsed = events(result.stdout);
     const fullResults = parsed.filter(
-      (event): event is { run_id: string; data: Record<string, unknown> } =>
-        event.event === "reviewer.result",
+      (
+        event,
+      ): event is {
+        run_id: string;
+        reviewer_id: string;
+        data: Record<string, unknown>;
+      } => event.event === "reviewer.result",
     );
-    const full = fullResults[0];
+    const full = fullResults.find(
+      (event) => event.reviewer_id === "portable_0",
+    );
     const completed = completion(result.stdout) as {
       run_id: string;
       data: Record<string, unknown>;
     };
-    const expectedDigest = digest(expectedResult);
+    const acceptedResult = full?.data.result as Record<string, unknown>;
+    const expectedDigest = digest(acceptedResult);
     const expectedBytes = Buffer.byteLength(
-      JSON.stringify(expectedResult),
+      JSON.stringify(acceptedResult),
       "utf8",
     );
     expect(fullResults).toHaveLength(2);
@@ -367,83 +344,128 @@ profile = "portable_1"
       data: {
         digest: expectedDigest,
         byte_count: expectedBytes,
-        result: expectedResult,
+        result: {
+          ...expectedResult,
+          change_coverage: { status: "not_applicable" },
+        },
       },
     });
-    expect(fullResults[1]).toMatchObject({
+    expect(
+      fullResults.find((event) => event.reviewer_id === "portable_1"),
+    ).toMatchObject({
       run_id: completed.run_id,
-      data: { result: secondResult },
+      data: {
+        result: {
+          ...secondResult,
+          change_coverage: { status: "not_applicable" },
+        },
+      },
     });
     expect(completed).toMatchObject({
       event: "run.completed",
       data: {
-        status: "findings",
-        exit_code: 1,
-        raw_findings: 2,
-        unique_findings: 1,
-        gate_findings: 1,
-        advisory_findings: 0,
-        results_complete: true,
+        run_outcome: "clear",
+        gate_outcome: "no_gate_findings",
+        coverage_outcome: "complete",
+        exit_code: 0,
+        raw_source_findings: 2,
+        atomic_subfindings: 1,
+        canonical_roots: 1,
+        gate_eligible_subfindings: 0,
+        result_delivery: {
+          completed_results: 2,
+          artifact: "complete",
+          planned_public_stream: "complete",
+        },
       },
     });
-    expect(completed.data.result_manifest).toHaveLength(2);
-    const manifest = completed.data.result_manifest as Array<
-      Record<string, unknown>
+    const artifactReference = completed.data.artifact as Record<
+      string,
+      unknown
     >;
-    for (const [index, event] of fullResults.entries()) {
-      expect(event.data.artifact_path).toBe(completed.data.report_path);
-      expect(manifest[index]).toMatchObject({
-        digest: event.data.digest,
-        byte_count: event.data.byte_count,
-        artifact_path: completed.data.report_path,
-      });
-    }
-    expect(full?.data.artifact_path).toBe(completed.data.report_path);
+    expect(artifactReference).toMatchObject({ completed_results: 2 });
+    for (const event of fullResults)
+      expect(event.data).not.toHaveProperty("artifact_path");
 
     const artifactRecords = (
-      await readFile(String(completed.data.report_path), "utf8")
+      await readFile(String(artifactReference.path), "utf8")
     )
       .trim()
       .split(/\r?\n/u)
       .map((line) => JSON.parse(line) as Record<string, unknown>);
-    expect(artifactRecords).toContainEqual(
-      expect.objectContaining({
-        record: "reviewer.result",
-        run_id: completed.run_id,
-        reviewer_id: "portable-0",
-        digest: expectedDigest,
-        byte_count: expectedBytes,
-        result: expectedResult,
-      }),
+    const artifactResult = artifactRecords.find(
+      (record) =>
+        record.record === "reviewer.result" &&
+        record.reviewer_id === "portable_0",
     );
-    expect(artifactRecords).toContainEqual(
-      expect.objectContaining({
-        event: "reviewer.result",
-        run_id: completed.run_id,
-        data: expect.not.objectContaining({ result: expect.anything() }),
-      }),
-    );
+    expect(artifactResult).toMatchObject({
+      record: "reviewer.result",
+      run_id: completed.run_id,
+      reviewer_id: "portable_0",
+    });
+    expect(
+      artifactRecords.some(
+        (record) =>
+          record.record === "reviewer.result" &&
+          record.reviewer_id === "portable_1",
+      ),
+    ).toBe(true);
 
     for (const [args, assertion] of [
       [
         ["status", completed.run_id, "--json"],
         {
           reviewers: [
-            { complete_result: expectedResult },
-            { complete_result: secondResult },
+            {
+              complete_result: {
+                ...expectedResult,
+                change_coverage: { status: "not_applicable" },
+              },
+            },
+            {
+              complete_result: {
+                ...secondResult,
+                change_coverage: { status: "not_applicable" },
+              },
+            },
           ],
         },
       ],
       [
         ["report", completed.run_id, "--format", "json"],
         {
-          reviewers: [{ result: expectedResult }, { result: secondResult }],
-          finding_counts: { raw: 2, unique: 1, gate: 1, advisory: 0 },
+          reviewers: [
+            {
+              result: {
+                ...expectedResult,
+                change_coverage: { status: "not_applicable" },
+              },
+            },
+            {
+              result: {
+                ...secondResult,
+                change_coverage: { status: "not_applicable" },
+              },
+            },
+          ],
+          finding_counts: {
+            raw_source_findings: 2,
+            atomic_subfindings: 1,
+            canonical_roots: 1,
+            gate_eligible_subfindings: 0,
+          },
         },
       ],
       [
         ["findings", completed.run_id, "--deduplicate", "--json"],
-        { findings: [expect.objectContaining({ id: "portable-root-a" })] },
+        {
+          findings: [
+            expect.objectContaining({
+              id: "portable-shared-root",
+              subfindings: [expect.objectContaining({ id: "portable-root-a" })],
+            }),
+          ],
+        },
       ],
     ] as const) {
       const readback = await runArguments(artifact, args, {
@@ -466,6 +488,26 @@ profile = "portable_1"
     await mkdir(dirname(config), { recursive: true });
     await writeFile(join(workspace, "source.ts"), "export const value = 1;\n");
 
+    const observedBodies: Array<Record<string, unknown>> = [];
+    let scriptedResponseIndex = 0;
+    let firstPage = "";
+    const scriptedResponses = [
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "read-source",
+            type: "function",
+            function: {
+              name: "read_file",
+              arguments: JSON.stringify({ path: "source.ts" }),
+            },
+          },
+        ],
+      },
+      { role: "assistant", content: "Inspection complete." },
+    ];
     const server = createServer(
       (request: IncomingMessage, response: ServerResponse) => {
         response.setHeader("content-type", "application/json");
@@ -474,25 +516,73 @@ profile = "portable_1"
           return;
         }
         if (request.url === "/v1/chat/completions") {
-          response.end(
-            JSON.stringify({
-              choices: [
-                {
-                  message: {
-                    content: JSON.stringify({
-                      schema_version: "3",
-                      verdict: "pass",
-                      review_markdown:
-                        "# Portable OpenAI review\n\nThe embedded adapter returned a complete result.",
-                      summary: "portable OpenAI compatible",
-                      actionable_findings: [],
-                      informational_notes: [],
-                    }),
-                  },
-                },
-              ],
-            }),
-          );
+          const chunks: Buffer[] = [];
+          request.on("data", (chunk: Buffer) => chunks.push(chunk));
+          request.on("end", () => {
+            observedBodies.push(
+              JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<
+                string,
+                unknown
+              >,
+            );
+            const body = observedBodies.at(-1)!;
+            const messages = body.messages as Array<{
+              role?: string;
+              content?: string;
+            }>;
+            const lastContent = messages.at(-1)?.content;
+            let message: Record<string, unknown> | undefined;
+            if (scriptedResponseIndex < scriptedResponses.length) {
+              message = scriptedResponses[scriptedResponseIndex++];
+            } else if (body.response_format !== undefined) {
+              const assignment = JSON.parse(lastContent ?? "{}") as {
+                result_id: string;
+                page_index: number;
+                previous_page_digest: string | null;
+              };
+              const page = JSON.stringify({
+                schema_version: "1",
+                kind: "review-mesh.result-page",
+                result_id: assignment.result_id,
+                result_kind: "reviewer",
+                result_schema_version: "4",
+                page_index: assignment.page_index,
+                page_count: 2,
+                page_kind: assignment.page_index === 0 ? "header" : "narrative",
+                previous_page_digest: assignment.previous_page_digest,
+                payload:
+                  assignment.page_index === 0
+                    ? {
+                        verdict: "pass",
+                        summary: "portable OpenAI compatible",
+                        informational_notes: [],
+                        narrative_byte_count: Buffer.byteLength(
+                          "Portable observed review.",
+                          "utf8",
+                        ),
+                        narrative_fragment_count: 1,
+                        actionable_finding_count: 0,
+                        coverage_attestation: null,
+                      }
+                    : { text_fragment: "Portable observed review." },
+              });
+              if (assignment.page_index === 0) firstPage = page;
+              else {
+                expect(assignment.previous_page_digest).toBe(
+                  createHash("sha256").update(firstPage, "utf8").digest("hex"),
+                );
+              }
+              message = { role: "assistant", content: page };
+            }
+            if (message === undefined) {
+              response.statusCode = 500;
+              response.end("{}");
+              return;
+            }
+            response.end(
+              JSON.stringify({ choices: [{ message, finish_reason: "stop" }] }),
+            );
+          });
           return;
         }
         response.statusCode = 404;
@@ -508,35 +598,45 @@ profile = "portable_1"
     }
     await writeFile(
       config,
-      `schema_version = "1"
+      `schema_version = "7"
 [execution]
 max_concurrency = 1
-heartbeat_interval_ms = 100
-shutdown_grace_period_ms = 100
+heartbeat_interval_ms = 1000
+shutdown_grace_period_ms = 1000
+deadline_mode = "adaptive"
+no_progress_timeout_ms = 1000
 [diagnostics]
-persist_runs = false
-max_runs = 1
+persist_runs = true
+max_runs = 10
 [adapters.portable]
 type = "openai_compatible"
 base_url_env = "PORTABLE_BASE_URL"
 api_key_env = "PORTABLE_API_KEY"
-[reviewer_profiles.portable]
+[agents.portable]
 adapter = "portable"
 model = "portable-model"
 purpose = "Portable OpenAI acceptance"
 instructions = "Review read-only."
 isolation = "prefer_enforced"
-timeout_ms = 5000
-[[reviewers]]
-id = "portable"
-profile = "portable"
+timeout_ms = 20000
+kind = "generic"
+required_input = []
+adjudication = "off"
+[agents.portable.applicability]
+mode = "always"
+[agents.portable.change_coverage]
+relevant_paths = ["**"]
+minimum_inspection = "full_file"
+proof = "observed"
+[defaults]
+agents = ["portable"]
 `,
     );
     try {
       const result = await run(
         artifact,
         {
-          schema_version: "2",
+          schema_version: "3",
           project_name: "openai-workspace",
           workspace,
           instructions: "Review the portable OpenAI-compatible fixture.",
@@ -551,11 +651,30 @@ profile = "portable"
           },
         },
       );
+      if (result.exitCode !== 0) {
+        throw new Error(
+          `portable OpenAI fixture failed ${JSON.stringify({ result, observedBodies })}`,
+        );
+      }
       expect(result).toMatchObject({ exitCode: 0, stderr: "" });
       expect(completion(result.stdout)).toMatchObject({
         event: "run.completed",
-        data: { status: "passed", exit_code: 0 },
+        data: {
+          run_outcome: "clear",
+          gate_outcome: "no_gate_findings",
+          coverage_outcome: "complete",
+          exit_code: 0,
+        },
       });
+      expect(scriptedResponseIndex).toBe(scriptedResponses.length);
+      expect(
+        observedBodies.some((body) =>
+          JSON.stringify(body).includes('"name":"read_file"'),
+        ),
+      ).toBe(true);
+      expect(
+        observedBodies.filter((body) => body.response_format !== undefined),
+      ).toHaveLength(2);
     } finally {
       await new Promise<void>((resolveClose, reject) =>
         server.close((error) => (error ? reject(error) : resolveClose())),
