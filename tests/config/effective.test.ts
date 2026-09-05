@@ -157,7 +157,7 @@ describe("effective configuration description", () => {
     expect(configSchema).toContain("required_context");
     expect(configSchema).toContain("changed_paths");
     const help = `${renderHelp("config")}\n${renderHelp("schema")}\n${renderHelp("adapters")}`;
-    expect(help).toContain("schema-v6");
+    expect(help).toContain("schema-v7");
     expect(help).toContain("allow_provider_concentration");
     expect(help).toContain("allow_zero_outage_tolerance");
     expect(help).toContain("applicability.mode");

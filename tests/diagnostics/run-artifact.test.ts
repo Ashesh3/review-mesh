@@ -74,6 +74,25 @@ describe("immutable artifact format two", () => {
       code: "invalid_artifact_record",
     });
   });
+  it("rejects active-prefix path replacement before returning it", async () => {
+    const { path } = await fixture();
+    const writer = await createRunArtifact({
+      path,
+      runId: "run-active",
+      toolVersion: "9.0.0",
+    });
+    await writer.record({ record: "context", context: {} });
+    await expect(
+      readRunArtifact(path, {
+        allowActive: true,
+        beforeFinalVerify: async () => {
+          await rm(path);
+          await writeFile(path, "replacement\n");
+        },
+      }),
+    ).rejects.toMatchObject({ code: "artifact_identity_changed" });
+    await writer.close();
+  });
   it("rejects redirected ancestors for creation and replay", async () => {
     const { root } = await fixture();
     const outside = join(root, "outside");

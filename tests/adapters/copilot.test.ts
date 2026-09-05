@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createCopilotAdapter,
   type CopilotClientFacade,
@@ -60,9 +60,20 @@ function sdkEvent(value: object): CopilotSessionEvent {
   return value as CopilotSessionEvent;
 }
 
+const pendingStorage: Array<{ abandoned(): void | Promise<void> }> = [];
+afterEach(async () => {
+  await Promise.all(
+    pendingStorage.splice(0).map((storage) => storage.abandoned()),
+  );
+});
+
 async function collect(iterable: AsyncIterable<AdapterEvent>) {
   const values: AdapterEvent[] = [];
-  for await (const value of iterable) values.push(value);
+  for await (const value of iterable) {
+    values.push(value);
+    if (value.type === "result" && value.resultStorage)
+      pendingStorage.push(value.resultStorage);
+  }
   return values;
 }
 

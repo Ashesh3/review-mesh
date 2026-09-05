@@ -348,9 +348,11 @@ export async function readNormalizedRun(
       artifact.summary.coverage_outcome) === "complete";
   const reportedChange = object(artifact.summary.change_coverage)?.status;
   const changeComplete =
-    reportedChange === "not_applicable" || reportedChange === "complete"
-      ? coverageComplete || contributing.length === 0
-      : coverageComplete;
+    reportedChange === "incomplete" || reportedChange === "legacy_unknown"
+      ? false
+      : reportedChange === "not_applicable" || reportedChange === "complete"
+        ? coverageComplete || contributing.length === 0
+        : coverageComplete;
   const coverage = changeComplete && executionComplete ? "complete" : "partial";
   const gateCount = canonical.counts.gate_eligible_subfindings;
   const cancelled = artifact.summary.run_outcome === "cancelled";

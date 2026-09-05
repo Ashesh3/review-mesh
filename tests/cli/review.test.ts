@@ -445,7 +445,7 @@ describe("review-mesh review", () => {
     expect(commandHelp).toMatchObject({ exitCode: 0, stderr: "" });
     expect(commandHelp.stdout).toContain("REVIEW-MESH REVIEW");
     expect(commandHelp.stdout).toContain(
-      "Full JSONL, no ANSI, and aggregate heartbeats are the defaults.",
+      "Concise JSONL, no ANSI, and aggregate heartbeats are the defaults.",
     );
 
     const version = await runCli(fixture, ["--version"], "");

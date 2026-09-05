@@ -150,9 +150,20 @@ function throwingStream(error: Error): ControlledStream {
   };
 }
 
+const pendingStorage: Array<{ abandoned(): void | Promise<void> }> = [];
+afterEach(async () => {
+  await Promise.all(
+    pendingStorage.splice(0).map((storage) => storage.abandoned()),
+  );
+});
+
 async function collect(iterable: AsyncIterable<AdapterEvent>) {
   const collected: AdapterEvent[] = [];
-  for await (const event of iterable) collected.push(event);
+  for await (const event of iterable) {
+    collected.push(event);
+    if (event.type === "result" && event.resultStorage)
+      pendingStorage.push(event.resultStorage);
+  }
   return collected;
 }
 
