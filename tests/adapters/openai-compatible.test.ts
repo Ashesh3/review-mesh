@@ -14,7 +14,7 @@ import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createOpenAICompatibleAdapter,
   type OpenAICompatibleAdapterDependencies,
@@ -233,9 +233,20 @@ function fetchMock(
 
 async function collect(adapter: ReviewAdapter, input: AdapterReviewInput) {
   const events: AdapterEvent[] = [];
-  for await (const event of adapter.run(input)) events.push(event);
+  for await (const event of adapter.run(input)) {
+    events.push(event);
+    if (event.type === "result" && event.resultStorage)
+      pendingStorage.push(event.resultStorage);
+  }
   return events;
 }
+
+const pendingStorage: Array<{ abandoned(): void | Promise<void> }> = [];
+afterEach(async () => {
+  await Promise.all(
+    pendingStorage.splice(0).map((storage) => storage.abandoned()),
+  );
+});
 
 function terminal(events: AdapterEvent[]) {
   const event = events.find(
