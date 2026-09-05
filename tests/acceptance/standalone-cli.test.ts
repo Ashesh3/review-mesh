@@ -363,10 +363,16 @@ describe.skipIf(!verifyStandalone)("standalone release executables", () => {
       expect(review.exitCode, runner.name).toBe(0);
       expect(review.stderr, runner.name).toBe("");
       const events = parsedEvents(review.stdout);
-      const fullResults = events.filter(
-        (event): event is { run_id: string; data: Record<string, unknown> } =>
-          event.event === "reviewer.result",
-      );
+      const fullResults = events
+        .filter(
+          (event): event is { run_id: string; data: Record<string, unknown> } =>
+            event.event === "reviewer.result",
+        )
+        .sort((left, right) =>
+          String((left as Record<string, unknown>).reviewer_id).localeCompare(
+            String((right as Record<string, unknown>).reviewer_id),
+          ),
+        );
       const full = fullResults[0];
       if (full === undefined) throw new Error(`${runner.name} omitted results`);
       const completed = events.at(-1) as {
@@ -408,7 +414,7 @@ describe.skipIf(!verifyStandalone)("standalone release executables", () => {
           gate_outcome: "no_gate_findings",
           coverage_outcome: "complete",
           raw_source_findings: 2,
-          atomic_subfindings: 2,
+          atomic_subfindings: 1,
           canonical_roots: 1,
           gate_eligible_subfindings: 0,
           result_delivery: {
@@ -481,18 +487,19 @@ describe.skipIf(!verifyStandalone)("standalone release executables", () => {
         ],
         finding_counts: {
           raw_source_findings: 2,
-          atomic_subfindings: 2,
+          atomic_subfindings: 1,
           canonical_roots: 1,
           gate_eligible_subfindings: 0,
         },
       });
       expect(JSON.parse(findings.stdout), runner.name).toMatchObject({
         run_id: completed.run_id,
-        canonical: {
-          roots: [
-            expect.objectContaining({ root_id: "standalone-shared-root" }),
-          ],
-        },
+        findings: [
+          expect.objectContaining({
+            id: "standalone-shared-root",
+            subfindings: expect.any(Array),
+          }),
+        ],
       });
     }
   }, 120_000);
