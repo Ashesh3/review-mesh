@@ -49,7 +49,8 @@ const SECRET_PATTERNS = [
 
 export type AdapterFailureScope =
   "run_input" | "adapter" | "provider" | "model";
-export type AdapterRepairOutcome = "not_attempted" | "succeeded" | "failed";
+export type AdapterRepairOutcome =
+  "not_attempted" | "pending" | "succeeded" | "failed";
 export type AdapterFailureCode =
   | "rate_limited"
   | "provider_unavailable"
@@ -134,6 +135,22 @@ export interface AdapterFailureDiagnostics {
   estimated_input_tokens?: number;
   context_window_tokens?: number;
   segment_index?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  reasoning_tokens?: number;
+  cached_tokens?: number;
+  cache_creation_tokens?: number;
+  cache_read_tokens?: number;
+  request_output_tokens?: number;
+  output_ceiling_tokens?: number;
+  output_recovery_attempts?: number;
+  response_sequence?: number;
+  output_cap_source?: "configured" | "model_metadata" | "default" | "adaptive";
+  output_recovery_action?:
+    "increase_output" | "split_evidence" | "compact_synthesis";
+  response_body_truncated?: boolean;
+  model_output_truncated?: boolean;
   finish_reason?: string;
   content_types?: string[];
   response_bytes?: number;
@@ -275,6 +292,7 @@ function sanitizeDiagnostics(
       : undefined;
   const repairOutcome =
     input.repair_outcome === "not_attempted" ||
+    input.repair_outcome === "pending" ||
     input.repair_outcome === "succeeded" ||
     input.repair_outcome === "failed"
       ? input.repair_outcome
@@ -449,6 +467,94 @@ function sanitizeDiagnostics(
         [
           "segment_index",
           finiteInteger(input.segment_index, 0, Number.MAX_SAFE_INTEGER),
+        ],
+        [
+          "prompt_tokens",
+          finiteInteger(input.prompt_tokens, 0, Number.MAX_SAFE_INTEGER),
+        ],
+        [
+          "completion_tokens",
+          finiteInteger(input.completion_tokens, 0, Number.MAX_SAFE_INTEGER),
+        ],
+        [
+          "total_tokens",
+          finiteInteger(input.total_tokens, 0, Number.MAX_SAFE_INTEGER),
+        ],
+        [
+          "reasoning_tokens",
+          finiteInteger(input.reasoning_tokens, 0, Number.MAX_SAFE_INTEGER),
+        ],
+        [
+          "cached_tokens",
+          finiteInteger(input.cached_tokens, 0, Number.MAX_SAFE_INTEGER),
+        ],
+        [
+          "cache_creation_tokens",
+          finiteInteger(
+            input.cache_creation_tokens,
+            0,
+            Number.MAX_SAFE_INTEGER,
+          ),
+        ],
+        [
+          "cache_read_tokens",
+          finiteInteger(input.cache_read_tokens, 0, Number.MAX_SAFE_INTEGER),
+        ],
+        [
+          "request_output_tokens",
+          finiteInteger(
+            input.request_output_tokens,
+            0,
+            Number.MAX_SAFE_INTEGER,
+          ),
+        ],
+        [
+          "output_ceiling_tokens",
+          finiteInteger(
+            input.output_ceiling_tokens,
+            0,
+            Number.MAX_SAFE_INTEGER,
+          ),
+        ],
+        [
+          "output_recovery_attempts",
+          finiteInteger(
+            input.output_recovery_attempts,
+            0,
+            Number.MAX_SAFE_INTEGER,
+          ),
+        ],
+        [
+          "response_sequence",
+          finiteInteger(input.response_sequence, 1, Number.MAX_SAFE_INTEGER),
+        ],
+        [
+          "output_cap_source",
+          ["configured", "model_metadata", "default", "adaptive"].includes(
+            input.output_cap_source ?? "",
+          )
+            ? input.output_cap_source
+            : undefined,
+        ],
+        [
+          "output_recovery_action",
+          ["increase_output", "split_evidence", "compact_synthesis"].includes(
+            input.output_recovery_action ?? "",
+          )
+            ? input.output_recovery_action
+            : undefined,
+        ],
+        [
+          "response_body_truncated",
+          typeof input.response_body_truncated === "boolean"
+            ? input.response_body_truncated
+            : undefined,
+        ],
+        [
+          "model_output_truncated",
+          typeof input.model_output_truncated === "boolean"
+            ? input.model_output_truncated
+            : undefined,
         ],
         ["model", sanitizedText(input.model, 256)],
         ["operation_phase", sanitizedText(input.operation_phase, 64)],

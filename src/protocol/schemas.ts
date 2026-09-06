@@ -427,6 +427,25 @@ export const adapterFailureDiagnosticsSchema = z.strictObject({
   estimated_input_tokens: nonNegativeInteger.optional(),
   context_window_tokens: nonNegativeInteger.optional(),
   segment_index: nonNegativeInteger.optional(),
+  prompt_tokens: nonNegativeInteger.optional(),
+  completion_tokens: nonNegativeInteger.optional(),
+  total_tokens: nonNegativeInteger.optional(),
+  reasoning_tokens: nonNegativeInteger.optional(),
+  cached_tokens: nonNegativeInteger.optional(),
+  cache_creation_tokens: nonNegativeInteger.optional(),
+  cache_read_tokens: nonNegativeInteger.optional(),
+  request_output_tokens: nonNegativeInteger.optional(),
+  output_ceiling_tokens: nonNegativeInteger.optional(),
+  output_recovery_attempts: nonNegativeInteger.optional(),
+  response_sequence: positiveInteger.optional(),
+  output_cap_source: z
+    .enum(["configured", "model_metadata", "default", "adaptive"])
+    .optional(),
+  output_recovery_action: z
+    .enum(["increase_output", "split_evidence", "compact_synthesis"])
+    .optional(),
+  response_body_truncated: z.boolean().optional(),
+  model_output_truncated: z.boolean().optional(),
   model: z.string().min(1).max(256).optional(),
   operation_phase: z.string().min(1).max(64).optional(),
   inspection_turn: nonNegativeInteger.optional(),
@@ -498,7 +517,9 @@ export const adapterFailureDiagnosticsSchema = z.strictObject({
   checkpoint_id: z.string().max(256).optional(),
   artifact_ref: z.string().max(4096).optional(),
   recommended_action: z.string().max(256).optional(),
-  repair_outcome: z.enum(["not_attempted", "succeeded", "failed"]).optional(),
+  repair_outcome: z
+    .enum(["not_attempted", "pending", "succeeded", "failed"])
+    .optional(),
   attempt_count: positiveInteger.optional(),
   retry_outcome: z.enum(["not_attempted", "succeeded", "exhausted"]).optional(),
 });

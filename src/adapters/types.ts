@@ -53,6 +53,10 @@ export interface AdapterExceptionDiagnostic {
   kind: "adapter_exception";
   diagnostics: AdapterFailureDiagnostics;
 }
+export interface AdapterResponseDiagnostic {
+  kind: "provider_response";
+  diagnostics: AdapterFailureDiagnostics;
+}
 export interface SegmentDiagnostic {
   kind: "review_segment";
   segment_id: string;
@@ -61,7 +65,10 @@ export interface SegmentDiagnostic {
   data: Record<string, unknown>;
 }
 export type AdapterDiagnostic =
-  ReviewerDraftDiagnostic | AdapterExceptionDiagnostic | SegmentDiagnostic;
+  | ReviewerDraftDiagnostic
+  | AdapterExceptionDiagnostic
+  | AdapterResponseDiagnostic
+  | SegmentDiagnostic;
 
 export interface AdapterCapabilities {
   available: boolean;

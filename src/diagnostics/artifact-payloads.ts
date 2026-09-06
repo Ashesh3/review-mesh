@@ -160,6 +160,25 @@ export const failureDiagnosticsSchema = z.strictObject({
   estimated_input_tokens: count.optional(),
   context_window_tokens: count.optional(),
   segment_index: count.optional(),
+  prompt_tokens: count.optional(),
+  completion_tokens: count.optional(),
+  total_tokens: count.optional(),
+  reasoning_tokens: count.optional(),
+  cached_tokens: count.optional(),
+  cache_creation_tokens: count.optional(),
+  cache_read_tokens: count.optional(),
+  request_output_tokens: count.optional(),
+  output_ceiling_tokens: count.optional(),
+  output_recovery_attempts: count.optional(),
+  response_sequence: z.number().int().positive().optional(),
+  output_cap_source: z
+    .enum(["configured", "model_metadata", "default", "adaptive"])
+    .optional(),
+  output_recovery_action: z
+    .enum(["increase_output", "split_evidence", "compact_synthesis"])
+    .optional(),
+  response_body_truncated: z.boolean().optional(),
+  model_output_truncated: z.boolean().optional(),
   model: z.string().min(1).max(256).optional(),
   operation_phase: z.string().min(1).max(64).optional(),
   inspection_turn: count.optional(),
@@ -228,7 +247,9 @@ export const failureDiagnosticsSchema = z.strictObject({
   checkpoint_id: z.string().max(256).optional(),
   artifact_ref: z.string().max(4096).optional(),
   recommended_action: z.string().max(256).optional(),
-  repair_outcome: z.enum(["not_attempted", "succeeded", "failed"]).optional(),
+  repair_outcome: z
+    .enum(["not_attempted", "pending", "succeeded", "failed"])
+    .optional(),
   attempt_count: z.number().int().min(1).max(100).optional(),
   retry_outcome: z.enum(["not_attempted", "succeeded", "exhausted"]).optional(),
 });
@@ -420,12 +441,16 @@ export const artifactAttemptV1Schema = z.strictObject({
 
 const followUpKind = z.enum(["snapshot", "diff", "context"]);
 const followUpRequest = z.strictObject({
+  question_id: id.optional(),
+  purpose: text.max(512).optional(),
   kind: followUpKind.optional(),
   path: text.max(1024).optional(),
   offset: count,
   byte_count: z.number().int().min(1).max(32768),
 });
 const followUpResult = z.strictObject({
+  already_delivered: z.boolean().optional(),
+  prior_delivery: z.enum(["complete", "partial", "none"]).optional(),
   request: followUpRequest,
   status: z.enum(["queued", "rejected"]),
   kind: followUpKind.optional(),
@@ -445,6 +470,10 @@ const followUpResult = z.strictObject({
 });
 
 export const privatePayloadSchemas: Record<string, z.ZodType> = {
+  "reviewer.response": z.strictObject({
+    attempt: count,
+    diagnostics: failureDiagnosticsSchema,
+  }),
   "reviewer.exception": z.strictObject({
     attempt: count,
     diagnostics: failureDiagnosticsSchema,

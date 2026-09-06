@@ -755,6 +755,14 @@ const v6ReviewerPhaseSchema = z.enum([
   "finalizing",
   "terminal",
 ]);
+const circuitCauseSchema = z.strictObject({
+  reviewer_id: boundedId,
+  attempt: positiveInteger,
+  reason: boundedId,
+  at: timestampSchema,
+  failure_code: boundedId.optional(),
+});
+
 export const segmentProgressSchema = z.strictObject({
   index: nonNegativeInteger,
   phase: z.enum(["evidence", "synthesis"]),
@@ -781,8 +789,12 @@ const v6ActiveHeartbeatEntrySchema = z.strictObject({
   last_progress_age_ms: nonNegativeInteger,
   coalesced_activity_count: nonNegativeInteger,
   admitted_at: timestampSchema.optional(),
-  queue_reason: z.enum(["provider_limit", "execution_limit"]).optional(),
+  queue_reason: z
+    .enum(["provider_limit", "execution_limit", "circuit_cooldown"])
+    .optional(),
   queue_wait_ms: nonNegativeInteger.optional(),
+  retry_at: timestampSchema.optional(),
+  circuit_cause: circuitCauseSchema.optional(),
   probe_elapsed_ms: nonNegativeInteger.optional(),
   inspection: inspectionProgressSchema.optional(),
   segment: segmentProgressSchema.optional(),
@@ -802,8 +814,12 @@ const progressData = z.strictObject({
   attempt: positiveInteger.optional(),
   maximum_attempts: positiveInteger.optional(),
   message: utf8String(1000).optional(),
-  queue_reason: z.enum(["provider_limit", "execution_limit"]).optional(),
+  queue_reason: z
+    .enum(["provider_limit", "execution_limit", "circuit_cooldown"])
+    .optional(),
   queued_at: timestampSchema.optional(),
+  retry_at: timestampSchema.optional(),
+  circuit_cause: circuitCauseSchema.optional(),
   inspection: inspectionProgressSchema.optional(),
   segment: segmentProgressSchema.optional(),
   workload: snapshotWorkloadSchema.optional(),
@@ -934,6 +950,8 @@ const publicEventV6BaseSchema = z.discriminatedUnion("event", [
       proof: v9CoverageProofKindSchema,
       admitted_at: timestampSchema.optional(),
       queue_wait_ms: nonNegativeInteger.optional(),
+      retry_at: timestampSchema.optional(),
+      circuit_cause: circuitCauseSchema.optional(),
       probe_elapsed_ms: nonNegativeInteger.optional(),
     }),
   }),

@@ -36,7 +36,7 @@ function checkpointIssueMessage(issue: z.core.$ZodIssue): string {
         return `Must contain ${relation} ${limit} ${limit === 1 ? "character" : "characters"}.`;
       if (issue.origin === "array")
         return `Must contain ${relation} ${limit} ${limit === 1 ? "item" : "items"}.`;
-      return `Must satisfy the schema ${issue.code === "too_small" ? "minimum" : "maximum"} of ${limit}.`;
+      return `Must be ${relation} ${limit}.`;
     }
     return issue.code === "too_small"
       ? "Required field or collection is below its minimum."
@@ -117,6 +117,7 @@ export function parseCheckpointResponse(
   const serialized = text ?? JSON.stringify(content ?? null);
   const details: AdapterFailureDiagnostics = {
     ...diagnostics,
+    model_output_truncated: diagnostics.finish_reason === "length",
     response_bytes: Buffer.byteLength(serialized, "utf8"),
     response_fingerprint: createHash("sha256").update(serialized).digest("hex"),
     content_types: [

@@ -5,6 +5,8 @@ export const segmentReadSchema = z.object({
   path: z.string().min(1).max(1024).optional(),
   offset: z.number().int().nonnegative().default(0),
   byte_count: z.number().int().min(1).max(32768).default(8192),
+  question_id: z.string().min(1).max(128).optional(),
+  purpose: z.string().min(1).max(512).optional(),
 });
 export type SegmentRead = z.infer<typeof segmentReadSchema>;
 export type SourceRange = {
@@ -14,6 +16,7 @@ export type SourceRange = {
   byte_count: number;
 };
 export type FollowUpResult = {
+  already_delivered?: boolean;
   error_id?: string;
   request: SegmentRead;
   status: "queued" | "rejected";

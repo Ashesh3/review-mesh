@@ -870,13 +870,16 @@ describe("v9 run orchestration", () => {
     expect(completion.exitCode).toBe(0);
   });
 
-  it("preserves the provider circuit breaker across queued logical lenses", async () => {
+  it("does not bypass a provider cooldown when the waiting lens deadline expires", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "review-mesh-v9-run-"));
     roots.push(workspace);
     const base = roundInput();
     base.config.execution.max_concurrency = 1;
     base.config.execution.retry_attempts = 1;
     base.config.execution.circuit_breaker_threshold = 1;
+    base.config.execution.circuit_breaker_cooldown_ms = 1000;
+    base.config.execution.deadline_mode = "fixed";
+    base.config.execution.run_deadline_ms = 250;
     base.config.reviewers = ["first", "second"].map((id) => ({
       ...structuredClone(base.config.reviewers[0]!),
       id,
@@ -962,6 +965,7 @@ describe("v9 run orchestration", () => {
         expect.objectContaining({
           data: expect.objectContaining({
             failure: expect.objectContaining({
+              reason: "queue_deadline_exceeded",
               diagnostics: expect.objectContaining({
                 retry_blocked_by_circuit: true,
                 circuit_caused_by_reviewer_id: admittedReviewerId,

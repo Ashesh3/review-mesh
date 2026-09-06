@@ -57,6 +57,7 @@ const PRIVATE_VERSIONS = {
   "run.error": "1",
   "reviewer.draft": "1",
   "reviewer.exception": "1",
+  "reviewer.response": "1",
   "reviewer.segment": "1",
   "reviewer.preflight": "1",
   "reviewer.attempt": "2",
@@ -92,6 +93,7 @@ const headerSchema = z.strictObject({
                   key === "reviewer.draft" ||
                   key === "reviewer.preflight" ||
                   key === "reviewer.exception" ||
+                  key === "reviewer.response" ||
                   key === "reviewer.segment"
                 ? z.literal(value).optional()
                 : key === "reviewer.attempt" || key === "reviewer.terminal"
@@ -176,6 +178,7 @@ const genericRecords: Record<string, z.ZodType> = {
 for (const record of [
   "reviewer.draft",
   "reviewer.exception",
+  "reviewer.response",
   "reviewer.segment",
   "reviewer.preflight",
   "reviewer.attempt",
@@ -630,6 +633,7 @@ export async function createRunArtifact(options: {
           kind === "reviewer.activity_summary" ||
           kind === "reviewer.draft" ||
           kind === "reviewer.exception" ||
+          kind === "reviewer.response" ||
           kind === "reviewer.segment" ||
           kind === "run.error"
             ? (sanitizeRunMetadata(value) as Record<string, unknown>)

@@ -123,7 +123,9 @@ interface Job {
   admittedAt?: number;
   queueStartedAt?: number;
   queueWaitMs?: number;
-  queueReason?: "provider_limit" | "execution_limit";
+  queueReason?: "provider_limit" | "execution_limit" | "circuit_cooldown";
+  retryAt?: string;
+  circuitCause?: NonNullable<AdapterFailure["diagnostics"]>["circuit_cause"];
   probeStartedAt?: number;
   probeElapsedMs?: number;
   expiredBoundary?: V9IncompleteReason;
@@ -338,6 +340,12 @@ export async function runV9Review(input: V9RunInput) {
     cause?: NonNullable<AdapterFailure["diagnostics"]>["circuit_cause"];
   }
   const circuits = new Map<string, ProviderCircuit>();
+  const circuitWaiters = new Set<() => void>();
+  let circuitRevision = 0;
+  const notifyCircuit = () => {
+    circuitRevision++;
+    for (const wake of [...circuitWaiters]) wake();
+  };
   const cleanupTasks = new Set<Promise<void>>();
   const cleanupScheduled = new Set<ReviewAdapter>();
   let cleanupDeadline: number | undefined;
@@ -397,6 +405,7 @@ export async function runV9Review(input: V9RunInput) {
   };
   const recordCircuitSuccess = (reviewer: ResolvedReviewer) => {
     circuits.delete(provider(reviewer));
+    notifyCircuit();
   };
   const recordCircuitFailure = (
     reviewer: ResolvedReviewer,
@@ -405,7 +414,14 @@ export async function runV9Review(input: V9RunInput) {
     const key = provider(reviewer);
     const previous = circuits.get(key);
     if (!circuitQualifying(failure)) {
-      if (previous?.state === "half_open") circuits.delete(key);
+      if (
+        previous?.state === "half_open" &&
+        previous.halfOpenReviewerId === reviewer.id
+      ) {
+        previous.state = "open";
+        delete previous.halfOpenReviewerId;
+        notifyCircuit();
+      }
       return;
     }
     const failures = (previous?.failures ?? 0) + 1;
@@ -428,6 +444,7 @@ export async function runV9Review(input: V9RunInput) {
           : {}),
       },
     });
+    notifyCircuit();
   };
   const scheduleCleanup = (adapter: ReviewAdapter | undefined) => {
     if (adapter?.forceCleanup === undefined || cleanupScheduled.has(adapter))
@@ -486,6 +503,82 @@ export async function runV9Review(input: V9RunInput) {
           },
         });
       }
+    }
+  };
+  const waitForCircuit = async (
+    job: Job,
+    signal: AbortSignal,
+    boundary: number,
+  ) => {
+    while (true) {
+      if (signal.aborted || now() >= boundary)
+        throw signal.reason ?? new Error("Queue deadline exceeded.");
+      const admission = circuitAdmission(job.reviewer);
+      if (admission.allowed) {
+        if (job.queueReason === "circuit_cooldown") delete job.queueReason;
+        delete job.retryAt;
+        delete job.circuitCause;
+        return;
+      }
+      const circuit = circuits.get(provider(job.reviewer))!;
+      const until =
+        circuit.state === "open"
+          ? Math.min(
+              boundary,
+              (circuit.openedAt ?? now()) +
+                execution.circuit_breaker_cooldown_ms,
+            )
+          : boundary;
+      const revision = circuitRevision;
+      job.queueReason = "circuit_cooldown";
+      job.retryAt = new Date(until).toISOString();
+      if (circuit.cause) job.circuitCause = circuit.cause;
+      await emit({
+        event: "reviewer.progress",
+        reviewer_id: job.reviewer.id,
+        data: {
+          lens_id: lensId(job.reviewer),
+          mode: job.mode,
+          phase: "queued",
+          attempt: job.attempt,
+          queue_reason: "circuit_cooldown",
+          queued_at: new Date(job.queueStartedAt!).toISOString(),
+          retry_at: job.retryAt,
+          ...(job.circuitCause ? { circuit_cause: job.circuitCause } : {}),
+        },
+      });
+      await new Promise<void>((resolve, reject) => {
+        let timer: ReturnType<typeof setTimeout>;
+        const cleanup = () => {
+          clearTimeout(timer);
+          circuitWaiters.delete(wake);
+          signal.removeEventListener("abort", abort);
+        };
+        const wake = () => {
+          cleanup();
+          resolve();
+        };
+        const abort = () => {
+          cleanup();
+          reject(signal.reason ?? new Error("Queue cancelled."));
+        };
+        circuitWaiters.add(wake);
+        signal.addEventListener("abort", abort, { once: true });
+        timer = setTimeout(wake, Math.max(0, until - now()));
+        if (signal.aborted) abort();
+        else if (revision !== circuitRevision) wake();
+      });
+    }
+  };
+  const releaseCircuitReservation = (job: Job) => {
+    const circuit = circuits.get(provider(job.reviewer));
+    if (
+      circuit?.state === "half_open" &&
+      circuit.halfOpenReviewerId === job.reviewer.id
+    ) {
+      circuit.state = "open";
+      delete circuit.halfOpenReviewerId;
+      notifyCircuit();
     }
   };
   const modelCounts = () => ({
@@ -616,6 +709,8 @@ export async function runV9Review(input: V9RunInput) {
       delete job.queueStartedAt;
       job.queueWaitMs = 0;
       delete job.queueReason;
+      delete job.retryAt;
+      delete job.circuitCause;
       delete job.expiredBoundary;
       const boundary = Math.min(
         runDeadline,
@@ -829,56 +924,39 @@ export async function runV9Review(input: V9RunInput) {
             phase: "queued",
             at: now(),
           });
-          const admissionPromise = acquireAdmission(
-            job,
-            child.signal,
-            boundary,
-          );
-          // Attach rejection handling before awaiting public delivery.
-          void admissionPromise.catch(() => undefined);
-          if (job.queueReason !== undefined)
-            await emit({
-              event: "reviewer.progress",
-              reviewer_id: reviewer.id,
-              data: {
-                lens_id: lensId(reviewer),
-                mode: job.mode,
-                phase: "queued",
-                attempt,
-                queue_reason: job.queueReason,
-                queued_at: new Date(job.queueStartedAt).toISOString(),
-              },
-            });
-          releaseAdmission = await admissionPromise;
-          if (child.signal.aborted || now() >= boundary)
-            throw new Error("Queue deadline exceeded.");
-          const admission = circuitAdmission(reviewer);
-          if (!admission.allowed) {
-            failure = sanitizeAdapterFailure(
-              "adapter_unavailable",
-              "The provider circuit opened before this queued review could start.",
-              false,
-              {
-                fallback_eligible: true,
-                circuit_qualifying: false,
-                diagnostics: {
-                  failure_stage: "circuit_breaker",
-                  scope: "provider",
-                  retry_blocked_by_circuit: true,
-                  ...(admission.cause
-                    ? { circuit_cause: admission.cause }
-                    : {}),
-                  ...(admission.causedByReviewerId === undefined
-                    ? {}
-                    : {
-                        circuit_caused_by_reviewer_id:
-                          admission.causedByReviewerId,
-                      }),
-                },
-              },
+          for (;;) {
+            await waitForCircuit(job, child.signal, boundary);
+            const admissionPromise = acquireAdmission(
+              job,
+              child.signal,
+              boundary,
             );
+            void admissionPromise.catch(() => undefined);
+            if (
+              job.queueReason !== undefined &&
+              job.queueReason !== "circuit_cooldown"
+            )
+              await emit({
+                event: "reviewer.progress",
+                reviewer_id: reviewer.id,
+                data: {
+                  lens_id: lensId(reviewer),
+                  mode: job.mode,
+                  phase: "queued",
+                  attempt,
+                  queue_reason: job.queueReason,
+                  queued_at: new Date(job.queueStartedAt).toISOString(),
+                },
+              });
+            releaseAdmission = await admissionPromise;
+            if (child.signal.aborted || now() >= boundary)
+              throw new Error("Queue deadline exceeded.");
+            if (circuitAdmission(reviewer).allowed) break;
+            releaseAdmission();
+            releaseAdmission = undefined;
           }
         }
+
         if (!failure) {
           admitted = true;
           job.status = "running";
@@ -1043,9 +1121,15 @@ export async function runV9Review(input: V9RunInput) {
                   string,
                   unknown
                 >;
-                if (diagnostic.kind === "adapter_exception") {
+                if (
+                  diagnostic.kind === "adapter_exception" ||
+                  diagnostic.kind === "provider_response"
+                ) {
                   await input.record({
-                    record: "reviewer.exception",
+                    record:
+                      diagnostic.kind === "adapter_exception"
+                        ? "reviewer.exception"
+                        : "reviewer.response",
                     reviewer_id: reviewer.id,
                     data: { attempt, diagnostics: safe.diagnostics },
                   });
@@ -1415,6 +1499,24 @@ export async function runV9Review(input: V9RunInput) {
           error instanceof Error ? error.message : "Reviewer result failed",
           reason === "attempt_deadline_exceeded" ||
             reason === "no_progress_timeout",
+          job.queueReason === "circuit_cooldown"
+            ? {
+                circuit_qualifying: false,
+                fallback_eligible: reason !== "cancelled",
+                diagnostics: {
+                  failure_stage: "circuit_wait",
+                  scope: "provider",
+                  retry_blocked_by_circuit: true,
+                  ...(job.circuitCause
+                    ? {
+                        circuit_cause: job.circuitCause,
+                        circuit_caused_by_reviewer_id:
+                          job.circuitCause.reviewer_id,
+                      }
+                    : {}),
+                },
+              }
+            : {},
         );
       } finally {
         clearTimeout(timer);
@@ -1422,8 +1524,15 @@ export async function runV9Review(input: V9RunInput) {
         controller.signal.removeEventListener("abort", onAbort);
         if (job.phase === "probing")
           job.probeElapsedMs = Math.max(0, now() - job.probeStartedAt!);
-        if (failure !== undefined) recordCircuitFailure(reviewer, failure);
+        const reservedWithoutRequest =
+          !admitted &&
+          circuits.get(group)?.state === "half_open" &&
+          circuits.get(group)?.halfOpenReviewerId === reviewer.id;
+        if (reservedWithoutRequest) releaseCircuitReservation(job);
+        if (failure !== undefined && !reservedWithoutRequest)
+          recordCircuitFailure(reviewer, failure);
         releaseAdmission?.();
+        releaseCircuitReservation(job);
         if (child.signal.aborted) scheduleCleanup(job.adapter);
         if (terminal?.type === "result" && !resultStoragePersisted)
           void Promise.resolve(terminal.resultStorage?.abandoned()).catch(
@@ -1619,6 +1728,8 @@ export async function runV9Review(input: V9RunInput) {
           phase: job.phase as "reviewing",
           ...(job.inspection ? { inspection: job.inspection } : {}),
           ...(job.segment ? { segment: job.segment } : {}),
+          ...(job.retryAt ? { retry_at: job.retryAt } : {}),
+          ...(job.circuitCause ? { circuit_cause: job.circuitCause } : {}),
           attempt_elapsed_ms:
             job.admittedAt === undefined ? 0 : now() - job.admittedAt,
           ...(job.admittedAt === undefined

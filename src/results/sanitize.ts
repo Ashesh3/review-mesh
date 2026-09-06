@@ -17,6 +17,15 @@ const REDACTED = "[redacted]";
 const SENSITIVE_KEY = /token|secret|password|authorization|api[_-]?key/iu;
 const TOKEN_STATISTIC_KEYS = new Set([
   "input_tokens",
+  "prompt_tokens",
+  "completion_tokens",
+  "total_tokens",
+  "reasoning_tokens",
+  "cached_tokens",
+  "cache_creation_tokens",
+  "cache_read_tokens",
+  "request_output_tokens",
+  "output_ceiling_tokens",
   "limit_tokens",
   "input_budget_tokens",
   "output_reserve_tokens",

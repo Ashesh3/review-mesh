@@ -1,8 +1,9 @@
 # Review Mesh
 
-[v9.6.0](docs/releases/v9.6.0.md) repairs segmented follow-up reads and checkpoint
-recovery, delivers PR metadata before source analysis, and preserves semantic
-progress and safe token diagnostics across status and dashboard views.
+[v9.7.0](docs/releases/v9.7.0.md) adds output-aware checkpoint recovery, retained
+numeric usage diagnostics, bounded evidence memory, and cooldown-aware provider
+admission. Full-source coverage, candidate preservation and strict quorum remain
+enforced.
 [Quality evaluation](docs/quality-evaluation.md) scores actual model reports
 against independent synthetic behavior oracles. Strict evidence and quorum
 remain enforced.

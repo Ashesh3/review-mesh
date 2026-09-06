@@ -124,6 +124,40 @@ function segmentSummary(record: Record<string, unknown>) {
       : [],
   };
 }
+function responseSummary(records: Record<string, unknown>[]) {
+  const responses = records.filter(
+    (record) => record.record === "reviewer.response",
+  );
+  const totals: Record<string, number> = {};
+  for (const response of responses) {
+    const diagnostics = (
+      response.data as { diagnostics: Record<string, unknown> }
+    ).diagnostics;
+    for (const key of [
+      "prompt_tokens",
+      "completion_tokens",
+      "total_tokens",
+      "reasoning_tokens",
+      "cached_tokens",
+      "cache_creation_tokens",
+      "cache_read_tokens",
+    ]) {
+      const value = diagnostics[key];
+      if (
+        typeof value === "number" &&
+        Number.isSafeInteger(value) &&
+        value >= 0 &&
+        Number.isSafeInteger((totals[key] ?? 0) + value)
+      )
+        totals[key] = (totals[key] ?? 0) + value;
+    }
+  }
+  return {
+    responses: responses.length,
+    reported_usage_totals: totals,
+    usage_is_provider_reported: true,
+  };
+}
 export function v9Report(
   run: NormalizedRun,
   options: { includeRaw?: boolean } = {},
@@ -190,6 +224,7 @@ export function v9Report(
     attempts: run.records.filter(
       (record) => record.record === "reviewer.attempt",
     ),
+    response_summary: responseSummary(records),
     preflight: records.filter(
       (record) => record.record === "reviewer.preflight",
     ),
@@ -286,6 +321,7 @@ export function v9Status(
       ...reviewer,
       ...(liveReviewer?.segment ? { segment: liveReviewer.segment } : {}),
       attempt_count: attempts.length,
+      response_summary: responseSummary(selected),
       timing,
       ...(latest
         ? {
@@ -305,6 +341,9 @@ export function v9Status(
       ...(details
         ? {
             attempts,
+            responses: selected.filter(
+              (record) => record.record === "reviewer.response",
+            ),
             preflight: selected.filter(
               (record) => record.record === "reviewer.preflight",
             ),

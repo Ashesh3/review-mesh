@@ -257,7 +257,7 @@ describe("segmented checkpoint repair", () => {
             diagnostics: {
               failure_stage: stage,
               failure_code: code,
-              attempt_count: 3,
+              attempt_count: expect.any(Number),
               finish_reason: finish,
               response_fingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
               response_bytes: expect.any(Number),
@@ -267,8 +267,15 @@ describe("segmented checkpoint repair", () => {
         const drafts = f.diagnostics.filter(
           (value) => value.kind === "unverified_result_draft",
         );
-        expect(calls).toBe(3);
-        expect(drafts).toHaveLength(3);
+        if (finish === "length") {
+          expect(calls).toBeGreaterThanOrEqual(1);
+          expect(calls).toBeLessThanOrEqual(7);
+        } else expect(calls).toBe(3);
+        expect(drafts).toHaveLength(calls);
+        expect(drafts.at(-1).diagnostics).toMatchObject({
+          attempt_count: calls,
+          repair_outcome: "failed",
+        });
         for (const draft of drafts)
           expect(draft.diagnostics).toMatchObject({
             failure_stage: stage,

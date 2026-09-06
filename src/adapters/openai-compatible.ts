@@ -27,6 +27,7 @@ import { createReadOnlyFileTools } from "./file-tools.js";
 import { providerErrorBody } from "./provider-error-body.js";
 import { InspectionSession } from "./inspection-session.js";
 import { ContextBudget, resolveModelBudget } from "./context-budget.js";
+import { usageDiagnostics } from "./usage-diagnostics.js";
 import { SegmentedReview, SegmentedReviewError } from "./segmented-review.js";
 import { unexpectedAdapterFailure } from "./unexpected-error.js";
 import { createResultPagePreservation } from "../results/result-pages.js";
@@ -1648,6 +1649,11 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
   private readonly admittedInspection = new Map<string, InspectionSession>();
   private readonly modelMetadata = new Map<string, unknown>();
   private readonly sessionBudgets = new Map<string, ContextBudget>();
+  private readonly responseRecorders = new Map<
+    string,
+    NonNullable<AdapterReviewInput["recordDiagnostic"]>
+  >();
+  private readonly responseSequences = new Map<string, number>();
   private readonly segments = new WeakMap<object, SegmentedReview>();
 
   constructor(
@@ -2018,6 +2024,8 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           value,
           diagnostics: {
             ...responseDiagnostics,
+            ...usageDiagnostics(value),
+            response_body_truncated: false,
             response_bytes: responseBytes,
             response_fingerprint: responseFingerprint(structure, responseBytes),
             response_structure: structure,
@@ -2192,6 +2200,8 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               value,
               diagnostics: {
                 ...streamed.diagnostics,
+                ...usageDiagnostics(value),
+                response_body_truncated: false,
                 response_bytes: parsed.response_bytes,
                 response_fingerprint: responseFingerprint(
                   structure,
@@ -2323,6 +2333,20 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
       ...(typeof body.model === "string" ? { model: body.model } : {}),
       operation_phase: body.tools === undefined ? "finalization" : "inspection",
       request_bytes: Buffer.byteLength(JSON.stringify(body)),
+      ...(typeof body.max_tokens === "number"
+        ? { request_output_tokens: body.max_tokens }
+        : {}),
+      ...(budget
+        ? {
+            output_cap_source:
+              budget.model.outputSource ??
+              (budget.model.source === "configured"
+                ? "configured"
+                : budget.model.source === "model_metadata"
+                  ? "model_metadata"
+                  : "default"),
+          }
+        : {}),
       ...failureDiagnostics,
     };
     if (
@@ -2339,14 +2363,43 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     }
     let retriedEnvelope = false;
     let response: ProviderJsonResponse;
-    try {
-      response = await this.chatResponse(
+    const receive = async () => {
+      const received = await this.chatResponse(
         configuration,
         signal,
         sessionId,
         body,
         onProgress,
       );
+      const reason = finishReason(received.value);
+      const sequence = (this.responseSequences.get(sessionId) ?? 0) + 1;
+      this.responseSequences.set(sessionId, sequence);
+      received.diagnostics.response_sequence = sequence;
+      const safe = sanitizeAdapterFailure(
+        "unknown",
+        "Provider response telemetry",
+        false,
+        {
+          diagnostics: {
+            ...received.diagnostics,
+            ...failureDiagnostics,
+            ...(reason === undefined
+              ? {}
+              : {
+                  finish_reason: reason,
+                  model_output_truncated: reason === "length",
+                }),
+          },
+        },
+      ).diagnostics!;
+      await this.responseRecorders.get(sessionId)?.({
+        kind: "provider_response",
+        diagnostics: safe,
+      });
+      return received;
+    };
+    try {
+      response = await receive();
     } catch (error) {
       if (
         !(error instanceof ProviderRequestError) ||
@@ -2374,13 +2427,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
       }
       retriedEnvelope = true;
       try {
-        response = await this.chatResponse(
-          configuration,
-          signal,
-          sessionId,
-          body,
-          onProgress,
-        );
+        response = await receive();
         response.diagnostics = {
           ...response.diagnostics,
           attempt_count: 2,
@@ -2412,13 +2459,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
       if (Array.isArray(choices) && choices.length === 0) {
         retriedEnvelope = true;
         try {
-          response = await this.chatResponse(
-            configuration,
-            signal,
-            sessionId,
-            body,
-            onProgress,
-          );
+          response = await receive();
         } catch (error) {
           if (error instanceof ProviderRequestError)
             throw new ProviderRequestError({
@@ -2455,7 +2496,10 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         : { content_types: receivedContentTypes }),
       ...(receivedFinishReason === undefined
         ? {}
-        : { finish_reason: receivedFinishReason }),
+        : {
+            finish_reason: receivedFinishReason,
+            model_output_truncated: receivedFinishReason === "length",
+          }),
     };
     if (!parsed.success) {
       throw new ProviderRequestError(
@@ -2490,7 +2534,10 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           : { content_types: receivedContentTypes }),
         ...(receivedFinishReason === undefined
           ? {}
-          : { finish_reason: receivedFinishReason }),
+          : {
+              finish_reason: receivedFinishReason,
+              model_output_truncated: receivedFinishReason === "length",
+            }),
       },
     };
   }
@@ -2834,7 +2881,9 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
                     schema: resultPageSchemaFor(request, resultKind),
                   },
                 },
-                max_tokens: DEFAULT_FINALIZATION_MAX_TOKENS,
+                max_tokens:
+                  this.sessionBudgets.get(sessionId)?.model.outputTokens ??
+                  DEFAULT_FINALIZATION_MAX_TOKENS,
               },
               {
                 failure_stage: "structured_result_page_envelope",
@@ -3192,6 +3241,8 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     }
 
     const sessionId = session.sessionId;
+    if (input.recordDiagnostic)
+      this.responseRecorders.set(sessionId, input.recordDiagnostic);
     const budget = new ContextBudget(
       resolveModelBudget(
         this.modelMetadata.get(input.reviewer.model),
@@ -3321,7 +3372,9 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               schema: relaxedStructuredOutputSchema(input.resultJsonSchema),
             },
           },
-          max_tokens: budget.model.outputTokens,
+          max_tokens:
+            this.sessionBudgets.get(sessionId)?.model.outputTokens ??
+            budget.model.outputTokens,
         },
         { operation_phase: "finalization" },
       );
@@ -3441,7 +3494,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
                   ? READ_ONLY_TOOLS
                   : EXACT_READ_ONLY_TOOLS,
               tool_choice: turn === 0 ? "required" : "auto",
-              max_tokens: 8_192,
+              max_tokens: budget.model.outputTokens,
             },
             {
               inspection_turn: turn + 1,
@@ -3723,7 +3776,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
                   : { reasoning_effort: input.reviewer.effort }),
                 messages: finalizationMessages,
                 response_format: responseFormat,
-                max_tokens: DEFAULT_FINALIZATION_MAX_TOKENS,
+                max_tokens: budget.model.outputTokens,
               },
               {
                 failure_stage: "structured_result_envelope",
@@ -3820,7 +3873,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
                     : { reasoning_effort: input.reviewer.effort }),
                   messages: finalizationMessages,
                   response_format: responseFormat,
-                  max_tokens: DEFAULT_FINALIZATION_MAX_TOKENS,
+                  max_tokens: budget.model.outputTokens,
                 },
                 {
                   failure_stage: "structured_result_repair_envelope",
@@ -4034,6 +4087,8 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     } finally {
       this.admittedInspection.delete(sessionId);
       this.sessionBudgets.delete(sessionId);
+      this.responseRecorders.delete(sessionId);
+      this.responseSequences.delete(sessionId);
       await workspace.dispose().catch(() => undefined);
       this.activeWorkspaces.delete(workspace);
     }

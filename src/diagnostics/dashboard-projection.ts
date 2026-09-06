@@ -296,7 +296,12 @@ export function projectDashboardRun(
           "probe_elapsed_ms",
         ])
           if (count(entry[key]) !== undefined) reviewer[key] = entry[key];
-        for (const key of ["admitted_at", "queue_reason"])
+        for (const key of [
+          "admitted_at",
+          "queue_reason",
+          "retry_at",
+          "circuit_cause",
+        ])
           if (entry[key] !== undefined) reviewer[key] = entry[key];
         if (at && count(entry.last_progress_age_ms) !== undefined)
           activityAt(
@@ -349,6 +354,8 @@ export function projectDashboardRun(
         });
       setPhase(reviewer, "reviewing", at);
       delete reviewer.queue_reason;
+      delete reviewer.retry_at;
+      delete reviewer.circuit_cause;
     } else if (
       record.event === "reviewer.progress" ||
       record.event === "reviewer.heartbeat"
@@ -357,7 +364,12 @@ export function projectDashboardRun(
       setPhase(reviewer, data.phase, at);
       const segment = segmentProgressSchema.safeParse(data.segment);
       if (segment.success) reviewer.segment = segment.data;
-      for (const key of ["queued_at", "queue_reason"])
+      for (const key of [
+        "queued_at",
+        "queue_reason",
+        "retry_at",
+        "circuit_cause",
+      ])
         if (data[key] !== undefined) reviewer[key] = data[key];
       if (text(data.mode)) reviewer.mode = data.mode;
       if (count(data.attempt)) attempt(reviewer, count(data.attempt)!);

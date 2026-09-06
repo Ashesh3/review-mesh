@@ -117,7 +117,11 @@ describe("unexpected adapter diagnostics", () => {
           expect(terminal?.failure.diagnostics?.artifact_ref).toBe(
             "reviewer.exception",
           );
-          expect(diagnostics).toEqual([
+          expect(
+            diagnostics.filter(
+              (record: any) => record.kind === "adapter_exception",
+            ),
+          ).toEqual([
             expect.objectContaining({
               kind: "adapter_exception",
               diagnostics: expect.objectContaining({

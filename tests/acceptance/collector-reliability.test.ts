@@ -332,7 +332,24 @@ agents=["collector"]
           review_scope: { mode: "changes", base: "HEAD" },
         }),
       );
-      expect(run.code, run.stderr + run.stdout.slice(-4000)).toBe(0);
+      const failedEvents = run.stdout
+        .trim()
+        .split(/\r?\n/)
+        .flatMap((line) => {
+          try {
+            const event = JSON.parse(line);
+            return event.event === "reviewer.incomplete" ||
+              event.event === "run.persistence_failed"
+              ? [event]
+              : [];
+          } catch {
+            return [];
+          }
+        });
+      expect(
+        run.code,
+        run.stderr + JSON.stringify(failedEvents) + run.stdout.slice(-4000),
+      ).toBe(0);
       const events = run.stdout
         .trim()
         .split(/\r?\n/)

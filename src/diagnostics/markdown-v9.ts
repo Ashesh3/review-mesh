@@ -28,6 +28,11 @@ export function renderV9Markdown(input: ReturnType<typeof v9Report>): string {
     "Source delivery records available evidence. Scenario checks below are model reasoning unless independently executed by an evaluator.",
     "",
   ];
+  if (report.response_summary.responses)
+    lines.push(
+      `Provider responses: ${report.response_summary.responses}; reported usage totals: ${code(JSON.stringify(report.response_summary.reported_usage_totals))}.`,
+      "",
+    );
   if (report.public_delivery_failure)
     lines.push(
       "## Public delivery failure",

@@ -8,7 +8,10 @@ export interface ModelContextSettings {
 export interface ModelBudget {
   contextTokens: number;
   inputTokens: number;
+  inputCeilingTokens: number;
   outputTokens: number;
+  outputCeilingTokens: number;
+  outputSource: "configured" | "model_metadata" | "default" | "adaptive";
   source:
     | "configured"
     | "model_metadata"
@@ -45,23 +48,37 @@ export function resolveModelBudget(
     capacity(limits.max_context_window_tokens) ??
     capacity(metadata.context_window) ??
     128_000;
-  const output = Math.min(
-    capacity(settings.max_output_tokens) ??
-      capacity(limits.max_output_tokens) ??
-      8192,
-    8192,
-    Math.floor(context / 4),
+  const configuredOutput = capacity(settings.max_output_tokens);
+  const metadataOutput = capacity(limits.max_output_tokens);
+  const outputCeiling = Math.min(
+    configuredOutput ?? metadataOutput ?? 8192,
+    metadataOutput ?? 65536,
+    65536,
+    Math.max(
+      1,
+      context -
+        Math.max(1024, Math.ceil(context * 0.05)) -
+        Math.min(2048, Math.floor(context / 2)),
+    ),
   );
-  const input = Math.min(
+  const output = Math.min(configuredOutput ?? 8192, outputCeiling);
+  const inputCeiling =
     capacity(settings.max_input_tokens) ??
-      capacity(limits.max_prompt_tokens) ??
-      context - output,
-    context - output,
-  );
+    capacity(limits.max_prompt_tokens) ??
+    context;
+  const input = Math.min(inputCeiling, context - output);
   return {
     contextTokens: context,
     inputTokens: input,
+    inputCeilingTokens: inputCeiling,
     outputTokens: output,
+    outputCeilingTokens: outputCeiling,
+    outputSource:
+      configuredOutput !== undefined
+        ? "configured"
+        : metadataOutput !== undefined
+          ? "model_metadata"
+          : "default",
     source: explicit
       ? "configured"
       : capacity(limits.max_context_window_tokens) ||
@@ -79,11 +96,11 @@ export function resolveModelBudget(
  * overestimate BPE tokens; it is an explicit safe default, never an exact count. */
 export class ContextBudget {
   private limit: number;
+  private feedbackLimit = Number.POSITIVE_INFINITY;
+  private readonly headroom: number;
   constructor(readonly model: ModelBudget) {
-    this.limit = Math.max(
-      0,
-      model.inputTokens - Math.max(1024, Math.ceil(model.contextTokens * 0.05)),
-    );
+    this.headroom = Math.max(1024, Math.ceil(model.contextTokens * 0.05));
+    this.limit = Math.max(0, model.inputTokens - this.headroom);
   }
   get inputLimit() {
     return this.limit;
@@ -93,6 +110,30 @@ export class ContextBudget {
   }
   fits(body: unknown) {
     return this.estimate(body) <= this.limit;
+  }
+  growOutput(minimumInputTokens = 2048): boolean {
+    if (!Number.isSafeInteger(minimumInputTokens) || minimumInputTokens < 2048)
+      return false;
+    const next = Math.min(
+      this.model.outputCeilingTokens,
+      this.model.outputTokens * 2,
+      this.model.contextTokens - this.headroom - minimumInputTokens,
+    );
+    if (next <= this.model.outputTokens) return false;
+    const input = Math.min(
+      this.model.inputCeilingTokens,
+      this.model.contextTokens - next,
+    );
+    const limit = Math.max(
+      0,
+      Math.min(input - this.headroom, this.feedbackLimit),
+    );
+    if (limit < minimumInputTokens) return false;
+    this.model.outputTokens = next;
+    this.model.inputTokens = input;
+    this.model.outputSource = "adaptive";
+    this.limit = limit;
+    return true;
   }
   reduce(
     feedback: Pick<AdapterFailureDiagnostics, "input_tokens" | "limit_tokens">,
@@ -110,6 +151,7 @@ export class ContextBudget {
     );
     if (next < 2048 || next >= this.limit) return false;
     this.limit = next;
+    this.feedbackLimit = next;
     this.model.source = "provider_feedback";
     return true;
   }
@@ -119,6 +161,9 @@ export class ContextBudget {
       token_estimation: "utf8_upper_bound",
       input_budget_tokens: this.limit,
       output_reserve_tokens: this.model.outputTokens,
+      request_output_tokens: this.model.outputTokens,
+      output_cap_source: this.model.outputSource,
+      output_ceiling_tokens: this.model.outputCeilingTokens,
       context_window_tokens: this.model.contextTokens,
       ...(body === undefined
         ? {}
