@@ -1,9 +1,8 @@
 import type { AdapterRegistration } from "../config/schemas.js";
-import { createClaudeAdapter } from "./claude.js";
-import { createCopilotAdapter } from "./copilot.js";
-import { createCodexAdapter } from "./codex.js";
+import { createNativeClaudeAdapter } from "./native-claude.js";
+import { createNativeCopilotAdapter } from "./native-copilot.js";
+import { createNativeCodexAdapter } from "./native-codex.js";
 import { adapterFailure } from "./errors.js";
-import { createOpenAICompatibleAdapter } from "./openai-compatible.js";
 import type {
   AdapterCapabilities,
   AdapterEvent,
@@ -52,19 +51,16 @@ export class AdapterRegistry {
   >();
 
   constructor() {
-    this.register("codex", (registration) => createCodexAdapter(registration));
+    this.register("codex", (registration) => {
+      if (registration.type !== "codex")
+        throw new Error("Expected Codex registration");
+      return createNativeCodexAdapter(registration);
+    });
     this.register("claude", (registration) =>
-      createClaudeAdapter(registration),
+      createNativeClaudeAdapter(registration),
     );
     this.register("copilot", (registration) =>
-      createCopilotAdapter(registration),
-    );
-    this.register("openai_compatible", (registration, options) =>
-      createOpenAICompatibleAdapter(registration, {
-        ...(options?.continuationAttempts === undefined
-          ? {}
-          : { continuationAttempts: options.continuationAttempts }),
-      }),
+      createNativeCopilotAdapter(registration),
     );
   }
 

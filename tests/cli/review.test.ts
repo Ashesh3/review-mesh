@@ -18,7 +18,7 @@ import { PassThrough, Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { execa } from "execa";
-import { runLegacyReviewApplication as runReviewApplication } from "../../src/app.js";
+import { runLegacyReviewApplication as runReviewApplication } from "../../src/app-legacy.js";
 import {
   publicEventSchema,
   type PublicEvent,
@@ -228,7 +228,7 @@ function startCompiledCli(
   args: readonly string[] = ["review"],
   input = fixture.request,
 ): ChildProcessWithoutNullStreams {
-  const script = `import {runCli} from ${JSON.stringify(pathToFileURL(compiledCliEntry).href)}; import {runLegacyReviewApplication} from ${JSON.stringify(pathToFileURL(join(projectRoot, "dist", "app.js")).href)}; await runCli(process,{argv:process.argv.slice(1),runReview:runLegacyReviewApplication});`;
+  const script = `import {runCli} from ${JSON.stringify(pathToFileURL(compiledCliEntry).href)}; import {runLegacyReviewApplication} from ${JSON.stringify(pathToFileURL(join(projectRoot, "dist", "app-legacy.js")).href)}; await runCli(process,{argv:process.argv.slice(1),runReview:runLegacyReviewApplication});`;
   const child = spawn(
     process.execPath,
     ["--input-type=module", "-e", script, ...args],
@@ -583,7 +583,7 @@ describe("review-mesh review", () => {
         progress: {
           adapter_activity_streamed: false,
           status_query_available: true,
-          retryable_adapter_failures: { maximum_attempts: 2 },
+          sdk_transport_recovery: "vendor_owned",
         },
       },
       request_examples: {

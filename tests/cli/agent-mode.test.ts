@@ -40,13 +40,17 @@ describe("explicit agent-mode flags", () => {
         "details.jsonl",
       ],
       cwd: root,
+      configFile: join(root, "fixture-config.toml"),
       input,
       output: new PassThrough(),
       error: new PassThrough(),
       runReview,
     });
     expect(runReview).toHaveBeenCalledWith(
-      expect.objectContaining({ detailsFile: join(root, "details.jsonl") }),
+      expect.objectContaining({
+        detailsFile: join(root, "details.jsonl"),
+        configFile: join(root, "fixture-config.toml"),
+      }),
     );
   });
 

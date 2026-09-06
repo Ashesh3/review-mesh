@@ -18,8 +18,10 @@ import {
 } from "./run-index.js";
 import { createV9EventWriter } from "../protocol/v9-event-writer.js";
 import { runV9Review } from "../orchestrator/run-v9.js";
+import { runNativeReview } from "../orchestrator/run-native.js";
 import { reviewMeshVersion } from "../discovery/help.js";
 import { prepareV9Retry } from "./retry-v9.js";
+import { reviewerResultDigest } from "../results/digest.js";
 
 export async function runDoctorV9(
   adapter: ReviewAdapter,
@@ -32,6 +34,7 @@ export async function runDoctorV9(
   let artifact:
     Awaited<ReturnType<typeof createManagedRunArtifact>> | undefined;
   let writer: ReturnType<typeof createV9EventWriter> | undefined;
+  const native = ["claude", "codex", "copilot"].includes(reviewer.adapter.type);
   try {
     const workspace = join(directory, "workspace");
     await mkdir(workspace);
@@ -67,24 +70,35 @@ export async function runDoctorV9(
         schema_version: "3",
         workspace,
         project_name: "review-mesh-doctor",
-        instructions:
-          "Read review-mesh-doctor.txt with the provided read tool, inspect the supplied Git diff, then produce the required result pages.",
+        instructions: native
+          ? "Inspect review-mesh-doctor.txt and its Git diff with the native SDK's approved read-only tools. Return the supplied complete structured result and attest the inspected scope."
+          : "Read review-mesh-doctor.txt with the provided read tool, inspect the supplied Git diff, then produce the required result pages.",
         review_scope: { mode: "changes", base: "HEAD" },
       },
       git,
       signal,
     });
-    const proof =
-      reviewer.policy?.changeCoverage?.proof ??
-      (reviewer.adapter.type === "command" || reviewer.adapter.type === "codex"
-        ? "attested"
-        : "observed");
+    const proof = native
+      ? "native_attested"
+      : (reviewer.policy?.changeCoverage?.proof ??
+        (reviewer.adapter.type === "command" ||
+        reviewer.adapter.type === "codex"
+          ? "attested"
+          : "observed"));
     const syntheticReviewer: ResolvedReviewer = {
       ...reviewer,
       id: "doctor",
       agentId: "doctor",
       modelIndex: 0,
       modelCount: 1,
+      ...(native
+        ? {
+            runtime: {
+              ...reviewer.runtime,
+              execution_contract: "native_review_v1",
+            },
+          }
+        : {}),
       policy: {
         applicability: { mode: "always" },
         kind: "generic",
@@ -202,7 +216,7 @@ export async function runDoctorV9(
           outcome,
         }),
     });
-    const completion = await runV9Review({
+    const completion = await (native ? runNativeReview : runV9Review)({
       runId,
       config: syntheticConfig,
       context,
@@ -215,12 +229,113 @@ export async function runDoctorV9(
     });
     const job = completion.jobs[0];
     const failureStage = lastFailure?.diagnostics?.failure_stage;
-    // Reading validates the durable page chain, digest, and assembled result
-    // against the recorded reviewer output; a whole-result adapter bypass is
-    // insufficient evidence that its paged output path works.
+    // Reading validates the published artifact, result digests and any legacy
+    // page chains before doctor reports the corresponding contract as ready.
     const persisted = await readRunArtifact(
       openedArtifact.publishedReference!.path,
+      { expectedSha256: openedArtifact.publishedReference!.sha256 },
     );
+    if (native) {
+      const persistedResult = persisted.results.find(
+        (record) => record.reviewer_id === "doctor",
+      );
+      const executionRecord = persisted.records.find(
+        (record) =>
+          record.record === "reviewer.native_execution" &&
+          record.reviewer_id === "doctor",
+      );
+      const execution = executionRecord?.data as
+        Record<string, unknown> | undefined;
+      const result =
+        job?.result?.schema_version === "4" ? job.result : undefined;
+      const submitted =
+        result !== undefined &&
+        persistedResult?.digest === reviewerResultDigest(result) &&
+        persisted.digest_status === "verified";
+      const executionVerified =
+        submitted &&
+        execution?.contract === "native_review_v1" &&
+        execution.sdk_completed === true &&
+        execution.harness === reviewer.adapter.type &&
+        execution.model === reviewer.model &&
+        typeof execution.execution_fingerprint === "string";
+      const scope = result?.native_scope_attestation;
+      const scopeAttested =
+        scope?.complete === true &&
+        scope.reviewed_paths.includes(path) &&
+        result?.change_coverage.status === "complete";
+      let rerunVerified = false;
+      if (completion.exitCode === 0) {
+        const retry = await prepareV9Retry({
+          runsDirectory,
+          parentRunId: runId,
+          selectedLensIds: ["doctor"],
+          config: syntheticConfig,
+          context,
+        });
+        rerunVerified =
+          retry.inheritance === "rerun_all" &&
+          retry.inherited.length === 0 &&
+          retry.runLensIds.includes("doctor");
+      }
+      const checks: Array<{
+        name: string;
+        passed: boolean;
+        required?: boolean;
+        message?: string;
+        failure?: AdapterFailure;
+      }> = [
+        {
+          name: "authentication",
+          passed: executionVerified || capabilities?.authenticated === true,
+        },
+        { name: "model", passed: executionVerified },
+        {
+          name: "progress_observability",
+          passed: capabilities?.progress_observable === true,
+          required: false,
+        },
+        { name: "native_schema_submission", passed: submitted },
+        {
+          name: "native_scope_attestation",
+          passed: scopeAttested,
+          message:
+            "Scope completion is model-attested; Review Mesh does not claim observed source reads.",
+        },
+        { name: "native_execution_artifact", passed: executionVerified },
+        {
+          name: "retry_rerun_all",
+          passed: rerunVerified,
+          message:
+            "Native live-worktree retries rerun all configured reviewers without inheriting snapshot proof.",
+        },
+      ];
+      if (lastFailure) {
+        const stage =
+          lastFailure.reason === "authentication_failed"
+            ? "authentication"
+            : lastFailure.reason === "model_unavailable"
+              ? "model"
+              : lastFailure.reason === "read_failure"
+                ? "native_scope_attestation"
+                : "native_schema_submission";
+        const check = checks.find((entry) => entry.name === stage)!;
+        check.passed = false;
+        check.message = lastFailure.message;
+        check.failure = lastFailure;
+      }
+      return {
+        ready:
+          completion.exitCode === 0 &&
+          checks.every((check) => check.required === false || check.passed),
+        readiness_scope: "end_to_end_native_attested",
+        proof_kind: "native_attested",
+        checks,
+        run_id: runId,
+        artifact: openedArtifact.publishedReference!.path,
+        ...(job?.reason ? { failure: { reason: job.reason } } : {}),
+      };
+    }
     const coverageEntries = persisted.records
       .flatMap((record) => {
         if (
@@ -283,7 +398,10 @@ export async function runDoctorV9(
       { name: "model", passed: capabilities?.model_available === true },
       {
         name: "progress_observability",
-        passed: job?.progressObservable === true,
+        passed:
+          job !== undefined &&
+          "progressObservable" in job &&
+          job.progressObservable === true,
         required: false,
       },
       {

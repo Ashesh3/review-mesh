@@ -34,6 +34,111 @@ afterEach(async () => {
 });
 
 describe("config menu", () => {
+  it.each([
+    [{ type: "claude", api_key_env: "KEY" }, "gpt-5.5", undefined],
+    [{ type: "copilot" }, "claude-sonnet", undefined],
+    [{ type: "sdk" }, "gpt-5.5", undefined],
+    [{ type: "sdk", api_key_env: "KEY" }, "claude-sonnet", "ultra"],
+  ] as const)(
+    "rejects an unusable native model selection before saving: %j %s",
+    async (adapter, model, effort) => {
+      const directory = await mkdtemp(
+        join(tmpdir(), "review-mesh-config-tui-"),
+      );
+      roots.push(directory);
+      const file = join(directory, "config.toml");
+      const loaded = await loadManagedConfig(file, true);
+      loaded.config.adapters.vendor = adapter;
+      await runConfigMenu({
+        configFile: file,
+        config: loaded.config,
+        snapshot: loaded.snapshot,
+        prompt: new Answers([
+          "a",
+          "bad-model",
+          "vendor",
+          "single",
+          model,
+          ...(effort ? [effort] : []),
+          "q",
+        ]),
+        output: new PassThrough(),
+      });
+      expect(loaded.config.agents["bad-model"]).toBeUndefined();
+    },
+  );
+  it.each(["claude", "codex"] as const)(
+    "stores explicit credentials and provider references when creating %s adapters",
+    async (type) => {
+      const directory = await mkdtemp(
+        join(tmpdir(), "review-mesh-config-tui-"),
+      );
+      roots.push(directory);
+      const file = join(directory, "config.toml");
+      const loaded = await loadManagedConfig(file, true);
+      await runConfigMenu({
+        configFile: file,
+        config: loaded.config,
+        snapshot: loaded.snapshot,
+        prompt: new Answers([
+          "a",
+          "native-reviewer",
+          "new",
+          "vendor",
+          type,
+          "REVIEW_KEY",
+          "REVIEW_URL",
+          "single",
+          type === "claude" ? "claude-sonnet" : "gpt-5.5",
+          "high",
+          "Review",
+          "Review correctness.",
+          "900000",
+          "n",
+          "q",
+        ]),
+        output: new PassThrough(),
+      });
+      const saved = (await loadManagedConfig(file)).config;
+      expect(saved.adapters.vendor).toEqual({
+        type,
+        api_key_env: "REVIEW_KEY",
+        base_url_env: "REVIEW_URL",
+      });
+      expect(saved.agents["native-reviewer"]?.change_coverage?.proof).toBe(
+        "native_attested",
+      );
+    },
+  );
+
+  it.each(["claude", "codex"] as const)(
+    "does not save a %s adapter when the credential reference is blank",
+    async (type) => {
+      const directory = await mkdtemp(
+        join(tmpdir(), "review-mesh-config-tui-"),
+      );
+      roots.push(directory);
+      const file = join(directory, "config.toml");
+      const loaded = await loadManagedConfig(file, true);
+      await runConfigMenu({
+        configFile: file,
+        config: loaded.config,
+        snapshot: loaded.snapshot,
+        prompt: new Answers([
+          "a",
+          "native-reviewer",
+          "new",
+          "vendor",
+          type,
+          "",
+          "q",
+        ]),
+        output: new PassThrough(),
+      });
+      expect(loaded.config.adapters.vendor).toBeUndefined();
+    },
+  );
+
   it("converts a lens to change readiness and edits every v7 policy field", async () => {
     const directory = await mkdtemp(join(tmpdir(), "review-mesh-config-tui-"));
     roots.push(directory);
@@ -132,11 +237,23 @@ describe("config menu", () => {
         models: authenticated
           ? [
               {
-                id: "gpt-test",
-                name: "GPT Test",
+                id: "grok-test",
+                name: "Grok Test",
                 capabilities: { supports: { reasoningEffort: true } },
                 policy: { state: "enabled" },
                 supportedReasoningEfforts: ["low", "high"],
+              },
+              {
+                id: "gpt-test",
+                name: "GPT Test",
+                capabilities: {},
+                policy: { state: "enabled" },
+              },
+              {
+                id: "claude-test",
+                name: "Claude Test",
+                capabilities: {},
+                policy: { state: "enabled" },
               },
             ]
           : [],
@@ -150,7 +267,7 @@ describe("config menu", () => {
       "copilot",
       "single",
       "y",
-      "gpt-test",
+      "grok-test",
       "high",
       "Independent review",
       "Review correctness.",
@@ -159,12 +276,15 @@ describe("config menu", () => {
       "q",
     ]);
 
+    const catalogOutput = new PassThrough();
+    let catalog = "";
+    catalogOutput.on("data", (chunk) => (catalog += chunk.toString()));
     await runConfigMenu({
       configFile: file,
       config: loaded.config,
       snapshot: loaded.snapshot,
       prompt,
-      output: new PassThrough(),
+      output: catalogOutput,
       copilotAccount,
     });
 
@@ -175,11 +295,13 @@ describe("config menu", () => {
     });
     expect(saved.agents["copilot-reviewer"]).toMatchObject({
       adapter: "github",
-      model: "gpt-test",
+      model: "grok-test",
       effort: "high",
       applicability: { mode: "always" },
       required_input: [],
     });
+    expect(catalog).not.toContain("gpt-test:");
+    expect(catalog).not.toContain("claude-test:");
   });
 
   it("adds a multi-model agent with inherited and Copilot run adapters", async () => {

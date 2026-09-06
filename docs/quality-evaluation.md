@@ -13,16 +13,20 @@ node --import tsx scripts/evaluate-quality.mjs create state buggy
 node --import tsx scripts/evaluate-quality.mjs create state corrected
 ```
 
-Other cases are `search` and `eligibility`. Each command returns a `workspace`, an `oraclePath`, a normal review `request`, and separate `adapter_requirements`. The workspace has only `engine.mjs` and `contract.md`. The oracle is in a sibling private directory, outside snapshot capture and the review tool's file boundary. Pass **only the request** to Review Mesh; do not include the creation command, variant, oracle path, proof output, expected result, or evaluator output in the review prompt. Use neutral model/lens names and the same prompts and policies for buggy and corrected variants.
+Other cases are `search` and `eligibility`. Each command returns a `workspace`, an `oraclePath`, a normal review `request`, and separate `adapter_requirements`. The workspace has only `engine.mjs` and `contract.md`. The oracle is in a sibling private directory, outside the declared review workspace. Pass **only the request** to Review Mesh; do not include the creation command, variant, oracle path, proof output, expected result, or evaluator output in the review prompt. Use neutral model/lens names and the same prompts and policies for buggy and corrected variants. A native read-only sandbox can permit reads outside the workspace; use a separately restricted evaluation environment when stronger answer-key isolation is required.
 
-Real scoring requires an OpenAI-compatible adapter configured in trusted configuration with `semantic_checkpoints = true`. This explicitly collects scenario checkpoints even for the small full-scope fixtures; a normal small full-scope tool review may otherwise produce no segment records. The request does not enable or override this trusted setting. Apply the same setting to both variants:
+Use the native SDK pipeline and model-attested coverage for both variants. The returned requirements are `{type:"sdk", change_coverage_proof:"native_attested"}`. The request asks the reviewer to include structured scenario claims in its final Markdown; it does not enable a custom inspection, model-call, or continuation loop. Configure the adapter and the selected agent's coverage policy in trusted configuration:
 
 ```toml
 [adapters.evaluation]
-type = "openai_compatible"
+type = "sdk"
 base_url_env = "EVALUATION_BASE_URL"
 api_key_env = "EVALUATION_API_KEY"
-semantic_checkpoints = true
+
+[agents.evaluation.change_coverage]
+relevant_paths = ["**"]
+minimum_inspection = "full_file"
+proof = "native_attested"
 ```
 
 The programs exercise three explicit contracts:
@@ -52,20 +56,24 @@ review-mesh report RUN_ID --format json --raw
 node --import tsx scripts/evaluate-quality.mjs score ORACLE_PATH RAW_REPORT_JSON_PATH
 ```
 
-The scorer reads accepted reviewers' findings and their checkpoint scenario checks at `reviewer.segment.data.data.scenario_checks` (it also accepts the unnested checkpoint form for evaluator adapters):
+The scorer reads completed reviewers' findings and a JSON array in a final `review_markdown` fence tagged `review-mesh-scenarios`. This is an evaluation-only convention inside the existing Markdown field; it adds no production reviewer API fields. For historical reports, the scorer also accepts scenario checks at `reviewer.segment.data.data.scenario_checks` and the unnested checkpoint form.
 
-```json
-{
-  "path": "engine.mjs",
-  "start_line": 1,
-  "end_line": 3,
-  "input": {},
-  "expected": null,
-  "observed": null,
-  "reasoning": "A concrete explanation of the path through the code.",
-  "finding_id": "optional-linked-finding-id"
-}
+````text
+```review-mesh-scenarios
+[
+  {
+    "path": "engine.mjs",
+    "start_line": 1,
+    "end_line": 3,
+    "input": {},
+    "expected": null,
+    "observed": null,
+    "reasoning": "A concrete explanation of the path through the code.",
+    "finding_id": "optional-linked-finding-id"
+  }
+]
 ```
+````
 
 The illustrative empty input above is not a valid test case; reviewers construct inputs from the documented module contract. Scoring does not match defect names or title keywords. Credit requires all of:
 
@@ -76,7 +84,7 @@ The illustrative empty input above is not a valid test case; reviewers construct
 
 Corrected pass claims also need independently verified boundary and control scenario classes. Arbitrary prose, fabricated observations, a complete source-delivery ledger, or a blanket pass do not satisfy that check. The evaluator retains an explicit limitation: it checks a runnable counterexample and source linkage, but does not automatically prove the entire free-form causal explanation. Review that explanation independently when promoting benchmark results.
 
-Scoring requires a raw report whose context identifies the exact fixture workspace. The workspace and oracle must still match their registered source/contract/probe hashes. At most 128 scenario claims are executed per report. This is a bounded evaluation tool, not a runner for arbitrary user-supplied programs.
+Scoring requires a raw report whose context identifies the exact fixture workspace. The workspace and oracle must still match their registered source/contract/probe hashes. At most 128 scenario claims are executed per report, and each review's Markdown is limited to 4 MiB for scoring. Malformed JSON claims receive no credit. The evaluator parses the fence as JSON data and only executes the existing registered fixture oracle; it never executes Markdown or model-provided code.
 
 The response separately records infrastructure outcomes, verified/rejected scenarios, true positives, false negatives, unmatched findings, false positives on corrected controls, unsubstantiated passes, and unsupported overall clear outcomes. Incomplete reviewer drafts do not count as detections. A run that stays inconclusive is not automatically a successful quality evaluation. A keyword-only alleged defect remains unmatched rather than receiving credit.
 

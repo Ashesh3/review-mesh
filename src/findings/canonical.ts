@@ -1,5 +1,8 @@
 import { createHash } from "node:crypto";
-import type { ReviewerResultV4 } from "../protocol/v9.js";
+import type {
+  NativeFindingEvidence,
+  ReviewerResultV4,
+} from "../protocol/v9.js";
 
 export type CanonicalFindingSeverity = "critical" | "high" | "medium" | "low";
 export type CanonicalFindingConfidence = "high" | "medium" | "low";
@@ -82,6 +85,7 @@ export interface CanonicalRawFinding {
   };
 }
 export interface CanonicalFindingCoreProof {
+  native_evidence?: NativeFindingEvidence;
   evidence_verified?: boolean;
   source_coverage_verified?: boolean;
   ordered_proof_required?: boolean;
@@ -498,10 +502,13 @@ function eligibilityForSource(
     reasons.add("adjudication_required");
   if (finding.adjudication === "rejected") reasons.add("adjudication_rejected");
   const currentV4 = finding.provenance === "reviewer_result_v4";
+  const nativeEvidence = proof?.native_evidence;
   if (
-    currentV4
-      ? proof?.evidence_verified !== true
-      : proof?.evidence_verified === false
+    nativeEvidence?.contract === "native_review_v1"
+      ? !nativeEvidence.citation_valid
+      : currentV4
+        ? proof?.evidence_verified !== true
+        : proof?.evidence_verified === false
   )
     reasons.add("evidence_unverified");
   const orderedProofRequired =
@@ -517,9 +524,11 @@ function eligibilityForSource(
   )
     reasons.add("change_impact_unverified");
   if (
-    currentV4
-      ? proof?.source_coverage_verified !== true
-      : proof?.source_coverage_verified === false
+    nativeEvidence?.contract === "native_review_v1"
+      ? !nativeEvidence.scope_attested || !nativeEvidence.scope_related
+      : currentV4
+        ? proof?.source_coverage_verified !== true
+        : proof?.source_coverage_verified === false
   )
     reasons.add("source_coverage_unverified");
   if (proof?.out_of_scope === true) reasons.add("out_of_scope");

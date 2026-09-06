@@ -6,11 +6,6 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createReadOnlyFileTools } from "../../src/adapters/file-tools.js";
 import { createChangeCoverageLedger } from "../../src/context/change-coverage.js";
 import type { ResolvedContext } from "../../src/context/resolve.js";
-import { InspectionSession } from "../../src/adapters/inspection-session.js";
-import { resolvedReviewer } from "../helpers/fixtures.js";
-import { reviewerResultJsonSchema } from "../../src/protocol/json-schema.js";
-import { createOpenAICompatibleAdapter } from "../../src/adapters/openai-compatible.js";
-import { passResult } from "../helpers/fixtures.js";
 
 const sha256 = (value: string): string =>
   createHash("sha256").update(value).digest("hex");
@@ -92,41 +87,6 @@ describe("createReadOnlyFileTools", () => {
       ),
     ).toBe(true);
     expect(read.response.content.charCodeAt(0)).toBe(0xfeff);
-    const session = new InspectionSession(
-      {
-        runId: "bom",
-        reviewer: resolvedReviewer(),
-        context: ctx,
-        coverage: ledger,
-        prompt: {
-          system: "synthetic",
-          user: "synthetic",
-          combined: "synthetic",
-        },
-        resultJsonSchema: reviewerResultJsonSchema,
-        isolationPolicy: "prefer_enforced",
-        signal: new AbortController().signal,
-      },
-      [],
-    );
-    await session.deliver(6 * 1024 * 1024);
-    const ranges = session.messages.map((message) =>
-      JSON.parse(String(message.content).split("\n").slice(1).join("\n")),
-    );
-    expect(
-      ranges.map((range) => ({
-        encoding: range.encoding,
-        bytes: range.byte_count,
-      })),
-    ).toEqual([
-      { encoding: "utf8", bytes: 131072 },
-      { encoding: "utf8", bytes: source.length - 131072 },
-    ]);
-    expect(
-      Buffer.concat(
-        ranges.map((range) => Buffer.from(range.content, "utf8")),
-      ).equals(source),
-    ).toBe(true);
     await ledger.close();
   });
 
@@ -198,83 +158,6 @@ describe("createReadOnlyFileTools", () => {
       await ledger.close();
     },
   );
-
-  it("continues a real adapter review after an invalid list path", async () => {
-    const root = await mkdtemp(join(tmpdir(), "review-mesh-path-repair-"));
-    directories.push(root);
-    await writeFile(join(root, "worker.ts"), "needle\n");
-    const ctx = context(root);
-    const ledger = await createChangeCoverageLedger({
-      context: ctx,
-      policy: {
-        relevantPaths: ["**"],
-        minimumInspection: "full_file",
-        proof: "observed",
-      },
-    });
-    const registration = {
-      type: "openai_compatible" as const,
-      base_url_env: "URL",
-      api_key_env: "KEY",
-    };
-    const requests: any[] = [];
-    const adapter = createOpenAICompatibleAdapter(registration, {
-      environment: { URL: "https://no-network.invalid/v1", KEY: "synthetic" },
-      fetch: async (_url, init) => {
-        const body = JSON.parse(String(init?.body));
-        requests.push(body);
-        const message =
-          requests.length === 1
-            ? {
-                role: "assistant",
-                content: null,
-                tool_calls: [
-                  {
-                    id: "bad-path",
-                    type: "function",
-                    function: {
-                      name: "list_files",
-                      arguments: '{"path":"../private"}',
-                    },
-                  },
-                ],
-              }
-            : {
-                role: "assistant",
-                content: body.response_format
-                  ? JSON.stringify(passResult("Recovered after tool error."))
-                  : "Ready.",
-              };
-        return new Response(
-          JSON.stringify({ choices: [{ message, finish_reason: "stop" }] }),
-          { headers: { "content-type": "application/json" } },
-        );
-      },
-    });
-    const events = [];
-    for await (const event of adapter.run({
-      runId: "path-repair",
-      reviewer: resolvedReviewer({ adapter: registration }),
-      context: ctx,
-      coverage: ledger,
-      prompt: { system: "synthetic", user: "synthetic", combined: "synthetic" },
-      resultJsonSchema: reviewerResultJsonSchema,
-      isolationPolicy: "prefer_enforced",
-      signal: new AbortController().signal,
-    }))
-      events.push(event);
-    expect(events.some((event) => event.type === "result")).toBe(true);
-    expect(events.some((event) => event.type === "failure")).toBe(false);
-    const errorResponse = requests[1].messages.find(
-      (message: any) => message.role === "tool",
-    );
-    expect(JSON.parse(errorResponse.content)).toMatchObject({
-      reason: "invalid_path",
-      retryable: true,
-    });
-    expect(errorResponse.content).not.toContain("private");
-    await ledger.close();
-  });
 
   it("returns exact base64 bytes and records only an acknowledged response", async () => {
     const root = await mkdtemp(join(tmpdir(), "review-mesh-tools-"));

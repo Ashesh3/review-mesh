@@ -83,7 +83,11 @@ export async function describeTool(options: DescribeToolOptions = {}) {
     workspace,
     ...(options.signal === undefined ? {} : { signal: options.signal }),
   });
-  const ready = configuration.valid;
+  const migrationRequired =
+    configuration.valid &&
+    configuration.reviewers.some(
+      (reviewer) => reviewer.adapter_type === "openai_compatible",
+    );
   const effectiveWorkspace =
     configuration.valid && "workspace" in configuration
       ? configuration.workspace
@@ -144,9 +148,15 @@ export async function describeTool(options: DescribeToolOptions = {}) {
     },
     configuration,
     readiness: {
-      status: "not_probed" as const,
-      meaning:
-        "Configuration and workspace selection are valid; adapters, credentials, models, and isolation are probed when review starts.",
+      status: migrationRequired
+        ? ("migration_required" as const)
+        : ("not_probed" as const),
+      review_supported: configuration.valid && !migrationRequired,
+      meaning: migrationRequired
+        ? "The configuration remains inspectable for migration, but reviews reject the retired raw-inference adapter."
+        : configuration.valid
+          ? "Configuration and workspace selection are valid; credentials, model access, and isolation remain unprobed. Use structured doctor to verify native execution."
+          : "Repair configuration or workspace selection before probing native execution.",
     },
     protocol: {
       version: "6" as const,
@@ -179,14 +189,7 @@ export async function describeTool(options: DescribeToolOptions = {}) {
         percentages_reported: false as const,
         adapter_activity_streamed: false as const,
         status_query_available: true as const,
-        retryable_adapter_failures: {
-          maximum_attempts: configuration.valid
-            ? configuration.execution.retry_attempts
-            : undefined,
-          backoff_ms: configuration.valid
-            ? configuration.execution.retry_backoff_ms
-            : undefined,
-        },
+        sdk_transport_recovery: "vendor_owned" as const,
       },
       deadlines: configuration.valid
         ? {
@@ -196,17 +199,36 @@ export async function describeTool(options: DescribeToolOptions = {}) {
               configuration.execution.no_progress_timeout_ms,
           }
         : undefined,
-      provider_transport: {
-        openai_compatible_streaming_modes: [
-          "auto",
-          "required",
-          "disabled",
-        ] as const,
-        exact_output_continuation: true as const,
-        continuation_attempts: configuration.valid
-          ? configuration.execution.continuation_attempts
-          : undefined,
-        provider_envelope_retry_attempts: 1 as const,
+      sdk_execution: {
+        contract: "native_review_v1" as const,
+        mode: "managed_process" as const,
+        routing: {
+          openai: "codex",
+          anthropic: "claude",
+          other_models: "copilot",
+        } as const,
+        inference_owner: "vendor_sdk" as const,
+        tool_execution_owner: "vendor_sdk" as const,
+        context_management_owner: "vendor_sdk" as const,
+        in_turn_retry_owner: "vendor_sdk" as const,
+        mesh_session_attempts: 1 as const,
+        mesh_exact_output_continuation: false as const,
+        structured_submission: {
+          codex: "output_schema",
+          claude: "output_format_json_schema",
+          copilot: "terminal_submit_review_tool",
+        } as const,
+      },
+      model_support: {
+        source: "vendor_runtime" as const,
+        availability: "not_probed" as const,
+        exact_model_identifier_preserved: true as const,
+        verification_command: "review-mesh doctor --structured-output",
+      },
+      retry: {
+        native_inheritance: "rerun_all" as const,
+        native_coverage_basis: "model_attested" as const,
+        legacy_command_inheritance: "verified_compatible_results" as const,
       },
       review_scope: {
         default_mode: "changes" as const,
@@ -248,30 +270,40 @@ export async function describeTool(options: DescribeToolOptions = {}) {
       "3": "review incomplete because a reviewer or runtime failed",
       "4": "interrupted",
     },
-    next_actions: ready
+    next_actions: migrationRequired
       ? [
           {
-            command: reviewCommand,
+            command: "review-mesh config export --json",
             reason:
-              "Configuration is valid. Run the review to probe adapter, authentication, model, and isolation readiness, then consume JSONL through run.completed.",
+              'Migrate the retired adapter to type "sdk" with explicitly selected native_attested coverage. Preserve the exact models and supported provider environment references.',
           },
         ]
-      : configuration.error.code === "invalid_workspace"
+      : configuration.valid
         ? [
             {
-              command: "review-mesh describe <existing-workspace> --json",
-              reason: "The requested workspace must be an existing directory.",
+              command: reviewCommand,
+              reason:
+                "Configuration is valid. Run the review to probe adapter, authentication, model, and isolation readiness, then consume JSONL through run.completed.",
             },
           ]
-        : [
-            {
-              command: "review-mesh config --help",
-              reason: "Create or repair the trusted configuration.",
-            },
-            {
-              command: "review-mesh config export --json",
-              reason: "Inspect the current config revision when a file exists.",
-            },
-          ],
+        : configuration.error.code === "invalid_workspace"
+          ? [
+              {
+                command: "review-mesh describe <existing-workspace> --json",
+                reason:
+                  "The requested workspace must be an existing directory.",
+              },
+            ]
+          : [
+              {
+                command: "review-mesh config --help",
+                reason: "Create or repair the trusted configuration.",
+              },
+              {
+                command: "review-mesh config export --json",
+                reason:
+                  "Inspect the current config revision when a file exists.",
+              },
+            ],
   };
 }

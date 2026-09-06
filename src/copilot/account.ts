@@ -1,6 +1,5 @@
-import { createRequire } from "node:module";
 import { mkdir } from "node:fs/promises";
-import { dirname, extname, join } from "node:path";
+import { dirname, join } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { execa } from "execa";
 import { buildAllowlistedEnvironment } from "../adapters/types.js";
@@ -10,8 +9,9 @@ import {
   type CopilotClientFacade,
   type CopilotClientFactory,
   type CopilotModelInfo,
-} from "../adapters/copilot.js";
+} from "../adapters/copilot-client.js";
 import { getAppPaths } from "../config/paths.js";
+import { resolveSdkRuntime } from "../runtime/sdk-runtime.js";
 
 export interface CopilotAccountStatus extends CopilotAuthStatus {
   runtimeVersion: string;
@@ -22,7 +22,7 @@ export interface CopilotAccountSnapshot {
   models: CopilotModelInfo[];
 }
 
-export type { CopilotModelInfo } from "../adapters/copilot.js";
+export type { CopilotModelInfo } from "../adapters/copilot-client.js";
 
 export interface CopilotLoginOptions {
   flow?: "device-code" | "web-flow";
@@ -72,7 +72,6 @@ const COPILOT_ACCOUNT_ENVIRONMENT = [
   "APPDATA",
   "LOCALAPPDATA",
   "PROGRAMDATA",
-  "COPILOT_CLI_PATH",
   "XDG_CONFIG_HOME",
   "XDG_DATA_HOME",
   "XDG_CACHE_HOME",
@@ -122,41 +121,8 @@ function accountEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return buildAllowlistedEnvironment(COPILOT_ACCOUNT_ENVIRONMENT, source);
 }
 
-function platformPackageNames(): string[] {
-  const variants =
-    process.platform === "linux" ? ["linux", "linuxmusl"] : [process.platform];
-  return variants.map(
-    (variant) => `@github/copilot-${variant}-${process.arch}`,
-  );
-}
-
-function executableCommand(path: string): CopilotLoginCommand {
-  return [".js", ".mjs", ".cjs"].includes(extname(path).toLowerCase())
-    ? { command: process.execPath, args: [path] }
-    : { command: path, args: [] };
-}
-
 export function resolveCopilotLoginCommand(): CopilotLoginCommand {
-  const override = process.env.COPILOT_CLI_PATH?.trim();
-  if (override) return executableCommand(override);
-
-  const require = createRequire(import.meta.url);
-  for (const packageName of platformPackageNames()) {
-    try {
-      return executableCommand(require.resolve(packageName));
-    } catch {
-      // Try the next platform package name before falling back to PATH.
-    }
-  }
-  try {
-    const packageFile = require.resolve("@github/copilot/package.json");
-    return {
-      command: process.execPath,
-      args: [join(dirname(packageFile), "npm-loader.js")],
-    };
-  } catch {
-    return { command: "copilot", args: [] };
-  }
+  return { command: resolveSdkRuntime("copilot").executablePath, args: [] };
 }
 
 const defaultLoginLauncher: CopilotLoginLauncher = async (
@@ -168,6 +134,7 @@ const defaultLoginLauncher: CopilotLoginLauncher = async (
     env: options.env,
     extendEnv: false,
     reject: false,
+    windowsHide: true,
     ...(options.signal === undefined
       ? {}
       : { cancelSignal: options.signal, gracefulCancel: true }),
@@ -258,7 +225,11 @@ export function createCopilotAccountService(
         ...(options.host === undefined ? [] : ["--host", options.host]),
       ];
       const exitCode = await launchLogin(resolveLoginCommand(), args, {
-        env: { ...runtimeEnvironment, COPILOT_HOME: baseDirectory },
+        env: {
+          ...runtimeEnvironment,
+          COPILOT_HOME: baseDirectory,
+          COPILOT_DISABLE_KEYTAR: "1",
+        },
         ...(options.input === undefined ? {} : { input: options.input }),
         ...(options.output === undefined ? {} : { output: options.output }),
         ...(options.error === undefined ? {} : { error: options.error }),

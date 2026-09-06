@@ -1305,37 +1305,17 @@ describe("Codex SDK facade and registry", () => {
     expect(registry.create("command-main", registration)).toBe(commandAdapter);
     const codex = registry.create("codex-main", {
       type: "codex",
-      env_allowlist: ["CODEX_API_KEY"],
+      env_allowlist: [],
     });
+    expect(codex.id).toBe("codex");
     const capabilities = await codex.probe(
-      resolvedReviewer({
-        adapterId: "codex-main",
-        adapter: { type: "codex", env_allowlist: ["CODEX_API_KEY"] },
-      }),
+      resolvedReviewer({ adapter: { type: "codex" }, model: "gpt-5.6" }),
       new AbortController().signal,
     );
     expect(capabilities).toMatchObject({
       available: false,
       maximumIsolation: "runtime_read_only",
     });
-    expect(capabilities.message).toMatch(/isolation/i);
-    const output = await collect(
-      codex.run({
-        runId: "run-default-registry",
-        reviewer: resolvedReviewer({
-          adapterId: "codex-main",
-          adapter: { type: "codex", env_allowlist: ["CODEX_API_KEY"] },
-        }),
-        context: resolvedContext(),
-        prompt: buildReviewerPrompt({
-          reviewer: resolvedReviewer(),
-          context: resolvedContext(),
-        }),
-        resultJsonSchema: reviewerResultJsonSchema,
-        isolationPolicy: "prefer_enforced",
-        signal: new AbortController().signal,
-      }),
-    );
-    expect(terminalFailure(output).failure.reason).toBe("adapter_unavailable");
+    expect(capabilities.message).toMatch(/credential|API.key/i);
   });
 });

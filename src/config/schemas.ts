@@ -54,19 +54,32 @@ const uniqueAgentIds = z
 
 export const adapterRegistrationSchema = z.discriminatedUnion("type", [
   z.strictObject({
+    type: z.literal("sdk"),
+    env_allowlist: z.array(nonEmptyString).optional(),
+    base_url_env: nonEmptyString.optional(),
+    api_key_env: nonEmptyString.optional(),
+    use_logged_in_user: z.boolean().optional(),
+  }),
+  z.strictObject({
     type: z.literal("copilot"),
     env_allowlist: z.array(nonEmptyString).optional(),
     use_logged_in_user: z.boolean().optional(),
+    base_url_env: nonEmptyString.optional(),
+    api_key_env: nonEmptyString.optional(),
   }),
   z.strictObject({
     type: z.literal("claude"),
     env_allowlist: z.array(nonEmptyString).optional(),
     executable: nonEmptyString.optional(),
+    base_url_env: nonEmptyString.optional(),
+    api_key_env: nonEmptyString.optional(),
   }),
   z.strictObject({
     type: z.literal("codex"),
     env_allowlist: z.array(nonEmptyString).optional(),
     executable: nonEmptyString.optional(),
+    base_url_env: nonEmptyString.optional(),
+    api_key_env: nonEmptyString.optional(),
   }),
   z.strictObject({
     type: z.literal("openai_compatible"),
@@ -482,7 +495,7 @@ const executionV7Schema = executionV6Schema
 const changeCoveragePolicySchema = z.strictObject({
   relevant_paths: z.array(nonEmptyString).min(1).max(256),
   minimum_inspection: z.enum(["full_file", "diff"]),
-  proof: z.enum(["observed", "attested"]),
+  proof: z.enum(["observed", "attested", "native_attested"]),
 });
 
 const lensPolicyV7Shape = {
@@ -950,7 +963,7 @@ export interface ResolvedReviewer {
     changeCoverage?: {
       relevantPaths: string[];
       minimumInspection: "full_file" | "diff";
-      proof: "observed" | "attested";
+      proof: "observed" | "attested" | "native_attested";
     };
     applicability?:
       | { mode: "always" }

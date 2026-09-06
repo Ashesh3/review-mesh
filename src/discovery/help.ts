@@ -28,7 +28,7 @@ export type HelpTopic =
 const overview = `Review Mesh ${reviewMeshVersion}
 
 Agent-first multi-runtime code review gate. Review Mesh runs the complete trusted
-agent suite selected for a workspace, streams factual JSONL progress, waits for
+agent suite selected for a workspace using vendor SDKs, streams factual JSONL progress, waits for
 each agent's executed model chain, and reports run.completed after durable
 publication or run.persistence_failed if terminal storage fails.
 
@@ -67,7 +67,7 @@ AGENT QUICK START
      the inferred default branch, including local staged/unstaged/untracked work.
      With JSON on stdin, send the current v3 request described below.
   4. Read stdout until run.completed or run.persistence_failed. Logical lenses
-     run in parallel. A transient failure may retry; an operational failure
+     run in parallel. Each SDK owns its transport retries; a terminal failure
      advances to an eligible fallback. Clean runs stop at quorum, while findings
      can be independently adjudicated.
 
@@ -143,10 +143,12 @@ an existing file. During execution, status reports the active artifact path.
 
 Exit codes: 0 passed, 1 findings, 2 invalid request/config/usage,
 3 incomplete reviewer/runtime, 4 interrupted.
-Large changes-only OpenAI-compatible reviews use bounded evidence segments and
-cross-file synthesis. Segment scenario checks are model reasoning, not executed
-tests. Adapter context_window_tokens/max_input_tokens/max_output_tokens may be
-configured explicitly; otherwise model metadata or conservative defaults apply.
+OpenAI models use Codex SDK, Anthropic/Claude models use Claude Agent SDK, and
+other models use Copilot SDK. Each vendor owns inference, native read-only tools,
+context management and turn retries. Review Mesh submits one session per admitted
+reviewer and validates its complete structured result. It does not run tests or
+builds. Coverage is model-attested against the live worktree; it is not proof of
+observed source bytes or exhaustive defect detection.
 `,
   serve: `REVIEW-MESH SERVE
 
@@ -192,7 +194,8 @@ USAGE
 
 Requests cooperative cancellation through the run's private local control lease.
 The runner completes cleanup and finalizes a cancelled artifact. Poll status
-until terminal=true. Completed compatible model results remain reusable.
+until terminal=true. Native SDK retries rerun the configured roster; compatible
+legacy command results may be reused only after evidence validation.
 `,
   diagnostics: `REVIEW-MESH DIAGNOSTICS
 
@@ -201,7 +204,7 @@ USAGE
   review-mesh diagnostics export RUN_ID ARTIFACT_REF DESTINATION
   review-mesh diagnostics cleanup RUN_ID [ARTIFACT_REF]
 
-List private failed-result page metadata without exposing raw content. Export
+Inspect legacy private failed-result page metadata without exposing raw content. Export
 writes an exact raw page to a new private file; it may contain code or secrets.
 Cleanup immediately wipes the selected verified owned raw files. Successful
 pages are wiped after persistence. Failed pages are eligible for stale cleanup
@@ -214,8 +217,8 @@ USAGE
   review-mesh pause RUN_ID
 
 Stops the run cooperatively and finalizes its checkpoint as cancelled. Completed
-model results are preserved. In-flight model conversations are not persisted;
-resume retries unfinished work with current config and verified Git evidence.
+model results are preserved. Native resume starts new SDK sessions for the full
+configured roster with current config and verified Git evidence.
 `,
   resume: `REVIEW-MESH RESUME
 
@@ -223,8 +226,8 @@ USAGE
   review-mesh resume RUN_ID
 
 Starts a child run equivalent to retry RUN_ID --only-incomplete after the parent
-has finalized. Git head/base/scope must still match. Completed compatible model
-results are reused; incomplete attempts restart with fresh Git evidence.
+has finalized. Git head/base/scope must still match. Native SDK runs rerun the
+configured roster; legacy command runs may reuse compatible completed results.
 `,
   recover: `REVIEW-MESH RECOVER
 
@@ -280,8 +283,9 @@ USAGE
 Starts a new review linked to the persisted parent run and targets the logical
 lenses that lacked a verdict. The normalized request is recovered from the
 private run artifact. Git evidence is rebuilt and original head/base/scope must
-match. Completed compatible model slots are reused, including inside incomplete
-lenses. Changed trusted config causes a fresh pass; retry metadata explains reuse.
+match. Native SDK runs rerun every configured reviewer with fresh sessions and
+inherit no snapshot proof. Legacy command runs may reuse verified compatible
+model slots. Retry metadata explains the selected behavior.
 Redacted caller narrative remains redacted. Use resume RUN_ID after cancel/pause.
 `,
   doctor: `REVIEW-MESH DOCTOR
@@ -292,15 +296,15 @@ USAGE
 
 Preflights the resolved adapter/model roster before a long run. Structured mode
 runs the real reviewer execution mechanism against a Review Mesh-owned
-synthetic workspace. It verifies authentication/model readiness, streaming
-negotiation, read-tool execution, bounded v4 result-page production, and schema
-validation with the selected model, effort, retry, continuation, and deadline
-rules. --adapter and --model are exact, case-sensitive filters. The command
+synthetic changed Git workspace. Native checks verify structured schema submission,
+model-attested scope, durable SDK execution evidence, and full-roster retry
+semantics using the selected model, effort, and deadline. Model access is verified
+by a successful SDK result. --adapter and --model are exact, case-sensitive filters. The command
 fails without contacting a provider when no reviewer matches the selection.
 Basic mode reports probe_ready for credentials/model and marks remaining facets
-not_tested; it never reports full ready. Structured mode uses a real changed Git
-file and verifies coverage, page production, and deterministic retry inheritance.
-Observed versus attested proof is explicitly reported.
+not_tested; it never reports full ready. Native doctor does not claim observed
+reads or result-page production. Legacy command doctor retains its page and
+snapshot checks. Proof kind is explicitly reported.
 `,
   config: `REVIEW-MESH CONFIG
 
@@ -347,14 +351,16 @@ includes trusted instruction and runtime fields, so treat it as sensitive;
 effective/describe redact them.
 
 Schema-v7 saves require every lens to declare applicability.mode as always or
-changed_paths and to include required_context, even when it is empty. New
-OpenAI-compatible adapters default streaming to auto. Multi-lens suites that
+changed_paths and to include required_input, even when it is empty (legacy
+required_context migrates to required_input). Native SDK agents explicitly select
+change_coverage.proof = "native_attested". Multi-lens suites that
 concentrate every primary on one provider require
 execution.allow_provider_concentration=true. Multi-provider lenses with zero
 provider-outage tolerance require allow_zero_outage_tolerance=true on the lens.
-execution.continuation_attempts controls 1-10 exact continuation requests for
-length-limited results independently from whole-result retry_attempts; legacy
-configurations preserve the prior default of 2.
+Legacy retry/continuation fields remain readable for migration. Native SDK review
+uses one session attempt and no Review Mesh exact-output continuation; retries
+and context management belong to the vendor runtime. Retired openai_compatible
+configurations remain inspectable, but review rejects them until migrated.
 
 For the complete supported TOML shape, use:
   review-mesh schema config --json
@@ -367,7 +373,8 @@ USAGE
 Loads and validates the trusted global configuration, canonicalizes WORKSPACE
 (default: current directory), resolves its project name and assignment, and
 prints the exact effective reviewer suite without probing providers or starting
-a review.
+a review. Native adapter types reflect the effective model routing. Retired raw
+inference configurations report migration_required instead of a runnable next step.
 
 The JSON form includes configuration status/path, workspace, resolved
 project_name, project_name_source, matched_project_name when configured,
@@ -387,7 +394,7 @@ USAGE
                       run-status|command-adapter-event] [--json]
 
 Prints JSON Schema generated from the runtime Zod schemas:
-  request  Required v2 JSON object accepted on review stdin
+  request  Current v3 JSON request, with legacy v2 input compatibility
   events   JSONL event object emitted by a valid review run
   run-status  Compact active or completed run/reviewer status snapshot
   result   Terminal result required from each reviewer
@@ -432,23 +439,27 @@ Review Mesh reports factual phases and elapsed time, never invented percentages.
 Use 'review-mesh schema events --json' for the exact machine contract.
 High-frequency adapter activity is retained as latest status instead of being
 emitted once per tool action; query it with
-'review-mesh status RUN_ID [REVIEWER_ID] --json'. Retry count and backoff are
-trusted configuration; each attempt has a bounded deadline and fallback uses the
-remaining logical-lens budget. The OpenAI-compatible adapter checkpoints its
-completed inspection and retries transient structured finalization/repair from
-that retained conversation without repeating repository tools.
+'review-mesh status RUN_ID [REVIEWER_ID] --json'. Each native SDK session has a
+bounded reviewer deadline; terminal failures advance through the configured
+fallback roster. SDKs own transport retries and context compaction. Review Mesh
+does not add model-turn retries, segmented inspection, or output repair loops.
 `,
   adapters: `REVIEW-MESH ADAPTERS
 
 Supported trusted adapter types:
-  openai_compatible  Embedded read-only agent loop. Config references base URL
-                     and API key environment-variable names, never their values.
-                     streaming is auto, required, or disabled.
+  sdk                Selects the native SDK from the exact model identifier.
   command            External reviewer using review-mesh-command-v1 JSONL.
-  copilot            GitHub Copilot SDK reviewer with login/model discovery.
-  claude             Claude Agent SDK reviewer with read/search tools only.
-  codex              Codex SDK reviewer; fails closed if isolation cannot be
-                     characterized safely.
+  codex              OpenAI models through Codex SDK and its native read-only sandbox.
+  claude             Anthropic/Claude models through Claude Agent SDK read/search tools.
+  copilot            Other models through GitHub Copilot SDK.
+
+All native SDKs use managed vendor runtimes. They own inference, tool execution,
+context and retries. Model routing preserves the exact identifier; it does not
+guarantee account access or vendor support. Use structured doctor to verify the
+selected runtime, model and credentials. Explicit native types must match the
+model family. Store API key/base URL environment-variable names, never values.
+The retired openai_compatible raw-inference type can be inspected for migration,
+but cannot start a review. Migrate to sdk and explicitly select native_attested.
 
 Every agent chooses a required default adapter plus either one exact model and
 optional effort, or ordered model_runs with explicit run ids, exact models,
@@ -459,7 +470,8 @@ successive multi-model logical lenses rotate their configured model runs
 cyclically, while scalar lenses do not consume a rotation slot. Set
 execution.distribute_primaries=false to preserve declaration order for every
 lens; migrated v1-v5 configurations preserve their prior order for compatibility.
-Every lens explicitly declares applicability.mode and required_context. Strict
+Every lens explicitly declares applicability.mode and required_input (legacy
+required_context remains a migration input). Strict
 provider concentration and zero-outage quorum require the explicit
 allow_provider_concentration and allow_zero_outage_tolerance acknowledgements.
 Existing
@@ -499,10 +511,9 @@ for its exact platform path. Workspace .review-mesh.toml files are ignored.
 Schema version 7 contains:
   execution    max concurrency, heartbeat interval, shutdown grace, primary
                distribution/concentration policy, provider limits, circuit
-               breaking, retries, and exact-continuation attempts
+               and deadlines; legacy retry/continuation settings remain readable
   diagnostics  sanitized run persistence and retention
-  adapters     trusted runtime registrations, environment-variable names, and
-               OpenAI-compatible streaming mode
+  adapters     sdk/native runtime registrations and credential environment references
   agents       scalar model/effort or model_runs, purpose, instructions,
                isolation, timeout, applicability, required context, quorum,
                outage acknowledgement, and optional per-run adapter overrides
@@ -523,8 +534,9 @@ For autonomous changes, use export/apply with revision compare-and-swap:
 Export contains instruction and runtime fields and should be treated as
 sensitive. Readers/export migrate legacy v1-v5 documents in memory. Apply
 accepts one complete schema-v1 through schema-v7 document, not a patch; legacy
-inputs are migrated and saved canonically as v7 with behavior-preserving
-applicability, context, primary-order, and streaming defaults. Use
+inputs are migrated and saved canonically as v7. Native execution additionally
+requires explicit native_attested coverage and a supported SDK route; retired
+raw inference settings remain available for inspection, not execution. Use
 'review-mesh schema config --json' and 'review-mesh config --help' for exact
 details.
 `,

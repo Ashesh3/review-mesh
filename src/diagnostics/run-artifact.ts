@@ -59,6 +59,8 @@ const PRIVATE_VERSIONS = {
   "reviewer.exception": "1",
   "reviewer.response": "1",
   "reviewer.segment": "1",
+  "reviewer.native_execution": "1",
+  "run.native_consistency": "1",
   "reviewer.preflight": "1",
   "reviewer.attempt": "2",
   "reviewer.activity": "1",
@@ -94,7 +96,9 @@ const headerSchema = z.strictObject({
                   key === "reviewer.preflight" ||
                   key === "reviewer.exception" ||
                   key === "reviewer.response" ||
-                  key === "reviewer.segment"
+                  key === "reviewer.segment" ||
+                  key === "reviewer.native_execution" ||
+                  key === "run.native_consistency"
                 ? z.literal(value).optional()
                 : key === "reviewer.attempt" || key === "reviewer.terminal"
                   ? z.enum(["1", "2"])
@@ -143,6 +147,12 @@ const resultSchema = z.strictObject({
     .optional(),
 });
 const genericRecords: Record<string, z.ZodType> = {
+  "run.native_consistency": z.strictObject({
+    record: z.literal("run.native_consistency"),
+    schema_version: z.literal("1"),
+    run_id: id,
+    data: z.record(z.string(), z.unknown()),
+  }),
   "run.error": z.strictObject({
     record: z.literal("run.error"),
     schema_version: z.literal("1"),
@@ -180,6 +190,7 @@ for (const record of [
   "reviewer.exception",
   "reviewer.response",
   "reviewer.segment",
+  "reviewer.native_execution",
   "reviewer.preflight",
   "reviewer.attempt",
   "reviewer.activity",
@@ -635,6 +646,8 @@ export async function createRunArtifact(options: {
           kind === "reviewer.exception" ||
           kind === "reviewer.response" ||
           kind === "reviewer.segment" ||
+          kind === "reviewer.native_execution" ||
+          kind === "run.native_consistency" ||
           kind === "run.error"
             ? (sanitizeRunMetadata(value) as Record<string, unknown>)
             : value;

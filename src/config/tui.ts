@@ -18,6 +18,7 @@ import {
   type ManagedConfig,
 } from "./manage.js";
 import { requireProjectName } from "./project-names.js";
+import { sdkForModel } from "./sdk-routing.js";
 import {
   providerOutageTolerance,
   validateCallerContextRequirement,
@@ -295,10 +296,24 @@ async function createAdapter(
     throw new Error(`adapter already exists: ${id}`);
   const type = await answer(
     prompt,
-    "Adapter type (openai_compatible, command, copilot, claude, codex): ",
+    "Adapter type (sdk, copilot, claude, codex): ",
   );
   let adapter: AdapterRegistration;
-  if (type === "openai_compatible") {
+  if (type === "sdk") {
+    const base = await answer(
+      prompt,
+      "Base URL environment variable [blank for native provider]: ",
+    );
+    const key = await answer(
+      prompt,
+      "API key environment variable [required for OpenAI/Anthropic; blank only for Copilot login with other models]: ",
+    );
+    adapter = {
+      type,
+      ...(base ? { base_url_env: requireEnvironmentName(base) } : {}),
+      ...(key ? { api_key_env: requireEnvironmentName(key) } : {}),
+    };
+  } else if (type === "openai_compatible") {
     const baseUrlEnvironment = requireEnvironmentName(
       await answer(prompt, "Base URL environment variable: "),
     );
@@ -345,11 +360,18 @@ async function createAdapter(
   } else if (type === "copilot") {
     adapter = { type, use_logged_in_user: true };
   } else if (type === "claude" || type === "codex") {
-    const executable = await answer(
-      prompt,
-      "Executable override [leave blank for runtime default]: ",
+    const key = requireEnvironmentName(
+      await answer(prompt, "API key environment variable (required): "),
     );
-    adapter = { type, ...(executable === "" ? {} : { executable }) };
+    const base = await answer(
+      prompt,
+      "Base URL environment variable [blank for native provider]: ",
+    );
+    adapter = {
+      type,
+      api_key_env: key,
+      ...(base ? { base_url_env: requireEnvironmentName(base) } : {}),
+    };
   } else {
     throw new Error(`unsupported adapter type: ${type}`);
   }
@@ -369,7 +391,31 @@ async function modelAndEffort(
       current === undefined ? "Model id: " : `Model id [${current.model}]: `,
       current?.model,
     );
-    const supported = supportedEffortsForAdapter(adapter?.type ?? "command");
+    const selectedHarness = sdkForModel(model);
+    const nativeAdapter =
+      adapter !== undefined &&
+      ["sdk", "claude", "codex", "copilot"].includes(adapter.type);
+    if (
+      nativeAdapter &&
+      adapter.type !== "sdk" &&
+      adapter.type !== selectedHarness
+    ) {
+      throw new Error(
+        `Model ${model} requires the ${selectedHarness} adapter. Select that adapter before saving.`,
+      );
+    }
+    if (
+      adapter?.type === "sdk" &&
+      selectedHarness !== "copilot" &&
+      !adapter.api_key_env
+    ) {
+      throw new Error(
+        `Model ${model} requires an explicit API-key environment reference. Configure a ${selectedHarness} adapter or add credentials to this SDK adapter.`,
+      );
+    }
+    const supported = supportedEffortsForAdapter(
+      nativeAdapter ? selectedHarness : (adapter?.type ?? "command"),
+    );
     const effort = reasoningEffort(
       await answer(
         options.prompt,
@@ -384,7 +430,9 @@ async function modelAndEffort(
       supported !== undefined &&
       !supported.includes(effort)
     ) {
-      throw new Error(`${adapter?.type} does not support effort ${effort}`);
+      throw new Error(
+        `${nativeAdapter ? selectedHarness : adapter?.type} does not support effort ${effort}`,
+      );
     }
     return { model, ...(effort === undefined ? {} : { effort }) };
   }
@@ -411,10 +459,14 @@ async function modelAndEffort(
   }
 
   const selectable = snapshot.models.filter(
-    (model) => model.policy === undefined || model.policy.state === "enabled",
+    (model) =>
+      sdkForModel(model.id) === "copilot" &&
+      (model.policy === undefined || model.policy.state === "enabled"),
   );
   if (selectable.length === 0) {
-    throw new Error("the GitHub Copilot account has no available models");
+    throw new Error(
+      "The GitHub Copilot account has no available models for this adapter. OpenAI models require Codex and Anthropic models require Claude.",
+    );
   }
   await write(options.output, "GitHub Copilot models:\n");
   for (const model of selectable) {
@@ -639,12 +691,22 @@ async function addAgent(options: ConfigMenuOptions): Promise<void> {
       proof: ("model_runs" in selection
         ? selection.model_runs.map((run) => run.adapter ?? adapter)
         : [adapter]
-      ).some((adapterId) => {
+      ).every((adapterId) => {
         const type = config.adapters[adapterId]?.type;
-        return type === "codex" || type === "command";
+        return (
+          type === "sdk" ||
+          type === "codex" ||
+          type === "claude" ||
+          type === "copilot"
+        );
       })
-        ? "attested"
-        : "observed",
+        ? "native_attested"
+        : ("model_runs" in selection
+              ? selection.model_runs.map((run) => run.adapter ?? adapter)
+              : [adapter]
+            ).some((id) => config.adapters[id]?.type === "command")
+          ? "attested"
+          : "observed",
     },
   };
   if (agent.model_runs !== undefined) {
@@ -913,12 +975,18 @@ async function editAgentPolicy(options: ConfigMenuOptions): Promise<void> {
   const proof = (
     await answer(
       options.prompt,
-      `Coverage proof (observed or attested) [${coverage.proof}]: `,
+      `Coverage proof (native_attested for SDKs) [${coverage.proof}]: `,
       coverage.proof,
     )
   ).toLowerCase();
-  if (proof !== "observed" && proof !== "attested") {
-    throw new Error("coverage proof must be observed or attested");
+  if (
+    proof !== "observed" &&
+    proof !== "attested" &&
+    proof !== "native_attested"
+  ) {
+    throw new Error(
+      "coverage proof must be native_attested for SDKs, or an explicit legacy proof",
+    );
   }
   coverage.proof = proof;
   agent.change_coverage = coverage;

@@ -11,6 +11,7 @@ import {
   deliveryFailureSchema,
   snapshotWorkloadSchema,
   actionableFindingV4Schema,
+  nativeFindingEvidenceSchema,
 } from "../protocol/v9.js";
 import { runFindingsPayloadSchema } from "./artifact-record-schemas.js";
 
@@ -107,6 +108,7 @@ export const artifactCoverageV3Schema = z
       "Coverage must reference a manifest or contain a legacy identity, not both.",
   });
 const proof = z.strictObject({
+  native_evidence: nativeFindingEvidenceSchema.optional(),
   evidence_verified: z.boolean().optional(),
   source_coverage_verified: z.boolean().optional(),
   ordered_proof_required: z.boolean().optional(),
@@ -323,7 +325,7 @@ export const artifactResolutionPolicySchema = z.strictObject({
     .strictObject({
       relevantPaths: z.array(text),
       minimumInspection: z.enum(["full_file", "diff"]),
-      proof: z.enum(["observed", "attested"]),
+      proof: z.enum(["observed", "attested", "native_attested"]),
     })
     .optional(),
   applicability: z
@@ -470,6 +472,35 @@ const followUpResult = z.strictObject({
 });
 
 export const privatePayloadSchemas: Record<string, z.ZodType> = {
+  "reviewer.native_execution": z.strictObject({
+    contract: z.literal("native_review_v1"),
+    harness: z.enum(["codex", "claude", "copilot"]),
+    model: text.min(1).max(256),
+    sdk_version: text.min(1).max(128),
+    runtime_version: text.min(1).max(128).optional(),
+    execution_mode: z.literal("managed_process"),
+    consistency_mode: z.literal("live_worktree"),
+    coverage_basis: z.enum(["model_attested", "native_observed", "unknown"]),
+    sdk_completed: z.boolean(),
+    execution_fingerprint: digest.optional(),
+    scope_digest: digest.optional(),
+    observed_paths: z.array(text.max(4096)).max(10_000).optional(),
+  }),
+  "run.native_consistency": z.strictObject({
+    contract: z.literal("native_review_v1"),
+    consistency_mode: z.literal("live_worktree"),
+    initial: z.strictObject({
+      sha256: digest,
+      file_count: count,
+      complete: z.boolean(),
+    }),
+    final: z.strictObject({
+      sha256: digest,
+      file_count: count,
+      complete: z.boolean(),
+    }),
+    changed: z.boolean(),
+  }),
   "reviewer.response": z.strictObject({
     attempt: count,
     diagnostics: failureDiagnosticsSchema,

@@ -10,6 +10,7 @@ import type {
   CopilotClientFacade,
   CopilotClientFactory,
 } from "../../src/adapters/copilot.js";
+import { registerEmbeddedSdkRuntime } from "../../src/runtime/sdk-runtime.js";
 
 const roots: string[] = [];
 
@@ -106,13 +107,26 @@ describe("Copilot account service", () => {
         env: {
           PATH: "safe",
           COPILOT_HOME: join(root, "runtime", "copilot"),
+          COPILOT_DISABLE_KEYTAR: "1",
         },
       },
     ]);
   });
 
-  it("resolves a packaged Copilot login executable", () => {
-    const command = resolveCopilotLoginCommand();
-    expect(command.command.length).toBeGreaterThan(0);
+  it("uses the embedded runtime for login even when an unrelated CLI override exists", () => {
+    const path = join(tmpdir(), "embedded-copilot-runtime.exe");
+    registerEmbeddedSdkRuntime("copilot", () => ({
+      executablePath: path,
+      pathEntries: [],
+      sdkVersion: "1.0.11",
+      runtimeVersion: "1.0.81",
+      mode: "managed_process",
+    }));
+    vi.stubEnv("COPILOT_CLI_PATH", "unrelated-copilot.exe");
+    try {
+      expect(resolveCopilotLoginCommand()).toEqual({ command: path, args: [] });
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });

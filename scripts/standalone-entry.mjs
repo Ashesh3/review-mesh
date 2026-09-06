@@ -1,10 +1,21 @@
-import { CopilotClient } from "@github/copilot-sdk";
+import { CopilotClient, RuntimeConnection } from "@github/copilot-sdk";
 import { runCli } from "../src/cli.ts";
 import { registerEmbeddedCopilotSdkModule } from "../src/copilot/runtime.ts";
+import { runSdkRuntimeVerification } from "../src/runtime/verify-runtime.ts";
 
-registerEmbeddedCopilotSdkModule({ CopilotClient });
+registerEmbeddedCopilotSdkModule({ CopilotClient, RuntimeConnection });
 
-await runCli().catch(() => {
+const verifyingRuntime = process.argv[2] === "--verify-sdk-runtime";
+const main = verifyingRuntime
+  ? () => runSdkRuntimeVerification(process.argv.slice(3))
+  : runCli;
+
+await main().catch((error) => {
+  if (verifyingRuntime) {
+    process.stderr.write(`${error.message}\n`);
+    process.exitCode = 1;
+    return;
+  }
   process.stderr.write(
     `${JSON.stringify({
       schema_version: "1",

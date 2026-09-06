@@ -481,7 +481,7 @@ describe("portable CLI", () => {
     }
   });
 
-  it("runs the embedded OpenAI-compatible adapter without node_modules", async () => {
+  it("rejects retired raw inference without contacting its endpoint", async () => {
     const workspace = join(root, "openai-workspace");
     const home = join(root, "openai-home");
     const config = configPath(home);
@@ -652,30 +652,10 @@ agents = ["portable"]
           },
         },
       );
-      if (result.exitCode !== 0) {
-        throw new Error(
-          `portable OpenAI fixture failed ${JSON.stringify({ result, observedBodies })}`,
-        );
-      }
-      expect(result).toMatchObject({ exitCode: 0, stderr: "" });
-      expect(completion(result.stdout)).toMatchObject({
-        event: "run.completed",
-        data: {
-          run_outcome: "clear",
-          gate_outcome: "no_gate_findings",
-          coverage_outcome: "complete",
-          exit_code: 0,
-        },
-      });
-      expect(scriptedResponseIndex).toBe(scriptedResponses.length);
-      expect(
-        observedBodies.some((body) =>
-          JSON.stringify(body).includes('"name":"read_file"'),
-        ),
-      ).toBe(true);
-      expect(
-        observedBodies.filter((body) => body.response_format !== undefined),
-      ).toHaveLength(2);
+      expect(result.exitCode).toBe(2);
+      expect(result.stderr).toContain("retired raw inference");
+      expect(result.stdout).toBe("");
+      expect(observedBodies).toHaveLength(0);
     } finally {
       await new Promise<void>((resolveClose, reject) =>
         server.close((error) => (error ? reject(error) : resolveClose())),

@@ -164,7 +164,7 @@ function resolvedPolicy(profile: AgentProfile): ResolvedReviewer["policy"] {
     change_coverage?: {
       relevant_paths: string[];
       minimum_inspection: "full_file" | "diff";
-      proof: "observed" | "attested";
+      proof: "observed" | "attested" | "native_attested";
     };
     pass_quorum?: number;
     minimum_provider_groups?: number;

@@ -28,8 +28,10 @@ it.each(["state", "search", "eligibility"] as const)(
         directory: root,
       });
       expect(fixture.adapter_requirements).toEqual({
-        semantic_checkpoints: true,
+        type: "sdk",
+        change_coverage_proof: "native_attested",
       });
+      expect(fixture.request.instructions).toContain("review-mesh-scenarios");
       expect(fixture.request.project_name).toBe("workspace");
       expect(
         relative(fixture.workspace, fixture.oraclePath).startsWith(".."),
@@ -188,6 +190,91 @@ it("does not award detection for keywords or a blanket pass; requires executable
   ).rejects.toThrow("exact fixture workspace");
 });
 
+it("independently scores native Markdown scenario JSON and rejects fabricated, malformed or unlinked claims", async () => {
+  const root = await mkdtemp(join(tmpdir(), "mesh-quality-native-"));
+  roots.push(root);
+  const fixture = await createQualityFixture({
+    caseId: "state",
+    variant: "buggy",
+    directory: root,
+  });
+  const scenario = {
+    path: "engine.mjs",
+    start_line: 7,
+    end_line: 7,
+    finding_id: "f",
+    input: {
+      events: [
+        { key: "q", value: 8, items: [] },
+        { key: "q", value: 9, items: [] },
+      ],
+    },
+    expected: [8, 8],
+    observed: [8, 9],
+    reasoning:
+      "The first event does not store its selected value when the associated collection is empty.",
+  };
+  const fence = (body: string) =>
+    `Native reasoning.\n\n\`\`\`review-mesh-scenarios\n${body}\n\`\`\``;
+  const report = {
+    context: { workspace: fixture.workspace },
+    run_outcome: "gate_findings",
+    reviewers: [
+      {
+        reviewer_id: "native",
+        status: "completed",
+        result: {
+          verdict: "fail",
+          review_markdown: fence(JSON.stringify([scenario])),
+          actionable_findings: [
+            {
+              id: "f",
+              evidence: [{ path: "engine.mjs", start_line: 7, end_line: 7 }],
+              claim: {
+                trigger: "Repeated key after empty items",
+                affected_behavior: "First selection is not retained",
+                outcome: "The second value changes",
+              },
+            },
+          ],
+        },
+      },
+    ],
+    records: [],
+  };
+  expect(await evaluateQualityReport(fixture.oraclePath, report)).toMatchObject(
+    {
+      verified_scenarios: 1,
+      rejected_scenarios: 0,
+      detection: { true_positives: 1, false_negatives: 0 },
+    },
+  );
+  report.reviewers[0]!.result.review_markdown = fence(
+    JSON.stringify([{ ...scenario, observed: [99, 99] }]),
+  );
+  expect(await evaluateQualityReport(fixture.oraclePath, report)).toMatchObject(
+    { rejected_scenarios: 1, detection: { true_positives: 0 } },
+  );
+  report.reviewers[0]!.result.review_markdown = fence(
+    "globalThis.process.exit(1)",
+  );
+  expect(await evaluateQualityReport(fixture.oraclePath, report)).toMatchObject(
+    { rejected_scenarios: 1, detection: { true_positives: 0 } },
+  );
+  report.reviewers[0]!.result.review_markdown = fence(
+    JSON.stringify([{ ...scenario, finding_id: "unknown" }]),
+  );
+  expect(await evaluateQualityReport(fixture.oraclePath, report)).toMatchObject(
+    { verified_scenarios: 1, detection: { true_positives: 0 } },
+  );
+  report.reviewers[0]!.result.review_markdown = fence(
+    JSON.stringify(Array(129).fill(scenario)),
+  );
+  await expect(
+    evaluateQualityReport(fixture.oraclePath, report),
+  ).rejects.toThrow("at most 128 scenario claims");
+});
+
 it("requires runtime-checked boundary and control scenarios for a corrected pass", async () => {
   const root = await mkdtemp(join(tmpdir(), "mesh-quality-pass-"));
   roots.push(root);
@@ -247,6 +334,23 @@ it("requires runtime-checked boundary and control scenarios for a corrected pass
     (await evaluateQualityReport(fixture.oraclePath, nested))
       .verified_scenarios,
   ).toBe(checks.length);
+  const native = {
+    ...report,
+    records: [],
+    reviewers: report.reviewers.map((reviewer) => ({
+      ...reviewer,
+      result: {
+        ...reviewer.result,
+        review_markdown: `\`\`\`review-mesh-scenarios\n${JSON.stringify(report.records[0]!.data.scenario_checks)}\n\`\`\``,
+      },
+    })),
+  };
+  expect(await evaluateQualityReport(fixture.oraclePath, native)).toMatchObject(
+    {
+      verified_scenarios: checks.length,
+      unsubstantiated_passes: 0,
+    },
+  );
   report.records[0]!.data.scenario_checks.shift();
   expect(
     (await evaluateQualityReport(fixture.oraclePath, report))

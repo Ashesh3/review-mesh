@@ -8,6 +8,7 @@ import {
 } from "./manage.js";
 import { getAppPaths } from "./paths.js";
 import { resolveConfig } from "./resolve.js";
+import { routeSdkReviewers } from "./sdk-routing.js";
 import { providerOutageTolerance } from "../orchestrator/lens-policy.js";
 import { describeTopology } from "./topology.js";
 
@@ -138,7 +139,15 @@ function environmentNames(adapter: AdapterRegistration): string[] {
   if (adapter.type === "openai_compatible") {
     return [adapter.base_url_env, adapter.api_key_env];
   }
-  return adapter.env_allowlist ?? [];
+  return [
+    ...(adapter.env_allowlist ?? []),
+    ...("base_url_env" in adapter && adapter.base_url_env
+      ? [adapter.base_url_env]
+      : []),
+    ...("api_key_env" in adapter && adapter.api_key_env
+      ? [adapter.api_key_env]
+      : []),
+  ];
 }
 
 /** Converts an already-resolved configuration to its safe public description. */
@@ -320,7 +329,7 @@ export async function describeEffectiveConfig(
       workspace,
       ...(input.signal === undefined ? {} : { signal: input.signal }),
     });
-    const resolved = resolveConfig({
+    const unresolved = resolveConfig({
       trusted: loaded.trusted,
       workspace: loaded.workspace,
       projectName: loaded.projectName,
@@ -329,6 +338,12 @@ export async function describeEffectiveConfig(
       migrated: loaded.migrated,
       migrationWarnings: loaded.migrationWarnings,
     });
+    // Configuration inspection stays available for migration of retired backends.
+    const resolved = unresolved.reviewers.some(
+      (reviewer) => reviewer.adapter.type === "openai_compatible",
+    )
+      ? unresolved
+      : routeSdkReviewers(unresolved);
     const after = await loadManagedConfig(configFile);
     if (configRevision(after.snapshot) !== revision) {
       throw new Error("configuration changed while resolving");

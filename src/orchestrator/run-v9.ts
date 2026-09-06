@@ -677,15 +677,25 @@ export async function runV9Review(input: V9RunInput) {
       },
     });
   };
-  const changePolicy = (reviewer: ResolvedReviewer) =>
-    reviewer.policy?.changeCoverage ?? {
-      relevantPaths: ["**"],
-      minimumInspection: "full_file" as const,
-      proof:
-        reviewer.adapter.type === "codex" || reviewer.adapter.type === "command"
-          ? ("attested" as const)
-          : ("observed" as const),
-    };
+  const changePolicy = (reviewer: ResolvedReviewer) => {
+    if (reviewer.policy?.changeCoverage?.proof === "native_attested")
+      throw new Error(
+        "Native coverage requires the native SDK execution path.",
+      );
+    return (
+      (reviewer.policy?.changeCoverage as
+        | import("../context/change-coverage.js").ChangeCoveragePolicy
+        | undefined) ?? {
+        relevantPaths: ["**"],
+        minimumInspection: "full_file" as const,
+        proof:
+          reviewer.adapter.type === "codex" ||
+          reviewer.adapter.type === "command"
+            ? ("attested" as const)
+            : ("observed" as const),
+      }
+    );
+  };
   async function execute(
     job: Job,
     source?: { reviewer: ResolvedReviewer; result: ReviewerResultV4 },

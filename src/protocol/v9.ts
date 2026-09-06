@@ -116,7 +116,12 @@ export const v9FindingCategorySchema = z.enum([
   "performance",
   "other",
 ]);
-export const v9CoverageProofKindSchema = z.enum(["observed", "attested"]);
+export const v9CoverageProofKindSchema = z.enum([
+  "observed",
+  "attested",
+  "native_attested",
+  "unknown",
+]);
 export const v9CoverageStatusSchema = z.enum([
   "complete",
   "incomplete",
@@ -280,12 +285,27 @@ export const changeCoverageResultSchema = z
   .strictObject({
     status: v9CoverageStatusSchema,
     proof_kind: v9CoverageProofKindSchema.optional(),
+    contract: z.literal("native_review_v1").optional(),
     scope_digest: digestSchema.optional(),
     inspected_count: nonNegativeInteger,
     deficit_count: nonNegativeInteger,
     deficit_sample: z.array(coverageDeficitSchema).max(8),
   })
   .superRefine((value, ctx) => {
+    if (
+      (value.proof_kind === "native_attested" ||
+        value.proof_kind === "unknown") &&
+      value.contract !== "native_review_v1"
+    )
+      ctx.addIssue({
+        code: "custom",
+        message: "native coverage requires its explicit contract",
+      });
+    if (value.proof_kind === "unknown" && value.status === "complete")
+      ctx.addIssue({
+        code: "custom",
+        message: "unknown coverage cannot be complete",
+      });
     if (
       (value.status === "complete" || value.status === "incomplete") &&
       (value.proof_kind === undefined || value.scope_digest === undefined)
@@ -356,19 +376,64 @@ export const coverageAttestationSchema = z
     }
   });
 
+export const nativeScopeAttestationSchema = z
+  .strictObject({
+    reviewed_paths: z.array(evidencePathSchema).max(10_000),
+    complete: z
+      .boolean()
+      .describe(
+        "Whether the declared review scope was completed. Set false when any required scope remains unreviewed; general review caveats do not imply incomplete scope.",
+      ),
+    limitations: z
+      .array(nonEmpty(1024))
+      .max(256)
+      .describe(
+        "Informational review limitations and caveats, retained verbatim. Scope completion is represented by the complete boolean, not by whether this list is empty.",
+      ),
+  })
+  .superRefine((value, ctx) => {
+    if (new Set(value.reviewed_paths).size !== value.reviewed_paths.length)
+      ctx.addIssue({
+        code: "custom",
+        message: "native attestation paths must be unique",
+      });
+  });
+
+/** Host-owned checks; these do not assert observed delivery of snapshot bytes. */
+export const nativeFindingEvidenceSchema = z.strictObject({
+  contract: z.literal("native_review_v1"),
+  citation_valid: z.boolean(),
+  scope_attested: z.boolean(),
+  scope_related: z.boolean(),
+});
+export type NativeFindingEvidence = z.infer<typeof nativeFindingEvidenceSchema>;
+
 const providerReviewerShape = {
   schema_version: z.literal("4"),
   verdict: z.enum(["pass", "fail"]),
   review_markdown: z.string(),
   summary: nonEmpty(1_024),
-  actionable_findings: z.array(actionableFindingV4Schema).max(16),
+  actionable_findings: z.array(actionableFindingV4Schema).max(4_096),
   informational_notes: z.array(informationalNoteV4Schema).max(4),
   coverage_attestation: coverageAttestationSchema.optional(),
+  native_scope_attestation: nativeScopeAttestationSchema.optional(),
 };
 function validateVerdict(
-  value: { verdict: "pass" | "fail"; actionable_findings: unknown[] },
+  value: {
+    verdict: "pass" | "fail";
+    actionable_findings: unknown[];
+    native_scope_attestation?: unknown;
+  },
   ctx: z.RefinementCtx,
 ): void {
+  if (
+    value.native_scope_attestation === undefined &&
+    value.actionable_findings.length > 16
+  )
+    ctx.addIssue({
+      code: "custom",
+      message: "legacy v4 results cannot exceed 16 actionable findings",
+    });
   if (value.verdict === "pass" && value.actionable_findings.length !== 0)
     ctx.addIssue({
       code: "custom",

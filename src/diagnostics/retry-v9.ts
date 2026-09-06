@@ -245,6 +245,14 @@ export async function prepareV9Retry(input: {
     };
   }
   if (!exactScope || !exactPolicies) return rerunAll("scope_or_policy_changed");
+  // Native agents inspect the live worktree. Snapshot-bound proof must never be
+  // inherited into this execution contract, even when Git refs still match.
+  if (
+    input.config.reviewers.some(
+      (reviewer) => reviewer.runtime.execution_contract === "native_review_v1",
+    )
+  )
+    return rerunAll("snapshot_identity_unavailable");
 
   const selected = new Set(selectedLensIds);
   const parentIncompleteLenses = new Set(

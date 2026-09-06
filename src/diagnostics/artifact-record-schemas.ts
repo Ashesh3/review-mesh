@@ -1,6 +1,7 @@
 import { z } from "zod";
 import {
   actionableFindingV4Schema,
+  nativeFindingEvidenceSchema,
   adjudicationDecisionV2Schema,
   v9FindingClassificationSchema,
   v9FindingConfidenceSchema,
@@ -108,6 +109,7 @@ export const canonicalRawFindingSchema = z.strictObject({
 });
 
 export const canonicalFindingCoreProofSchema = z.strictObject({
+  native_evidence: nativeFindingEvidenceSchema.optional(),
   evidence_verified: z.boolean().optional(),
   source_coverage_verified: z.boolean().optional(),
   ordered_proof_required: z.boolean().optional(),

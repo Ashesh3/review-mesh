@@ -835,10 +835,9 @@ describe("report and findings commands", () => {
       diagnostics: { persist_runs: false, max_runs: 1 },
       adapters: {
         gateway: {
-          type: "openai_compatible",
-          base_url_env: "BASE",
-          api_key_env: "KEY",
-          streaming: "required",
+          type: "command",
+          command: "unused",
+          protocol: "review-mesh-command-v1",
         },
       },
       agents: {
@@ -856,7 +855,7 @@ describe("report and findings commands", () => {
     };
     await writeFile(configFile, serializeManagedConfig(config));
     const registry = new AdapterRegistry();
-    registry.register("openai_compatible", () => ({
+    registry.register("command", () => ({
       id: "gateway",
       async probe() {
         return {

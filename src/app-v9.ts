@@ -27,6 +27,8 @@ import {
   type ArtifactReference,
 } from "./diagnostics/run-index.js";
 import { runV9Review } from "./orchestrator/run-v9.js";
+import { runNativeReview } from "./orchestrator/run-native.js";
+import { routeSdkReviewers } from "./config/sdk-routing.js";
 import { createDefaultRegistry, type ReviewApplicationOptions } from "./app.js";
 import { sanitizePublicText } from "./adapters/errors.js";
 import { prepareV9Retry, V9RetryError } from "./diagnostics/retry-v9.js";
@@ -101,6 +103,7 @@ export async function runV9Application(
       migrated: loaded.migrated,
       migrationWarnings: loaded.migrationWarnings,
     });
+    config = routeSdkReviewers(config);
     context = await resolveContext({
       request: { ...request, workspace: loaded.workspace },
       git: createGitRunner(),
@@ -310,7 +313,12 @@ export async function runV9Application(
   let control: Awaited<ReturnType<typeof createRunControl>> | undefined;
   try {
     control = await createRunControl(paths.runsDirectory, runId, controlAbort);
-    const result = await runV9Review({
+    const run = config.reviewers.every(
+      (reviewer) => reviewer.adapter.type === "command",
+    )
+      ? runV9Review
+      : runNativeReview;
+    const result = await run({
       runId,
       config,
       context,

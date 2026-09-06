@@ -18,6 +18,7 @@ import { resolveProjectName } from "./config/project-names.js";
 import { getAppPaths, type AppPaths } from "./config/paths.js";
 import { loadConfigFiles } from "./config/load.js";
 import { resolveConfig } from "./config/resolve.js";
+import { routeSdkReviewers } from "./config/sdk-routing.js";
 import { resolveContext } from "./context/resolve.js";
 import { readRunStatus, RunStatusError } from "./diagnostics/run-status.js";
 import {
@@ -540,12 +541,14 @@ export async function runCli(
           workspace,
           signal: controller.signal,
         });
-        const config = resolveConfig({
-          trusted: loaded.trusted,
-          workspace: loaded.workspace,
-          projectName: loaded.projectName,
-          projectNameSource: loaded.projectNameSource,
-        });
+        const config = routeSdkReviewers(
+          resolveConfig({
+            trusted: loaded.trusted,
+            workspace: loaded.workspace,
+            projectName: loaded.projectName,
+            projectNameSource: loaded.projectNameSource,
+          }),
+        );
         const reviewers = config.reviewers.filter(
           (reviewer) =>
             (adapterFilter === undefined ||
@@ -604,13 +607,22 @@ export async function runCli(
                         ? {}
                         : { message: capabilities!.message }),
                     },
-                    ...[
-                      "tool_invocation",
-                      "changed_snapshot_access",
-                      "coverage_completion",
-                      "result_page_production",
-                      "retry",
-                    ].map((name) => ({
+                    ...(reviewer.runtime.execution_contract ===
+                    "native_review_v1"
+                      ? [
+                          "native_schema_submission",
+                          "native_scope_attestation",
+                          "native_execution_artifact",
+                          "retry_rerun_all",
+                        ]
+                      : [
+                          "tool_invocation",
+                          "changed_snapshot_access",
+                          "coverage_completion",
+                          "result_page_production",
+                          "retry",
+                        ]
+                    ).map((name) => ({
                       name,
                       passed: false,
                       status: "not_tested",
@@ -1093,6 +1105,9 @@ export async function runCli(
         try {
           process.exitCode = await (runtime.runReview ?? runReviewApplication)({
             requestText: JSON.stringify(request),
+            ...(runtime.configFile === undefined
+              ? {}
+              : { configFile: runtime.configFile }),
             stdout: output,
             stderr: errorOutput,
             signal: controller.signal,
@@ -1276,6 +1291,9 @@ export async function runCli(
       try {
         process.exitCode = await (runtime.runReview ?? runReviewApplication)({
           requestText,
+          ...(runtime.configFile === undefined
+            ? {}
+            : { configFile: runtime.configFile }),
           stdout: output,
           stderr: errorOutput,
           signal: controller.signal,

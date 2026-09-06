@@ -14,11 +14,6 @@ import {
   v9Report,
   v9DashboardRun,
 } from "../../src/diagnostics/v9-views.js";
-import { createOpenAICompatibleAdapter } from "../../src/adapters/openai-compatible.js";
-import { createChangeCoverageLedger } from "../../src/context/change-coverage.js";
-import { resolvedContext, resolvedReviewer } from "../helpers/fixtures.js";
-import { reviewerResultJsonSchema } from "../../src/protocol/json-schema.js";
-import { writeFile, mkdir } from "node:fs/promises";
 import {
   readDashboardRun,
   readDashboardReviewer,
@@ -35,116 +30,6 @@ const budget = {
   limit_tokens: 128000,
   segment_index: 0,
 };
-
-it("persists an actual segmented HTTP failure as an ordinary incomplete attempt", async () => {
-  const root = await mkdtemp(join(tmpdir(), "mesh-segment-http-persist-"));
-  const workspace = join(root, "source");
-  await mkdir(workspace);
-  await writeFile(join(workspace, "worker.ts"), "x".repeat(100_000));
-  const context = resolvedContext({
-    workspace,
-    git: {
-      is_repository: true,
-      root: workspace,
-      branch: "main",
-      head: "a".repeat(40),
-      merge_base: "b".repeat(40),
-      status_entries: [],
-      changed_files: ["worker.ts"],
-      changed_paths: [{ path: "worker.ts", kind: "untracked" }],
-      diff: "",
-      diff_stat: "",
-      truncated: {
-        status_entries: false,
-        changed_files: false,
-        diff_stat: false,
-        diff: false,
-      },
-    },
-  });
-  const ledger = await createChangeCoverageLedger({
-    context,
-    policy: {
-      relevantPaths: ["**"],
-      minimumInspection: "full_file",
-      proof: "observed",
-    },
-  });
-  const writer = await createManagedRunArtifact({
-    runsDirectory: root,
-    runId: "segmented-http",
-    toolVersion: "9.5.0",
-    publishManaged: false,
-  });
-  const registration = {
-    type: "openai_compatible" as const,
-    base_url_env: "URL",
-    api_key_env: "KEY",
-    context_window_tokens: 32768,
-  };
-  let requests = 0;
-  const adapter = createOpenAICompatibleAdapter(registration, {
-    environment: { URL: "https://no-network.invalid/v1", KEY: "synthetic" },
-    fetch: async () => {
-      requests++;
-      return new Response(
-        JSON.stringify({ error: { message: "Synthetic upstream failure" } }),
-        { status: 500, headers: { "content-type": "application/json" } },
-      );
-    },
-  });
-  try {
-    let failure;
-    for await (const event of adapter.run({
-      runId: "segmented-http",
-      reviewer: resolvedReviewer({ adapter: registration }),
-      context,
-      coverage: ledger,
-      prompt: { system: "Synthetic", user: "Synthetic", combined: "Synthetic" },
-      resultJsonSchema: reviewerResultJsonSchema,
-      isolationPolicy: "prefer_enforced",
-      signal: new AbortController().signal,
-    }))
-      if (event.type === "failure") failure = event.failure;
-    expect(requests).toBe(1);
-    expect(failure).toMatchObject({
-      reason: "adapter_unavailable",
-      diagnostics: {
-        http_status: 500,
-        operation_phase: "evidence",
-        input_budget_tokens: expect.any(Number),
-        token_estimation: "utf8_upper_bound",
-      },
-    });
-    await expect(
-      writer.record({
-        record: "reviewer.attempt",
-        reviewer_id: "synthetic",
-        data: {
-          attempt: 1,
-          started_at: "2026-09-06T00:00:00Z",
-          ended_at: "2026-09-06T00:00:01Z",
-          elapsed_ms: 1000,
-          failure,
-        },
-      }),
-    ).resolves.toBeUndefined();
-    const artifact = await readRunArtifact(
-      join(root, "segmented-http.jsonl.active"),
-      { allowActive: true },
-    );
-    expect(
-      (
-        artifact.records.find((record) => record.record === "reviewer.attempt")
-          ?.data as any
-      ).failure.diagnostics.http_status,
-    ).toBe(500);
-  } finally {
-    await ledger.close();
-    await writer.close();
-    await rm(root, { recursive: true, force: true });
-  }
-});
 
 it("persists typed token diagnostics in managed attempt and segment records", async () => {
   const root = await mkdtemp(join(tmpdir(), "mesh-token-diagnostics-"));

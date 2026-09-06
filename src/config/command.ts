@@ -12,6 +12,7 @@ import {
   serializeManagedConfig,
 } from "./manage.js";
 import { describeEffectiveConfig } from "./effective.js";
+import { migrateSdkConfig } from "./migrate-sdk.js";
 import { configApplyEnvelopeSchema, trustedConfigSchema } from "./schemas.js";
 import { createReadlinePrompter, runConfigMenu } from "./tui.js";
 import {
@@ -45,6 +46,11 @@ USAGE
       Show this help page.
 
 READ-ONLY COMMANDS
+  review-mesh config migrate-sdk --json
+      Preview the SDK routing migration as a config-apply request. This preserves
+      endpoint/key variable names and changes coverage to explicit native model
+      attestation. Review the JSON, then apply it with config apply --json.
+
   review-mesh config path
       Print the global configuration file path.
 
@@ -435,6 +441,18 @@ export async function runConfigCommand(
     }
     if (command === "path" && rest.length === 0) {
       await write(options.output, `${configFile}\n`);
+      return 0;
+    }
+    if (
+      command === "migrate-sdk" &&
+      rest.length === 1 &&
+      rest[0] === "--json"
+    ) {
+      const loaded = await loadManagedConfig(configFile);
+      await write(
+        options.output,
+        `${JSON.stringify({ schema_version: "1", expected_revision: configRevision(loaded.snapshot), config: migrateSdkConfig(loaded.config) })}\n`,
+      );
       return 0;
     }
     if (command === "export" && rest.length === 1 && rest[0] === "--json") {

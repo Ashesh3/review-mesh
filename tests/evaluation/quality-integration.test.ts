@@ -5,14 +5,13 @@ import { PassThrough } from "node:stream";
 import { expect, it } from "vitest";
 import { runReviewApplication } from "../../src/app.js";
 import { AdapterRegistry } from "../../src/adapters/registry.js";
-import { createOpenAICompatibleAdapter } from "../../src/adapters/openai-compatible.js";
 import { readRunReport } from "../../src/diagnostics/run-report.js";
 import {
   createQualityFixture,
   evaluateQualityReport,
 } from "../../src/evaluation/quality-fixtures.js";
 
-it("routes a generated full-scope request through trusted checkpoints and scores the captured constructed counterexample", async () => {
+it("routes a generated full-scope request through native SDK submission and scores the captured counterexample", async () => {
   const root = await mkdtemp(join(tmpdir(), "mesh-quality-app-"));
   try {
     const fixture = await createQualityFixture({
@@ -34,11 +33,11 @@ no_progress_timeout_ms=30000
 persist_runs=true
 max_runs=10
 [adapters.test]
-type="openai_compatible"
+type="sdk"
 base_url_env="TEST_BASE"
 api_key_env="TEST_KEY"
-streaming="disabled"
-semantic_checkpoints=true
+
+
 [agents.test]
 adapter="test"
 model="fixture"
@@ -54,7 +53,7 @@ mode="always"
 [agents.test.change_coverage]
 relevant_paths=["**"]
 minimum_inspection="full_file"
-proof="observed"
+proof="native_attested"
 [defaults]
 agents=["test"]
 `,
@@ -86,99 +85,64 @@ agents=["test"]
         outcome: "The later record returns a different value.",
       },
     };
-    const scenario = {
-      path: "engine.mjs",
-      start_line: 7,
-      end_line: 7,
-      finding_id: "f",
-      input: {
-        events: [
-          { key: "q", value: 8, items: [] },
-          { key: "q", value: 9, items: [] },
-        ],
-      },
-      expected: [8, 8],
-      observed: [8, 9],
-      reasoning:
-        "The first record stores nothing when its collection is empty; the next record finds no retained value.",
-    };
-    let segments = 0;
-    const registry = new AdapterRegistry();
-    registry.register("openai_compatible", (registration) =>
-      createOpenAICompatibleAdapter(registration as never, {
-        environment: {
-          TEST_BASE: "https://fixture.invalid/v1",
-          TEST_KEY: "local-only",
+    let reviews = 0;
+    const scenarios = [
+      {
+        path: "engine.mjs",
+        start_line: 7,
+        end_line: 7,
+        finding_id: "f",
+        input: {
+          events: [
+            { key: "q", value: 8, items: [] },
+            { key: "q", value: 9, items: [] },
+          ],
         },
-        fetch: (async (url, init) => {
-          if (String(url).endsWith("/models"))
-            return Response.json({ data: [{ id: "fixture" }] });
-          const body = JSON.parse(String(init?.body));
-          let result: unknown;
-          if (body.response_format?.json_schema?.name === "review_segment") {
-            segments++;
-            result = {
-              summary: "The selected value can change across repeated records.",
-              findings: [finding],
-              unresolved_questions: [],
-              resolved_question_ids: [],
-              follow_up_reads: [],
-              scenario_checks: [scenario],
-            };
-          } else {
-            const assignment = [...body.messages]
-              .reverse()
-              .map((m: { content: string }) => {
-                try {
-                  return JSON.parse(m.content);
-                } catch {
-                  return {};
-                }
-              })
-              .find(
-                (item: any) =>
-                  item.result_id && Number.isInteger(item.page_index),
-              );
-            if (!assignment) throw new Error("Missing result page assignment");
-            result = {
-              schema_version: "1",
-              kind: "review-mesh.result-page",
-              result_id: assignment.result_id,
-              result_kind: "reviewer",
-              result_schema_version: "4",
-              page_index: assignment.page_index,
-              page_count: 2,
-              previous_page_digest: assignment.previous_page_digest,
-              ...(assignment.page_index === 0
-                ? {
-                    page_kind: "header",
-                    payload: {
-                      verdict: "fail",
-                      summary:
-                        "A repeated empty collection changes the selected value.",
-                      informational_notes: [],
-                      narrative_byte_count: 0,
-                      narrative_fragment_count: 0,
-                      actionable_finding_count: 1,
-                    },
-                  }
-                : {
-                    page_kind: "findings",
-                    payload: { actionable_findings: [finding] },
-                  }),
-            };
-          }
-          return Response.json({
-            choices: [
-              {
-                message: { role: "assistant", content: JSON.stringify(result) },
-                finish_reason: "stop",
-              },
-            ],
-          });
-        }) as typeof fetch,
-      }),
-    );
+        expected: [8, 8],
+        observed: [8, 9],
+        reasoning:
+          "The first empty collection prevents retaining its selected value, so the later record selects its own proposed value.",
+      },
+    ];
+    const registry = new AdapterRegistry();
+    registry.register("copilot", () => ({
+      id: "copilot",
+      async probe() {
+        return {
+          available: true,
+          authenticated: true,
+          model_available: true,
+          streaming: true,
+          cancellation: true,
+          maximumIsolation: "runtime_read_only" as const,
+        };
+      },
+      async *run(input) {
+        reviews++;
+        expect(input.coverage).toBeUndefined();
+        expect(input.resultPages).toBeUndefined();
+        yield {
+          type: "result" as const,
+          isolation: "runtime_read_only" as const,
+          result: {
+            schema_version: "4" as const,
+            verdict: "fail" as const,
+            review_markdown:
+              "The first selection is not retained after an empty collection.\n\n```review-mesh-scenarios\n" +
+              JSON.stringify(scenarios) +
+              "\n```",
+            summary: "Empty collection loses state",
+            actionable_findings: [finding as never],
+            informational_notes: [],
+            native_scope_attestation: {
+              complete: true,
+              reviewed_paths: ["engine.mjs"],
+              limitations: [],
+            },
+          },
+        };
+      },
+    }));
     const stdout = new PassThrough(),
       stderr = new PassThrough();
     stdout.resume();
@@ -203,7 +167,7 @@ agents=["test"]
     });
     expect(error).toBe("");
     expect(code).toBe(1);
-    expect(segments).toBeGreaterThanOrEqual(2);
+    expect(reviews).toBe(1);
     const report = await readRunReport({
       runsDirectory: appPaths.runsDirectory,
       runId: "quality-integration",

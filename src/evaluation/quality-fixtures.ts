@@ -257,13 +257,16 @@ export async function createQualityFixture(options: {
   return {
     workspace,
     oraclePath,
-    adapter_requirements: { semantic_checkpoints: true },
+    adapter_requirements: {
+      type: "sdk",
+      change_coverage_proof: "native_attested",
+    },
     request: {
       schema_version: "3",
       project_name: basename(workspace),
       workspace,
       instructions:
-        "Review the module against its documented contract. Report concrete incorrect behavior with source locations. Trace representative valid boundary inputs, compare expected and observed outputs, and record your scenario checks. Do not execute code; distinguish reasoned results from runtime validation.",
+        "Review the module against its documented contract. Report concrete incorrect behavior with source locations. Trace representative valid boundary and control inputs, compare expected and observed outputs, and record your scenario checks in the final review_markdown as a fenced code block tagged review-mesh-scenarios. The block must contain a JSON array of objects with path, start_line, end_line, input, expected, observed, reasoning, and optional finding_id linking a finding in the final result. Construct inputs from the documented contract; do not execute code. Distinguish reasoned results from runtime validation.",
       review_scope: { mode: "full" },
     },
   };
@@ -358,6 +361,38 @@ const scenarioSchema = z.object({
   finding_id: key.optional(),
 });
 
+/** Evaluation-only data: parse JSON claims, never execute Markdown or model code. */
+function markdownScenarios(markdown: unknown): unknown[] {
+  if (typeof markdown !== "string") return [];
+  if (Buffer.byteLength(markdown, "utf8") > 4 * 1024 * 1024)
+    throw new Error(
+      "Quality scoring accepts at most 4 MiB of reviewer Markdown.",
+    );
+  const scenarios: unknown[] = [];
+  for (const match of markdown.matchAll(
+    /^ {0,3}(`{3,}|~{3,})review-mesh-scenarios[ \t]*\r?\n([\s\S]*?)^ {0,3}\1[ \t]*$/gm,
+  )) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(match[2]!);
+    } catch {
+      parsed = undefined;
+    }
+    if (Array.isArray(parsed)) {
+      if (parsed.length + scenarios.length > 128)
+        throw new Error(
+          "Quality scoring accepts at most 128 scenario claims per fixture report.",
+        );
+      scenarios.push(...parsed);
+    } else scenarios.push(undefined);
+    if (scenarios.length > 128)
+      throw new Error(
+        "Quality scoring accepts at most 128 scenario claims per fixture report.",
+      );
+  }
+  return scenarios;
+}
+
 function scenarioClasses(caseId: QualityCase, input: unknown): string[] {
   if (caseId === "state") {
     const { events } = inputs.state.parse(input);
@@ -439,7 +474,7 @@ export async function evaluateQualityReport(
   const records = Array.isArray(report.records)
     ? report.records.map(object)
     : [];
-  const scenarios = records
+  const historicalScenarios = records
     .filter((record) => record.record === "reviewer.segment")
     .flatMap((record) => {
       const data = object(record.data);
@@ -452,6 +487,14 @@ export async function evaluateQualityReport(
           : []
       ).map((value) => ({ reviewerId: record.reviewer_id, value }));
     });
+  const scenarios = [
+    ...historicalScenarios,
+    ...completed.flatMap((reviewer) =>
+      markdownScenarios(object(reviewer.result).review_markdown).map(
+        (value) => ({ reviewerId: reviewer.reviewer_id, value }),
+      ),
+    ),
+  ];
   if (scenarios.length > 128)
     throw new Error(
       "Quality scoring accepts at most 128 scenario claims per fixture report.",

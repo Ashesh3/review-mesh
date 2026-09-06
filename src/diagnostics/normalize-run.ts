@@ -13,6 +13,7 @@ import type {
   ReviewerResultV4,
   V9RunOutcome,
 } from "../protocol/v9.js";
+import { nativeFindingEvidenceSchema } from "../protocol/v9.js";
 import type { DeliveryFailure } from "../protocol/v9-event-writer.js";
 import { runOutcome } from "../protocol/concise.js";
 import { readRunArtifact } from "./run-artifact.js";
@@ -99,6 +100,10 @@ function explicitProofs(
       const parsed = object(proof);
       if (parsed === undefined) continue;
       const known: CanonicalFindingCoreProof = {};
+      const nativeEvidence = nativeFindingEvidenceSchema.safeParse(
+        parsed.native_evidence,
+      );
+      if (nativeEvidence.success) known.native_evidence = nativeEvidence.data;
       for (const key of [
         "evidence_verified",
         "source_coverage_verified",

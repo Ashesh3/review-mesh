@@ -79,6 +79,7 @@ export interface AdapterCapabilities {
   /** A preflight capability claim; run events report actual achieved isolation. */
   maximumIsolation: IsolationLevel | "unknown";
   runtime_version?: string;
+  sdk_version?: string;
   message?: string;
   /** Readiness failed transiently and may be probed once more. */
   retryable?: boolean;
