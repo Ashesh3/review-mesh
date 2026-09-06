@@ -13,9 +13,15 @@ management, compaction, and provider retries. Review Mesh owns the trusted revie
 roster, review scope, concurrency, deadlines, cancellation, structured results,
 configured gate policy, and durable reports.
 
-The raw `openai_compatible` inference engine is retired on this development branch.
+The raw `openai_compatible` inference engine is retired in v10.0.0.
 See [SDK configuration and migration](docs/sdk-migration.md) for the replacement.
-Historical releases and contracts remain documented under [release notes](docs/releases/v9.7.0.md).
+See [v10.0.0 release notes](docs/releases/v10.0.0.md) for changes and upgrade requirements.
+
+## Download
+
+- [Windows x64](https://github.com/Ashesh3/review-mesh/releases/download/v10.0.0/review-mesh-windows-x64.exe)
+- [Linux x64](https://github.com/Ashesh3/review-mesh/releases/download/v10.0.0/review-mesh-linux-x64)
+- [SHA-256 checksums](https://github.com/Ashesh3/review-mesh/releases/download/v10.0.0/SHA256SUMS.txt)
 
 ## Build
 
