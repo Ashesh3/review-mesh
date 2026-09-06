@@ -1,10 +1,11 @@
 # Review Mesh
 
-[v9.5.0](docs/releases/v9.5.0.md) adds model-aware request budgets, bounded
-evidence segments, BOM-safe readable source, recoverable tool errors and complete
-adjudication assignments. [Quality evaluation](docs/quality-evaluation.md) scores
-actual model reports against independent synthetic behavior oracles. Strict
-evidence and quorum remain enforced.
+[v9.6.0](docs/releases/v9.6.0.md) repairs segmented follow-up reads and checkpoint
+recovery, delivers PR metadata before source analysis, and preserves semantic
+progress and safe token diagnostics across status and dashboard views.
+[Quality evaluation](docs/quality-evaluation.md) scores actual model reports
+against independent synthetic behavior oracles. Strict evidence and quorum
+remain enforced.
 
 The [v9.2.0 pilot fixes](docs/releases/v9.2.0.md) add recoverable coverage reads,
 admission-based execution budgets, retained-conversation page repair, compact

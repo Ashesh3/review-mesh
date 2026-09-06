@@ -127,6 +127,10 @@ export function renderV9Markdown(input: ReturnType<typeof v9Report>): string {
           lines.push(
             `  Unresolved questions: ${code(JSON.stringify(segment.unresolved_questions))}`,
           );
+        if (segment.follow_up_results.length)
+          lines.push(
+            `  Follow-up requests: ${code(JSON.stringify(segment.follow_up_results))}`,
+          );
       }
     }
     if (reviewer.result) {

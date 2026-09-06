@@ -7,6 +7,7 @@ import {
   resultPageSchema,
   v9RunOutcomeSchema,
   v9GateOutcomeSchema,
+  segmentProgressSchema,
 } from "../protocol/v9.js";
 import {
   configApplyRequestSchema,
@@ -206,6 +207,7 @@ const schemas = {
           .array(z.record(z.string(), z.unknown()))
           .optional(),
         segments: z.array(z.record(z.string(), z.unknown())).optional(),
+        segment: segmentProgressSchema.optional(),
         reviewers: z
           .array(
             z
@@ -225,6 +227,7 @@ const schemas = {
                 complete_result: z
                   .union([reviewerResultV4Schema, adjudicationResultV2Schema])
                   .optional(),
+                segment: segmentProgressSchema.optional(),
               })
               .passthrough(),
           )

@@ -445,7 +445,10 @@ it("refuses a repair that drops a malformed candidate identity", async () => {
         diagnostics: {},
       })),
     ).rejects.toMatchObject({
-      failure: { reason: "change_coverage_incomplete" },
+      failure: {
+        reason: "provider_response_invalid",
+        diagnostics: { failure_stage: "checkpoint_obligations" },
+      },
     });
   } finally {
     await f.cleanup();

@@ -32,6 +32,17 @@ function safeTokenStatistic(key: string, value: unknown): boolean {
     (key === "token_estimation" && value === "utf8_upper_bound")
   );
 }
+/** Shared by private metadata and public projections; exceptions require typed values. */
+export function sensitiveMetadataField(
+  key: string,
+  value: unknown,
+  additionalSensitiveKey?: RegExp,
+): boolean {
+  return (
+    (SENSITIVE_KEY.test(key) || additionalSensitiveKey?.test(key) === true) &&
+    !safeTokenStatistic(key, value)
+  );
+}
 const SENSITIVE_QUERY_KEY =
   /^(?:api[_-]?key|access[_-]?token|authorization|auth|client[_-]?secret|password|secret|accountkey)$/iu;
 const SENSITIVE_QUERY_VALUE =
@@ -181,10 +192,9 @@ function sanitizeValue(value: unknown): unknown {
   if (typeof value === "object") {
     const sanitized = Object.create(null) as Record<string, unknown>;
     for (const [key, child] of Object.entries(value)) {
-      sanitized[key] =
-        SENSITIVE_KEY.test(key) && !safeTokenStatistic(key, child)
-          ? REDACTED
-          : sanitizeValue(child);
+      sanitized[key] = sensitiveMetadataField(key, child)
+        ? REDACTED
+        : sanitizeValue(child);
     }
     return sanitized;
   }

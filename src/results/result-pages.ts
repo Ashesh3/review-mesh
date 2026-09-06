@@ -873,6 +873,30 @@ export function createResultPageCollector(
       fail("protocol_violation", "page count changed", raw);
     if (page.page_count <= page.page_index)
       fail("protocol_violation", "page index exceeds declared count", raw);
+    if (page.result_kind === "reviewer" && page.page_kind === "header") {
+      // The header itself occupies one page. Coverage pages hold at most 16
+      // entries, findings pages at most 2 items, and each narrative fragment
+      // occupies one page. Validate capacity before accepting a terminal header;
+      // declarations and preserved candidates must never be reduced to fit it.
+      const minimumPages =
+        1 +
+        page.payload.narrative_fragment_count +
+        Math.ceil((page.payload.coverage_attestation?.entry_count ?? 0) / 16) +
+        Math.ceil(page.payload.actionable_finding_count / 2);
+      if (page.page_count < minimumPages) {
+        const message = `page_count must be at least ${minimumPages} for the declared content.`;
+        const error = new ResultPageError("protocol_violation", message, {
+          receivedRaw: raw,
+          receivedBytes: Buffer.byteLength(raw, "utf8"),
+        });
+        error.validationIssues.push({
+          path: "page_count",
+          code: "too_small",
+          message,
+        });
+        throw error;
+      }
+    }
     const nextPhase = validateOrdering(page, raw);
     let nextCoverageEntries = acceptedCoverageEntries;
     let nextNarrativeFragments = acceptedNarrativeFragments;

@@ -106,7 +106,7 @@ export function buildReviewerPrompt({
       : [
           `Changed-file coverage uses ${reviewer.policy.changeCoverage.proof} proof and requires ${reviewer.policy.changeCoverage.minimumInspection} inspection for every relevant path. The scope digest and path list are core-owned obligations.`,
           reviewer.policy.changeCoverage.proof === "observed"
-            ? "Use Review Mesh-mediated reads for every required snapshot. Call coverage_status before finalizing and read its outstanding byte ranges, at most maximum_read_bytes per call. Do not emit a coverage attestation or a provider-owned change_coverage field."
+            ? "Use Review Mesh-mediated reads for every required snapshot. When the adapter exposes coverage_status, call it before finalizing and read its outstanding byte ranges, at most maximum_read_bytes per call. In a core-managed segmented workflow without callable tools, use the host input_manifest and exact source_ranges instead; source acquisition and coverage accounting are host-owned. Do not emit a coverage attestation or a provider-owned change_coverage field."
             : "Emit an exact coverage attestation for attested proof. Attested evidence must never be labelled observed.",
           coverage.unavailablePaths?.length
             ? `These files are explicitly unavailable and must remain coverage deficits: ${coverage.unavailablePaths.join(", ")}. Do not claim they were inspected.`

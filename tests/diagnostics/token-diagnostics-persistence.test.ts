@@ -7,11 +7,22 @@ import {
   readRunArtifact,
 } from "../../src/diagnostics/run-artifact.js";
 import { sanitizeRunMetadata } from "../../src/results/sanitize.js";
+import { sanitizeDashboardValue } from "../../src/diagnostics/dashboard-projection.js";
+import { readNormalizedRun } from "../../src/diagnostics/normalize-run.js";
+import {
+  v9Status,
+  v9Report,
+  v9DashboardRun,
+} from "../../src/diagnostics/v9-views.js";
 import { createOpenAICompatibleAdapter } from "../../src/adapters/openai-compatible.js";
 import { createChangeCoverageLedger } from "../../src/context/change-coverage.js";
 import { resolvedContext, resolvedReviewer } from "../helpers/fixtures.js";
 import { reviewerResultJsonSchema } from "../../src/protocol/json-schema.js";
 import { writeFile, mkdir } from "node:fs/promises";
+import {
+  readDashboardRun,
+  readDashboardReviewer,
+} from "../../src/server/dashboard-data.js";
 
 const budget = {
   budget_source: "conservative_default",
@@ -100,6 +111,7 @@ it("persists an actual segmented HTTP failure as an ordinary incomplete attempt"
       reason: "adapter_unavailable",
       diagnostics: {
         http_status: 500,
+        operation_phase: "evidence",
         input_budget_tokens: expect.any(Number),
         token_estimation: "utf8_upper_bound",
       },
@@ -222,6 +234,53 @@ it("persists typed token diagnostics in managed attempt and segment records", as
     ) as any;
     expect(attempt.data.failure.diagnostics).toMatchObject(budget);
     expect(segment.data.data.budget).toEqual(budget);
+    await writer.record({
+      record: "reviewer.terminal",
+      reviewer_id: "synthetic",
+      data: {
+        lens_id: "synthetic",
+        status: "incomplete",
+        reason: "adapter_unavailable",
+      },
+    });
+    const normalized = await readNormalizedRun(
+      join(root, "token-diagnostics.jsonl.active"),
+      { allowActive: true },
+    );
+    for (const details of [false, true]) {
+      const selected = v9Status(normalized, "synthetic", details) as any;
+      expect(selected.latest_failure.diagnostics).toMatchObject(budget);
+    }
+    expect(
+      (v9Status(normalized, undefined, true) as any).attempts[0].data.failure
+        .diagnostics,
+    ).toMatchObject(budget);
+    expect(
+      (v9Report(normalized).attempts[0]!.data as any).failure.diagnostics,
+    ).toMatchObject(budget);
+    expect(
+      (v9DashboardRun(normalized).attempts[0]!.data as any).failure.diagnostics,
+    ).toMatchObject(budget);
+    const appPaths = {
+      configFile: join(root, "config.toml"),
+      reviewersDirectory: join(root, "reviewers"),
+      runsDirectory: root,
+    };
+    const dashboard = (await readDashboardRun({
+      appPaths,
+      runId: "token-diagnostics",
+    })) as any;
+    expect(dashboard.attempts[0].data.failure.diagnostics).toMatchObject(
+      budget,
+    );
+    const dashboardReviewer = (await readDashboardReviewer({
+      appPaths,
+      runId: "token-diagnostics",
+      reviewerId: "synthetic",
+    })) as any;
+    expect(dashboardReviewer.attempts[0].failure.diagnostics).toMatchObject(
+      budget,
+    );
   } finally {
     await writer.close();
     await rm(root, { recursive: true, force: true });
@@ -254,4 +313,25 @@ it("allows only valid typed token telemetry and still redacts credentials", () =
   expect(sanitizeRunMetadata(invalid)).toEqual(
     Object.fromEntries(Object.keys(invalid).map((key) => [key, "[redacted]"])),
   );
+  expect(sanitizeDashboardValue({ ...budget, ...invalid })).toEqual({
+    ...budget,
+    ...Object.fromEntries(
+      Object.keys(invalid).map((key) => [key, "[redacted]"]),
+    ),
+  });
+  expect(
+    sanitizeDashboardValue({
+      ...budget,
+      access_token: 123,
+      api_token: "secret",
+      token_estimation: "utf8_upper_bound",
+      context_window_tokens: 128000,
+    }),
+  ).toEqual({
+    ...budget,
+    access_token: "[redacted]",
+    api_token: "[redacted]",
+    token_estimation: "utf8_upper_bound",
+    context_window_tokens: 128000,
+  });
 });

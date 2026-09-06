@@ -201,6 +201,105 @@ async function fixture(
 }
 
 describe("v9 live dashboard projection", () => {
+  it("projects the latest bounded segment through progress, heartbeat, selected status and dashboard", async () => {
+    const f = await fixture();
+    await f.resolve();
+    await f.start("quality::primary");
+    const initial = {
+      index: 1,
+      phase: "evidence",
+      input_budget_tokens: 100000,
+      estimated_input_tokens: 12000,
+      completed_segments: 1,
+      last_completed_checkpoint: "checkpoint-0",
+      delivered_bytes: 16384,
+      remaining_bytes: 32768,
+      unresolved_questions: 2,
+    };
+    await f.event(
+      "reviewer.progress",
+      {
+        lens_id: "quality",
+        mode: "full_review",
+        phase: "reviewing",
+        segment: initial,
+      },
+      1500,
+      "quality::primary",
+    );
+    let run = await readNormalizedRun(f.path, { allowActive: true });
+    expect((v9Status(run, "quality::primary") as any).segment).toEqual(initial);
+    expect(
+      (v9DashboardRun(run).reviewers as any[]).find(
+        (r) => r.reviewer_id === "quality::primary",
+      ).segment,
+    ).toEqual(initial);
+    const latest = {
+      ...initial,
+      index: 2,
+      phase: "synthesis",
+      completed_segments: 2,
+      last_completed_checkpoint: "checkpoint-1",
+      delivered_bytes: 49152,
+      remaining_bytes: 0,
+      unresolved_questions: 1,
+    };
+    await f.event(
+      "suite.heartbeat",
+      {
+        elapsed_ms: 2000,
+        active_count: 1,
+        active: [
+          {
+            reviewer_id: "quality::primary",
+            lens_id: "quality",
+            mode: "full_review",
+            attempt: 1,
+            maximum_attempts: 2,
+            phase: "reviewing",
+            attempt_elapsed_ms: 1000,
+            lens_elapsed_ms: 2000,
+            run_deadline_remaining_ms: 58000,
+            lens_deadline_remaining_ms: 58000,
+            attempt_deadline_remaining_ms: 29000,
+            last_progress_age_ms: 0,
+            coalesced_activity_count: 0,
+            segment: latest,
+          },
+        ],
+      },
+      2000,
+    );
+    await f.writer.record({
+      record: "reviewer.terminal",
+      reviewer_id: "quality::primary",
+      data: {
+        lens_id: "quality",
+        status: "incomplete",
+        reason: "adapter_unavailable",
+      },
+    });
+    run = await readNormalizedRun(f.path, { allowActive: true });
+    for (const details of [false, true])
+      expect(
+        (v9Status(run, "quality::primary", details) as any).segment,
+      ).toEqual(latest);
+    expect(
+      (v9Status(run) as any).reviewers.find(
+        (r: any) => r.reviewer_id === "quality::primary",
+      ).segment,
+    ).toEqual(latest);
+    expect(
+      (v9Report(run).reviewers as any[]).find(
+        (r) => r.reviewer_id === "quality::primary",
+      ).segment,
+    ).toEqual(latest);
+    expect(
+      (v9Status(run, undefined, true) as any).reviewers.find(
+        (r: any) => r.reviewer_id === "quality::primary",
+      ).segment,
+    ).toEqual(latest);
+  });
   it("retains a completed failed attempt while its selected reviewer is still retrying", async () => {
     const f = await fixture();
     await f.resolve();

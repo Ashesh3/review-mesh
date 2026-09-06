@@ -422,10 +422,15 @@ describe("reviewer result page collector", () => {
         page.previous_page_digest = digest(pages[index - 1]!);
         pages[index] = rawPage(page);
       }
-      for (const page of pages) collector.addPage(page);
-      if (field === "narrative_byte_count")
+      if (field === "actionable_finding_count") {
+        expect(() => collector.addPage(pages[0]!)).toThrow(
+          /page_count must be at least/,
+        );
+        expect(collector.nextRequest().pageIndex).toBe(0);
+      } else {
+        for (const page of pages) collector.addPage(page);
         expect(() => collector.assemble()).not.toThrow();
-      else expect(() => collector.assemble()).toThrow(ResultPageError);
+      }
     }
   });
 

@@ -222,17 +222,19 @@ describe("result assembly recovery", () => {
       resultId: "repair",
       resultKind: "reviewer",
     });
-    missing.addPage(
-      header(
-        {
-          verdict: "pass",
-          actionable_finding_count: 0,
-          narrative_fragment_count: 1,
-        },
-        1,
+    expect(() =>
+      missing.addPage(
+        header(
+          {
+            verdict: "pass",
+            actionable_finding_count: 0,
+            narrative_fragment_count: 1,
+          },
+          1,
+        ),
       ),
-    );
-    expect(() => missing.assemble()).toThrow(/narrative/);
+    ).toThrow(/page_count must be at least 2/);
+    expect(missing.nextRequest().pageIndex).toBe(0);
   });
 
   it("retains narrative and coverage declarations when restarting an incomplete assembly", () => {
@@ -252,7 +254,7 @@ describe("result assembly recovery", () => {
             entries_digest: "b".repeat(64),
           },
         },
-        1,
+        3,
       ),
     );
     const next = c.restart();

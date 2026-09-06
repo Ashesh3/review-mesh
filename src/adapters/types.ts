@@ -36,6 +36,13 @@ export interface ReviewerDraftDiagnostic {
   candidate?: Record<string, unknown>;
   validation_issues?: AdapterFailureDiagnostics["validation_issues"];
   raw_excerpt?: string;
+  diagnostics?: AdapterFailureDiagnostics;
+  candidate_mutations?: Array<{
+    candidate_id: string;
+    original_sha256: string;
+    returned_sha256: string;
+    changed_fields: string[];
+  }>;
   result_kind?: "reviewer" | "adjudication";
   assigned_candidate_ids?: string[];
   accepted_decision_ids?: string[];
@@ -93,12 +100,7 @@ export type AdapterEvent =
       identity?: string;
       byteCount?: number;
       inspection?: InspectionProgress;
-      segment?: {
-        index: number;
-        phase: "evidence" | "synthesis";
-        input_budget_tokens: number;
-        estimated_input_tokens: number;
-      };
+      segment?: SegmentProgress;
     }
   | { type: "activity"; message: string; identity?: string; byteCount?: number }
   | {
@@ -114,6 +116,18 @@ export type AdapterEvent =
       };
     }
   | { type: "failure"; failure: AdapterFailure; isolation?: IsolationLevel };
+
+export interface SegmentProgress {
+  index: number;
+  phase: "evidence" | "synthesis";
+  input_budget_tokens: number;
+  estimated_input_tokens: number;
+  completed_segments?: number;
+  last_completed_checkpoint?: string;
+  delivered_bytes?: number;
+  remaining_bytes?: number;
+  unresolved_questions?: number;
+}
 
 export interface ReviewAdapter {
   readonly id: string;

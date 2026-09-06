@@ -41,6 +41,7 @@ import {
   reviewerResultV3Schema,
 } from "../protocol/schemas.js";
 import { reviewerResultDigest } from "../results/digest.js";
+import { sensitiveMetadataField } from "../results/sanitize.js";
 import { readRunRecordLines } from "../diagnostics/run-record-reader.js";
 
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
@@ -51,8 +52,7 @@ const MAX_DASHBOARD_TOTAL_BYTES = 128 * 1024 * 1024;
 const DASHBOARD_READ_CONCURRENCY = 4;
 const MAX_EVENT_PAYLOAD_BYTES = 16 * 1024;
 const MAX_ACTIVITY_ITEMS = 2_000;
-const SENSITIVE_KEY =
-  /token|secret|password|authorization|api[_-]?key|instructions?|runtime|context/i;
+const PRIVATE_CONTEXT_KEY = /instructions?|runtime|context/i;
 
 export interface DashboardServerInfo {
   host: string;
@@ -240,7 +240,9 @@ function bounded(value: unknown, depth = 0): unknown {
       .slice(0, 256)
       .map(([key, child]) => [
         key,
-        SENSITIVE_KEY.test(key) ? "[redacted]" : bounded(child, depth + 1),
+        sensitiveMetadataField(key, child, PRIVATE_CONTEXT_KEY)
+          ? "[redacted]"
+          : bounded(child, depth + 1),
       ]),
   );
 }

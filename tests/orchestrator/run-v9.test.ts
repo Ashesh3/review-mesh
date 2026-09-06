@@ -160,6 +160,53 @@ const schedulerPass = {
   },
 };
 
+it("retains segment progress in the next aggregate heartbeat", async () => {
+  const progress = {
+    index: 2,
+    phase: "synthesis" as const,
+    input_budget_tokens: 100000,
+    estimated_input_tokens: 40000,
+    completed_segments: 2,
+    last_completed_checkpoint: "checkpoint-1",
+    delivered_bytes: 80000,
+    remaining_bytes: 0,
+    unresolved_questions: 1,
+  };
+  let release!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const f = await schedulerFixture(
+    [{ id: "quality", lens: "quality", provider: "provider" }],
+    async function* () {
+      yield {
+        type: "progress",
+        phase: "reviewing",
+        segment: progress,
+        identity: "segment-2",
+      };
+      await ready;
+      yield schedulerPass;
+    },
+  );
+  try {
+    const deadline = Date.now() + 3000;
+    while (
+      !f.events.some((event) => event.event === "suite.heartbeat") &&
+      Date.now() < deadline
+    )
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    const heartbeat = f.events.find(
+      (event) => event.event === "suite.heartbeat",
+    )!;
+    expect((heartbeat.data?.active as any[])[0].segment).toEqual(progress);
+    expect(Buffer.byteLength(JSON.stringify(heartbeat))).toBeLessThan(16384);
+  } finally {
+    release();
+    await f.run;
+  }
+});
+
 async function waitForScheduler(predicate: () => boolean) {
   for (let index = 0; index < 1_000 && !predicate(); index += 1)
     await vi.advanceTimersByTimeAsync(0);

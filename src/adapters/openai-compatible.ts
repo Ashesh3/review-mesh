@@ -2838,6 +2838,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               },
               {
                 failure_stage: "structured_result_page_envelope",
+                operation_phase: "finalization",
                 scope: "provider",
               },
             );
@@ -3219,13 +3220,23 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
       // never from legacy queued tool messages.
       this.admittedInspection.delete(sessionId);
       const result = await segmented.run(
-        (body) =>
-          this.chat(
+        (body) => {
+          const assignment = JSON.parse(
+            String(
+              (body.messages as Array<{ content?: unknown }>).at(-1)?.content,
+            ),
+          ) as { phase: "evidence" | "synthesis" };
+          lastPhase = assignment.phase;
+          lastOperation =
+            assignment.phase === "evidence"
+              ? "snapshot_delivery"
+              : "cross_file_synthesis";
+          return this.chat(
             configuration,
             input.signal,
             sessionId,
             body,
-            {},
+            { operation_phase: assignment.phase },
             (progress) =>
               segmentProgress.push({
                 type: "progress",
@@ -3233,7 +3244,8 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
                 identity: progress.identity,
                 byteCount: progress.byteCount,
               }),
-          ),
+          );
+        },
         (progress) =>
           segmentProgress.push({
             type: "progress",
@@ -3245,6 +3257,24 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               phase: progress.phase as "evidence" | "synthesis",
               input_budget_tokens: Number(progress.input_budget_tokens),
               estimated_input_tokens: Number(progress.estimated_input_tokens),
+              ...(typeof progress.completed_segments === "number"
+                ? { completed_segments: progress.completed_segments }
+                : {}),
+              ...(typeof progress.last_completed_checkpoint === "string"
+                ? {
+                    last_completed_checkpoint:
+                      progress.last_completed_checkpoint,
+                  }
+                : {}),
+              ...(typeof progress.delivered_bytes === "number"
+                ? { delivered_bytes: progress.delivered_bytes }
+                : {}),
+              ...(typeof progress.remaining_bytes === "number"
+                ? { remaining_bytes: progress.remaining_bytes }
+                : {}),
+              ...(typeof progress.unresolved_questions === "number"
+                ? { unresolved_questions: progress.unresolved_questions }
+                : {}),
             },
           }),
       );
@@ -3276,21 +3306,27 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
       return result.messages as ChatMessage[];
     };
     const finalSegmentResult = async (checkpoint: ChatMessage[]) => {
-      const response = await this.chat(configuration, input.signal, sessionId, {
-        model: input.reviewer.model,
-        messages: checkpoint,
-        response_format: {
-          type: "json_schema",
-          json_schema: {
-            name: "reviewer_result",
-            strict: false,
-            schema: relaxedStructuredOutputSchema(input.resultJsonSchema),
+      const response = await this.chat(
+        configuration,
+        input.signal,
+        sessionId,
+        {
+          model: input.reviewer.model,
+          messages: checkpoint,
+          response_format: {
+            type: "json_schema",
+            json_schema: {
+              name: "reviewer_result",
+              strict: false,
+              schema: relaxedStructuredOutputSchema(input.resultJsonSchema),
+            },
           },
+          max_tokens: budget.model.outputTokens,
         },
-        max_tokens: budget.model.outputTokens,
-      });
+        { operation_phase: "finalization" },
+      );
       const result = currentReviewerOutputSchema.parse(
-        JSON.parse(String(response.message.content)),
+        JSON.parse(normalizedAssistantContent(response.message.content) ?? ""),
       );
       for (const finding of segmentedFindings)
         if (
@@ -3409,6 +3445,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
             },
             {
               inspection_turn: turn + 1,
+              operation_phase: "inspection",
               maximum_inspection_turns: this.maxTurns,
               remaining_inspection_turns: this.maxTurns - turn - 1,
             },
@@ -3690,6 +3727,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
               },
               {
                 failure_stage: "structured_result_envelope",
+                operation_phase: "finalization",
                 repair_attempted: false,
                 repair_outcome: "not_attempted",
               },
@@ -3786,6 +3824,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
                 },
                 {
                   failure_stage: "structured_result_repair_envelope",
+                  operation_phase: "finalization",
                   repair_attempted: true,
                   repair_outcome: "failed",
                 },

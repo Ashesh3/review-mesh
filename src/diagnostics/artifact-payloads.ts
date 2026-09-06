@@ -418,6 +418,32 @@ export const artifactAttemptV1Schema = z.strictObject({
   causes: z.array(v9IncompleteReasonSchema).optional(),
 });
 
+const followUpKind = z.enum(["snapshot", "diff", "context"]);
+const followUpRequest = z.strictObject({
+  kind: followUpKind.optional(),
+  path: text.max(1024).optional(),
+  offset: count,
+  byte_count: z.number().int().min(1).max(32768),
+});
+const followUpResult = z.strictObject({
+  request: followUpRequest,
+  status: z.enum(["queued", "rejected"]),
+  kind: followUpKind.optional(),
+  path: text.max(1024).optional(),
+  offset: count.optional(),
+  byte_count: count.optional(),
+  reason: z
+    .enum([
+      "invalid_path",
+      "not_in_snapshot",
+      "invalid_range",
+      "kind_path_mismatch",
+    ])
+    .optional(),
+  retryable: z.boolean().optional(),
+  error_id: id.optional(),
+});
+
 export const privatePayloadSchemas: Record<string, z.ZodType> = {
   "reviewer.exception": z.strictObject({
     attempt: count,
@@ -470,6 +496,9 @@ export const privatePayloadSchemas: Record<string, z.ZodType> = {
           )
           .max(8),
         budget: failureDiagnosticsSchema,
+        follow_up_reads: z.array(followUpRequest).max(8).optional(),
+        follow_up_results: z.array(followUpResult).max(8).optional(),
+        resolved_question_ids: z.array(id).max(32).optional(),
       }),
     })
     .refine((value) => Buffer.byteLength(JSON.stringify(value)) <= 512 * 1024),
@@ -490,6 +519,18 @@ export const privatePayloadSchemas: Record<string, z.ZodType> = {
   }),
   "reviewer.draft": z
     .strictObject({
+      diagnostics: failureDiagnosticsSchema.optional(),
+      candidate_mutations: z
+        .array(
+          z.strictObject({
+            candidate_id: text.max(256),
+            original_sha256: digest,
+            returned_sha256: digest,
+            changed_fields: z.array(text.max(128)).max(32),
+          }),
+        )
+        .max(16)
+        .optional(),
       result_kind: z.enum(["reviewer", "adjudication"]).optional(),
       assigned_candidate_ids: z.array(text.max(256)).max(256).optional(),
       accepted_decision_ids: z.array(text.max(256)).max(256).optional(),

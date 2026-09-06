@@ -755,6 +755,17 @@ const v6ReviewerPhaseSchema = z.enum([
   "finalizing",
   "terminal",
 ]);
+export const segmentProgressSchema = z.strictObject({
+  index: nonNegativeInteger,
+  phase: z.enum(["evidence", "synthesis"]),
+  input_budget_tokens: nonNegativeInteger,
+  estimated_input_tokens: nonNegativeInteger,
+  completed_segments: nonNegativeInteger.optional(),
+  last_completed_checkpoint: boundedId.optional(),
+  delivered_bytes: nonNegativeInteger.optional(),
+  remaining_bytes: nonNegativeInteger.optional(),
+  unresolved_questions: nonNegativeInteger.optional(),
+});
 const v6ActiveHeartbeatEntrySchema = z.strictObject({
   reviewer_id: boundedId,
   lens_id: boundedId,
@@ -774,6 +785,7 @@ const v6ActiveHeartbeatEntrySchema = z.strictObject({
   queue_wait_ms: nonNegativeInteger.optional(),
   probe_elapsed_ms: nonNegativeInteger.optional(),
   inspection: inspectionProgressSchema.optional(),
+  segment: segmentProgressSchema.optional(),
   workload: snapshotWorkloadSchema.optional(),
 });
 const v6GenericEventDataSchema = z.strictObject({
@@ -793,14 +805,7 @@ const progressData = z.strictObject({
   queue_reason: z.enum(["provider_limit", "execution_limit"]).optional(),
   queued_at: timestampSchema.optional(),
   inspection: inspectionProgressSchema.optional(),
-  segment: z
-    .strictObject({
-      index: nonNegativeInteger,
-      phase: z.enum(["evidence", "synthesis"]),
-      input_budget_tokens: nonNegativeInteger,
-      estimated_input_tokens: nonNegativeInteger,
-    })
-    .optional(),
+  segment: segmentProgressSchema.optional(),
   workload: snapshotWorkloadSchema.optional(),
 });
 const publicEventV6BaseSchema = z.discriminatedUnion("event", [

@@ -23,6 +23,7 @@ import type {
   AdapterEvent,
   ReviewAdapter,
   InspectionProgress,
+  SegmentProgress,
 } from "../adapters/types.js";
 import {
   sanitizeAdapterFailure,
@@ -134,6 +135,7 @@ interface Job {
   progressObservable?: boolean;
   fallbackEligible?: boolean;
   inspection?: InspectionProgress;
+  segment?: SegmentProgress;
   resultId?: string;
   resultPagePreservation?: ResultPagePreservation;
 }
@@ -1083,6 +1085,8 @@ export async function runV9Review(input: V9RunInput) {
               const event = next.value;
               if (event.type === "progress" && event.inspection)
                 job.inspection = event.inspection;
+              if (event.type === "progress" && event.segment)
+                job.segment = structuredClone(event.segment);
               if (event.type === "result" || event.type === "failure") {
                 if (terminal) throw new Error("Duplicate adapter terminal");
                 terminal = event;
@@ -1614,6 +1618,7 @@ export async function runV9Review(input: V9RunInput) {
           maximum_attempts: execution.retry_attempts,
           phase: job.phase as "reviewing",
           ...(job.inspection ? { inspection: job.inspection } : {}),
+          ...(job.segment ? { segment: job.segment } : {}),
           attempt_elapsed_ms:
             job.admittedAt === undefined ? 0 : now() - job.admittedAt,
           ...(job.admittedAt === undefined

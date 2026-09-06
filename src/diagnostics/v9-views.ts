@@ -113,6 +113,15 @@ function segmentSummary(record: Record<string, unknown>) {
     unresolved_questions: Array.isArray(data.unresolved_questions)
       ? data.unresolved_questions
       : [],
+    resolved_question_ids: Array.isArray(data.resolved_question_ids)
+      ? data.resolved_question_ids
+      : [],
+    follow_up_reads: Array.isArray(data.follow_up_reads)
+      ? data.follow_up_reads
+      : [],
+    follow_up_results: Array.isArray(data.follow_up_results)
+      ? data.follow_up_results
+      : [],
   };
 }
 export function v9Report(
@@ -127,6 +136,12 @@ export function v9Report(
     snapshot_manifests,
     ...compact
   } = run;
+  const liveSegments = new Map(
+    projectDashboardRun(run).reviewers.map((reviewer) => [
+      reviewer.reviewer_id,
+      reviewer.segment,
+    ]),
+  );
   return {
     ...compact,
     ...(options.includeRaw
@@ -134,6 +149,9 @@ export function v9Report(
       : {}),
     reviewers: run.reviewers.map((reviewer) => ({
       ...reviewer,
+      ...(liveSegments.get(reviewer.reviewer_id)
+        ? { segment: liveSegments.get(reviewer.reviewer_id) }
+        : {}),
       ...(reviewer.coverage
         ? {
             coverage: reviewer.coverage.filter(
@@ -205,8 +223,18 @@ export function v9Status(
   reviewerId?: string,
   details = false,
 ): Record<string, unknown> {
+  const projected = projectDashboardRun(run);
+  const segments = new Map(
+    projected.reviewers.map((reviewer) => [
+      reviewer.reviewer_id,
+      reviewer.segment,
+    ]),
+  );
   const reviewers = run.reviewers.map((reviewer) => ({
     ...reviewer,
+    ...(segments.get(reviewer.reviewer_id)
+      ? { segment: segments.get(reviewer.reviewer_id) }
+      : {}),
     state: reviewer.status,
     complete_result: reviewer.result,
     result_digest: reviewer.digest,
@@ -215,11 +243,11 @@ export function v9Status(
   if (reviewerId !== undefined) {
     // A running reviewer may have no result/private terminal yet. Its attempts
     // still belong to the configured live roster and must remain inspectable.
+    const liveReviewer = projected.reviewers.find(
+      (item) => item.reviewer_id === reviewerId,
+    );
     const reviewer =
-      reviewers.find((item) => item.reviewer_id === reviewerId) ??
-      projectDashboardRun(run).reviewers.find(
-        (item) => item.reviewer_id === reviewerId,
-      );
+      reviewers.find((item) => item.reviewer_id === reviewerId) ?? liveReviewer;
     if (!reviewer) throw new Error("Reviewer not found.");
     const selected = run.records.filter(
       (record) => record.reviewer_id === reviewerId,
@@ -256,6 +284,7 @@ export function v9Status(
       kind: "review-mesh.run-status",
       run_id: run.run_id,
       ...reviewer,
+      ...(liveReviewer?.segment ? { segment: liveReviewer.segment } : {}),
       attempt_count: attempts.length,
       timing,
       ...(latest
@@ -304,7 +333,7 @@ export function v9Status(
       kind: "review-mesh.run-status",
       reviewers,
     };
-  const live = projectDashboardRun(run);
+  const live = projected;
   return sanitizeDashboardValue({
     schema_version: "3",
     kind: "review-mesh.run-status",

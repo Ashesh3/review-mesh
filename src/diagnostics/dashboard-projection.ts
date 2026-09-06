@@ -1,5 +1,9 @@
-import { sanitizeRunMetadata } from "../results/sanitize.js";
+import {
+  sanitizeRunMetadata,
+  sensitiveMetadataField,
+} from "../results/sanitize.js";
 import type { NormalizedRun } from "./normalize-run.js";
+import { segmentProgressSchema } from "../protocol/v9.js";
 
 const MAX_ACTIVITY = 2_000;
 const MAX_EVENTS = 2_000;
@@ -63,7 +67,7 @@ export function sanitizeDashboardValue<T>(value: T): T {
     return Object.fromEntries(
       Object.entries(record).map(([key, entry]) => [
         key,
-        /token|secret|password|authorization|api[_-]?key/iu.test(key) ||
+        sensitiveMetadataField(key, entry) ||
         /^(?:instructions?|caller_context|runtime|command|args|endpoint|base_url)$/iu.test(
           key,
         )
@@ -274,6 +278,8 @@ export function projectDashboardRun(
         if (!entry || !id) continue;
         const reviewer = ensure(id, text(entry.lens_id));
         if (terminalIds.has(id)) continue;
+        const segment = segmentProgressSchema.safeParse(entry.segment);
+        if (segment.success) reviewer.segment = segment.data;
         setPhase(reviewer, entry.phase, at);
         if (text(entry.mode)) reviewer.mode = entry.mode;
         if (count(entry.attempt)) attempt(reviewer, count(entry.attempt)!);
@@ -349,6 +355,8 @@ export function projectDashboardRun(
     ) {
       if (terminalIds.has(id)) continue;
       setPhase(reviewer, data.phase, at);
+      const segment = segmentProgressSchema.safeParse(data.segment);
+      if (segment.success) reviewer.segment = segment.data;
       for (const key of ["queued_at", "queue_reason"])
         if (data[key] !== undefined) reviewer[key] = data[key];
       if (text(data.mode)) reviewer.mode = data.mode;
