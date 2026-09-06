@@ -1,4 +1,4 @@
-import { writeFile } from "node:fs/promises";
+import { rename, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 
 const mode = process.env.REVIEW_MESH_FIXTURE_MODE ?? "pass";
@@ -26,15 +26,20 @@ const descendant =
     : undefined;
 
 if (capturePath !== undefined) {
+  // Publish the capture only after its complete JSON has been written. Tests
+  // wait on this path while the silent child remains alive.
+  const pendingCapture = `${capturePath}.${process.pid}.pending`;
   await writeFile(
-    capturePath,
+    pendingCapture,
     JSON.stringify({
       request,
       env: process.env,
       pid: process.pid,
       ...(descendant?.pid === undefined ? {} : { child_pid: descendant.pid }),
     }),
+    { flag: "wx" },
   );
+  await rename(pendingCapture, capturePath);
 }
 
 const passResult = {

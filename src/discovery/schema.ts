@@ -197,6 +197,15 @@ const schemas = {
         run_outcome: v9RunOutcomeSchema.optional(),
         gate_outcome: v9GateOutcomeSchema.optional(),
         coverage_outcome: z.enum(["complete", "partial"]).optional(),
+        attempt_count: z.number().int().nonnegative().optional(),
+        latest_failure: z.record(z.string(), z.unknown()).optional(),
+        timing: z.record(z.string(), z.unknown()).optional(),
+        attempts: z.array(z.record(z.string(), z.unknown())).optional(),
+        preflight: z.array(z.record(z.string(), z.unknown())).optional(),
+        unverified_drafts: z
+          .array(z.record(z.string(), z.unknown()))
+          .optional(),
+        segments: z.array(z.record(z.string(), z.unknown())).optional(),
         reviewers: z
           .array(
             z

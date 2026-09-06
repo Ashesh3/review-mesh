@@ -1041,6 +1041,23 @@ export async function runV9Review(input: V9RunInput) {
                   string,
                   unknown
                 >;
+                if (diagnostic.kind === "adapter_exception") {
+                  await input.record({
+                    record: "reviewer.exception",
+                    reviewer_id: reviewer.id,
+                    data: { attempt, diagnostics: safe.diagnostics },
+                  });
+                  return;
+                }
+                if (diagnostic.kind === "review_segment") {
+                  const { kind: _kind, ...segment } = safe;
+                  await input.record({
+                    record: "reviewer.segment",
+                    reviewer_id: reviewer.id,
+                    data: { ...segment, attempt },
+                  });
+                  return;
+                }
                 if (typeof safe.raw_excerpt === "string")
                   safe.raw_excerpt = sanitizePublicText(safe.raw_excerpt, 4096);
                 if (
@@ -1113,7 +1130,8 @@ export async function runV9Review(input: V9RunInput) {
               if (
                 changed ||
                 repairing ||
-                (event.type === "progress" && event.inspection)
+                (event.type === "progress" &&
+                  (event.inspection || event.segment))
               )
                 await emit({
                   event: "reviewer.progress",
@@ -1126,6 +1144,9 @@ export async function runV9Review(input: V9RunInput) {
                     maximum_attempts: execution.retry_attempts,
                     ...(event.type === "progress" && event.inspection
                       ? { inspection: event.inspection }
+                      : {}),
+                    ...(event.type === "progress" && event.segment
+                      ? { segment: event.segment }
                       : {}),
                     ...(repairing
                       ? {

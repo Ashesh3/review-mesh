@@ -8,6 +8,7 @@ import {
   v9DashboardRun,
   v9RunSummary,
   v9Status,
+  v9Report,
 } from "../../src/diagnostics/v9-views.js";
 import {
   readDashboardRun,
@@ -200,6 +201,180 @@ async function fixture(
 }
 
 describe("v9 live dashboard projection", () => {
+  it("retains a completed failed attempt while its selected reviewer is still retrying", async () => {
+    const f = await fixture();
+    await f.resolve();
+    await f.start("quality::primary");
+    await f.writer.record({
+      record: "reviewer.attempt",
+      reviewer_id: "quality::primary",
+      data: {
+        attempt: 1,
+        started_at: at(1000),
+        elapsed_ms: 1000,
+        failure: {
+          reason: "provider_timeout",
+          message: "Provider timed out",
+          retryable: true,
+        },
+      },
+    });
+    const run = await readNormalizedRun(f.path, { allowActive: true });
+    expect(v9Status(run, "quality::primary")).toMatchObject({
+      reviewer_id: "quality::primary",
+      attempt_count: 1,
+      latest_failure: { reason: "provider_timeout" },
+    });
+  });
+  it("keeps selected-reviewer failure diagnostics compact and expands only its own records", async () => {
+    const f = await fixture();
+    await f.resolve();
+    for (const id of ["quality::primary", "security::primary"]) {
+      await f.writer.record({
+        record: "reviewer.attempt",
+        reviewer_id: id,
+        data: {
+          attempt: 1,
+          started_at: at(1000),
+          ended_at: at(3500),
+          elapsed_ms: 2500,
+          failure: {
+            reason: "adapter_unavailable",
+            message: "Context capacity exceeded",
+            retryable: false,
+            diagnostics: {
+              http_status: 400,
+              provider_request_id: `${id}-request`,
+              request_bytes: 12345,
+              inspection_turn: 3,
+              provider_error_code: "context_limit",
+            },
+          },
+        },
+      });
+      await f.writer.record({
+        record: "reviewer.terminal",
+        reviewer_id: id,
+        data: {
+          status: "incomplete",
+          lens_id: id.split("::")[0]!,
+          reason: "adapter_unavailable",
+        },
+      });
+      await f.writer.record({
+        record: "reviewer.draft",
+        reviewer_id: id,
+        data: {
+          kind: "unverified_result_draft",
+          checkpoint_id: `${id}-checkpoint`,
+          attempt: 1,
+          verified: false,
+          accepted_page_count: 0,
+          candidate_ids: [],
+          unresolved_obligations: [],
+          raw_excerpt: "private rejected draft",
+        },
+      });
+      await f.writer.record({
+        record: "reviewer.preflight",
+        reviewer_id: id,
+        data: {
+          lens_id: id.split("::")[0]!,
+          required_files: 2,
+          snapshot_bytes: 100,
+          minimum_read_requests: 2,
+          unavailable_files: 0,
+          model_runs: 1,
+          required_passes: 1,
+          required_provider_groups: 1,
+          run_deadline_remaining_ms: 1000,
+          estimated_minimum_tool_turns: 1,
+          limits_are_estimates: true,
+          warnings: [],
+        },
+      });
+      await f.writer.record({
+        record: "reviewer.segment",
+        reviewer_id: id,
+        data: {
+          attempt: 1,
+          segment_id: `${id}-segment`,
+          index: 0,
+          phase: "evidence",
+          data: {
+            provenance: "model_reasoning",
+            runtime_validation: "not_executed",
+            summary: "A checked source path",
+            findings: [],
+            source_ranges: [
+              {
+                kind: "snapshot",
+                path: "engine.mjs",
+                offset: 0,
+                byte_count: 20,
+                sha256: "a".repeat(64),
+                snapshot_digest: "a".repeat(64),
+              },
+            ],
+            budget: {},
+            scenario_checks: [
+              {
+                path: "engine.mjs",
+                start_line: 1,
+                end_line: 2,
+                input: {},
+                expected: null,
+                observed: null,
+                reasoning: "Reasoned observation only.",
+              },
+            ],
+            unresolved_questions: [],
+          },
+        },
+      });
+    }
+    const run = await readNormalizedRun(f.path, { allowActive: true });
+    const compact = v9Status(run, "quality::primary");
+    expect(compact).toMatchObject({
+      attempt_count: 1,
+      timing: {
+        total_elapsed_ms: 2500,
+        started_at: at(1000),
+        ended_at: at(3500),
+      },
+      latest_failure: {
+        attempt: 1,
+        diagnostics: {
+          request_bytes: 12345,
+          provider_error_code: "context_limit",
+          provider_request_id: "quality::primary-request",
+        },
+      },
+    });
+    expect(compact).not.toHaveProperty("attempts");
+    expect(compact).not.toHaveProperty("unverified_drafts");
+    const detail = v9Status(run, "quality::primary", true);
+    expect(detail.attempts).toHaveLength(1);
+    expect(detail.unverified_drafts).toHaveLength(1);
+    expect(detail.preflight).toHaveLength(1);
+    expect(detail.segments).toHaveLength(1);
+    expect(v9Report(run).segments).toHaveLength(2);
+    expect(JSON.stringify(detail)).not.toContain("security::primary-request");
+    expect(JSON.stringify(detail)).not.toContain("private rejected draft");
+    const reportAttempt = v9Report(run).attempts.find(
+      (record) => record.reviewer_id === "quality::primary",
+    )!;
+    expect(
+      (compact.latest_failure as Record<string, unknown>).diagnostics,
+    ).toEqual(
+      (
+        (reportAttempt.data as Record<string, unknown>).failure as Record<
+          string,
+          unknown
+        >
+      ).diagnostics,
+    );
+  });
   it("keeps active CLI status compact with a complete roster and no provisional exit", async () => {
     const f = await fixture();
     await f.resolve();

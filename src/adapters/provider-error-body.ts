@@ -11,6 +11,72 @@ const DIAGNOSTIC_WORDS = new Set(
   ),
 );
 
+/** Extract only provider-owned semantics; never reuse arbitrary request text. */
+function contextLimitDiagnostics(
+  code: unknown,
+  message: string,
+  fields: Record<string, unknown> | undefined,
+): Partial<AdapterFailureDiagnostics> {
+  const knownCode =
+    typeof code === "string" &&
+    /^(?:context_length_exceeded|model_max_prompt_tokens_exceeded|prompt_too_long|input_too_long|context_window_exceeded)$/iu.test(
+      code,
+    );
+  const knownText =
+    /(?:request|prompt|input)[\s\S]{0,80}(?:exceeds?|exceeded|too (?:long|large))[\s\S]{0,80}(?:context|token)|(?:context (?:window|length|limit))[\s\S]{0,80}(?:exceeds?|exceeded)|\d[\d,]*\s+tokens?\s*>\s*\d/iu.test(
+      message,
+    );
+  if (!knownCode && !knownText) return {};
+  const number = (value: string | undefined) => {
+    if (value === undefined) return undefined;
+    const result = Number(value.replaceAll(",", ""));
+    return Number.isSafeInteger(result) && result >= 0 ? result : undefined;
+  };
+  let input: number | undefined;
+  let limit: number | undefined;
+  const comparison =
+    /([\d,]+)\s+tokens?\s*>\s*([\d,]+)\s*(?:maximum|max|limit)/iu.exec(
+      message,
+    ) ??
+    /(?:prompt|input)\s+token\s+(?:count\s+)?(?:of\s+)?([\d,]+)\s+exceeds?\s+(?:the\s+)?(?:limit|maximum)(?:\s+of)?\s+([\d,]+)/iu.exec(
+      message,
+    );
+  if (comparison) {
+    input = number(comparison[1]);
+    limit = number(comparison[2]);
+  } else {
+    limit = number(
+      /maximum\s+context\s+length\s+(?:is\s+)?([\d,]+)\s+tokens?/iu.exec(
+        message,
+      )?.[1],
+    );
+    input = number(
+      /(?:requested|resulted\s+in)\s+([\d,]+)\s+tokens?/iu.exec(message)?.[1],
+    );
+  }
+  if (limit === 0) limit = undefined;
+  const integer = (value: unknown) =>
+    typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+      ? value
+      : undefined;
+  input ??= integer(fields?.input_tokens) ?? integer(fields?.prompt_tokens);
+  limit ??=
+    integer(fields?.limit_tokens) ??
+    integer(fields?.context_window_tokens) ??
+    integer(fields?.max_context_tokens);
+  if (limit === 0) limit = undefined;
+  return {
+    failure_code: "context_length_exceeded",
+    context_error_class: "context_too_large",
+    ...(input === undefined ? {} : { input_tokens: input }),
+    ...(limit === undefined ? {} : { limit_tokens: limit }),
+    provider_error_message:
+      input !== undefined && limit !== undefined
+        ? `Model context limit exceeded: input ${input} tokens; limit ${limit} tokens.`
+        : "Model context limit exceeded.",
+  };
+}
+
 /** Read only a small diagnostic response, never the original request or headers. */
 export async function providerErrorBody(
   response: Response,
@@ -55,6 +121,7 @@ export async function providerErrorBody(
   }
   let text = Buffer.concat(parts).toString("utf8");
   let code: unknown;
+  let fields: Record<string, unknown> | undefined;
   try {
     const json = JSON.parse(text);
     const error =
@@ -62,6 +129,7 @@ export async function providerErrorBody(
         ? json.error
         : json;
     code = error?.code ?? error?.type;
+    fields = typeof error === "object" && error !== null ? error : undefined;
     text =
       typeof error?.message === "string"
         ? error.message
@@ -77,6 +145,7 @@ export async function providerErrorBody(
       text = /<title[^>]*>([^<]{0,256})<\/title>/i.exec(text)?.[1] ?? "";
     }
   }
+  const contextDiagnostic = contextLimitDiagnostics(code, text, fields);
   const redact = (value: unknown, limit: number): string | undefined => {
     if (typeof value !== "string") return undefined;
     // Only the diagnostic prefix can be published. Bound echo matching work
@@ -122,12 +191,16 @@ export async function providerErrorBody(
       } catch {
         /* Request encoding is already validated by the caller. */
       }
-      for (const exact of [...exactValues].sort(
-        (left, right) => right.length - left.length,
-      ))
-        if (safe.includes(exact))
-          safe = safe.replaceAll(exact, "[request content redacted]");
       const spans: Array<[number, number]> = [];
+      // Find every match in the original text and replace once. Rescanning the
+      // replacement itself turns ordinary errors into nested redaction noise.
+      for (const exact of exactValues) {
+        let index = safe.indexOf(exact);
+        while (index >= 0) {
+          spans.push([index, index + exact.length]);
+          index = safe.indexOf(exact, index + exact.length);
+        }
+      }
       for (let index = 0; index <= safe.length - 16; index++) {
         const fragment = safe.slice(index, index + 16);
         if (
@@ -162,6 +235,7 @@ export async function providerErrorBody(
   return {
     ...(message === undefined ? {} : { provider_error_message: message }),
     ...(errorCode === undefined ? {} : { provider_error_code: errorCode }),
+    ...contextDiagnostic,
     error_body_truncated: truncated,
     ...(unavailable ? { error_body_unavailable: true } : {}),
   };

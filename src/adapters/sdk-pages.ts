@@ -21,6 +21,8 @@ import {
 } from "./result-spool.js";
 import { sanitizeRunMetadata } from "../results/sanitize.js";
 
+const recordedDrafts = new WeakMap<AdapterReviewInput, Set<string>>();
+
 /** Durable private diagnostics; schema-valid candidates remain unverified. */
 export async function recordResultPageDraft(
   input: AdapterReviewInput,
@@ -30,6 +32,21 @@ export async function recordResultPageDraft(
 ): Promise<boolean> {
   if (input.recordDiagnostic === undefined) return false;
   const draft = collector.draft();
+  const recorded = recordedDrafts.get(input) ?? new Set<string>();
+  recordedDrafts.set(input, recorded);
+  const emit = async (
+    value: Parameters<NonNullable<AdapterReviewInput["recordDiagnostic"]>>[0],
+  ) => {
+    const safe = sanitizeRunMetadata(value) as typeof value;
+    const key = createHash("sha256").update(JSON.stringify(safe)).digest("hex");
+    if (recorded.has(key)) return;
+    await input.recordDiagnostic!(safe);
+    recorded.add(key);
+  };
+  const issues = [
+    ...(error?.validationIssues ?? []),
+    ...(draft.metadataCorrections ?? []),
+  ].slice(0, 12);
   const common = {
     kind: "unverified_result_draft" as const,
     checkpoint_id: collector.nextRequest().resultId,
@@ -37,9 +54,7 @@ export async function recordResultPageDraft(
     accepted_page_count: draft.acceptedPageCount,
     candidate_ids: draft.candidateIds,
     unresolved_obligations: draft.unresolvedObligations,
-    ...(error === undefined
-      ? {}
-      : { validation_issues: error.validationIssues }),
+    ...(issues.length === 0 ? {} : { validation_issues: issues }),
   };
   let excerpt: string | undefined;
   if (raw !== undefined) {
@@ -55,12 +70,66 @@ export async function recordResultPageDraft(
         "Unparseable result page retained in the private diagnostic spool.";
     }
   }
-  await input.recordDiagnostic({
-    ...common,
-    ...(excerpt === undefined ? {} : { raw_excerpt: excerpt }),
-  });
+  if (draft.adjudication !== undefined) {
+    const assignment = draft.adjudication;
+    for (
+      let offset = 0;
+      offset < Math.max(1, assignment.assignedCandidateIds.length);
+      offset += 64
+    ) {
+      const ids = assignment.assignedCandidateIds.slice(offset, offset + 64);
+      await emit({
+        ...common,
+        result_kind: "adjudication",
+        candidate_ids: ids,
+        assigned_candidate_ids: ids,
+        accepted_decision_ids: ids.filter((id) =>
+          assignment.acceptedDecisionIds.includes(id),
+        ),
+        missing_decision_ids: ids.filter((id) =>
+          assignment.missingDecisionIds.includes(id),
+        ),
+        ...(offset !== 0 || excerpt === undefined
+          ? {}
+          : { raw_excerpt: excerpt }),
+      });
+    }
+    for (const decision of draft.decisions ?? []) {
+      const id = decision.source_finding_id as string;
+      // Decision records are deduplicated independently of page progress.
+      const retainedDecision = {
+        kind: "unverified_result_draft",
+        checkpoint_id: common.checkpoint_id,
+        accepted_page_count: draft.acceptedPageCount,
+        candidate_ids: [id],
+        unresolved_obligations: [
+          "Validated adjudication decision retained as unverified until the complete result is accepted.",
+        ],
+        result_kind: "adjudication",
+        decision,
+      } as const;
+      const decisionKey = `decision:${common.checkpoint_id}:${createHash(
+        "sha256",
+      )
+        .update(JSON.stringify(sanitizeRunMetadata(decision)))
+        .digest("hex")}`;
+      if (!recorded.has(decisionKey)) {
+        await emit({
+          ...retainedDecision,
+          candidate_ids: [id],
+          unresolved_obligations: [...retainedDecision.unresolved_obligations],
+        });
+        recorded.add(decisionKey);
+      }
+    }
+  } else
+    await emit({
+      ...common,
+      result_kind: "reviewer",
+      ...(excerpt === undefined ? {} : { raw_excerpt: excerpt }),
+    });
   for (const candidate of draft.candidates)
-    await input.recordDiagnostic({
+    await emit({
       ...common,
       candidate: sanitizeRunMetadata(candidate) as Record<string, unknown>,
     });
@@ -304,6 +373,8 @@ export function createResultPageStorageBridge(
       try {
         await spool.append(raw);
         collector.addPage(raw);
+        if (collector.draft().metadataCorrections?.length)
+          await recordResultPageDraft(input, collector);
         accepted.push(spool);
         active = undefined;
       } catch (error) {

@@ -26,6 +26,8 @@ const FAILURE_CODES = new Set<AdapterFailureCode>([
   "structured_page_limit_exceeded",
   "inspection_budget_exhausted",
   "inspection_acquisition_failed",
+  "unexpected_adapter_exception",
+  "context_length_exceeded",
 ]);
 const CORRELATION_HEADER_NAMES = new Set([
   "x-request-id",
@@ -61,7 +63,9 @@ export type AdapterFailureCode =
   | "result_page_too_large"
   | "structured_page_limit_exceeded"
   | "inspection_budget_exhausted"
-  | "inspection_acquisition_failed";
+  | "inspection_acquisition_failed"
+  | "unexpected_adapter_exception"
+  | "context_length_exceeded";
 
 export type AdapterRetryOutcome = "not_attempted" | "succeeded" | "exhausted";
 
@@ -112,6 +116,24 @@ export interface AdapterFailureDiagnostics {
   provider_error_message?: string;
   error_body_truncated?: boolean;
   error_body_unavailable?: boolean;
+  exception_name?: string;
+  exception_message?: string;
+  stack_fingerprint?: string;
+  last_operation?: string;
+  context_error_class?: "context_too_large";
+  input_tokens?: number;
+  limit_tokens?: number;
+  budget_source?:
+    | "configured"
+    | "model_metadata"
+    | "conservative_default"
+    | "provider_feedback";
+  token_estimation?: "utf8_upper_bound";
+  input_budget_tokens?: number;
+  output_reserve_tokens?: number;
+  estimated_input_tokens?: number;
+  context_window_tokens?: number;
+  segment_index?: number;
   finish_reason?: string;
   content_types?: string[];
   response_bytes?: number;
@@ -355,6 +377,79 @@ function sanitizeDiagnostics(
   const diagnostics: AdapterFailureDiagnostics = {
     ...Object.fromEntries(
       [
+        ["exception_name", sanitizedText(input.exception_name, 64)],
+        ["exception_message", sanitizedText(input.exception_message, 512)],
+        ["last_operation", sanitizedText(input.last_operation, 64)],
+        [
+          "context_error_class",
+          input.context_error_class === "context_too_large"
+            ? input.context_error_class
+            : undefined,
+        ],
+        [
+          "input_tokens",
+          finiteInteger(input.input_tokens, 0, Number.MAX_SAFE_INTEGER),
+        ],
+        [
+          "limit_tokens",
+          finiteInteger(input.limit_tokens, 1, Number.MAX_SAFE_INTEGER),
+        ],
+        [
+          "stack_fingerprint",
+          typeof input.stack_fingerprint === "string" &&
+          /^[a-f0-9]{64}$/u.test(input.stack_fingerprint)
+            ? input.stack_fingerprint
+            : undefined,
+        ],
+        [
+          "budget_source",
+          [
+            "configured",
+            "model_metadata",
+            "conservative_default",
+            "provider_feedback",
+          ].includes(input.budget_source ?? "")
+            ? input.budget_source
+            : undefined,
+        ],
+        [
+          "token_estimation",
+          input.token_estimation === "utf8_upper_bound"
+            ? input.token_estimation
+            : undefined,
+        ],
+        [
+          "input_budget_tokens",
+          finiteInteger(input.input_budget_tokens, 0, Number.MAX_SAFE_INTEGER),
+        ],
+        [
+          "output_reserve_tokens",
+          finiteInteger(
+            input.output_reserve_tokens,
+            0,
+            Number.MAX_SAFE_INTEGER,
+          ),
+        ],
+        [
+          "estimated_input_tokens",
+          finiteInteger(
+            input.estimated_input_tokens,
+            0,
+            Number.MAX_SAFE_INTEGER,
+          ),
+        ],
+        [
+          "context_window_tokens",
+          finiteInteger(
+            input.context_window_tokens,
+            0,
+            Number.MAX_SAFE_INTEGER,
+          ),
+        ],
+        [
+          "segment_index",
+          finiteInteger(input.segment_index, 0, Number.MAX_SAFE_INTEGER),
+        ],
         ["model", sanitizedText(input.model, 256)],
         ["operation_phase", sanitizedText(input.operation_phase, 64)],
         ["provider_error_code", sanitizedText(input.provider_error_code, 128)],

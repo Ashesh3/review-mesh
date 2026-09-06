@@ -398,9 +398,35 @@ export const adapterFailureDiagnosticsSchema = z.strictObject({
       "structured_page_limit_exceeded",
       "inspection_budget_exhausted",
       "inspection_acquisition_failed",
+      "unexpected_adapter_exception",
+      "context_length_exceeded",
     ])
     .optional(),
   failure_stage: z.string().min(1).max(64).optional(),
+  exception_name: z.string().max(64).optional(),
+  exception_message: z.string().max(512).optional(),
+  stack_fingerprint: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/u)
+    .optional(),
+  last_operation: z.string().max(64).optional(),
+  context_error_class: z.literal("context_too_large").optional(),
+  input_tokens: nonNegativeInteger.optional(),
+  limit_tokens: nonNegativeInteger.optional(),
+  budget_source: z
+    .enum([
+      "configured",
+      "model_metadata",
+      "conservative_default",
+      "provider_feedback",
+    ])
+    .optional(),
+  token_estimation: z.literal("utf8_upper_bound").optional(),
+  input_budget_tokens: nonNegativeInteger.optional(),
+  output_reserve_tokens: nonNegativeInteger.optional(),
+  estimated_input_tokens: nonNegativeInteger.optional(),
+  context_window_tokens: nonNegativeInteger.optional(),
+  segment_index: nonNegativeInteger.optional(),
   model: z.string().min(1).max(256).optional(),
   operation_phase: z.string().min(1).max(64).optional(),
   inspection_turn: nonNegativeInteger.optional(),

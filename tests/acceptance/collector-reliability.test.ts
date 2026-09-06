@@ -51,12 +51,21 @@ it.skipIf(!enabled)(
       );
     const delivered = new Map<string, Map<string, Array<[number, number]>>>();
     let providerCalls = 0;
+    const capacities = [64000, 96000, 128000, 192000, 256000];
     const server = createServer((req, res) => {
       res.setHeader("content-type", "application/json");
       if (req.url === "/v1/models") {
         res.end(
           JSON.stringify({
-            data: Array.from({ length: 5 }, (_, i) => ({ id: `model-${i}` })),
+            data: Array.from({ length: 5 }, (_, i) => ({
+              id: `model-${i}`,
+              capabilities: {
+                limits: {
+                  max_context_window_tokens: capacities[i],
+                  max_output_tokens: 8192,
+                },
+              },
+            })),
           }),
         );
         return;
@@ -66,11 +75,74 @@ it.skipIf(!enabled)(
       req.on("end", () => {
         try {
           const body = JSON.parse(Buffer.concat(chunks).toString());
+          expect(Buffer.byteLength(JSON.stringify(body)) + 256).toBeLessThan(
+            capacities[Number(body.model.split("-")[1])]! - 8192,
+          );
           providerCalls++;
           const key = String(req.headers["x-client-session-id"]);
           const byFile =
             delivered.get(key) ?? new Map<string, Array<[number, number]>>();
           delivered.set(key, byFile);
+          const segment = body.messages.flatMap((m: { content: unknown }) => {
+            try {
+              const value = JSON.parse(String(m.content));
+              return value.kind === "review-mesh.segment" ? [value] : [];
+            } catch {
+              return [];
+            }
+          })[0];
+          if (segment) {
+            for (const range of segment.source_ranges.filter(
+              (r: { kind: string }) => r.kind === "snapshot",
+            )) {
+              const bytes = Buffer.from(range.content, "utf8");
+              expect(
+                bytes.equals(
+                  expected
+                    .get(range.path)!
+                    .subarray(range.offset, range.offset + range.byte_count),
+                ),
+              ).toBe(true);
+              const seen = byFile.get(range.path) ?? [];
+              seen.push([range.offset, range.offset + range.byte_count]);
+              byFile.set(range.path, seen);
+            }
+            res.end(
+              JSON.stringify({
+                choices: [
+                  {
+                    message: {
+                      role: "assistant",
+                      content: JSON.stringify({
+                        summary:
+                          "Synthetic bounded-source checkpoint; quality not evaluated.",
+                        findings: [],
+                        unresolved_questions: [],
+                        resolved_question_ids: [],
+                        follow_up_reads: [],
+                        scenario_checks: [
+                          {
+                            path:
+                              segment.source_ranges.find(
+                                (r: { kind: string }) => r.kind === "snapshot",
+                              )?.path ?? "source-0.txt",
+                            start_line: 1,
+                            end_line: 1,
+                            input: 1,
+                            expected: 1,
+                            observed: 1,
+                            reasoning: "Synthetic infrastructure fixture only.",
+                          },
+                        ],
+                      }),
+                    },
+                    finish_reason: "stop",
+                  },
+                ],
+              }),
+            );
+            return;
+          }
           for (const message of body.messages) {
             if (
               typeof message.content !== "string" ||
@@ -274,7 +346,7 @@ agents=["collector"]
       });
       expect(events.map((e) => e.seq)).toEqual(events.map((_, i) => i + 1));
       expect(delivered.size).toBe(5);
-      expect(providerCalls).toBeLessThan(40);
+      expect(providerCalls).toBeLessThan(400);
       const report = await execute(
         binary,
         ["report", terminal.run_id, "--format", "markdown"],

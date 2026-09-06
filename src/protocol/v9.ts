@@ -793,6 +793,14 @@ const progressData = z.strictObject({
   queue_reason: z.enum(["provider_limit", "execution_limit"]).optional(),
   queued_at: timestampSchema.optional(),
   inspection: inspectionProgressSchema.optional(),
+  segment: z
+    .strictObject({
+      index: nonNegativeInteger,
+      phase: z.enum(["evidence", "synthesis"]),
+      input_budget_tokens: nonNegativeInteger,
+      estimated_input_tokens: nonNegativeInteger,
+    })
+    .optional(),
   workload: snapshotWorkloadSchema.optional(),
 });
 const publicEventV6BaseSchema = z.discriminatedUnion("event", [

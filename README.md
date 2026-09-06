@@ -1,9 +1,10 @@
 # Review Mesh
 
-[v9.4.0](docs/releases/v9.4.0.md) fixes timeout cancellation cascades, delivers
-required source ranges deterministically, preserves evidence and candidate
-findings across retries, and renders complete structured diagnostics. Snapshot
-manifests are shared across reviewers; strict evidence and quorum remain enforced.
+[v9.5.0](docs/releases/v9.5.0.md) adds model-aware request budgets, bounded
+evidence segments, BOM-safe readable source, recoverable tool errors and complete
+adjudication assignments. [Quality evaluation](docs/quality-evaluation.md) scores
+actual model reports against independent synthetic behavior oracles. Strict
+evidence and quorum remain enforced.
 
 The [v9.2.0 pilot fixes](docs/releases/v9.2.0.md) add recoverable coverage reads,
 admission-based execution budgets, retained-conversation page repair, compact

@@ -73,6 +73,15 @@ export const adapterRegistrationSchema = z.discriminatedUnion("type", [
     base_url_env: nonEmptyString,
     api_key_env: nonEmptyString,
     streaming: z.enum(["auto", "required", "disabled"]).optional(),
+    semantic_checkpoints: z.boolean().optional(),
+    context_window_tokens: z
+      .number()
+      .int()
+      .min(8192)
+      .max(16_000_000)
+      .optional(),
+    max_input_tokens: z.number().int().min(4096).max(16_000_000).optional(),
+    max_output_tokens: z.number().int().min(1024).max(65536).optional(),
   }),
   z.strictObject({
     type: z.literal("command"),

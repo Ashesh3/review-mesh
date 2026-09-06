@@ -15,6 +15,23 @@ export const MAX_REVIEWER_RESULT_BYTES = 16 * 1_024 * 1_024;
 
 const REDACTED = "[redacted]";
 const SENSITIVE_KEY = /token|secret|password|authorization|api[_-]?key/iu;
+const TOKEN_STATISTIC_KEYS = new Set([
+  "input_tokens",
+  "limit_tokens",
+  "input_budget_tokens",
+  "output_reserve_tokens",
+  "estimated_input_tokens",
+  "context_window_tokens",
+]);
+function safeTokenStatistic(key: string, value: unknown): boolean {
+  return (
+    (TOKEN_STATISTIC_KEYS.has(key) &&
+      typeof value === "number" &&
+      Number.isSafeInteger(value) &&
+      value >= 0) ||
+    (key === "token_estimation" && value === "utf8_upper_bound")
+  );
+}
 const SENSITIVE_QUERY_KEY =
   /^(?:api[_-]?key|access[_-]?token|authorization|auth|client[_-]?secret|password|secret|accountkey)$/iu;
 const SENSITIVE_QUERY_VALUE =
@@ -164,9 +181,10 @@ function sanitizeValue(value: unknown): unknown {
   if (typeof value === "object") {
     const sanitized = Object.create(null) as Record<string, unknown>;
     for (const [key, child] of Object.entries(value)) {
-      sanitized[key] = SENSITIVE_KEY.test(key)
-        ? REDACTED
-        : sanitizeValue(child);
+      sanitized[key] =
+        SENSITIVE_KEY.test(key) && !safeTokenStatistic(key, child)
+          ? REDACTED
+          : sanitizeValue(child);
     }
     return sanitized;
   }

@@ -21,6 +21,16 @@ export function resultPageRequestMessage(
     page_index: request.pageIndex,
     previous_page_digest: request.previousPageDigest,
     candidate_ids: [...request.candidateIds],
+    ...(request.adjudication === undefined
+      ? {}
+      : {
+          candidate_count: request.adjudication.candidateCount,
+          candidate_ids_digest: request.adjudication.candidateIdsDigest,
+          assigned_candidate_ids: request.adjudication.assignedCandidateIds,
+          accepted_decision_ids: request.adjudication.acceptedDecisionIds,
+          missing_decision_ids: request.adjudication.missingDecisionIds,
+          preserved_decisions: request.adjudication.preservedDecisions,
+        }),
     ...(request.pageCount === undefined
       ? {}
       : { page_count: request.pageCount }),
@@ -87,6 +97,21 @@ export function resultPageSchemaFor(
     properties.page_index = { type: "integer", const: request.pageIndex };
     if (request.pageCount !== undefined)
       properties.page_count = { type: "integer", const: request.pageCount };
+    if (request.pageIndex === 0 && request.adjudication !== undefined) {
+      const payloadProperties = objectValue(
+        objectValue(properties.payload)?.properties,
+      );
+      if (payloadProperties !== undefined) {
+        payloadProperties.candidate_count = {
+          type: "integer",
+          const: request.adjudication.candidateCount,
+        };
+        payloadProperties.candidate_ids_digest = {
+          type: "string",
+          const: request.adjudication.candidateIdsDigest,
+        };
+      }
+    }
     if (request.pageIndex === 0 && resultKind === "reviewer") {
       const payloadProperties = objectValue(
         objectValue(properties.payload)?.properties,

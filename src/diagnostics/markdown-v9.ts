@@ -24,7 +24,8 @@ export function renderV9Markdown(input: ReturnType<typeof v9Report>): string {
     "",
     `Artifact: ${code(report.artifact.path)}`,
     `Elapsed: ${report.total_elapsed_ms === undefined ? "unavailable" : `${report.total_elapsed_ms} ms`}.`,
-    `Execution coverage: ${report.execution_coverage.status}; changed-file coverage: ${report.change_coverage.status}.`,
+    `Execution coverage: ${report.execution_coverage.status}; changed-file source delivery: ${report.change_coverage.status}.`,
+    "Source delivery records available evidence. Scenario checks below are model reasoning unless independently executed by an evaluator.",
     "",
   ];
   if (report.public_delivery_failure)
@@ -105,6 +106,29 @@ export function renderV9Markdown(input: ReturnType<typeof v9Report>): string {
       lines.push(
         `Inspection preflight: ${code(JSON.stringify(object(preflight.data)))}`,
       );
+    const segments = report.segments.filter(
+      (segment) => segment.reviewer_id === reviewer.reviewer_id,
+    );
+    if (segments.length) {
+      lines.push("", "Segment analysis (model reasoning):", "");
+      for (const segment of segments) {
+        lines.push(
+          `- ${code(segment.segment_id)} (${plain(segment.phase)}): ${plain(segment.summary)}`,
+        );
+        if (Array.isArray(segment.source_refs) && segment.source_refs.length)
+          lines.push(
+            `  Source references: ${code(JSON.stringify(segment.source_refs))}`,
+          );
+        for (const check of segment.scenario_checks)
+          lines.push(
+            `  Scenario claim, not runtime-verified: ${code(JSON.stringify(check))}`,
+          );
+        if (segment.unresolved_questions.length)
+          lines.push(
+            `  Unresolved questions: ${code(JSON.stringify(segment.unresolved_questions))}`,
+          );
+      }
+    }
     if (reviewer.result) {
       if (!accepted)
         lines.push("Retained structured result; not accepted for clearance.");

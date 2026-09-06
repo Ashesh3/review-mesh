@@ -332,23 +332,26 @@ describe("inspection recovery", () => {
     const f = await fixture("x".repeat(150 * 1024));
     let toolTurns = 0;
     let finalizations = 0;
-    const adapter = createOpenAICompatibleAdapter(registration, {
-      environment,
-      maxTurns: 2,
-      fetch: async (_url, init) => {
-        const body = JSON.parse(String(init?.body));
-        if (body.response_format) {
-          finalizations++;
-          return done();
-        }
-        toolTurns++;
-        return read(
-          "changed.txt",
-          toolTurns === 1 ? 0 : 128 * 1024,
-          toolTurns === 1 ? 128 * 1024 : 22 * 1024,
-        );
+    const adapter = createOpenAICompatibleAdapter(
+      { ...registration, context_window_tokens: 4_000_000 },
+      {
+        environment,
+        maxTurns: 2,
+        fetch: async (_url, init) => {
+          const body = JSON.parse(String(init?.body));
+          if (body.response_format) {
+            finalizations++;
+            return done();
+          }
+          toolTurns++;
+          return read(
+            "changed.txt",
+            toolTurns === 1 ? 0 : 128 * 1024,
+            toolTurns === 1 ? 128 * 1024 : 22 * 1024,
+          );
+        },
       },
-    });
+    );
     try {
       const result = await collect(adapter, f.input);
       expect(result.terminal.type).toBe("result");
@@ -363,14 +366,17 @@ describe("inspection recovery", () => {
     const source = "Readable café 東京 source line\n".repeat(12_000);
     const f = await fixture(source);
     const bodies: any[] = [];
-    const adapter = createOpenAICompatibleAdapter(registration, {
-      environment,
-      fetch: async (_url, init) => {
-        const body = JSON.parse(String(init?.body));
-        bodies.push(body);
-        return body.response_format ? done() : ready();
+    const adapter = createOpenAICompatibleAdapter(
+      { ...registration, context_window_tokens: 4_000_000 },
+      {
+        environment,
+        fetch: async (_url, init) => {
+          const body = JSON.parse(String(init?.body));
+          bodies.push(body);
+          return body.response_format ? done() : ready();
+        },
       },
-    });
+    );
     try {
       const result = await collect(adapter, f.input);
       expect(result.terminal.type).toBe("result");
@@ -583,7 +589,7 @@ describe("provider error explanations", () => {
         },
       });
       expect(JSON.stringify(result.terminal)).toContain(
-        "Context limit exceeded",
+        "Model context limit exceeded.",
       );
       expect(JSON.stringify(result.terminal)).not.toContain(source);
       expect(JSON.stringify(result.terminal)).not.toContain(environment.KEY);
@@ -636,7 +642,7 @@ describe("provider error explanations", () => {
     [
       "text/plain",
       "Request exceeds the context window",
-      "Request exceeds the context window",
+      "Model context limit exceeded.",
     ],
     [
       "text/html",

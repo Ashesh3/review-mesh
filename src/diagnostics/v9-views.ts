@@ -93,6 +93,28 @@ export function v9Headline(run: NormalizedRun): string {
           : "Clear";
   return `${title}: ${run.coverage_outcome} coverage; ${counts.gate_eligible_subfindings} gate findings; ${counts.non_gating_subfindings} non-gating subfindings; ${run.summary.incomplete_lenses ?? 0} lenses incomplete.`;
 }
+
+function segmentSummary(record: Record<string, unknown>) {
+  const envelope = record.data as Record<string, unknown>;
+  const data = envelope.data as Record<string, unknown>;
+  return {
+    reviewer_id: record.reviewer_id,
+    attempt: envelope.attempt,
+    segment_id: envelope.segment_id,
+    index: envelope.index,
+    phase: envelope.phase,
+    provenance: "model_reasoning",
+    summary: data.summary,
+    source_refs: data.source_ranges ?? data.source_refs ?? data.sources ?? [],
+    runtime_validation: data.runtime_validation ?? "not_executed",
+    scenario_checks: Array.isArray(data.scenario_checks)
+      ? data.scenario_checks.slice(0, 8)
+      : [],
+    unresolved_questions: Array.isArray(data.unresolved_questions)
+      ? data.unresolved_questions
+      : [],
+  };
+}
 export function v9Report(
   run: NormalizedRun,
   options: { includeRaw?: boolean } = {},
@@ -153,6 +175,9 @@ export function v9Report(
     preflight: records.filter(
       (record) => record.record === "reviewer.preflight",
     ),
+    segments: records
+      .filter((record) => record.record === "reviewer.segment")
+      .map(segmentSummary),
     review_profile: run.summary.review_profile,
     clean_pass_unreachable: run.summary.clean_pass_unreachable ?? [],
     total_clean_pass_unreachable: run.summary.total_clean_pass_unreachable ?? 0,
@@ -166,6 +191,7 @@ export function v9Report(
         if (options.includeRaw) return record;
         const {
           candidate: _candidate,
+          decision: _decision,
           raw_excerpt: _excerpt,
           ...summary
         } = record.data as Record<string, unknown>;
@@ -187,14 +213,89 @@ export function v9Status(
     result_byte_count: reviewer.byte_count,
   }));
   if (reviewerId !== undefined) {
-    const reviewer = reviewers.find((item) => item.reviewer_id === reviewerId);
+    // A running reviewer may have no result/private terminal yet. Its attempts
+    // still belong to the configured live roster and must remain inspectable.
+    const reviewer =
+      reviewers.find((item) => item.reviewer_id === reviewerId) ??
+      projectDashboardRun(run).reviewers.find(
+        (item) => item.reviewer_id === reviewerId,
+      );
     if (!reviewer) throw new Error("Reviewer not found.");
-    return {
+    const selected = run.records.filter(
+      (record) => record.reviewer_id === reviewerId,
+    );
+    const attempts = selected.filter(
+      (record) => record.record === "reviewer.attempt",
+    );
+    const data = attempts.map(
+      (record) => record.data as Record<string, unknown>,
+    );
+    const latest = data
+      .slice()
+      .reverse()
+      .find((attempt) => attempt.failure !== undefined);
+    const first = data[0],
+      last = data.at(-1);
+    const timing = {
+      total_elapsed_ms: data.reduce(
+        (total, attempt) =>
+          total +
+          (typeof attempt.elapsed_ms === "number" ? attempt.elapsed_ms : 0),
+        0,
+      ),
+      ...(first?.started_at === undefined
+        ? {}
+        : { started_at: first.started_at }),
+      ...(last?.ended_at === undefined ? {} : { ended_at: last.ended_at }),
+      ...(last?.elapsed_ms === undefined
+        ? {}
+        : { latest_attempt_elapsed_ms: last.elapsed_ms }),
+    };
+    return sanitizeDashboardValue({
       schema_version: "3",
       kind: "review-mesh.run-status",
       run_id: run.run_id,
       ...reviewer,
-    };
+      attempt_count: attempts.length,
+      timing,
+      ...(latest
+        ? {
+            latest_failure: {
+              ...(latest.failure as Record<string, unknown>),
+              attempt: latest.attempt,
+              elapsed_ms: latest.elapsed_ms,
+              ...(latest.started_at === undefined
+                ? {}
+                : { started_at: latest.started_at }),
+              ...(latest.ended_at === undefined
+                ? {}
+                : { ended_at: latest.ended_at }),
+            },
+          }
+        : {}),
+      ...(details
+        ? {
+            attempts,
+            preflight: selected.filter(
+              (record) => record.record === "reviewer.preflight",
+            ),
+            unverified_drafts: selected
+              .filter((record) => record.record === "reviewer.draft")
+              .map((record) => {
+                const {
+                  raw_excerpt: _excerpt,
+                  candidate: _candidate,
+                  decision: _decision,
+                  ...metadata
+                } = record.data as Record<string, unknown>;
+                return { ...record, data: metadata };
+              }),
+            segments: selected
+              .filter((record) => record.record === "reviewer.segment")
+              .map(segmentSummary),
+          }
+        : {}),
+    });
   }
   if (details)
     return {

@@ -454,6 +454,7 @@ describe("OpenAI-compatible adapter", () => {
         coverage,
         prompt: buildReviewerPrompt({ context, reviewer: resolvedReviewer() }),
       },
+      { ...registration, context_window_tokens: 4_000_000 },
     );
     try {
       const output = await collect(prepared.adapter, prepared.input);

@@ -59,7 +59,20 @@ it.skipIf(!enabled)(
       if (request.url === "/v1/models") {
         response.end(
           JSON.stringify({
-            data: [{ id: "gpt-6-astra" }, { id: "claude-opus-5" }],
+            data: [
+              {
+                id: "gpt-6-astra",
+                capabilities: {
+                  limits: { max_context_window_tokens: 1000000 },
+                },
+              },
+              {
+                id: "claude-opus-5",
+                capabilities: {
+                  limits: { max_context_window_tokens: 1000000 },
+                },
+              },
+            ],
           }),
         );
         return;

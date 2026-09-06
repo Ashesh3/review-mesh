@@ -10,6 +10,7 @@ import {
   v9FindingConfidenceSchema,
   deliveryFailureSchema,
   snapshotWorkloadSchema,
+  actionableFindingV4Schema,
 } from "../protocol/v9.js";
 import { runFindingsPayloadSchema } from "./artifact-record-schemas.js";
 
@@ -133,9 +134,32 @@ export const failureDiagnosticsSchema = z.strictObject({
       "structured_page_limit_exceeded",
       "inspection_budget_exhausted",
       "inspection_acquisition_failed",
+      "unexpected_adapter_exception",
+      "context_length_exceeded",
     ])
     .optional(),
   failure_stage: z.string().min(1).max(64).optional(),
+  exception_name: text.max(64).optional(),
+  exception_message: text.max(512).optional(),
+  stack_fingerprint: digest.optional(),
+  last_operation: text.max(64).optional(),
+  context_error_class: z.literal("context_too_large").optional(),
+  input_tokens: count.optional(),
+  limit_tokens: count.optional(),
+  budget_source: z
+    .enum([
+      "configured",
+      "model_metadata",
+      "conservative_default",
+      "provider_feedback",
+    ])
+    .optional(),
+  token_estimation: z.literal("utf8_upper_bound").optional(),
+  input_budget_tokens: count.optional(),
+  output_reserve_tokens: count.optional(),
+  estimated_input_tokens: count.optional(),
+  context_window_tokens: count.optional(),
+  segment_index: count.optional(),
   model: z.string().min(1).max(256).optional(),
   operation_phase: z.string().min(1).max(64).optional(),
   inspection_turn: count.optional(),
@@ -395,6 +419,60 @@ export const artifactAttemptV1Schema = z.strictObject({
 });
 
 export const privatePayloadSchemas: Record<string, z.ZodType> = {
+  "reviewer.exception": z.strictObject({
+    attempt: count,
+    diagnostics: failureDiagnosticsSchema,
+  }),
+  "reviewer.segment": z
+    .strictObject({
+      attempt: count,
+      segment_id: id,
+      index: count,
+      phase: z.enum(["evidence", "synthesis"]),
+      data: z.strictObject({
+        provenance: z.literal("model_reasoning"),
+        runtime_validation: z.literal("not_executed"),
+        summary: text.max(512),
+        findings: z.array(actionableFindingV4Schema).max(16),
+        unresolved_questions: z
+          .array(z.strictObject({ id: id, question: text.max(1024) }))
+          .max(32),
+        scenario_checks: z
+          .array(
+            z
+              .strictObject({
+                path: text.max(1024),
+                start_line: count,
+                end_line: count,
+                input: z.json(),
+                expected: z.json(),
+                observed: z.json(),
+                reasoning: text.min(1).max(1024),
+                finding_id: text.max(256).optional(),
+              })
+              .refine(
+                (value) =>
+                  value.start_line > 0 && value.end_line >= value.start_line,
+              ),
+          )
+          .min(1)
+          .max(8),
+        source_ranges: z
+          .array(
+            z.strictObject({
+              kind: z.enum(["snapshot", "diff", "context"]),
+              path: text.max(1024),
+              offset: count,
+              byte_count: count,
+              sha256: digest,
+              snapshot_digest: digest.optional(),
+            }),
+          )
+          .max(8),
+        budget: failureDiagnosticsSchema,
+      }),
+    })
+    .refine((value) => Buffer.byteLength(JSON.stringify(value)) <= 512 * 1024),
   "reviewer.preflight": snapshotWorkloadSchema.extend({
     lens_id: id,
     model_runs: count,
@@ -412,6 +490,11 @@ export const privatePayloadSchemas: Record<string, z.ZodType> = {
   }),
   "reviewer.draft": z
     .strictObject({
+      result_kind: z.enum(["reviewer", "adjudication"]).optional(),
+      assigned_candidate_ids: z.array(text.max(256)).max(256).optional(),
+      accepted_decision_ids: z.array(text.max(256)).max(256).optional(),
+      missing_decision_ids: z.array(text.max(256)).max(256).optional(),
+      decision: z.record(z.string(), z.unknown()).optional(),
       kind: z.literal("unverified_result_draft"),
       checkpoint_id: text.max(256),
       attempt: count,

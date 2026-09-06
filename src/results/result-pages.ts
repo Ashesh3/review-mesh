@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { AdapterValidationIssue } from "../adapters/errors.js";
 import {
   adjudicationResultV2Schema,
+  adjudicationDecisionV2Schema,
   actionableFindingV4Schema,
   coverageAttestationSchema,
   providerReviewerResultV4Schema,
@@ -152,6 +153,14 @@ export interface ResultPageRequest {
   minimumCoverageEntries?: number;
   coverageScopeDigest?: string;
   acceptedCandidateIds?: readonly string[];
+  adjudication?: {
+    candidateCount: number;
+    candidateIdsDigest: string;
+    assignedCandidateIds: readonly string[];
+    acceptedDecisionIds: readonly string[];
+    missingDecisionIds: readonly string[];
+    preservedDecisions: readonly AdjudicationDecisionV2[];
+  };
 }
 
 export interface ResultPageDraft {
@@ -159,6 +168,13 @@ export interface ResultPageDraft {
   candidateIds: string[];
   candidates: Record<string, unknown>[];
   unresolvedObligations: string[];
+  adjudication?: {
+    assignedCandidateIds: string[];
+    acceptedDecisionIds: string[];
+    missingDecisionIds: string[];
+  };
+  decisions?: Record<string, unknown>[];
+  metadataCorrections?: AdapterValidationIssue[];
 }
 
 export interface ResultPagePreservation {
@@ -169,6 +185,8 @@ export interface ResultPagePreservation {
   narrativeFragments: number;
   coverageEntries: number;
   coverageScopeDigest?: string;
+  adjudicationAssignment?: string[];
+  decisions: Map<string, AdjudicationDecisionV2>;
 }
 
 /** One model's obligations survive both result-production and outer attempts. */
@@ -180,6 +198,7 @@ export function createResultPagePreservation(): ResultPagePreservation {
     candidates: new Map(),
     narrativeFragments: 0,
     coverageEntries: 0,
+    decisions: new Map(),
   };
 }
 
@@ -191,6 +210,9 @@ export interface ResultPageCollector {
   draft(): ResultPageDraft;
   restart(): ResultPageCollector;
   repairAssembly(): ResultPageCollector | undefined;
+  preserveFindings(
+    findings: readonly ProviderReviewerResultV4["actionable_findings"][number][],
+  ): void;
 }
 
 export interface ResultPageCollectorOptions {
@@ -222,30 +244,18 @@ function fail(
   throw new ResultPageError(reason, message, details);
 }
 
-function assertExactIds(
-  actual: readonly string[],
-  expected: readonly string[],
-  label: string,
-  raw?: string,
-): void {
-  if (
-    actual.length !== expected.length ||
-    actual.some((id, index) => id !== expected[index])
-  ) {
-    fail(
-      "protocol_violation",
-      `${label} must contain the exact assigned IDs in order`,
-      raw,
-    );
-  }
-}
-
 export function createResultPageCollector(
   options: ResultPageCollectorOptions,
   preservation: ResultPagePreservation = options.preservation ??
     createResultPagePreservation(),
 ): ResultPageCollector {
   const candidateIds = [...(options.candidateIds ?? [])];
+  if (
+    candidateIds.some(
+      (id) => typeof id !== "string" || id.length === 0 || id.length > 256,
+    )
+  )
+    fail("protocol_violation", "candidate IDs must contain 1-256 characters");
   if (new Set(candidateIds).size !== candidateIds.length) {
     fail("protocol_violation", "candidate IDs must be unique");
   }
@@ -261,6 +271,52 @@ export function createResultPageCollector(
       "adjudication accepts at most 256 candidate IDs",
     );
   }
+  if (options.resultKind === "adjudication") {
+    if (
+      preservation.adjudicationAssignment !== undefined &&
+      canonicalJson(preservation.adjudicationAssignment) !==
+        canonicalJson(candidateIds)
+    )
+      fail(
+        "protocol_violation",
+        "Adjudication candidate assignment changed across attempts",
+      );
+    preservation.adjudicationAssignment ??= [...candidateIds];
+  }
+  const adjudicationPageCount =
+    options.resultKind === "adjudication"
+      ? 1 + Math.ceil(candidateIds.length / 4)
+      : undefined;
+  const candidateIdsDigest = sha256(JSON.stringify(candidateIds));
+  const metadataCorrections: AdapterValidationIssue[] = [];
+  const structuralIssue = (
+    path: string,
+    expected: number | string,
+    actual: unknown,
+  ): AdapterValidationIssue => ({
+    path,
+    code: "host_owned_metadata",
+    message: `Expected ${expected}; received ${typeof actual === "number" || (typeof actual === "string" && /^[a-f0-9]{64}$/.test(actual)) ? actual : actual === undefined ? "missing" : `type ${typeof actual}`}. Host metadata is authoritative.`,
+  });
+  const decisionAssignmentFailure = (
+    actual: readonly string[],
+    expected: readonly string[],
+    raw?: string,
+  ): never => {
+    const error = new ResultPageError(
+      "protocol_violation",
+      "Adjudication decisions must contain the exact assigned IDs in order",
+      raw === undefined
+        ? {}
+        : { receivedRaw: raw, receivedBytes: Buffer.byteLength(raw) },
+    );
+    error.validationIssues.push({
+      path: "payload.decisions",
+      code: "invalid_assignment",
+      message: `Expected ${expected.length}; received ${actual.length} decision IDs. Missing ${expected.filter((id) => !actual.includes(id)).length}; foreign ${actual.filter((id) => !expected.includes(id)).length}; duplicates ${actual.length - new Set(actual).size}; order must match the assignment.`,
+    });
+    throw error;
+  };
 
   const accepted: Array<{ raw: string; page: ResultPage }> = [];
   let pageCount: number | undefined;
@@ -321,7 +377,11 @@ export function createResultPageCollector(
       pageIndex: accepted.length,
       previousPageDigest: last === undefined ? null : sha256(last.raw),
       candidateIds: assignedCandidateIds(accepted.length),
-      ...(pageCount === undefined ? {} : { pageCount }),
+      ...(adjudicationPageCount === undefined
+        ? pageCount === undefined
+          ? {}
+          : { pageCount }
+        : { pageCount: adjudicationPageCount }),
       expectedPageKind,
       ...(reviewerHeader === undefined
         ? {}
@@ -353,11 +413,63 @@ export function createResultPageCollector(
       ...(seenFindingIds.size === 0
         ? {}
         : { acceptedCandidateIds: [...seenFindingIds] }),
+      ...(options.resultKind !== "adjudication"
+        ? {}
+        : {
+            adjudication: {
+              candidateCount: candidateIds.length,
+              candidateIdsDigest,
+              assignedCandidateIds: [...candidateIds],
+              acceptedDecisionIds: [...seenDecisionIds],
+              missingDecisionIds: candidateIds.filter(
+                (id) => !seenDecisionIds.has(id),
+              ),
+              // Only the assigned page needs complete preserved content. Header and
+              // other pages receive IDs/counts without an unbounded transcript copy.
+              preservedDecisions: assignedCandidateIds(accepted.length).flatMap(
+                (id) => {
+                  const item = preservation.decisions.get(id);
+                  return item === undefined ? [] : [structuredClone(item)];
+                },
+              ),
+            },
+          }),
     };
   }
 
   function draft(): ResultPageDraft {
     const unresolvedObligations: string[] = [];
+    if (options.resultKind === "adjudication") {
+      const missingDecisionIds = candidateIds.filter(
+        (id) => !seenDecisionIds.has(id),
+      );
+      if (missingDecisionIds.length > 0)
+        unresolvedObligations.push(
+          `Complete ${missingDecisionIds.length} missing adjudication decisions in the assigned order; ${seenDecisionIds.size} of ${candidateIds.length} accepted in this assembly.`,
+        );
+      if (preservation.decisions.size > 0)
+        unresolvedObligations.push(
+          `Preserve ${preservation.decisions.size} validated decision items and their evidence across every repair; all remain unverified until complete adjudication.`,
+        );
+      return {
+        acceptedPageCount: accepted.length,
+        candidateIds: [...candidateIds],
+        candidates: [],
+        unresolvedObligations,
+        adjudication: {
+          assignedCandidateIds: [...candidateIds],
+          acceptedDecisionIds: [...seenDecisionIds],
+          missingDecisionIds,
+        },
+        decisions: candidateIds.flatMap((id) => {
+          const item = preservation.decisions.get(id);
+          return item === undefined ? [] : [structuredClone(item)];
+        }),
+        ...(metadataCorrections.length === 0
+          ? {}
+          : { metadataCorrections: [...metadataCorrections] }),
+      };
+    }
     const missing = [...preservation.candidateIds].filter(
       (id) => !seenFindingIds.has(id),
     );
@@ -477,6 +589,105 @@ export function createResultPageCollector(
         error,
       );
     }
+    // Representation bookkeeping is owned by the host. Keep `raw` untouched
+    // for transport digest chaining and persistence; normalize only the parsed
+    // adjudication view, and never synthesize or normalize decision content.
+    if (
+      options.resultKind === "adjudication" &&
+      typeof parsedJson === "object" &&
+      parsedJson !== null
+    ) {
+      const candidate = parsedJson as Record<string, unknown>;
+      if (
+        candidate.result_id === options.resultId &&
+        candidate.result_kind === "adjudication" &&
+        candidate.page_index === accepted.length
+      ) {
+        const correct = (
+          target: Record<string, unknown>,
+          key: string,
+          path: string,
+          expected: number | string,
+        ) => {
+          if (target[key] !== expected) {
+            if (metadataCorrections.length < 12)
+              metadataCorrections.push(
+                structuralIssue(path, expected, target[key]),
+              );
+            const actual = target[key];
+            const valid =
+              typeof expected === "string"
+                ? typeof actual === "string" && /^[a-f0-9]{64}$/.test(actual)
+                : typeof actual === "number" &&
+                  Number.isInteger(actual) &&
+                  actual >= (key === "page_count" ? 1 : 0) &&
+                  actual <= (key === "page_count" ? 65 : 256);
+            // Invalid raw pages still need a provider format repair so their
+            // exact persisted bytes remain readable by the existing schema.
+            if (!valid) return;
+            target[key] = expected;
+          }
+        };
+        correct(candidate, "page_count", "page_count", adjudicationPageCount!);
+        const payload = candidate.payload;
+        if (
+          typeof payload === "object" &&
+          payload !== null &&
+          !Array.isArray(payload)
+        ) {
+          if (candidate.page_kind === "header") {
+            correct(
+              payload as Record<string, unknown>,
+              "candidate_count",
+              "payload.candidate_count",
+              candidateIds.length,
+            );
+            correct(
+              payload as Record<string, unknown>,
+              "candidate_ids_digest",
+              "payload.candidate_ids_digest",
+              candidateIdsDigest,
+            );
+          }
+          if (
+            candidate.page_kind === "decisions" &&
+            candidate.previous_page_digest === nextRequest().previousPageDigest
+          ) {
+            const items = (payload as Record<string, unknown>).decisions;
+            const assigned = assignedCandidateIds(accepted.length);
+            if (Array.isArray(items))
+              for (const item of items.slice(0, 4)) {
+                const parsed = adjudicationDecisionV2Schema.safeParse(item);
+                if (
+                  !parsed.success ||
+                  !assigned.includes(parsed.data.source_finding_id)
+                )
+                  continue;
+                const id = parsed.data.source_finding_id;
+                const previous = preservation.decisions.get(id);
+                if (
+                  previous !== undefined &&
+                  canonicalJson(previous) !== canonicalJson(parsed.data)
+                ) {
+                  const error = new ResultPageError(
+                    "protocol_violation",
+                    "Repairs must preserve previously validated adjudication decision content",
+                    { receivedRaw: raw, receivedBytes: Buffer.byteLength(raw) },
+                  );
+                  error.validationIssues.push({
+                    path: "payload.decisions",
+                    code: "preserved_item_changed",
+                    message:
+                      "A previously validated decision or its evidence changed during repair.",
+                  });
+                  throw error;
+                }
+                preservation.decisions.set(id, parsed.data);
+              }
+          }
+        }
+      }
+    }
     if (typeof parsedJson === "object" && parsedJson !== null) {
       const candidate = parsedJson as Record<string, unknown>;
       const payload = candidate.payload as Record<string, unknown> | undefined;
@@ -486,7 +697,11 @@ export function createResultPageCollector(
         payload !== undefined &&
         payload !== null
       ) {
-        if (candidate.page_kind === "header" && payload.verdict === "fail")
+        if (
+          options.resultKind === "reviewer" &&
+          candidate.page_kind === "header" &&
+          payload.verdict === "fail"
+        )
           preservation.verdictFail = retainedVerdictFail = true;
         if (
           candidate.page_kind === "header" &&
@@ -710,7 +925,11 @@ export function createResultPageCollector(
       decisionIds = page.payload.decisions.map(
         (decision) => decision.source_finding_id,
       );
-      assertExactIds(decisionIds, request.candidateIds, "decision page", raw);
+      if (
+        decisionIds.length !== request.candidateIds.length ||
+        decisionIds.some((id, index) => id !== request.candidateIds[index])
+      )
+        decisionAssignmentFailure(decisionIds, request.candidateIds, raw);
       if (decisionIds.some((id) => seenDecisionIds.has(id))) {
         fail("protocol_violation", "candidate IDs must not repeat", raw);
       }
@@ -831,23 +1050,17 @@ export function createResultPageCollector(
     ) {
       fail("invalid_result", "adjudication header is missing");
     }
-    if (
-      header.payload.candidate_count !== candidateIds.length ||
-      header.payload.candidate_ids_digest !==
-        sha256(JSON.stringify(candidateIds))
-    ) {
-      fail("invalid_result", "candidate count or digest declaration is false");
-    }
     const decisions = accepted.flatMap(({ page }) =>
       page.result_kind === "adjudication" && page.page_kind === "decisions"
         ? page.payload.decisions
         : [],
     ) as AdjudicationDecisionV2[];
-    assertExactIds(
-      decisions.map((decision) => decision.source_finding_id),
-      candidateIds,
-      "assembled adjudication",
-    );
+    const actualIds = decisions.map((decision) => decision.source_finding_id);
+    if (
+      actualIds.length !== candidateIds.length ||
+      actualIds.some((id, index) => id !== candidateIds[index])
+    )
+      decisionAssignmentFailure(actualIds, candidateIds);
     try {
       return adjudicationResultV2Schema.parse(
         sanitizeReviewerOutput({
@@ -880,6 +1093,20 @@ export function createResultPageCollector(
       return pageCount !== undefined && accepted.length === pageCount;
     },
     nextRequest,
+    preserveFindings(findings) {
+      for (const finding of findings) {
+        const existing = preservation.candidates.get(finding.id);
+        if (existing && canonicalJson(existing) !== canonicalJson(finding))
+          fail("invalid_result", "A segment changed a preserved finding");
+        preservation.candidates.set(finding.id, structuredClone(finding));
+        preservation.candidateIds.add(finding.id);
+      }
+      preservation.findingCount = Math.max(
+        preservation.findingCount,
+        findings.length,
+      );
+      preservation.verdictFail ||= findings.length > 0;
+    },
     draft,
     restart() {
       return createResultPageCollector(options, preservation);
@@ -907,6 +1134,11 @@ export function createResultPageCollector(
     },
     addPage,
     assemble() {
+      if (
+        options.resultKind === "adjudication" &&
+        (pageCount === undefined || accepted.length !== pageCount)
+      )
+        decisionAssignmentFailure([...seenDecisionIds], candidateIds);
       if (pageCount === undefined || accepted.length !== pageCount)
         fail("invalid_result", "result pages are incomplete");
       return options.resultKind === "reviewer"

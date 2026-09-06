@@ -26,6 +26,10 @@ import {
 import { createReadOnlyFileTools } from "./file-tools.js";
 import { providerErrorBody } from "./provider-error-body.js";
 import { InspectionSession } from "./inspection-session.js";
+import { ContextBudget, resolveModelBudget } from "./context-budget.js";
+import { SegmentedReview, SegmentedReviewError } from "./segmented-review.js";
+import { unexpectedAdapterFailure } from "./unexpected-error.js";
+import { createResultPagePreservation } from "../results/result-pages.js";
 import {
   acknowledgeInitialDiffDelivery,
   isRepairablePageError,
@@ -199,7 +203,7 @@ const chatResponseSchema = z.object({
 });
 
 const modelsResponseSchema = z.object({
-  data: z.array(z.object({ id: z.string().min(1) })),
+  data: z.array(z.object({ id: z.string().min(1) }).passthrough()),
 });
 
 const listFilesArgumentsSchema = z.strictObject({
@@ -1047,6 +1051,30 @@ interface ChatProgress {
   identity: string;
   byteCount: number;
 }
+class AdapterProgressChannel implements AsyncIterable<AdapterEvent> {
+  private events: AdapterEvent[] = [];
+  private wakes: Array<() => void> = [];
+  private ended = false;
+  push(event: AdapterEvent) {
+    if (this.ended) return;
+    this.events.push(event);
+    this.wakes.shift()?.();
+  }
+  close() {
+    this.ended = true;
+    for (const wake of this.wakes.splice(0)) wake();
+  }
+  async *[Symbol.asyncIterator]() {
+    while (!this.ended || this.events.length) {
+      const event = this.events.shift();
+      if (event) {
+        yield event;
+        continue;
+      }
+      await new Promise<void>((resolve) => this.wakes.push(resolve));
+    }
+  }
+}
 
 class ChatProgressChannel implements AsyncIterable<ChatProgress> {
   private readonly queued: ChatProgress[] = [];
@@ -1618,6 +1646,9 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     InspectionSession
   >();
   private readonly admittedInspection = new Map<string, InspectionSession>();
+  private readonly modelMetadata = new Map<string, unknown>();
+  private readonly sessionBudgets = new Map<string, ContextBudget>();
+  private readonly segments = new WeakMap<object, SegmentedReview>();
 
   constructor(
     private readonly registration: OpenAICompatibleRegistration,
@@ -2253,6 +2284,41 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     failureDiagnostics: Partial<AdapterFailureDiagnostics> = {},
     onProgress?: (progress: ChatProgress) => void,
   ): Promise<ChatResponse> {
+    const budget = this.sessionBudgets.get(sessionId);
+    if (budget) {
+      body = {
+        ...body,
+        max_tokens: Math.min(
+          typeof body.max_tokens === "number"
+            ? body.max_tokens
+            : budget.model.outputTokens,
+          budget.model.outputTokens,
+        ),
+      };
+      failureDiagnostics = {
+        ...budget.diagnostics(body),
+        ...failureDiagnostics,
+      };
+      if (!budget.fits(body))
+        throw new ProviderRequestError(
+          sanitizeAdapterFailure(
+            "change_coverage_incomplete",
+            "The complete provider request exceeds the model input budget.",
+            false,
+            {
+              fallback_eligible: true,
+              circuit_qualifying: false,
+              diagnostics: {
+                ...failureDiagnostics,
+                failure_code: "context_length_exceeded",
+                context_error_class: "context_too_large",
+                scope: "model",
+                failure_stage: "request_budget",
+              },
+            },
+          ),
+        );
+    }
     failureDiagnostics = {
       ...(typeof body.model === "string" ? { model: body.model } : {}),
       operation_phase: body.tools === undefined ? "finalization" : "inspection",
@@ -2522,6 +2588,10 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
       const modelAvailable = parsed.data.data.some(
         (model) => model.id === reviewer.model,
       );
+      const metadata = parsed.data.data.find(
+        (model) => model.id === reviewer.model,
+      );
+      if (metadata) this.modelMetadata.set(reviewer.model, metadata);
       return {
         ...base,
         available: modelAvailable,
@@ -2839,6 +2909,8 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
             const raw = await pageSpool.readText();
             try {
               collector.addPage(raw);
+              if (collector.draft().metadataCorrections?.length)
+                await recordResultPageDraft(input, collector);
             } catch (error) {
               if (error instanceof ResultPageError) {
                 error.artifactRef = await recordInvalidResultSpool({
@@ -3119,6 +3191,124 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     }
 
     const sessionId = session.sessionId;
+    const budget = new ContextBudget(
+      resolveModelBudget(
+        this.modelMetadata.get(input.reviewer.model),
+        this.registration,
+      ),
+    );
+    this.sessionBudgets.set(sessionId, budget);
+    let lastOperation = "inspection";
+    let lastPhase = "inspection";
+    let segmentedFindings: import("../protocol/v9.js").ProviderReviewerResultV4["actionable_findings"] =
+      [];
+    const segmentProgress = new AdapterProgressChannel();
+    const runSegments = async (contextFailure?: AdapterFailure) => {
+      lastOperation = "snapshot_delivery";
+      let segmented = input.coverage
+        ? this.segments.get(input.coverage)
+        : undefined;
+      if (!segmented) {
+        segmented = new SegmentedReview(input, budget, this.maxTurns * 4);
+        segmented.seedAnalysis(messages);
+        if (input.coverage) this.segments.set(input.coverage, segmented);
+      } else segmented.input = input;
+      if (contextFailure) segmented.retainContextFailure(contextFailure);
+      this.sessionBudgets.set(sessionId, segmented.budget);
+      // Segmented delivery is acknowledged from validated durable checkpoints,
+      // never from legacy queued tool messages.
+      this.admittedInspection.delete(sessionId);
+      const result = await segmented.run(
+        (body) =>
+          this.chat(
+            configuration,
+            input.signal,
+            sessionId,
+            body,
+            {},
+            (progress) =>
+              segmentProgress.push({
+                type: "progress",
+                phase: "reviewing",
+                identity: progress.identity,
+                byteCount: progress.byteCount,
+              }),
+          ),
+        (progress) =>
+          segmentProgress.push({
+            type: "progress",
+            phase: "reviewing",
+            message: "Reviewing a bounded evidence segment.",
+            identity: `${segmented!.id}:segment:${progress.segment_index}`,
+            segment: {
+              index: Number(progress.segment_index),
+              phase: progress.phase as "evidence" | "synthesis",
+              input_budget_tokens: Number(progress.input_budget_tokens),
+              estimated_input_tokens: Number(progress.estimated_input_tokens),
+            },
+          }),
+      );
+      segmentedFindings = result.findings;
+      if (input.resultPages && "nextRequest" in input.resultPages)
+        input.resultPages.preserveFindings(result.findings);
+      if (input.resultPages && !("nextRequest" in input.resultPages)) {
+        const preservation = (input.resultPages.preservation ??=
+          createResultPagePreservation());
+        for (const finding of result.findings) {
+          const existing = preservation.candidates.get(finding.id);
+          if (existing && JSON.stringify(existing) !== JSON.stringify(finding))
+            throw new SegmentedReviewError(
+              adapterFailure.invalidResult(
+                "Segmented synthesis changed a preserved candidate.",
+                false,
+                { circuit_qualifying: false },
+              ),
+            );
+          preservation.candidates.set(finding.id, finding);
+          preservation.candidateIds.add(finding.id);
+        }
+        preservation.findingCount = Math.max(
+          preservation.findingCount,
+          result.findings.length,
+        );
+        preservation.verdictFail ||= result.findings.length > 0;
+      }
+      return result.messages as ChatMessage[];
+    };
+    const finalSegmentResult = async (checkpoint: ChatMessage[]) => {
+      const response = await this.chat(configuration, input.signal, sessionId, {
+        model: input.reviewer.model,
+        messages: checkpoint,
+        response_format: {
+          type: "json_schema",
+          json_schema: {
+            name: "reviewer_result",
+            strict: false,
+            schema: relaxedStructuredOutputSchema(input.resultJsonSchema),
+          },
+        },
+        max_tokens: budget.model.outputTokens,
+      });
+      const result = currentReviewerOutputSchema.parse(
+        JSON.parse(String(response.message.content)),
+      );
+      for (const finding of segmentedFindings)
+        if (
+          !result.actionable_findings.some(
+            (candidate) =>
+              candidate.id === finding.id &&
+              JSON.stringify(candidate) === JSON.stringify(finding),
+          )
+        )
+          throw new ProviderRequestError(
+            adapterFailure.invalidResult(
+              "Final result omitted or changed a segmented finding.",
+              false,
+              { circuit_qualifying: false, fallback_eligible: true },
+            ),
+          );
+      return result;
+    };
     this.admittedInspection.set(sessionId, session);
     yield {
       type: "progress",
@@ -3128,6 +3318,50 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     };
 
     try {
+      const sourceBytes =
+        input.coverage
+          ?.entries()
+          .filter((e) => e.relevant && e.required_method === "full_file")
+          .reduce((n, e) => n + (e.snapshot_byte_count ?? 0), 0) ?? 0;
+      if (
+        input.coverage &&
+        (input.context.review_scope.mode === "changes" ||
+          this.registration.semantic_checkpoints === true) &&
+        this.maxConversationBytes >= budget.inputLimit &&
+        (this.registration.semantic_checkpoints === true ||
+          sourceBytes + conversationBytes(messages) > budget.inputLimit * 0.8 ||
+          this.segments.has(input.coverage))
+      ) {
+        yield {
+          type: "progress",
+          phase: "reviewing",
+          message:
+            "Reviewing bounded evidence segments with model-aware context admission.",
+        };
+        const pending = runSegments().finally(() => segmentProgress.close());
+        void pending.catch(() => undefined);
+        for await (const progress of segmentProgress) yield progress;
+        messages = await pending;
+        lastPhase = "finalization";
+        lastOperation = "finalization";
+        if (input.resultPages) {
+          const collector =
+            "nextRequest" in input.resultPages
+              ? input.resultPages
+              : createResultPageCollector(input.resultPages);
+          yield* this.producePagedResult({
+            input,
+            configuration,
+            sessionId,
+            checkpoint: messages,
+            collector,
+          });
+          return;
+        }
+        const result = await finalSegmentResult(messages);
+        yield { type: "result", result, isolation };
+        return;
+      }
       const preflightFailure = session.preflight(
         this.maxConversationBytes -
           finalizationReserve(this.maxConversationBytes),
@@ -3227,6 +3461,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           if (toolCalls.length > 0) {
             for (const entry of toolCalls) {
               const call = entry.call;
+              lastOperation = call.function.name;
               if (inspectionBudgetReached) {
                 messages.push({
                   role: "tool",
@@ -3365,6 +3600,8 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           phase: "validating",
           message: "The reviewer is producing its structured result.",
         };
+        lastPhase = "finalization";
+        lastOperation = "finalization";
         const responseFormat = {
           type: "json_schema",
           json_schema: {
@@ -3693,16 +3930,71 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         isolation,
       };
     } catch (error) {
+      if (
+        error instanceof ProviderRequestError &&
+        error.failure.diagnostics?.context_error_class ===
+          "context_too_large" &&
+        input.coverage &&
+        input.context.review_scope.mode === "changes" &&
+        !this.segments.has(input.coverage)
+      ) {
+        try {
+          // Restart semantic analysis with bounded source segments; no legacy
+          // delivery credit is treated as completed reasoning.
+          budget.reduce(error.failure.diagnostics, { messages });
+          const pending = runSegments(error.failure).finally(() =>
+            segmentProgress.close(),
+          );
+          void pending.catch(() => undefined);
+          for await (const progress of segmentProgress) yield progress;
+          const checkpoint = await pending;
+          if (input.resultPages) {
+            const collector =
+              "nextRequest" in input.resultPages
+                ? input.resultPages
+                : createResultPageCollector(input.resultPages);
+            yield* this.producePagedResult({
+              input,
+              configuration,
+              sessionId,
+              checkpoint,
+              collector,
+            });
+            return;
+          }
+          const result = await finalSegmentResult(checkpoint);
+          yield { type: "result", result, isolation };
+          return;
+        } catch (next) {
+          error = next;
+        }
+      }
       const failure = input.signal.aborted
         ? adapterFailure.cancelled()
         : error instanceof ProviderRequestError
           ? error.failure
-          : adapterFailure.unknown(
-              "The OpenAI-compatible reviewer failed without a safe diagnostic.",
-            );
+          : error instanceof SegmentedReviewError
+            ? error.failure
+            : unexpectedAdapterFailure(error, {
+                model: input.reviewer.model,
+                operation: lastOperation,
+                phase: lastPhase,
+                turn: session.turns,
+              });
+      if (
+        failure.diagnostics?.failure_code === "unexpected_adapter_exception"
+      ) {
+        if (input.recordDiagnostic)
+          await input.recordDiagnostic({
+            kind: "adapter_exception",
+            diagnostics: failure.diagnostics,
+          });
+        else delete failure.diagnostics.artifact_ref;
+      }
       yield { type: "failure", failure, isolation };
     } finally {
       this.admittedInspection.delete(sessionId);
+      this.sessionBudgets.delete(sessionId);
       await workspace.dispose().catch(() => undefined);
       this.activeWorkspaces.delete(workspace);
     }

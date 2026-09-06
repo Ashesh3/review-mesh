@@ -40,9 +40,10 @@ export function createReadOnlyFileTools(options: {
       };
       if (options.readable) {
         try {
-          const text = new TextDecoder("utf-8", { fatal: true }).decode(
-            read.bytes,
-          );
+          const text = new TextDecoder("utf-8", {
+            fatal: true,
+            ignoreBOM: true,
+          }).decode(read.bytes);
           if (Buffer.from(text, "utf8").equals(Buffer.from(read.bytes))) {
             response.encoding = "utf8";
             response.content = text;
@@ -68,6 +69,7 @@ export function createReadOnlyFileTools(options: {
     },
     async listFiles(input: { path?: string } = {}) {
       const prefix = normalizedPrefix(input.path);
+      if (prefix === undefined) return invalidPath();
       const files = options.ledger
         .snapshotFiles()
         .filter(
@@ -89,6 +91,7 @@ export function createReadOnlyFileTools(options: {
       caseSensitive?: boolean;
     }) {
       const prefix = normalizedPrefix(input.path);
+      if (prefix === undefined) return invalidPath();
       const needle =
         input.caseSensitive === true
           ? input.query
@@ -126,16 +129,27 @@ export function createReadOnlyFileTools(options: {
   };
 }
 
-function normalizedPrefix(value: string | undefined): string {
+function invalidPath() {
+  return {
+    error: "Use a relative workspace path without parent traversal.",
+    reason: "invalid_path" as const,
+    retryable: true as const,
+  };
+}
+
+function normalizedPrefix(value: string | undefined): string | undefined {
   if (value === undefined || value === "" || value === ".") return "";
   const normalized = value.replaceAll("\\", "/").normalize("NFC");
   if (
     normalized.startsWith("/") ||
-    normalized
-      .split("/")
-      .some((part) => part === "" || part === "." || part === "..")
+    /^[A-Za-z]:/u.test(normalized) ||
+    /[\u0000-\u001f\u007f]/u.test(normalized) ||
+    normalized.split("/").some((part) => part === "..")
   ) {
-    throw new Error("The requested path is unavailable.");
+    return undefined;
   }
-  return normalized;
+  return normalized
+    .split("/")
+    .filter((part) => part !== "" && part !== ".")
+    .join("/");
 }

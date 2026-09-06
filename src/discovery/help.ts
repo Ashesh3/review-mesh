@@ -143,6 +143,10 @@ an existing file. During execution, status reports the active artifact path.
 
 Exit codes: 0 passed, 1 findings, 2 invalid request/config/usage,
 3 incomplete reviewer/runtime, 4 interrupted.
+Large changes-only OpenAI-compatible reviews use bounded evidence segments and
+cross-file synthesis. Segment scenario checks are model reasoning, not executed
+tests. Adapter context_window_tokens/max_input_tokens/max_output_tokens may be
+configured explicitly; otherwise model metadata or conservative defaults apply.
 `,
   serve: `REVIEW-MESH SERVE
 

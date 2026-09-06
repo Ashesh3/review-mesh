@@ -36,7 +36,25 @@ export interface ReviewerDraftDiagnostic {
   candidate?: Record<string, unknown>;
   validation_issues?: AdapterFailureDiagnostics["validation_issues"];
   raw_excerpt?: string;
+  result_kind?: "reviewer" | "adjudication";
+  assigned_candidate_ids?: string[];
+  accepted_decision_ids?: string[];
+  missing_decision_ids?: string[];
+  decision?: Record<string, unknown>;
 }
+export interface AdapterExceptionDiagnostic {
+  kind: "adapter_exception";
+  diagnostics: AdapterFailureDiagnostics;
+}
+export interface SegmentDiagnostic {
+  kind: "review_segment";
+  segment_id: string;
+  index: number;
+  phase: "evidence" | "synthesis";
+  data: Record<string, unknown>;
+}
+export type AdapterDiagnostic =
+  ReviewerDraftDiagnostic | AdapterExceptionDiagnostic | SegmentDiagnostic;
 
 export interface AdapterCapabilities {
   available: boolean;
@@ -64,7 +82,7 @@ export interface AdapterReviewInput {
   signal: AbortSignal;
   coverage?: ChangeCoverageLedger;
   resultPages?: ResultPageCollector | ResultPageCollectorOptions;
-  recordDiagnostic?(diagnostic: ReviewerDraftDiagnostic): Promise<void>;
+  recordDiagnostic?(diagnostic: AdapterDiagnostic): Promise<void>;
 }
 
 export type AdapterEvent =
@@ -75,6 +93,12 @@ export type AdapterEvent =
       identity?: string;
       byteCount?: number;
       inspection?: InspectionProgress;
+      segment?: {
+        index: number;
+        phase: "evidence" | "synthesis";
+        input_budget_tokens: number;
+        estimated_input_tokens: number;
+      };
     }
   | { type: "activity"; message: string; identity?: string; byteCount?: number }
   | {

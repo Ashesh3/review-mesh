@@ -92,6 +92,7 @@ export function buildReviewerPrompt({
     "Use only adapter-approved direct read-only file and search tools. Do not execute shell commands, programs, scripts, builds, tests, Git commands, or code. Review Mesh core may provide bounded read-only Git context collected outside the reviewer runtime.",
     "Return exactly the supplied schema.",
     "Use pass only with zero actionable findings.",
+    "Source delivery is not proof of correctness. Trace concrete zero/one/many, boundary, failure, and replay inputs through changed branches and durable state. Check whether persisted state actually survives empty collections and retry paths. Distinguish model reasoning from executed validation; no tests were executed by this reviewer. Avoid blanket claims that all branches or retries are correct. Report specific unresolved assumptions instead.",
     "Separate confirmed evidence from inference. For each finding, set confidence and classification accurately and list every external assumption. Use confirmed_defect only when the supplied or directly inspected evidence proves the defect; otherwise use needs_verification or advisory.",
     "Low-severity style and maintainability suggestions should normally be advisory and must not be overstated as merge-blocking defects.",
     "When multiple findings share one root issue, use the same stable root_issue_id and list duplicate finding ids rather than restating the defect independently.",
