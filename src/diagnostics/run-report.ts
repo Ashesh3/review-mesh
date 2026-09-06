@@ -1,3 +1,4 @@
+import { renderV9Markdown } from "./markdown-v9.js";
 import { constants } from "node:fs";
 import { lstat, open, readdir, realpath } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
@@ -814,6 +815,14 @@ export interface RunReport {
 
 export interface RunFindings {
   run_id: string;
+  schema_version?: "2";
+  run_outcome?: string;
+  gate_outcome?: string;
+  coverage_outcome?: string;
+  execution_coverage?: unknown;
+  change_coverage?: unknown;
+  exit_code?: number;
+  counts?: unknown;
   raw: RawRunFinding[];
   deduplicated: ConsolidatedRunFinding[];
   record_warnings?: RunRecordWarning[];
@@ -825,6 +834,7 @@ export interface ReadRunReportOptions {
   runId: string;
   /** Recover validated data around incompatible records without changing strict defaults. */
   bestEffort?: boolean;
+  includeRaw?: boolean;
   afterOpen?: () => void | Promise<void>;
 }
 
@@ -2327,11 +2337,12 @@ export async function readRunReport({
   runId,
   bestEffort = false,
   afterOpen,
+  includeRaw = false,
 }: ReadRunReportOptions): Promise<RunReport> {
   requireSafeRunId(runId);
   const { loadV9Run, v9Report } = await import("./v9-views.js");
   const current = await loadV9Run(runsDirectory, runId);
-  if (current) return v9Report(current) as unknown as RunReport;
+  if (current) return v9Report(current, { includeRaw }) as unknown as RunReport;
   return readLegacyRunReport({
     runsDirectory,
     runId,
@@ -2490,7 +2501,14 @@ export async function readRunFindings(
   const current = await loadV9Run(options.runsDirectory, options.runId);
   if (current)
     return {
+      schema_version: "2",
       run_id: current.run_id,
+      run_outcome: current.run_outcome,
+      gate_outcome: current.gate_outcome,
+      coverage_outcome: current.coverage_outcome,
+      execution_coverage: current.execution_coverage,
+      change_coverage: current.change_coverage,
+      exit_code: current.exit_code,
       raw: current.canonical.raw,
       deduplicated: current.canonical.roots,
       atomics: current.canonical.atomics,
@@ -2622,36 +2640,9 @@ function uppercaseLabel(value: string): string {
 
 export function renderRunReportMarkdown(report: RunReport): string {
   if ((report.schema_version as string) === "2") {
-    const current =
-      report as unknown as import("./normalize-run.js").NormalizedRun;
-    const { canonical, reviewers } = current;
-    const headline =
-      current.run_outcome === "inconclusive"
-        ? "Inconclusive"
-        : current.run_outcome === "cancelled"
-          ? "Cancelled"
-          : current.run_outcome === "gate_findings"
-            ? "Gate findings"
-            : "Clear";
-    return [
-      `# Review Mesh ${current.run_id}`,
-      "",
-      `${headline}: ${current.coverage_outcome} coverage; ${canonical.counts.gate_eligible_subfindings} gate findings; ${canonical.counts.non_gating_subfindings} non-gating subfindings; ${current.summary.incomplete_lenses ?? 0} lenses incomplete.`,
-      "",
-      `Artifact: ${current.artifact.path}`,
-      "",
-      ...canonical.atomics.flatMap((finding) => [
-        `## ${finding.title}`,
-        finding.description,
-        `Gate exclusion reasons: ${finding.gate_eligibility.reasons.join(", ") || "eligible"}`,
-        "",
-      ]),
-      ...reviewers.flatMap((reviewer) =>
-        reviewer.result
-          ? [`## ${reviewer.reviewer_id}`, reviewer.result.review_markdown, ""]
-          : [],
-      ),
-    ].join("\n");
+    return renderV9Markdown(
+      report as unknown as ReturnType<typeof import("./v9-views.js").v9Report>,
+    );
   }
   const lines = [
     "# Review Mesh Report",

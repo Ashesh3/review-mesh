@@ -20,6 +20,7 @@ import {
   createChangeCoverageLedger,
   releaseRunSnapshot,
 } from "../../src/context/change-coverage.js";
+import { createCoverageRecorder } from "../../src/diagnostics/coverage-records.js";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -82,6 +83,7 @@ async function parentFixture(options: {
   }>;
   incompleteLensIds?: string[];
   legacySnapshot?: boolean;
+  sharedManifest?: boolean;
   incompleteSummaryLensIds?: string[];
 }) {
   const root = await mkdtemp(join(tmpdir(), "review-mesh-v9-retry-"));
@@ -91,6 +93,9 @@ async function parentFixture(options: {
   const path = join(runsDirectory, `${runId}.jsonl`);
   const writer = await createRunArtifact({ path, runId, toolVersion: "9.0.0" });
   let snapshotIdentity;
+  let snapshotEntries: ReturnType<
+    Awaited<ReturnType<typeof createChangeCoverageLedger>>["entries"]
+  > = [];
   if (!options.legacySnapshot) {
     const ledger = await createChangeCoverageLedger({
       context: options.context,
@@ -101,6 +106,7 @@ async function parentFixture(options: {
       },
     });
     snapshotIdentity = ledger.snapshotIdentity();
+    snapshotEntries = ledger.entries();
     await ledger.close();
     releaseRunSnapshot(options.context);
   }
@@ -125,32 +131,43 @@ async function parentFixture(options: {
       })),
     },
   });
+  const recordCoverage = createCoverageRecorder((value) =>
+    writer.record(value),
+  );
   for (const completed of options.completed) {
     await writer.result(completed.reviewerId, completed.result);
-    await writer.record({
-      record: "reviewer.coverage",
-      reviewer_id: completed.reviewerId,
-      data: {
-        index: 0,
-        ...(snapshotIdentity === undefined
-          ? {}
-          : { snapshot_identity: snapshotIdentity }),
-        entries: [
-          {
-            path: "worker.ts",
-            kind: "tracked",
-            relevant: true,
-            required_method: "full_file",
-            proof_kind: "observed",
-            snapshot_digest: "a".repeat(64),
-            snapshot_byte_count: 10,
-            snapshot_read: "satisfied",
-            diff_delivery: "satisfied",
-            disposition: "satisfied",
-          },
-        ],
-      },
-    });
+    if (options.sharedManifest) {
+      await recordCoverage({
+        reviewerId: completed.reviewerId,
+        entries: snapshotEntries,
+        ...(snapshotIdentity ? { snapshotIdentity } : {}),
+      });
+    } else {
+      await writer.record({
+        record: "reviewer.coverage",
+        reviewer_id: completed.reviewerId,
+        data: {
+          index: 0,
+          ...(snapshotIdentity === undefined
+            ? {}
+            : { snapshot_identity: snapshotIdentity }),
+          entries: [
+            {
+              path: "worker.ts",
+              kind: "tracked",
+              relevant: true,
+              required_method: "full_file",
+              proof_kind: "observed",
+              snapshot_digest: "a".repeat(64),
+              snapshot_byte_count: 10,
+              snapshot_read: "satisfied",
+              diff_delivery: "satisfied",
+              disposition: "satisfied",
+            },
+          ],
+        },
+      });
+    }
     await writer.record({
       record: "reviewer.terminal",
       reviewer_id: completed.reviewerId,
@@ -279,9 +296,16 @@ describe("v9 retry inheritance", () => {
     ).toEqual([lensId]);
   });
 
-  it.each(["worker.ts", "support.ts", "added.ts"])(
-    "rejects stale %s bytes before inheriting a completed result",
-    async (path) => {
+  it.each(
+    [false, true].flatMap((sharedManifest) =>
+      ["worker.ts", "support.ts", "added.ts"].map((path) => ({
+        path,
+        sharedManifest,
+      })),
+    ),
+  )(
+    "rejects stale $path bytes before inheriting a result (shared manifest: $sharedManifest)",
+    async ({ path, sharedManifest }) => {
       const base = roundInput();
       const reviewer = base.config.reviewers[0]!;
       const context = await realContext({
@@ -289,6 +313,7 @@ describe("v9 retry inheritance", () => {
       });
       const parent = await parentFixture({
         context,
+        sharedManifest,
         config: base.config,
         completed: [
           {
@@ -457,56 +482,70 @@ describe("v9 retry inheritance", () => {
       }),
     ).rejects.toThrow(/head|evidence/i);
   });
-  it("inherits digest-verified completed parent results and preserves known findings", async () => {
-    const base = roundInput();
-    const security = structuredClone(base.config.reviewers[0]!);
-    security.id = "security::0";
-    security.agentId = "security";
-    security.policy = {
-      passQuorum: 1,
-      minimumProviderGroups: 1,
-      adjudication: "off",
-      gateMinimumSeverity: "medium",
-      gateMinimumConfidence: "medium",
-    };
-    const readiness = structuredClone(base.config.reviewers[0]!);
-    readiness.id = "readiness::0";
-    readiness.agentId = "readiness";
-    readiness.policy = structuredClone(security.policy);
-    const config = { ...base.config, reviewers: [security, readiness] };
-    const context = await realContext({
-      review_scope: { mode: "full", source: "request" },
-    });
-    const parent = await parentFixture({
-      context,
-      config,
-      completed: [
-        { reviewerId: security.id, lensId: "security", result: result("fail") },
-      ],
-      incompleteLensIds: ["readiness"],
-    });
+  it.each([false, true])(
+    "inherits digest-verified completed results and findings (shared manifest: %s)",
+    async (sharedManifest) => {
+      const base = roundInput();
+      const security = structuredClone(base.config.reviewers[0]!);
+      security.id = "security::0";
+      security.agentId = "security";
+      security.policy = {
+        passQuorum: 1,
+        minimumProviderGroups: 1,
+        adjudication: "off",
+        gateMinimumSeverity: "medium",
+        gateMinimumConfidence: "medium",
+      };
+      const readiness = structuredClone(base.config.reviewers[0]!);
+      readiness.id = "readiness::0";
+      readiness.agentId = "readiness";
+      readiness.policy = structuredClone(security.policy);
+      const config = { ...base.config, reviewers: [security, readiness] };
+      const context = await realContext({
+        review_scope: { mode: "full", source: "request" },
+      });
+      const parent = await parentFixture({
+        context,
+        config,
+        sharedManifest,
+        completed: [
+          {
+            reviewerId: security.id,
+            lensId: "security",
+            result: result("fail"),
+          },
+        ],
+        incompleteLensIds: ["readiness"],
+      });
 
-    const retry = await prepareV9Retry({
-      runsDirectory: parent.runsDirectory,
-      parentRunId: parent.runId,
-      selectedLensIds: ["readiness"],
-      config,
-      context,
-    });
+      const retry = await prepareV9Retry({
+        runsDirectory: parent.runsDirectory,
+        parentRunId: parent.runId,
+        selectedLensIds: ["readiness"],
+        config,
+        context,
+      });
 
-    expect(retry.runLensIds).toEqual(["readiness"]);
-    expect(retry.inherited).toHaveLength(1);
-    expect(retry.inherited[0]).toMatchObject({
-      reviewerId: security.id,
-      lensId: "security",
-      result: { verdict: "fail" },
-    });
-    expect(retry.inherited[0]?.coverageEntries).toHaveLength(1);
-    expect(retry.rawFindings).toHaveLength(1);
-    expect(retry.proofBySourceRef).toHaveProperty(
-      `${security.id}#known-finding`,
-    );
-  });
+      expect(retry.runLensIds).toEqual(["readiness"]);
+      expect(retry.inherited).toHaveLength(1);
+      expect(retry.inherited[0]).toMatchObject({
+        reviewerId: security.id,
+        lensId: "security",
+        result: { verdict: "fail" },
+      });
+      expect(retry.inherited[0]?.coverageEntries).toHaveLength(
+        sharedManifest ? 0 : 1,
+      );
+      if (sharedManifest)
+        expect(
+          retry.inherited[0]?.snapshotManifest?.files.map((file) => file.path),
+        ).toContain("support.ts");
+      expect(retry.rawFindings).toHaveLength(1);
+      expect(retry.proofBySourceRef).toHaveProperty(
+        `${security.id}#known-finding`,
+      );
+    },
+  );
 
   it("reruns every configured lens when the captured scope or policy differs", async () => {
     const base = roundInput();

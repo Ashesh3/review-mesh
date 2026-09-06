@@ -8,6 +8,52 @@ import { pageFailure } from "../../src/adapters/sdk-pages.js";
 import { ResultPageError } from "../../src/results/result-pages.js";
 
 describe("adapter failure diagnostics", () => {
+  it("sanitizes inspection, provider and circuit provenance", () => {
+    const failure = sanitizeAdapterFailure(
+      "change_coverage_incomplete",
+      "Local budget exhausted.",
+      false,
+      {
+        circuit_qualifying: false,
+        diagnostics: {
+          failure_code: "inspection_budget_exhausted",
+          model: "model password=hidden",
+          operation_phase: "inspection",
+          inspection_turn: 80,
+          maximum_inspection_turns: 80,
+          remaining_inspection_turns: 0,
+          request_bytes: 8192,
+          provider_error_code: "context_length_exceeded",
+          provider_error_message:
+            "Limit exceeded. Authorization: Bearer private-value",
+          error_body_truncated: true,
+          error_body_unavailable: false,
+          circuit_cause: {
+            reviewer_id: "reviewer",
+            attempt: 2,
+            reason: "timeout",
+            at: "2026-09-06T00:00:00Z",
+            failure_code: "gateway_timeout",
+          },
+        },
+      },
+    );
+    expect(failure.diagnostics).toMatchObject({
+      failure_code: "inspection_budget_exhausted",
+      model: "model [redacted]",
+      inspection_turn: 80,
+      remaining_inspection_turns: 0,
+      request_bytes: 8192,
+      provider_error_message: "Limit exceeded. [redacted]",
+      circuit_cause: {
+        reviewer_id: "reviewer",
+        attempt: 2,
+        at: "2026-09-06T00:00:00.000Z",
+        failure_code: "gateway_timeout",
+      },
+    });
+    expect(JSON.stringify(failure)).not.toContain("private-value");
+  });
   it("bounds and redacts optional diagnostic metadata", () => {
     const failure = sanitizeAdapterFailure(
       "protocol_violation",

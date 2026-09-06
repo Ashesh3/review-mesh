@@ -111,6 +111,7 @@ export interface ManagedProject {
 export interface ManagedConfig {
   schema_version: "5" | "6" | "7";
   execution: {
+    review_profile?: "strict-evaluation" | "routine-review" | undefined;
     max_concurrency: number;
     heartbeat_interval_ms: number;
     shutdown_grace_period_ms: number;

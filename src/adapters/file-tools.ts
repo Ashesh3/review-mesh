@@ -6,6 +6,8 @@ const MAX_SEARCH_LINE_BYTES = 2_000;
 
 export function createReadOnlyFileTools(options: {
   ledger: ChangeCoverageLedger;
+  /** Human-readable UTF-8 where exact decoding is possible; other adapters keep base64. */
+  readable?: boolean;
 }) {
   return {
     coverageStatus() {
@@ -27,7 +29,7 @@ export function createReadOnlyFileTools(options: {
       const response = {
         ok: true as const,
         path: read.path,
-        encoding: "base64" as const,
+        encoding: "base64" as "base64" | "utf8",
         offset: read.offset,
         byte_count: read.byteCount,
         total_byte_count: read.totalByteCount,
@@ -36,6 +38,20 @@ export function createReadOnlyFileTools(options: {
         snapshot_digest: read.snapshotDigest,
         eof: read.eof,
       };
+      if (options.readable) {
+        try {
+          const text = new TextDecoder("utf-8", { fatal: true }).decode(
+            read.bytes,
+          );
+          if (Buffer.from(text, "utf8").equals(Buffer.from(read.bytes))) {
+            response.encoding = "utf8";
+            response.content = text;
+          }
+        } catch {
+          // Arbitrary model ranges may divide a Unicode code point. Preserve
+          // those exact bytes as base64 instead of crediting replacement text.
+        }
+      }
       const expectedSerializedResponse = JSON.stringify(response);
       let credited = false;
       return {

@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   adapterRegistrationSchema,
   trustedConfigSchema,
+  trustedConfigV7Schema,
+  agentProfileV7Schema,
   type TrustedConfigV2,
   type TrustedConfigV3,
   type TrustedConfigV4,
@@ -12,6 +15,100 @@ import {
 import { loadConfigFiles } from "../../src/config/load.js";
 import { resolveConfig } from "../../src/config/resolve.js";
 import { trustedConfig } from "../helpers/fixtures.js";
+
+it("applies an explicitly selected routine profile to effective policy and preserves full observed reads", () => {
+  const input = {
+    schema_version: "7",
+    execution: {
+      max_concurrency: 2,
+      heartbeat_interval_ms: 1000,
+      shutdown_grace_period_ms: 1000,
+      deadline_mode: "adaptive",
+      no_progress_timeout_ms: 300000,
+      review_profile: "routine-review",
+    },
+    diagnostics: { persist_runs: true, max_runs: 10 },
+    adapters: {
+      test: {
+        type: "openai_compatible",
+        base_url_env: "TEST_BASE",
+        api_key_env: "TEST_KEY",
+      },
+    },
+    agents: {
+      lens: {
+        adapter: "test",
+        purpose: "Review",
+        instructions: "Review",
+        isolation: "prefer_enforced",
+        timeout_ms: 60000,
+        kind: "generic",
+        required_input: [],
+        applicability: { mode: "always" },
+        change_coverage: {
+          relevant_paths: ["**"],
+          minimum_inspection: "full_file",
+          proof: "observed",
+        },
+        pass_quorum: 5,
+        minimum_provider_groups: 5,
+        model_runs: Array.from({ length: 5 }, (_, i) => ({
+          id: `m${i}`,
+          model: `m${i}`,
+          provider_group: `p${i}`,
+        })),
+      },
+    },
+    defaults: { agents: ["lens"] },
+  };
+  const parsed = trustedConfigSchema.parse(input);
+  const config = resolveConfig({ trusted: parsed });
+  expect(config.execution.review_profile).toBe("routine-review");
+  expect(config.reviewers[0]!.policy).toMatchObject({
+    passQuorum: 2,
+    minimumProviderGroups: 2,
+    changeCoverage: { minimumInspection: "full_file", proof: "observed" },
+  });
+  expect(parsed).toMatchObject({
+    agents: { lens: { pass_quorum: 5, minimum_provider_groups: 5 } },
+  });
+  const concentrated = structuredClone(input);
+  concentrated.agents.lens.model_runs = ["a", "a", "b"].map((group, i) => ({
+    id: `m${i}`,
+    model: `m${i}`,
+    provider_group: group,
+  }));
+  expect(trustedConfigSchema.safeParse(concentrated).success).toBe(false);
+  Object.assign(concentrated.agents.lens, {
+    allow_zero_outage_tolerance: true,
+  });
+  const acknowledged = resolveConfig({
+    trusted: trustedConfigSchema.parse(concentrated),
+  });
+  expect(acknowledged.reviewers[0]!.policy).toMatchObject({
+    passQuorum: 2,
+    minimumProviderGroups: 2,
+    allowZeroOutageTolerance: true,
+  });
+  const strict = structuredClone(input);
+  strict.execution.review_profile = "strict-evaluation";
+  expect(
+    resolveConfig({ trusted: trustedConfigSchema.parse(strict) }).reviewers[0]!
+      .policy,
+  ).toMatchObject({
+    passQuorum: 5,
+    minimumProviderGroups: 5,
+    allowZeroOutageTolerance: true,
+  });
+  expect(agentProfileV7Schema.safeParse(input.agents.lens).success).toBe(false);
+  expect(() => z.toJSONSchema(trustedConfigV7Schema)).not.toThrow();
+  const unsupported = structuredClone(input) as unknown as Record<string, any>;
+  unsupported.adapters.test = { type: "command", command: "fixture", args: [] };
+  expect(trustedConfigSchema.safeParse(unsupported).success).toBe(false);
+  const invalidStructure = structuredClone(input);
+  invalidStructure.agents.lens.pass_quorum = -1;
+  expect(trustedConfigSchema.safeParse(invalidStructure).success).toBe(false);
+});
 
 function v2(workspace: string): TrustedConfigV2 {
   return {

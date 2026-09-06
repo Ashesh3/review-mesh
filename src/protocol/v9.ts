@@ -70,6 +70,8 @@ export const v9IncompleteReasonSchema = z.enum([
   "authentication_failed",
   "model_unavailable",
   "read_failure",
+  "provider_timeout",
+  "output_failed",
   "queue_deadline_exceeded",
   "probe_deadline_exceeded",
   "attempt_deadline_exceeded",
@@ -541,7 +543,37 @@ const artifactReferenceSchema = z.strictObject({
 const resultDeliverySchema = z.strictObject({
   completed_results: nonNegativeInteger,
   artifact: z.enum(["complete", "not_requested", "failed"]),
-  planned_public_stream: z.enum(["complete", "references_only"]),
+  planned_public_stream: z.enum(["complete", "references_only", "failed"]),
+});
+export const deliveryFailureSchema = z.strictObject({
+  stage: z.enum(["event_validation", "event_persistence", "output_write"]),
+  event: boundedId,
+  attempted_seq: positiveInteger,
+  reviewer_id: boundedId.optional(),
+  message: utf8String(1000),
+  native_error_code: boundedId.optional(),
+});
+export const inspectionProgressSchema = z.strictObject({
+  turn: nonNegativeInteger,
+  maximum_turns: positiveInteger,
+  remaining_turns: nonNegativeInteger,
+  inspected_count: nonNegativeInteger,
+  deficit_count: nonNegativeInteger,
+  remaining_bytes: nonNegativeInteger,
+});
+export const snapshotWorkloadSchema = z.strictObject({
+  required_files: nonNegativeInteger,
+  snapshot_bytes: nonNegativeInteger,
+  minimum_read_requests: nonNegativeInteger,
+  unavailable_files: nonNegativeInteger,
+});
+export const quorumFeasibilitySchema = z.strictObject({
+  lens_id: boundedId,
+  reachable: z.boolean(),
+  maximum_passes: nonNegativeInteger,
+  maximum_provider_groups: nonNegativeInteger,
+  required_passes: positiveInteger,
+  required_provider_groups: positiveInteger,
 });
 const v6LensSummarySchema = z.strictObject({
   lens_id: boundedId,
@@ -597,6 +629,10 @@ const v6RunCompletedDataSchema = z
     non_gating_subfindings: nonNegativeInteger,
     incomplete_lenses: nonNegativeInteger,
     result_delivery: resultDeliverySchema,
+    delivery_failure: deliveryFailureSchema.optional(),
+    review_profile: z.enum(["strict-evaluation", "routine-review"]).optional(),
+    clean_pass_unreachable: z.array(boundedId).max(8).optional(),
+    total_clean_pass_unreachable: nonNegativeInteger.optional(),
     execution_coverage: countDimension.optional(),
     change_coverage: z
       .strictObject({ status: v9CoverageStatusSchema })
@@ -737,6 +773,8 @@ const v6ActiveHeartbeatEntrySchema = z.strictObject({
   queue_reason: z.enum(["provider_limit", "execution_limit"]).optional(),
   queue_wait_ms: nonNegativeInteger.optional(),
   probe_elapsed_ms: nonNegativeInteger.optional(),
+  inspection: inspectionProgressSchema.optional(),
+  workload: snapshotWorkloadSchema.optional(),
 });
 const v6GenericEventDataSchema = z.strictObject({
   detail_ref: boundedId.optional(),
@@ -754,8 +792,15 @@ const progressData = z.strictObject({
   message: utf8String(1000).optional(),
   queue_reason: z.enum(["provider_limit", "execution_limit"]).optional(),
   queued_at: timestampSchema.optional(),
+  inspection: inspectionProgressSchema.optional(),
+  workload: snapshotWorkloadSchema.optional(),
 });
 const publicEventV6BaseSchema = z.discriminatedUnion("event", [
+  z.strictObject({
+    ...v6EventEnvelope,
+    event: z.literal("lens.quorum_unreachable"),
+    data: quorumFeasibilitySchema,
+  }),
   z.strictObject({
     ...v6EventEnvelope,
     event: z.literal("run.persistence_failed"),

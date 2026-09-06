@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { AdapterValidationIssue } from "../adapters/errors.js";
 import {
   adjudicationResultV2Schema,
+  actionableFindingV4Schema,
   coverageAttestationSchema,
   providerReviewerResultV4Schema,
   resultPageSchema,
@@ -61,6 +62,10 @@ export class ResultPageError extends Error {
       "page count changed": "page_count",
       "page index exceeds declared count": "page_index",
       "page zero must be a header": "page_kind",
+      "actionable finding count declaration is false": "actionable_findings",
+      "narrative fragment count declaration is false": "review_markdown",
+      "coverage attestation entry count declaration is false":
+        "coverage_attestation.entries",
     };
     const path = envelopePaths[message];
     if (this.validationIssues.length === 0 && path !== undefined)
@@ -73,10 +78,10 @@ function pageValidationIssues(
   cause: unknown,
   raw: string | undefined,
 ): AdapterValidationIssue[] {
-  if (!(cause instanceof z.ZodError) || raw === undefined) return [];
+  if (!(cause instanceof z.ZodError)) return [];
   let value: unknown;
   try {
-    value = JSON.parse(raw);
+    value = raw === undefined ? undefined : JSON.parse(raw);
   } catch {
     return [];
   }
@@ -131,6 +136,51 @@ export interface ResultPageRequest {
   pageIndex: number;
   previousPageDigest: string | null;
   candidateIds: readonly string[];
+  pageCount?: number;
+  expectedPageKind?: ResultPage["page_kind"];
+  acceptedHeader?: Record<string, unknown>;
+  remainingCounts?: {
+    coverage_entries: number;
+    narrative_fragments: number;
+    actionable_findings: number;
+  };
+  preservedCandidates?: readonly Record<string, unknown>[];
+  preservedCandidateIds?: readonly string[];
+  minimumFindingCount?: number;
+  preserveFail?: boolean;
+  minimumNarrativeFragments?: number;
+  minimumCoverageEntries?: number;
+  coverageScopeDigest?: string;
+  acceptedCandidateIds?: readonly string[];
+}
+
+export interface ResultPageDraft {
+  acceptedPageCount: number;
+  candidateIds: string[];
+  candidates: Record<string, unknown>[];
+  unresolvedObligations: string[];
+}
+
+export interface ResultPagePreservation {
+  findingCount: number;
+  verdictFail: boolean;
+  candidateIds: Set<string>;
+  candidates: Map<string, Record<string, unknown>>;
+  narrativeFragments: number;
+  coverageEntries: number;
+  coverageScopeDigest?: string;
+}
+
+/** One model's obligations survive both result-production and outer attempts. */
+export function createResultPagePreservation(): ResultPagePreservation {
+  return {
+    findingCount: 0,
+    verdictFail: false,
+    candidateIds: new Set(),
+    candidates: new Map(),
+    narrativeFragments: 0,
+    coverageEntries: 0,
+  };
 }
 
 export interface ResultPageCollector {
@@ -138,12 +188,16 @@ export interface ResultPageCollector {
   nextRequest(): ResultPageRequest;
   addPage(raw: string): void;
   assemble(): ProviderReviewerResultV4 | AdjudicationResultV2;
+  draft(): ResultPageDraft;
+  restart(): ResultPageCollector;
+  repairAssembly(): ResultPageCollector | undefined;
 }
 
 export interface ResultPageCollectorOptions {
   resultId: string;
   resultKind: "reviewer" | "adjudication";
   candidateIds?: readonly string[];
+  preservation?: ResultPagePreservation;
 }
 
 const sha256 = (value: string): string =>
@@ -188,6 +242,8 @@ function assertExactIds(
 
 export function createResultPageCollector(
   options: ResultPageCollectorOptions,
+  preservation: ResultPagePreservation = options.preservation ??
+    createResultPagePreservation(),
 ): ResultPageCollector {
   const candidateIds = [...(options.candidateIds ?? [])];
   if (new Set(candidateIds).size !== candidateIds.length) {
@@ -214,9 +270,9 @@ export function createResultPageCollector(
   const seenDecisionIds = new Set<string>();
   let acceptedCoverageEntries = 0;
   let acceptedNarrativeFragments = 0;
-  let retainedFindingCount = 0;
+  let retainedFindingCount = preservation.findingCount;
   const retainedPageFindingIds = new Set<string>();
-  let retainedVerdictFail = false;
+  let retainedVerdictFail = preservation.verdictFail;
 
   function assignedCandidateIds(pageIndex: number): readonly string[] {
     if (options.resultKind !== "adjudication" || pageIndex === 0) return [];
@@ -225,11 +281,113 @@ export function createResultPageCollector(
 
   function nextRequest(): ResultPageRequest {
     const last = accepted.at(-1);
+    const header = accepted[0]?.page;
+    const reviewerHeader =
+      header?.result_kind === "reviewer" && header.page_kind === "header"
+        ? header
+        : undefined;
+    const remainingCounts =
+      reviewerHeader === undefined
+        ? undefined
+        : {
+            coverage_entries: Math.max(
+              0,
+              (reviewerHeader.payload.coverage_attestation?.entry_count ?? 0) -
+                acceptedCoverageEntries,
+            ),
+            narrative_fragments: Math.max(
+              0,
+              reviewerHeader.payload.narrative_fragment_count -
+                acceptedNarrativeFragments,
+            ),
+            actionable_findings: Math.max(
+              0,
+              reviewerHeader.payload.actionable_finding_count -
+                seenFindingIds.size,
+            ),
+          };
+    const expectedPageKind =
+      accepted.length === 0
+        ? "header"
+        : options.resultKind === "adjudication"
+          ? "decisions"
+          : remainingCounts!.coverage_entries > 0
+            ? "coverage"
+            : remainingCounts!.narrative_fragments > 0
+              ? "narrative"
+              : "findings";
     return {
       resultId: options.resultId,
       pageIndex: accepted.length,
       previousPageDigest: last === undefined ? null : sha256(last.raw),
       candidateIds: assignedCandidateIds(accepted.length),
+      ...(pageCount === undefined ? {} : { pageCount }),
+      expectedPageKind,
+      ...(reviewerHeader === undefined
+        ? {}
+        : { acceptedHeader: structuredClone(reviewerHeader.payload) }),
+      ...(remainingCounts === undefined ? {} : { remainingCounts }),
+      ...(preservation.candidateIds.size === 0
+        ? {}
+        : { preservedCandidateIds: [...preservation.candidateIds] }),
+      ...(preservation.candidates.size === 0
+        ? {}
+        : {
+            preservedCandidates: [...preservation.candidates.values()].map(
+              (item) => structuredClone(item),
+            ),
+          }),
+      ...(preservation.findingCount === 0
+        ? {}
+        : { minimumFindingCount: preservation.findingCount }),
+      ...(preservation.verdictFail ? { preserveFail: true } : {}),
+      ...(preservation.narrativeFragments === 0
+        ? {}
+        : { minimumNarrativeFragments: preservation.narrativeFragments }),
+      ...(preservation.coverageEntries === 0
+        ? {}
+        : { minimumCoverageEntries: preservation.coverageEntries }),
+      ...(preservation.coverageScopeDigest === undefined
+        ? {}
+        : { coverageScopeDigest: preservation.coverageScopeDigest }),
+      ...(seenFindingIds.size === 0
+        ? {}
+        : { acceptedCandidateIds: [...seenFindingIds] }),
+    };
+  }
+
+  function draft(): ResultPageDraft {
+    const unresolvedObligations: string[] = [];
+    const missing = [...preservation.candidateIds].filter(
+      (id) => !seenFindingIds.has(id),
+    );
+    if (missing.length > 0)
+      unresolvedObligations.push(
+        `Preserve ${missing.length} previously returned candidate IDs.`,
+      );
+    if (seenFindingIds.size < preservation.findingCount)
+      unresolvedObligations.push(
+        `Provide at least ${preservation.findingCount} declared actionable findings; ${seenFindingIds.size} accepted in this assembly.`,
+      );
+    if (preservation.verdictFail)
+      unresolvedObligations.push(
+        "Preserve the failing verdict and every validated candidate until the complete result is verified.",
+      );
+    if (acceptedNarrativeFragments < preservation.narrativeFragments)
+      unresolvedObligations.push(
+        `Provide ${preservation.narrativeFragments} declared narrative fragments; ${acceptedNarrativeFragments} accepted.`,
+      );
+    if (acceptedCoverageEntries < preservation.coverageEntries)
+      unresolvedObligations.push(
+        `Provide ${preservation.coverageEntries} declared coverage entries; ${acceptedCoverageEntries} accepted.`,
+      );
+    return {
+      acceptedPageCount: accepted.length,
+      candidateIds: [...preservation.candidateIds],
+      candidates: [...preservation.candidates.values()].map((item) =>
+        structuredClone(item),
+      ),
+      unresolvedObligations,
     };
   }
 
@@ -329,7 +487,7 @@ export function createResultPageCollector(
         payload !== null
       ) {
         if (candidate.page_kind === "header" && payload.verdict === "fail")
-          retainedVerdictFail = true;
+          preservation.verdictFail = retainedVerdictFail = true;
         if (
           candidate.page_kind === "header" &&
           typeof payload.actionable_finding_count === "number" &&
@@ -337,7 +495,7 @@ export function createResultPageCollector(
           payload.actionable_finding_count >= 0 &&
           payload.actionable_finding_count <= 16
         )
-          retainedFindingCount = Math.max(
+          preservation.findingCount = retainedFindingCount = Math.max(
             retainedFindingCount,
             payload.actionable_finding_count,
           );
@@ -345,15 +503,56 @@ export function createResultPageCollector(
           candidate.page_kind === "findings" &&
           Array.isArray(payload.actionable_findings)
         ) {
-          for (const finding of payload.actionable_findings.slice(0, 2)) {
+          for (const finding of payload.actionable_findings.slice(0, 16)) {
             if (
               typeof finding === "object" &&
               finding !== null &&
               typeof finding.id === "string" &&
               finding.id.length <= 256
-            )
+            ) {
               retainedPageFindingIds.add(finding.id);
+              if (
+                !preservation.candidateIds.has(finding.id) &&
+                preservation.candidateIds.size >= 16
+              )
+                fail(
+                  "structured_page_limit_exceeded",
+                  "Previously returned candidates exceed the result finding limit",
+                  raw,
+                );
+              preservation.candidateIds.add(finding.id);
+              const validated = actionableFindingV4Schema.safeParse(finding);
+              if (validated.success) {
+                const previous = preservation.candidates.get(finding.id);
+                if (
+                  previous === undefined &&
+                  preservation.candidates.size >= 16
+                )
+                  fail(
+                    "structured_page_limit_exceeded",
+                    "Previously returned candidates exceed the result finding limit",
+                    raw,
+                  );
+                if (
+                  previous !== undefined &&
+                  canonicalJson(previous) !== canonicalJson(validated.data)
+                )
+                  fail(
+                    "protocol_violation",
+                    "Repairs must preserve previously validated candidate content",
+                    raw,
+                  );
+                preservation.candidates.set(finding.id, validated.data);
+                preservation.verdictFail = retainedVerdictFail = true;
+              }
+            }
           }
+          if (payload.actionable_findings.length > 16)
+            fail(
+              "structured_page_limit_exceeded",
+              "Previously returned candidates exceed the result finding limit",
+              raw,
+            );
         }
       }
     }
@@ -367,6 +566,48 @@ export function createResultPageCollector(
       );
     }
     const page = parsed.data;
+    if (
+      page.result_id === options.resultId &&
+      page.page_index === accepted.length &&
+      page.result_kind === "reviewer" &&
+      page.page_kind === "header"
+    ) {
+      if (
+        page.payload.narrative_fragment_count <
+          preservation.narrativeFragments ||
+        (page.payload.coverage_attestation?.entry_count ?? 0) <
+          preservation.coverageEntries
+      )
+        fail(
+          "protocol_violation",
+          "Repairs must preserve declared narrative and coverage item counts",
+          raw,
+        );
+      if (
+        preservation.coverageScopeDigest !== undefined &&
+        page.payload.coverage_attestation?.scope_digest !==
+          preservation.coverageScopeDigest
+      )
+        fail(
+          "protocol_violation",
+          "Repairs must preserve the coverage scope digest",
+          raw,
+        );
+      preservation.narrativeFragments = Math.max(
+        preservation.narrativeFragments,
+        page.payload.narrative_fragment_count,
+      );
+      preservation.coverageEntries = Math.max(
+        preservation.coverageEntries,
+        page.payload.coverage_attestation?.entry_count ?? 0,
+      );
+      if (
+        page.payload.coverage_attestation !== undefined &&
+        page.payload.coverage_attestation !== null
+      )
+        preservation.coverageScopeDigest ??=
+          page.payload.coverage_attestation.scope_digest;
+    }
     if (
       page.result_kind === "reviewer" &&
       page.page_kind === "header" &&
@@ -506,26 +747,31 @@ export function createResultPageCollector(
         : [],
     );
     const narrative = fragments.join("");
-    if (
-      Buffer.byteLength(narrative, "utf8") !==
-        header.payload.narrative_byte_count ||
-      fragments.length !== header.payload.narrative_fragment_count
-    ) {
-      fail("invalid_result", "narrative count or byte declaration is false");
+    // Bytes and digests describe a representation, not evidence. Core computes
+    // these from accepted content; declared item counts still detect omissions.
+    if (fragments.length !== header.payload.narrative_fragment_count) {
+      fail("invalid_result", "narrative fragment count declaration is false");
     }
     if (findings.length !== header.payload.actionable_finding_count) {
       fail("invalid_result", "actionable finding count declaration is false");
     }
+    if (
+      findings.length < preservation.findingCount ||
+      [...preservation.candidateIds].some(
+        (id) => !findings.some((finding) => finding.id === id),
+      )
+    )
+      fail(
+        "invalid_result",
+        "Repairs must preserve every previously returned candidate and declared finding count",
+      );
     let coverage_attestation: CoverageAttestation | undefined;
     const declaration = header.payload.coverage_attestation;
     if (declaration !== null && declaration !== undefined) {
-      if (
-        entries.length !== declaration.entry_count ||
-        sha256(canonicalJson(entries)) !== declaration.entries_digest
-      ) {
+      if (entries.length !== declaration.entry_count) {
         fail(
           "invalid_result",
-          "coverage attestation count or digest declaration is false",
+          "coverage attestation entry count declaration is false",
         );
       }
       const parsedAttestation = coverageAttestationSchema.safeParse({
@@ -557,6 +803,9 @@ export function createResultPageCollector(
       ...(coverage_attestation === undefined ? {} : { coverage_attestation }),
     };
     try {
+      // Validate the known result kind first so a semantic reviewer error is
+      // not obscured by unrelated alternatives in the sanitization union.
+      providerReviewerResultV4Schema.parse(output);
       return providerReviewerResultV4Schema.parse(
         sanitizeReviewerOutput(output),
       );
@@ -631,6 +880,31 @@ export function createResultPageCollector(
       return pageCount !== undefined && accepted.length === pageCount;
     },
     nextRequest,
+    draft,
+    restart() {
+      return createResultPageCollector(options, preservation);
+    },
+    repairAssembly() {
+      const header = accepted[0]?.page;
+      const last = accepted.at(-1)?.page;
+      if (
+        header?.result_kind !== "reviewer" ||
+        header.page_kind !== "header" ||
+        last?.result_kind !== "reviewer" ||
+        last.page_kind !== "findings"
+      )
+        return undefined;
+      const missingCount =
+        header.payload.actionable_finding_count - seenFindingIds.size;
+      if (
+        missingCount <= 0 ||
+        missingCount + last.payload.actionable_findings.length > 2
+      )
+        return undefined;
+      const repaired = createResultPageCollector(options, preservation);
+      for (const page of accepted.slice(0, -1)) repaired.addPage(page.raw);
+      return repaired;
+    },
     addPage,
     assemble() {
       if (pageCount === undefined || accepted.length !== pageCount)

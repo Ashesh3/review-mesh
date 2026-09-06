@@ -22,6 +22,12 @@ import {
   createRunArtifact,
   readRunArtifact,
 } from "../../src/diagnostics/run-artifact.js";
+import {
+  loadV9Run,
+  v9Report,
+  v9Status,
+} from "../../src/diagnostics/v9-views.js";
+import { renderRunReportMarkdown } from "../../src/diagnostics/run-report.js";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -601,13 +607,38 @@ describe("authoritative run artifact index", () => {
     await observePublicStream({
       runsDirectory,
       runId: "run-1",
-      outcome: "complete",
+      outcome: "failed",
+      failure: {
+        stage: "output_write",
+        event: "run.completed",
+        attempted_seq: 5,
+        message: "Terminal pipe closed.",
+        native_error_code: "EPIPE",
+      },
     });
     expect(await resolveRunArtifact("run-1", { runsDirectory })).toMatchObject({
       artifact: reference,
-      observed_public_stream: "complete",
+      observed_public_stream: "failed",
+      public_delivery_failure: {
+        stage: "output_write",
+        event: "run.completed",
+        native_error_code: "EPIPE",
+      },
       resolution: { source: "primary", primary_path: path },
     });
+    const normalized = (await loadV9Run(runsDirectory, "run-1"))!;
+    expect(v9Status(normalized)).toHaveProperty(
+      "public_delivery_failure.native_error_code",
+      "EPIPE",
+    );
+    const report = v9Report(normalized);
+    expect(report).toHaveProperty(
+      "public_delivery_failure.event",
+      "run.completed",
+    );
+    expect(renderRunReportMarkdown(report as never)).toContain(
+      "Terminal pipe closed.",
+    );
     expect(JSON.parse(await readFile(indexPath, "utf8")).schema_version).toBe(
       "1",
     );

@@ -478,9 +478,20 @@ describe("OpenAI-compatible adapter", () => {
           (entry: any) => entry.function.name === "coverage_status",
         ),
       ).toBe(true);
-      expect(bodies[1].messages.at(-1).content).toContain(
-        '"missing_byte_ranges":[{"offset":0,"byte_count":131072}]',
-      );
+      expect(
+        bodies[1].messages.some(
+          (message: any) =>
+            typeof message.content === "string" &&
+            message.content.includes(
+              '"missing_byte_ranges":[{"offset":0,"byte_count":131072}]',
+            ),
+        ),
+      ).toBe(true);
+      expect(
+        bodies[1].messages
+          .at(-1)
+          .content.startsWith("Required source snapshot"),
+      ).toBe(true);
       expect(
         output.some(
           (event) =>
@@ -623,8 +634,13 @@ describe("OpenAI-compatible adapter", () => {
     ).toMatchObject({
       type: "failure",
       failure: {
-        reason: "timeout",
-        diagnostics: { failure_stage: "structured_result_deadline" },
+        reason: "invalid_result",
+        retryable: false,
+        circuit_qualifying: false,
+        diagnostics: {
+          failure_stage: "structured_result_deadline",
+          scope: "model",
+        },
       },
     });
     expect(calls).toBe(2);
@@ -2239,10 +2255,14 @@ describe("OpenAI-compatible adapter", () => {
     ).toMatchObject({
       type: "failure",
       failure: {
-        reason: "timeout",
+        reason: "invalid_result",
         retryable: false,
         fallback_eligible: true,
-        diagnostics: { failure_stage: "structured_result_deadline" },
+        circuit_qualifying: false,
+        diagnostics: {
+          failure_stage: "structured_result_deadline",
+          scope: "model",
+        },
       },
       isolation: "runtime_read_only",
     });

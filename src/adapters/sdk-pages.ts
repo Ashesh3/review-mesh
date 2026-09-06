@@ -19,6 +19,53 @@ import {
   ResultSpoolError,
   type ResultSpool,
 } from "./result-spool.js";
+import { sanitizeRunMetadata } from "../results/sanitize.js";
+
+/** Durable private diagnostics; schema-valid candidates remain unverified. */
+export async function recordResultPageDraft(
+  input: AdapterReviewInput,
+  collector: ResultPageCollector,
+  error?: ResultPageError,
+  raw?: string,
+): Promise<boolean> {
+  if (input.recordDiagnostic === undefined) return false;
+  const draft = collector.draft();
+  const common = {
+    kind: "unverified_result_draft" as const,
+    checkpoint_id: collector.nextRequest().resultId,
+    page_index: collector.nextRequest().pageIndex,
+    accepted_page_count: draft.acceptedPageCount,
+    candidate_ids: draft.candidateIds,
+    unresolved_obligations: draft.unresolvedObligations,
+    ...(error === undefined
+      ? {}
+      : { validation_issues: error.validationIssues }),
+  };
+  let excerpt: string | undefined;
+  if (raw !== undefined) {
+    try {
+      excerpt = JSON.stringify(sanitizeRunMetadata(JSON.parse(raw))).slice(
+        0,
+        4096,
+      );
+    } catch {
+      // Unparseable provider bytes remain in the private spool. A string-only
+      // redactor cannot safely identify arbitrary quoted credential fields.
+      excerpt =
+        "Unparseable result page retained in the private diagnostic spool.";
+    }
+  }
+  await input.recordDiagnostic({
+    ...common,
+    ...(excerpt === undefined ? {} : { raw_excerpt: excerpt }),
+  });
+  for (const candidate of draft.candidates)
+    await input.recordDiagnostic({
+      ...common,
+      candidate: sanitizeRunMetadata(candidate) as Record<string, unknown>,
+    });
+  return true;
+}
 
 export function pageCollectorFor(
   input: AdapterReviewInput,
@@ -168,6 +215,10 @@ export interface ResultPageStorageBridge {
     pageIndex: number,
   ): Promise<void>;
   abandon(): Promise<void>;
+  recordDraft?(
+    collector: ResultPageCollector,
+    error?: ResultPageError,
+  ): Promise<boolean>;
   resultStorage(): {
     serializationBoundary?: "provider_raw" | "sdk_canonical_json";
     pages(): AsyncIterable<{ raw: string; sha256: string }>;
@@ -187,6 +238,14 @@ export async function assembleResultPages(
   try {
     return { ok: true, result: collector.assemble() };
   } catch (error) {
+    if (
+      await storage.recordDraft?.(
+        collector,
+        error instanceof ResultPageError ? error : undefined,
+      )
+    )
+      if (error instanceof ResultPageError)
+        error.artifactRef = "reviewer.draft";
     await storage.abandon();
     return { ok: false, failure: pageFailure(error, provider) };
   }
@@ -203,6 +262,7 @@ export function createResultPageStorageBridge(
   const pageIndices = new WeakMap<ResultSpool, number>();
   const recorded = new WeakSet<ResultSpool>();
   let checkpointId = "result-production";
+  let lastCollector: ResultPageCollector | undefined;
   const retain = async (spool: ResultSpool) => {
     try {
       if (!recorded.has(spool)) {
@@ -227,7 +287,11 @@ export function createResultPageStorageBridge(
       "-",
     );
   return {
+    async recordDraft(collector, error) {
+      return await recordResultPageDraft(input, collector, error);
+    },
     async addPage(collector, raw, pageIndex) {
+      lastCollector = collector;
       const spool = await createResultSpool({
         directory: join(tmpdir(), "review-mesh-result-spools"),
         id: spoolId(pageIndex),
@@ -254,6 +318,8 @@ export function createResultPageStorageBridge(
             validationIssues: error.validationIssues,
           });
           recorded.add(spool);
+          if (await recordResultPageDraft(input, collector, error, raw))
+            error.artifactRef = "reviewer.draft";
         }
         await retain(spool).catch(() => undefined);
         active = undefined;
@@ -261,6 +327,8 @@ export function createResultPageStorageBridge(
       }
     },
     async abandon() {
+      if (lastCollector !== undefined)
+        await recordResultPageDraft(input, lastCollector);
       if (active !== undefined) await retain(active).catch(() => undefined);
       active = undefined;
       await Promise.all(

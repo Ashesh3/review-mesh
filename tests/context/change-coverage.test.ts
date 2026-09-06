@@ -107,6 +107,35 @@ describe("createChangeCoverageLedger", () => {
     return path;
   }
 
+  it("labels unchanged snapshots as supporting instead of Git-untracked", async () => {
+    const root = await workspace();
+    await writeFile(join(root, "changed.ts"), "changed");
+    await writeFile(join(root, "support.ts"), "support");
+    await writeFile(join(root, "new.ts"), "new");
+    const ledger = await createChangeCoverageLedger({
+      context: context(root, [
+        { path: "changed.ts", kind: "tracked" },
+        { path: "new.ts", kind: "untracked" },
+      ]),
+      policy: observedFullFile,
+    });
+    expect(ledger.entries()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: "support.ts",
+          kind: "supporting",
+          relevant: false,
+        }),
+        expect.objectContaining({
+          path: "new.ts",
+          kind: "untracked",
+          relevant: true,
+        }),
+      ]),
+    );
+    expect(ledger.summary().deficit_count).toBe(2);
+  });
+
   it("captures a newly written file when Windows settles its metadata during the first open", async () => {
     const root = await workspace();
     await writeFile(join(root, "changed.txt"), "x".repeat(131072));

@@ -814,6 +814,7 @@ export async function runCli(
             index > 1 &&
             argument.startsWith("--") &&
             argument !== "--format" &&
+            argument !== "--raw" &&
             argument !== "--best-effort",
         )
       ) {
@@ -830,6 +831,7 @@ export async function runCli(
           runsDirectory: (runtime.appPaths ?? getAppPaths()).runsDirectory,
           runId,
           bestEffort,
+          includeRaw: argv.includes("--raw"),
         });
         await writeText(
           output,
@@ -901,7 +903,24 @@ export async function runCli(
                     omitted_record_warnings: findings.omitted_record_warnings,
                   }),
             };
-        await writeText(output, `${JSON.stringify(payload)}\n`);
+        const metadata = Object.fromEntries(
+          Object.entries(findings).filter(([key]) =>
+            [
+              "schema_version",
+              "run_outcome",
+              "gate_outcome",
+              "coverage_outcome",
+              "execution_coverage",
+              "change_coverage",
+              "exit_code",
+              "counts",
+            ].includes(key),
+          ),
+        );
+        await writeText(
+          output,
+          `${JSON.stringify({ ...metadata, ...payload })}\n`,
+        );
         process.exitCode = 0;
       } catch (error) {
         await writeDiagnostic(

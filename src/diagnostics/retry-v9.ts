@@ -15,6 +15,7 @@ import {
   type RunSnapshotIdentity,
 } from "../context/change-coverage.js";
 import { runSnapshotIdentitySchema } from "./artifact-payloads.js";
+import type { RunSnapshotManifest } from "./coverage-records.js";
 
 export interface InheritedV9ReviewerResult {
   reviewerId: string;
@@ -24,6 +25,7 @@ export interface InheritedV9ReviewerResult {
   resultByteCount: number;
   coverageEntries: Record<string, unknown>[];
   snapshotIdentity?: RunSnapshotIdentity;
+  snapshotManifest?: RunSnapshotManifest;
   terminal: Record<string, unknown>;
 }
 
@@ -265,6 +267,13 @@ export async function prepareV9Retry(input: {
   for (const reviewer of parent.reviewers.filter(
     (entry) => entry.status === "completed",
   )) {
+    if (reviewer.snapshot_ref !== undefined) {
+      const manifest = parent.snapshot_manifests?.[reviewer.snapshot_ref];
+      if (!manifest?.identity.complete)
+        return rerunAll("snapshot_identity_unavailable");
+      snapshotIdentities.set(reviewer.reviewer_id, manifest.identity);
+      continue;
+    }
     const records = parent.records.filter(
       (record) =>
         record.record === "reviewer.coverage" &&
@@ -337,6 +346,13 @@ export async function prepareV9Retry(input: {
         resultDigest: reviewer.digest,
         resultByteCount: reviewer.byte_count,
         coverageEntries: structuredClone(reviewer.coverage ?? []),
+        ...(reviewer.snapshot_ref === undefined
+          ? {}
+          : {
+              snapshotManifest: structuredClone(
+                parent.snapshot_manifests![reviewer.snapshot_ref]!,
+              ),
+            }),
         ...(snapshotIdentities.get(reviewer.reviewer_id) === undefined
           ? {}
           : {

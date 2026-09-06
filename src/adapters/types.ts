@@ -16,7 +16,27 @@ import type {
   ResultPageCollector,
   ResultPageCollectorOptions,
 } from "../results/result-pages.js";
-import type { AdapterFailure } from "./errors.js";
+import type { AdapterFailure, AdapterFailureDiagnostics } from "./errors.js";
+
+export interface InspectionProgress {
+  turn: number;
+  maximum_turns: number;
+  remaining_turns: number;
+  inspected_count: number;
+  deficit_count: number;
+  remaining_bytes: number;
+}
+export interface ReviewerDraftDiagnostic {
+  kind: "unverified_result_draft";
+  checkpoint_id: string;
+  page_index?: number;
+  accepted_page_count: number;
+  candidate_ids: string[];
+  unresolved_obligations: string[];
+  candidate?: Record<string, unknown>;
+  validation_issues?: AdapterFailureDiagnostics["validation_issues"];
+  raw_excerpt?: string;
+}
 
 export interface AdapterCapabilities {
   available: boolean;
@@ -44,6 +64,7 @@ export interface AdapterReviewInput {
   signal: AbortSignal;
   coverage?: ChangeCoverageLedger;
   resultPages?: ResultPageCollector | ResultPageCollectorOptions;
+  recordDiagnostic?(diagnostic: ReviewerDraftDiagnostic): Promise<void>;
 }
 
 export type AdapterEvent =
@@ -53,6 +74,7 @@ export type AdapterEvent =
       message?: string;
       identity?: string;
       byteCount?: number;
+      inspection?: InspectionProgress;
     }
   | { type: "activity"; message: string; identity?: string; byteCount?: number }
   | {

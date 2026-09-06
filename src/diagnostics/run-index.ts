@@ -14,6 +14,8 @@ import {
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
 import { sanitizePublicText } from "../adapters/errors.js";
+import { deliveryFailureSchema } from "../protocol/v9.js";
+import type { DeliveryFailure } from "../protocol/v9-event-writer.js";
 
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
@@ -43,6 +45,7 @@ const indexV1Schema = z.strictObject({
   observed_public_stream: z
     .enum(["complete", "references_only", "failed"])
     .optional(),
+  public_delivery_failure: deliveryFailureSchema.optional(),
 });
 const alternateSchema = z.strictObject({
   artifact: artifactReferenceSchema,
@@ -959,6 +962,7 @@ export async function resolveRunArtifact(
 ): Promise<{
   artifact: ArtifactReference;
   observed_public_stream?: PublicStreamOutcome;
+  public_delivery_failure?: z.infer<typeof deliveryFailureSchema>;
   expected_identity: ArtifactIdentity;
   digest_status: "verified" | "final_digest_unavailable";
   resolution: {
@@ -1071,6 +1075,9 @@ export async function resolveRunArtifact(
     ...(index.observed_public_stream === undefined
       ? {}
       : { observed_public_stream: index.observed_public_stream }),
+    ...(index.public_delivery_failure === undefined
+      ? {}
+      : { public_delivery_failure: index.public_delivery_failure }),
     digest_status: "verified",
     resolution: {
       source,
@@ -1097,6 +1104,7 @@ export async function observePublicStream(input: {
   runsDirectory: string;
   runId: string;
   outcome: PublicStreamOutcome;
+  failure?: DeliveryFailure;
 }): Promise<void> {
   const path = indexPath(input.runsDirectory, input.runId);
   await ensureNoUpdate(path);
@@ -1109,6 +1117,9 @@ export async function observePublicStream(input: {
   await updateIndex(path, current, {
     ...current.document,
     observed_public_stream: input.outcome,
+    ...(input.failure
+      ? { public_delivery_failure: deliveryFailureSchema.parse(input.failure) }
+      : {}),
   });
 }
 

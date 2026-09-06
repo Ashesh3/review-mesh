@@ -36,7 +36,7 @@ USAGE
   review-mesh review [WORKSPACE] [--output-mode concise-jsonl|full-jsonl|compact-jsonl] [--no-ansi]
       [--heartbeat aggregate] [--details-file PATH]
   review-mesh status RUN_ID [REVIEWER_ID] [--json]
-  review-mesh report RUN_ID [--format markdown|json] [--best-effort]
+  review-mesh report RUN_ID [--format markdown|json] [--best-effort] [--raw]
   review-mesh findings RUN_ID [--deduplicate] [--json] [--best-effort]
   review-mesh retry RUN_ID --only-incomplete
   review-mesh cancel RUN_ID
@@ -246,6 +246,10 @@ USAGE
 Renders the persisted detailed review artifact. Markdown is the default; JSON
 includes logical-lens and model-run coverage, raw findings, deterministic
 deduplication, provenance, confidence, classification, and assumptions.
+Normal JSON is compact; --raw includes private records and expanded snapshot
+manifests. Markdown renders structured summaries, notes, evidence, coverage and
+attempt diagnostics even when a reviewer supplies no narrative. Retained results
+with incomplete coverage are marked unaccepted. Private drafts remain unverified.
 By default every persisted record is validated. --best-effort skips incompatible
 records, marks coverage partial, and returns bounded line/schema warnings; it
 never treats salvaged output as a complete clean review.
@@ -259,6 +263,10 @@ Reads findings from the persisted detailed artifact. --deduplicate returns the
 consolidated set with source reviewer/finding ids and duplicate ids.
 --best-effort salvages findings from valid records around incompatible records
 and includes bounded record_warnings in the JSON result.
+Current v9 responses also include run_outcome, gate_outcome, coverage_outcome,
+execution_coverage, change_coverage and exit_code. Empty findings alone do not
+mean a clear run. This command exits zero after successful retrieval; use the
+response's run_outcome or exit_code for gate decisions.
 `,
   retry: `REVIEW-MESH RETRY
 

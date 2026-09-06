@@ -9,8 +9,10 @@ import {
   artifactAttemptV1Schema,
   artifactTerminalV1Schema,
   artifactCoverageV1Schema,
+  artifactCoverageV2Schema,
   privatePayloadSchemas,
 } from "./artifact-payloads.js";
+import { readCoverageManifests } from "./coverage-records.js";
 import { runFindingsRecordSchema } from "./artifact-record-schemas.js";
 import { createResultPageCollector } from "../results/result-pages.js";
 import {
@@ -52,10 +54,14 @@ const PRIVATE_VERSIONS = {
   resolution: "3",
   request: "3",
   context: "1",
+  "run.error": "1",
+  "reviewer.draft": "1",
+  "reviewer.preflight": "1",
   "reviewer.attempt": "2",
   "reviewer.activity": "1",
   "reviewer.activity_summary": "1",
-  "reviewer.coverage": "2",
+  "reviewer.coverage": "3",
+  "run.snapshot_manifest": "1",
   "reviewer.result_page": "1",
   "reviewer.narrative": "1",
   "reviewer.result": "1",
@@ -77,11 +83,16 @@ const headerSchema = z.strictObject({
           key,
           key === "resolution"
             ? z.enum(["1", "2", "3"])
-            : key === "reviewer.attempt" ||
-                key === "reviewer.terminal" ||
-                key === "reviewer.coverage"
-              ? z.enum(["1", "2"])
-              : z.literal(value),
+            : key === "reviewer.coverage"
+              ? z.enum(["1", "2", "3"])
+              : key === "run.snapshot_manifest" ||
+                  key === "run.error" ||
+                  key === "reviewer.draft" ||
+                  key === "reviewer.preflight"
+                ? z.literal(value).optional()
+                : key === "reviewer.attempt" || key === "reviewer.terminal"
+                  ? z.enum(["1", "2"])
+                  : z.literal(value),
         ]),
       ),
     )
@@ -126,6 +137,18 @@ const resultSchema = z.strictObject({
     .optional(),
 });
 const genericRecords: Record<string, z.ZodType> = {
+  "run.error": z.strictObject({
+    record: z.literal("run.error"),
+    schema_version: z.literal("1"),
+    run_id: id,
+    data: z.record(z.string(), z.unknown()),
+  }),
+  "run.snapshot_manifest": z.strictObject({
+    record: z.literal("run.snapshot_manifest"),
+    schema_version: z.literal("1"),
+    run_id: id,
+    data: z.record(z.string(), z.unknown()),
+  }),
   "run.findings": runFindingsRecordSchema,
   resolution: z.strictObject({
     record: z.literal("resolution"),
@@ -147,6 +170,8 @@ const genericRecords: Record<string, z.ZodType> = {
   }),
 };
 for (const record of [
+  "reviewer.draft",
+  "reviewer.preflight",
   "reviewer.attempt",
   "reviewer.activity",
   "reviewer.activity_summary",
@@ -157,11 +182,11 @@ for (const record of [
   genericRecords[record] = z.strictObject({
     record: z.literal(record),
     schema_version:
-      record === "reviewer.attempt" ||
-      record === "reviewer.terminal" ||
       record === "reviewer.coverage"
-        ? z.enum(["1", "2"])
-        : z.literal("1"),
+        ? z.enum(["1", "2", "3"])
+        : record === "reviewer.attempt" || record === "reviewer.terminal"
+          ? z.enum(["1", "2"])
+          : z.literal("1"),
     run_id: id,
     reviewer_id: id,
     data: z.record(z.string(), z.unknown()),
@@ -200,7 +225,9 @@ function validatePayload(record: Record<string, unknown>): void {
             ? artifactTerminalV1Schema
             : kind === "reviewer.coverage" && record.schema_version === "1"
               ? artifactCoverageV1Schema
-              : privatePayloadSchemas[kind];
+              : kind === "reviewer.coverage" && record.schema_version === "2"
+                ? artifactCoverageV2Schema
+                : privatePayloadSchemas[kind];
   if (schema)
     parseRecord(
       schema,
@@ -225,6 +252,7 @@ function validateHeaderManifest(record: Record<string, unknown>): void {
       typeof declared === "string" &&
       declared !== expected &&
       !(kind === "resolution" && ["1", "2"].includes(declared)) &&
+      !(kind === "reviewer.coverage" && ["1", "2"].includes(declared)) &&
       !(
         ["reviewer.attempt", "reviewer.terminal", "reviewer.coverage"].includes(
           kind,
@@ -593,7 +621,9 @@ export async function createRunArtifact(options: {
           kind === "resolution" ||
           kind === "reviewer.attempt" ||
           kind === "reviewer.activity" ||
-          kind === "reviewer.activity_summary"
+          kind === "reviewer.activity_summary" ||
+          kind === "reviewer.draft" ||
+          kind === "run.error"
             ? (sanitizeRunMetadata(value) as Record<string, unknown>)
             : value;
         const parsed = schema.parse({
@@ -1043,6 +1073,7 @@ export async function readRunArtifact(
         fail("Artifact record exceeds the line limit.");
     }
     const active = !terminalSeen;
+    readCoverageManifests(records, active && options.allowActive === true);
     const allowActive =
       active &&
       options.allowActive === true &&

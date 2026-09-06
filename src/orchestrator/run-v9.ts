@@ -19,7 +19,11 @@ import {
 import { validateAdjudication } from "../findings/adjudication.js";
 import { verifyAdjudicationEvidence } from "../findings/evidence-verifier.js";
 import type { AdapterRegistry } from "../adapters/registry.js";
-import type { AdapterEvent, ReviewAdapter } from "../adapters/types.js";
+import type {
+  AdapterEvent,
+  ReviewAdapter,
+  InspectionProgress,
+} from "../adapters/types.js";
 import {
   sanitizeAdapterFailure,
   sanitizePublicText,
@@ -45,14 +49,28 @@ import type {
   V9EventWriter,
   V9EventDraft,
 } from "../protocol/v9-event-writer.js";
+import { PublicDeliveryError } from "../protocol/v9-event-writer.js";
 import { reviewerResultDigest } from "../results/digest.js";
+import {
+  createResultPagePreservation,
+  type ResultPagePreservation,
+} from "../results/result-pages.js";
 import { reviewerConfigFingerprint } from "../diagnostics/retry-v9.js";
+import {
+  createCoverageRecorder,
+  type RunSnapshotManifest,
+} from "../diagnostics/coverage-records.js";
 import { sanitizedResultPages } from "../results/sanitized-pages.js";
 import {
   ResultSanitizationError,
   sanitizeReviewerOutput,
+  sanitizeRunMetadata,
 } from "../results/sanitize.js";
 import { selectRunDeadline, deadlineCause } from "./deadlines.js";
+import {
+  evaluateRemainingQuorum,
+  snapshotWorkload,
+} from "./review-feasibility.js";
 import { createActivityTracker } from "./activity.js";
 import { changedPathMatchesGlob, evaluatePassQuorum } from "./lens-policy.js";
 
@@ -80,6 +98,7 @@ export interface V9RunInput {
       resultByteCount: number;
       coverageEntries: readonly Record<string, unknown>[];
       snapshotIdentity?: RunSnapshotIdentity;
+      snapshotManifest?: RunSnapshotManifest;
       terminal: Record<string, unknown>;
     }>;
     inheritance: "exact" | "rerun_all";
@@ -114,6 +133,14 @@ interface Job {
   adapter?: ReviewAdapter;
   progressObservable?: boolean;
   fallbackEligible?: boolean;
+  inspection?: InspectionProgress;
+  resultId?: string;
+  resultPagePreservation?: ResultPagePreservation;
+}
+function publicFailureReason(
+  reason: AdapterFailure["reason"],
+): V9IncompleteReason {
+  return reason === "timeout" ? "provider_timeout" : reason;
 }
 const lensId = (reviewer: ResolvedReviewer) => reviewer.agentId ?? reviewer.id;
 const provider = (reviewer: ResolvedReviewer) =>
@@ -306,6 +333,7 @@ export async function runV9Review(input: V9RunInput) {
     openedAt?: number;
     causedByReviewerId?: string;
     halfOpenReviewerId?: string;
+    cause?: NonNullable<AdapterFailure["diagnostics"]>["circuit_cause"];
   }
   const circuits = new Map<string, ProviderCircuit>();
   const cleanupTasks = new Set<Promise<void>>();
@@ -315,7 +343,11 @@ export async function runV9Review(input: V9RunInput) {
   let pendingHeartbeat: Promise<void> | undefined;
   let completedResults = input.retry?.inherited.length ?? 0;
   let outputFailure = false;
+  let emissionFailureRecorded = false;
+  let artifactFinalizing = false;
   const mode = input.outputMode ?? "concise-jsonl";
+  const preflightLenses = new Set<string>();
+  const unreachableLenses = new Set<string>();
   const circuitAdmission = (reviewer: ResolvedReviewer) => {
     const key = provider(reviewer);
     const circuit = circuits.get(key);
@@ -327,11 +359,13 @@ export async function runV9Review(input: V9RunInput) {
         : ({
             allowed: false,
             causedByReviewerId: circuit.causedByReviewerId,
+            cause: circuit.cause,
           } as const);
     if (now() - (circuit.openedAt ?? 0) < execution.circuit_breaker_cooldown_ms)
       return {
         allowed: false,
         causedByReviewerId: circuit.causedByReviewerId,
+        cause: circuit.cause,
       } as const;
     circuit.state = "half_open";
     circuit.halfOpenReviewerId = reviewer.id;
@@ -347,6 +381,9 @@ export async function runV9Review(input: V9RunInput) {
       failure.reason === "authentication_failed" ||
       failure.reason === "model_unavailable" ||
       failure.reason === "read_failure" ||
+      failure.reason === "change_coverage_incomplete" ||
+      failure.reason === "output_failed" ||
+      failure.reason === "persistence_failed" ||
       failure.reason === "cancelled"
     )
       return false;
@@ -378,6 +415,16 @@ export async function runV9Review(input: V9RunInput) {
       state: opens ? "open" : "closed",
       ...(opens ? { openedAt: now() } : {}),
       causedByReviewerId: reviewer.id,
+      cause: {
+        reviewer_id: reviewer.id,
+        attempt:
+          jobs.find((job) => job.reviewer.id === reviewer.id)?.attempt ?? 1,
+        reason: failure.reason,
+        at: new Date(now()).toISOString(),
+        ...(failure.diagnostics?.failure_code
+          ? { failure_code: failure.diagnostics.failure_code }
+          : {}),
+      },
     });
   };
   const scheduleCleanup = (adapter: ReviewAdapter | undefined) => {
@@ -404,9 +451,39 @@ export async function runV9Review(input: V9RunInput) {
   const emit = async (draft: V9EventDraft) => {
     try {
       await input.writer.emit(draft);
-    } catch {
+    } catch (error) {
       outputFailure = true;
-      controller.abort(new Error("Public output failed."));
+      if (
+        error instanceof PublicDeliveryError &&
+        error.details.stage === "event_persistence"
+      ) {
+        controller.abort(error);
+        throw error;
+      }
+      // Output and serialization faults do not own reviewer cancellation. The
+      // authoritative artifact remains usable and every active job may finish.
+      if (!emissionFailureRecorded && !artifactFinalizing) {
+        emissionFailureRecorded = true;
+        await input.record({
+          record: "run.error",
+          data: {
+            reason: "output_failed",
+            scope: "public_delivery",
+            cancellation_initiator: "none",
+            ...(error instanceof PublicDeliveryError
+              ? error.details
+              : {
+                  stage: "output_write",
+                  event: draft.event,
+                  attempted_seq: 1,
+                  message:
+                    sanitizePublicText(
+                      error instanceof Error ? error.message : error,
+                    ) ?? "Public delivery failed.",
+                }),
+          },
+        });
+      }
     }
   };
   const modelCounts = () => ({
@@ -419,21 +496,14 @@ export async function runV9Review(input: V9RunInput) {
     running: jobs.filter((job) => job.status === "running").length,
     queued: jobs.filter((job) => job.status === "queued").length,
   });
+  const persistCoverage = createCoverageRecorder(input.record);
   const recordCoverage = async (job: Job) => {
     if (job.ledger === undefined) return;
-    const entries = job.ledger.entries();
-    for (let index = 0; index < Math.max(1, entries.length); index += 256)
-      await input.record({
-        record: "reviewer.coverage",
-        reviewer_id: job.reviewer.id,
-        data: {
-          index: index / 256,
-          entries: entries.slice(index, index + 256),
-          ...(index === 0
-            ? { snapshot_identity: job.ledger.snapshotIdentity() }
-            : {}),
-        },
-      });
+    await persistCoverage({
+      reviewerId: job.reviewer.id,
+      entries: job.ledger.entries(),
+      snapshotIdentity: job.ledger.snapshotIdentity(),
+    });
   };
   const skip = async (
     job: Job,
@@ -580,6 +650,8 @@ export async function runV9Review(input: V9RunInput) {
       let failure: AdapterFailure | undefined;
       const attemptId = String(attempt);
       const expiration = () => {
+        if (controller.signal.reason instanceof PublicDeliveryError)
+          return "persistence_failed" as const;
         const cause = deadlineCause({
           now: now(),
           cancelled: input.signal.aborted,
@@ -601,7 +673,7 @@ export async function runV9Review(input: V9RunInput) {
         if (cause === "cancelled") return cause;
         if (job.phase === "queued") return "queue_deadline_exceeded";
         if (!admitted) return cause ?? "probe_deadline_exceeded";
-        return cause ?? "attempt_deadline_exceeded";
+        return cause ?? "unknown";
       };
       const recordAttempt = async (attemptFailure?: AdapterFailure) => {
         const endedAt = now();
@@ -666,6 +738,52 @@ export async function runV9Review(input: V9RunInput) {
           }),
           child.signal,
         );
+        if (!preflightLenses.has(lensId(reviewer))) {
+          preflightLenses.add(lensId(reviewer));
+          const workload = snapshotWorkload(job.ledger.entries());
+          const rawDiffBytes = input.context.git.is_repository
+            ? (input.context.git.raw_diff?.byte_count ?? 0)
+            : 0;
+          const costWarnings = [
+            ...(workload.unavailable_files > 0
+              ? ["required_snapshot_unavailable"]
+              : []),
+            ...(rawDiffBytes > 0 && workload.snapshot_bytes > rawDiffBytes * 4
+              ? ["full_snapshot_exceeds_diff_budget_basis"]
+              : []),
+          ];
+          await input.record({
+            record: "reviewer.preflight",
+            reviewer_id: reviewer.id,
+            data: {
+              lens_id: lensId(reviewer),
+              ...workload,
+              model_runs: jobs.filter(
+                (member) => lensId(member.reviewer) === lensId(reviewer),
+              ).length,
+              required_passes: reviewer.policy?.passQuorum ?? 1,
+              required_provider_groups:
+                reviewer.policy?.minimumProviderGroups ?? 1,
+              run_deadline_remaining_ms: Math.max(0, runDeadline - now()),
+              estimated_minimum_tool_turns: Math.ceil(
+                workload.minimum_read_requests / 32,
+              ),
+              limits_are_estimates: true,
+              warnings: costWarnings,
+            },
+          });
+          await emit({
+            event: "reviewer.progress",
+            reviewer_id: reviewer.id,
+            data: {
+              lens_id: lensId(reviewer),
+              mode: job.mode,
+              phase: "probing",
+              workload,
+              message: `Evidence preflight: ${workload.required_files} files, ${workload.snapshot_bytes} bytes, at least ${workload.minimum_read_requests} reads; ${workload.unavailable_files} unavailable. Deadline estimates do not guarantee provider completion.`,
+            },
+          });
+        }
         let adapterCapabilities = capabilities.get(reviewer.id);
         if (adapterCapabilities === undefined) {
           adapterCapabilities = await abortable(
@@ -745,6 +863,9 @@ export async function runV9Review(input: V9RunInput) {
                   failure_stage: "circuit_breaker",
                   scope: "provider",
                   retry_blocked_by_circuit: true,
+                  ...(admission.cause
+                    ? { circuit_cause: admission.cause }
+                    : {}),
                   ...(admission.causedByReviewerId === undefined
                     ? {}
                     : {
@@ -858,7 +979,9 @@ export async function runV9Review(input: V9RunInput) {
                   ),
                 });
           const resultPages = {
-            resultId: randomUUID(),
+            resultId: (job.resultId ??= randomUUID()),
+            preservation: (job.resultPagePreservation ??=
+              createResultPagePreservation()),
             resultKind: source
               ? ("adjudication" as const)
               : ("reviewer" as const),
@@ -913,6 +1036,27 @@ export async function runV9Review(input: V9RunInput) {
               isolationPolicy: reviewer.isolationPolicy,
               coverage: job.ledger,
               resultPages,
+              recordDiagnostic: async (diagnostic) => {
+                const safe = sanitizeRunMetadata(diagnostic) as Record<
+                  string,
+                  unknown
+                >;
+                if (typeof safe.raw_excerpt === "string")
+                  safe.raw_excerpt = sanitizePublicText(safe.raw_excerpt, 4096);
+                if (
+                  Buffer.byteLength(JSON.stringify(safe), "utf8") >
+                  256 * 1024
+                ) {
+                  delete safe.candidate;
+                  safe.raw_excerpt =
+                    "Draft candidate exceeded the private diagnostic size limit.";
+                }
+                await input.record({
+                  record: "reviewer.draft",
+                  reviewer_id: reviewer.id,
+                  data: { ...safe, attempt, verified: false },
+                });
+              },
             })
             [Symbol.asyncIterator]();
           try {
@@ -920,6 +1064,8 @@ export async function runV9Review(input: V9RunInput) {
               const next = await abortable(iterator.next(), child.signal);
               if (next.done) break;
               const event = next.value;
+              if (event.type === "progress" && event.inspection)
+                job.inspection = event.inspection;
               if (event.type === "result" || event.type === "failure") {
                 if (terminal) throw new Error("Duplicate adapter terminal");
                 terminal = event;
@@ -964,7 +1110,11 @@ export async function runV9Review(input: V9RunInput) {
                       },
                     }),
               });
-              if (changed || repairing)
+              if (
+                changed ||
+                repairing ||
+                (event.type === "progress" && event.inspection)
+              )
                 await emit({
                   event: "reviewer.progress",
                   reviewer_id: reviewer.id,
@@ -974,6 +1124,9 @@ export async function runV9Review(input: V9RunInput) {
                     phase: phase as "reviewing",
                     attempt,
                     maximum_attempts: execution.retry_attempts,
+                    ...(event.type === "progress" && event.inspection
+                      ? { inspection: event.inspection }
+                      : {}),
                     ...(repairing
                       ? {
                           message:
@@ -1001,7 +1154,7 @@ export async function runV9Review(input: V9RunInput) {
           );
         } else if (terminal?.type === "failure")
           failure = sanitizeAdapterFailure(
-            terminal.failure.reason,
+            publicFailureReason(terminal.failure.reason),
             terminal.failure.message,
             terminal.failure.retryable,
             {
@@ -1391,22 +1544,16 @@ export async function runV9Review(input: V9RunInput) {
     });
     for (const inherited of input.retry?.inherited ?? []) {
       await input.recordResult(inherited.reviewerId, inherited.result);
-      for (
-        let index = 0;
-        index < Math.max(1, inherited.coverageEntries.length);
-        index += 256
-      )
-        await input.record({
-          record: "reviewer.coverage",
-          reviewer_id: inherited.reviewerId,
-          data: {
-            index: index / 256,
-            entries: inherited.coverageEntries.slice(index, index + 256),
-            ...(index === 0 && inherited.snapshotIdentity !== undefined
-              ? { snapshot_identity: inherited.snapshotIdentity }
-              : {}),
-          },
-        });
+      await persistCoverage({
+        reviewerId: inherited.reviewerId,
+        entries: inherited.coverageEntries,
+        ...(inherited.snapshotIdentity
+          ? { snapshotIdentity: inherited.snapshotIdentity }
+          : {}),
+        ...(inherited.snapshotManifest
+          ? { snapshotManifest: inherited.snapshotManifest }
+          : {}),
+      });
       await input.record({
         record: "reviewer.terminal",
         reviewer_id: inherited.reviewerId,
@@ -1445,6 +1592,7 @@ export async function runV9Review(input: V9RunInput) {
           attempt: Math.max(1, job.attempt),
           maximum_attempts: execution.retry_attempts,
           phase: job.phase as "reviewing",
+          ...(job.inspection ? { inspection: job.inspection } : {}),
           attempt_elapsed_ms:
             job.admittedAt === undefined ? 0 : now() - job.admittedAt,
           ...(job.admittedAt === undefined
@@ -1573,12 +1721,32 @@ export async function runV9Review(input: V9RunInput) {
                 ? "cancelled"
                 : now() >= runDeadline
                   ? "run_deadline_exceeded"
-                  : "lens_deadline_exceeded",
+                  : controller.signal.aborted
+                    ? "persistence_failed"
+                    : "lens_deadline_exceeded",
             );
             continue;
           }
           const result = await execute(job, source);
           if (result === "incomplete") {
+            const feasibility = evaluateRemainingQuorum(
+              {
+                passQuorum: reviewer.policy?.passQuorum ?? allMembers.length,
+                minimumProviderGroups:
+                  reviewer.policy?.minimumProviderGroups ?? 1,
+              },
+              passes,
+              members
+                .slice(index + 1)
+                .map((member) => provider(member.reviewer)),
+            );
+            if (!feasibility.reachable && !unreachableLenses.has(id)) {
+              unreachableLenses.add(id);
+              await emit({
+                event: "lens.quorum_unreachable",
+                data: { lens_id: id, ...feasibility },
+              });
+            }
             if (!job.fallbackEligible) {
               for (const rest of members.slice(index + 1))
                 await skip(rest, "blocked_by_infrastructure_failure");
@@ -1723,6 +1891,11 @@ export async function runV9Review(input: V9RunInput) {
         planned_public_stream:
           mode === "full-jsonl" ? "complete" : "references_only",
       },
+      ...(execution.review_profile
+        ? { review_profile: execution.review_profile }
+        : {}),
+      clean_pass_unreachable: [...unreachableLenses].sort().slice(0, 8),
+      total_clean_pass_unreachable: unreachableLenses.size,
       lens_summaries: lensSamples.items,
       total_lens_summaries: lensSamples.total,
       omitted_lens_summaries_count: lensSamples.omitted,
@@ -1750,6 +1923,7 @@ export async function runV9Review(input: V9RunInput) {
     await awaitCleanup();
     await pendingHeartbeat;
     try {
+      artifactFinalizing = true;
       await input.writer.finish(summary);
     } finally {
       if (heartbeat) {

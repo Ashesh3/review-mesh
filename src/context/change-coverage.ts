@@ -50,7 +50,8 @@ export type DiffDeliveryState =
 
 export interface ChangeCoverageEntry {
   path: string;
-  kind: "tracked" | "deleted" | "untracked";
+  /** Supporting is a review role; it makes no assertion about Git tracking. */
+  kind: "tracked" | "deleted" | "untracked" | "supporting";
   required_method: "full_file" | "diff" | "deleted_diff";
   proof_kind: "observed" | "attested";
   relevant: boolean;
@@ -628,7 +629,7 @@ export async function createChangeCoverageLedger(input: {
     if (entries.has(path)) continue;
     entries.set(path, {
       path,
-      kind: "untracked",
+      kind: "supporting",
       required_method: "full_file",
       proof_kind: input.policy.proof,
       relevant: false,

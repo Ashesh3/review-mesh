@@ -75,6 +75,40 @@ async function settle() {
 }
 
 describe("dashboard user workflows", () => {
+  it("labels a retained pass as incomplete when coverage was rejected", async () => {
+    const { document, window } = await openDashboard(
+      "#/reviews/run-active",
+      (fixture) => {
+        Object.assign(fixture.reviewers[0]!, {
+          state: "incomplete",
+          phase: "terminal",
+          result: {
+            verdict: "pass",
+            summary: "Retained review summary",
+            actionable_findings: [],
+            informational_notes: [],
+          },
+        });
+      },
+    );
+    document
+      .querySelector('[data-open-reviewer="security::primary"]')
+      ?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+    await settle();
+    document
+      .querySelector('[data-inspector-tab="result"]')
+      ?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+    await settle();
+    expect(document.querySelector(".dock-panel")?.textContent).toContain(
+      "not accepted for clearance",
+    );
+    expect(document.querySelector(".dock-panel")?.textContent).toContain(
+      "Retained review summary",
+    );
+    expect(
+      document.querySelector('.dock-panel [data-status="pass"]'),
+    ).toBeNull();
+  });
   it("does not mark stages complete when a review terminates before context and reviewer selection", async () => {
     const { document } = await openDashboard(
       "#/reviews/run-complete",

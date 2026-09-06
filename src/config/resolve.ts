@@ -1,5 +1,6 @@
 import {
   trustedConfigSchema,
+  effectiveV7AgentPolicy,
   validateAdapterEffort,
   type ResolvedConfig,
   type ResolvedReviewer,
@@ -21,6 +22,7 @@ import {
   validateLensPolicy,
 } from "../orchestrator/lens-policy.js";
 import { selectProject } from "./project-paths.js";
+import { applyReviewProfile } from "../orchestrator/review-feasibility.js";
 import {
   projectNameFromLegacyPath,
   selectProjectByName,
@@ -573,7 +575,19 @@ function resolveV2(
 }
 
 export function resolveConfig(input: ResolveConfigInput): ResolvedConfig {
-  const trusted = trustedConfigSchema.parse(input.trusted);
+  const parsed = trustedConfigSchema.parse(input.trusted);
+  const trusted =
+    parsed.schema_version === "7" && parsed.execution.review_profile
+      ? {
+          ...parsed,
+          agents: Object.fromEntries(
+            Object.entries(parsed.agents).map(([id, agent]) => [
+              id,
+              effectiveV7AgentPolicy(agent, parsed.execution.review_profile),
+            ]),
+          ),
+        }
+      : parsed;
   const resolved =
     trusted.schema_version === "1"
       ? resolveV1(trusted, input.projectName, input.projectNameSource)
@@ -583,6 +597,7 @@ export function resolveConfig(input: ResolveConfigInput): ResolvedConfig {
           input.projectName,
           input.projectNameSource,
         );
+  applyReviewProfile(resolved, resolved.execution.review_profile);
   return {
     ...resolved,
     sourceSchemaVersion: input.sourceSchemaVersion ?? trusted.schema_version,

@@ -4,6 +4,11 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createRunArtifact } from "../../src/diagnostics/run-artifact.js";
 import { readNormalizedRun } from "../../src/diagnostics/normalize-run.js";
+import { v9Report } from "../../src/diagnostics/v9-views.js";
+import {
+  renderRunReportMarkdown,
+  readRunFindings,
+} from "../../src/diagnostics/run-report.js";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -33,10 +38,12 @@ describe("one normalized run model", () => {
       await writer.result(reviewer, {
         schema_version: "4",
         verdict: "pass",
-        review_markdown: "Review",
-        summary: "Review",
+        review_markdown: "",
+        summary: "Structured review summary",
         actionable_findings: [],
-        informational_notes: [],
+        informational_notes: [
+          { title: "Retained note", description: "Structured note evidence." },
+        ],
         change_coverage: {
           status,
           proof_kind: "observed",
@@ -55,6 +62,40 @@ describe("one normalized run model", () => {
         },
       });
     }
+    await writer.record({
+      record: "reviewer.attempt",
+      reviewer_id: "partial",
+      data: {
+        attempt: 1,
+        started_at: "2026-09-06T00:00:00Z",
+        elapsed_ms: 1234,
+        failure: {
+          reason: "adapter_unavailable",
+          message: "Endpoint rejected request.",
+          retryable: false,
+          diagnostics: {
+            http_status: 400,
+            provider_request_id: "request-123",
+            correlation_headers: { "cf-ray": "ray-123" },
+          },
+        },
+      },
+    });
+    await writer.record({
+      record: "reviewer.draft",
+      reviewer_id: "partial",
+      data: {
+        kind: "unverified_result_draft",
+        checkpoint_id: "checkpoint-123",
+        attempt: 1,
+        verified: false,
+        accepted_page_count: 0,
+        candidate_ids: [],
+        unresolved_obligations: ["missing field"],
+        raw_excerpt: "Large rejected text",
+        candidate: { title: "Not a verified finding" },
+      },
+    });
     await writer.finalize({
       run_outcome: "inconclusive",
       gate_outcome: "no_gate_findings",
@@ -81,7 +122,32 @@ describe("one normalized run model", () => {
       warnings: [],
       deficit_samples: [],
     });
-    expect(await readNormalizedRun(path)).toMatchObject({
+    const normalized = await readNormalizedRun(path);
+    const report = v9Report(normalized);
+    const markdown = renderRunReportMarkdown(report as never);
+    expect(markdown).toContain("Structured review summary");
+    expect(markdown).toContain("Retained note");
+    expect(markdown).toContain("not accepted for clearance");
+    expect(markdown).toContain("request-123");
+    expect(markdown).toContain("ray-123");
+    expect(markdown).toContain("1234 ms");
+    expect(markdown).toContain("Unverified drafts");
+    expect(markdown).not.toContain("Large rejected text");
+    expect(report).not.toHaveProperty("records");
+    expect(report).not.toHaveProperty("request");
+    expect(report).not.toHaveProperty("resolution");
+    expect(v9Report(normalized, { includeRaw: true })).toHaveProperty(
+      "records",
+    );
+    expect(
+      await readRunFindings({ runsDirectory: root, runId: "run-1" }),
+    ).toMatchObject({
+      run_outcome: "inconclusive",
+      coverage_outcome: "partial",
+      exit_code: 3,
+      raw: [],
+    });
+    expect(normalized).toMatchObject({
       run_outcome: "inconclusive",
       coverage_outcome: "partial",
       exit_code: 3,

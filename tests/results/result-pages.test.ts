@@ -272,14 +272,14 @@ describe("reviewer result page collector", () => {
       resultKind: "reviewer",
     });
     const pages = reviewerPages();
-    expect(collector.nextRequest()).toEqual({
+    expect(collector.nextRequest()).toMatchObject({
       resultId: "result-1",
       pageIndex: 0,
       previousPageDigest: null,
       candidateIds: [],
     });
     collector.addPage(pages[0]!);
-    expect(collector.nextRequest()).toEqual({
+    expect(collector.nextRequest()).toMatchObject({
       resultId: "result-1",
       pageIndex: 1,
       previousPageDigest: digest(pages[0]!),
@@ -404,7 +404,7 @@ describe("reviewer result page collector", () => {
     ).toBe(fragment);
   });
 
-  it("rejects false narrative and finding declarations during assembly", () => {
+  it("rejects false finding counts while computing narrative bytes on the host", () => {
     for (const field of [
       "narrative_byte_count",
       "actionable_finding_count",
@@ -423,7 +423,9 @@ describe("reviewer result page collector", () => {
         pages[index] = rawPage(page);
       }
       for (const page of pages) collector.addPage(page);
-      expect(() => collector.assemble()).toThrow(ResultPageError);
+      if (field === "narrative_byte_count")
+        expect(() => collector.assemble()).not.toThrow();
+      else expect(() => collector.assemble()).toThrow(ResultPageError);
     }
   });
 

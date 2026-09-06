@@ -1,4 +1,4 @@
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { createV9EventWriter } from "../../src/protocol/v9-event-writer.js";
 import { RunArtifactError } from "../../src/diagnostics/run-index.js";
@@ -28,6 +28,120 @@ const terminal = {
   deficit_samples: [],
 };
 describe("v6 public writer", () => {
+  it("preserves a destroyed stream's synchronous native error before its error event", async () => {
+    const output = new PassThrough();
+    output.on("error", () => undefined);
+    const writer = createV9EventWriter({
+      output,
+      runId: "closed",
+      recordEvent: async () => undefined,
+      finalize: async () => ({
+        path: "/artifact",
+        sha256: "a".repeat(64),
+        byte_count: 1,
+        completed_results: 0,
+      }),
+      observe: async () => undefined,
+    });
+    output.destroy(Object.assign(new Error("broken pipe"), { code: "EPIPE" }));
+    await expect(
+      writer.emit({
+        event: "run.started",
+        data: { consistency_mode: "live_worktree" },
+      }),
+    ).rejects.toThrow();
+    expect(writer.failureDetails()).toMatchObject({
+      native_error_code: "EPIPE",
+      message: "broken pipe",
+    });
+    await writer.close();
+  });
+  it("retains the precise terminal-write failure through publication observation", async () => {
+    const output = new Writable({
+      write(chunk, _encoding, callback) {
+        callback(
+          String(chunk).includes('"run.completed"')
+            ? Object.assign(new Error("terminal closed"), { code: "EPIPE" })
+            : null,
+        );
+      },
+    });
+    const observations: unknown[] = [];
+    const writer = createV9EventWriter({
+      output,
+      runId: "terminal-fault",
+      recordEvent: async () => undefined,
+      finalize: async () => ({
+        path: "/artifact",
+        sha256: "a".repeat(64),
+        byte_count: 1,
+        completed_results: 0,
+      }),
+      observe: async (...args) => {
+        observations.push(args);
+      },
+    });
+    await expect(writer.finish(terminal)).rejects.toThrow();
+    expect(observations).toEqual([
+      [
+        "failed",
+        expect.objectContaining({
+          stage: "output_write",
+          event: "run.completed",
+          attempted_seq: 1,
+          native_error_code: "EPIPE",
+        }),
+      ],
+    ]);
+    await writer.close();
+  });
+  it("records rejected serialization as failed delivery even when terminal output succeeds", async () => {
+    const output = new PassThrough();
+    let text = "";
+    output.on("data", (chunk) => {
+      text += String(chunk);
+    });
+    const observed: string[] = [];
+    let saved: Record<string, unknown> | undefined;
+    const writer = createV9EventWriter({
+      output,
+      runId: "run-1",
+      recordEvent: async () => undefined,
+      finalize: async (summary) => {
+        saved = summary;
+        return {
+          path: "/artifact",
+          sha256: "a".repeat(64),
+          byte_count: 1,
+          completed_results: 0,
+        };
+      },
+      observe: async (outcome) => {
+        observed.push(outcome);
+      },
+    });
+    await expect(
+      writer.emit({
+        event: "reviewer.incomplete",
+        data: { reason: "invalid" },
+      } as never),
+    ).rejects.toThrow();
+    await writer.emit({
+      event: "run.started",
+      data: { consistency_mode: "live_worktree" },
+    });
+    await writer.finish(terminal);
+    expect(observed).toEqual(["failed"]);
+    expect(saved).toMatchObject({
+      delivery_failure: {
+        stage: "event_validation",
+        event: "reviewer.incomplete",
+        attempted_seq: 1,
+      },
+    });
+    expect(text).not.toContain('"seq":3');
+    await writer.close();
+  });
   it("emits a terminal persistence failure without claiming a clear completed run", async () => {
     const output = new PassThrough();
     let text = "";

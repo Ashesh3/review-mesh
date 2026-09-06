@@ -74,6 +74,9 @@ export async function loadV9Run(
     ...(resolved.observed_public_stream
       ? { observedPublicStream: resolved.observed_public_stream }
       : {}),
+    ...(resolved.public_delivery_failure
+      ? { publicDeliveryFailure: resolved.public_delivery_failure }
+      : {}),
   });
   run.artifact_resolution = resolved.resolution;
   return run;
@@ -90,9 +93,33 @@ export function v9Headline(run: NormalizedRun): string {
           : "Clear";
   return `${title}: ${run.coverage_outcome} coverage; ${counts.gate_eligible_subfindings} gate findings; ${counts.non_gating_subfindings} non-gating subfindings; ${run.summary.incomplete_lenses ?? 0} lenses incomplete.`;
 }
-export function v9Report(run: NormalizedRun) {
+export function v9Report(
+  run: NormalizedRun,
+  options: { includeRaw?: boolean } = {},
+) {
+  const {
+    records,
+    request,
+    context,
+    resolution,
+    snapshot_manifests,
+    ...compact
+  } = run;
   return {
-    ...run,
+    ...compact,
+    ...(options.includeRaw
+      ? { records, request, context, resolution, snapshot_manifests }
+      : {}),
+    reviewers: run.reviewers.map((reviewer) => ({
+      ...reviewer,
+      ...(reviewer.coverage
+        ? {
+            coverage: reviewer.coverage.filter(
+              (entry) => entry.relevant === true,
+            ),
+          }
+        : {}),
+    })),
     schema_version: "2",
     kind: "review-mesh.run-report",
     status: run.active
@@ -113,12 +140,37 @@ export function v9Report(run: NormalizedRun) {
     findings: run.canonical.atomics,
     roots: run.canonical.roots,
     finding_counts: run.canonical.counts,
-    incomplete_lenses: run.reviewers
-      .filter((reviewer) => reviewer.status === "incomplete")
-      .map((reviewer) => reviewer.lens_id),
+    incomplete_lenses: [
+      ...new Set(
+        run.reviewers
+          .filter((reviewer) => reviewer.status === "incomplete")
+          .map((reviewer) => reviewer.lens_id),
+      ),
+    ],
     attempts: run.records.filter(
       (record) => record.record === "reviewer.attempt",
     ),
+    preflight: records.filter(
+      (record) => record.record === "reviewer.preflight",
+    ),
+    review_profile: run.summary.review_profile,
+    clean_pass_unreachable: run.summary.clean_pass_unreachable ?? [],
+    total_clean_pass_unreachable: run.summary.total_clean_pass_unreachable ?? 0,
+    quorum_failures: records.filter(
+      (record) => record.event === "lens.quorum_unreachable",
+    ),
+    errors: records.filter((record) => record.record === "run.error"),
+    unverified_drafts: records
+      .filter((record) => record.record === "reviewer.draft")
+      .map((record) => {
+        if (options.includeRaw) return record;
+        const {
+          candidate: _candidate,
+          raw_excerpt: _excerpt,
+          ...summary
+        } = record.data as Record<string, unknown>;
+        return { ...record, data: summary };
+      }),
     headline: v9Headline(run),
   };
 }
@@ -146,7 +198,7 @@ export function v9Status(
   }
   if (details)
     return {
-      ...v9Report(run),
+      ...v9Report(run, { includeRaw: true }),
       schema_version: "3",
       kind: "review-mesh.run-status",
       reviewers,
@@ -169,6 +221,9 @@ export function v9Status(
     model_runs: live.model_runs,
     reviewers: live.reviewers.map(dashboardReviewerSummary),
     artifact: run.artifact,
+    ...(run.public_delivery_failure
+      ? { public_delivery_failure: run.public_delivery_failure }
+      : {}),
     ...(run.artifact_resolution
       ? { artifact_resolution: run.artifact_resolution }
       : {}),

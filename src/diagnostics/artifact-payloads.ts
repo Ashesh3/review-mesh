@@ -8,6 +8,8 @@ import {
   v9IncompleteReasonSchema,
   v9FindingSeveritySchema,
   v9FindingConfidenceSchema,
+  deliveryFailureSchema,
+  snapshotWorkloadSchema,
 } from "../protocol/v9.js";
 import { runFindingsPayloadSchema } from "./artifact-record-schemas.js";
 
@@ -72,6 +74,37 @@ export const artifactCoverageV1Schema = z.strictObject({
   index: count,
   entries: z.array(coverageEntry).max(256),
 });
+export const artifactCoverageV2Schema = artifactCoverageV1Schema.extend({
+  snapshot_identity: runSnapshotIdentitySchema.optional(),
+});
+export const snapshotFileSchema = z.strictObject({
+  path: z.string().min(1).max(1024),
+  byte_count: count,
+  sha256: digest,
+});
+export const snapshotManifestChunkSchema = z.strictObject({
+  index: count,
+  chunk_count: z.number().int().min(1).max(128),
+  identity: runSnapshotIdentitySchema,
+  files: z.array(snapshotFileSchema).max(256),
+});
+export const artifactCoverageV3Schema = z
+  .strictObject({
+    index: count,
+    entries: z
+      .array(
+        coverageEntry.extend({
+          kind: z.enum(["tracked", "deleted", "untracked", "supporting"]),
+        }),
+      )
+      .max(256),
+    snapshot_ref: digest.optional(),
+    snapshot_identity: runSnapshotIdentitySchema.optional(),
+  })
+  .refine((value) => !(value.snapshot_ref && value.snapshot_identity), {
+    message:
+      "Coverage must reference a manifest or contain a legacy identity, not both.",
+  });
 const proof = z.strictObject({
   evidence_verified: z.boolean().optional(),
   source_coverage_verified: z.boolean().optional(),
@@ -98,9 +131,30 @@ export const failureDiagnosticsSchema = z.strictObject({
       "streaming_unsupported",
       "result_page_too_large",
       "structured_page_limit_exceeded",
+      "inspection_budget_exhausted",
+      "inspection_acquisition_failed",
     ])
     .optional(),
   failure_stage: z.string().min(1).max(64).optional(),
+  model: z.string().min(1).max(256).optional(),
+  operation_phase: z.string().min(1).max(64).optional(),
+  inspection_turn: count.optional(),
+  maximum_inspection_turns: count.optional(),
+  remaining_inspection_turns: count.optional(),
+  request_bytes: count.optional(),
+  provider_error_code: z.string().max(128).optional(),
+  provider_error_message: z.string().max(512).optional(),
+  error_body_truncated: z.boolean().optional(),
+  error_body_unavailable: z.boolean().optional(),
+  circuit_cause: z
+    .strictObject({
+      reviewer_id: id,
+      attempt: count,
+      reason: text.max(128),
+      at: z.iso.datetime({ offset: true }),
+      failure_code: text.max(128).optional(),
+    })
+    .optional(),
   scope: z.enum(["run_input", "adapter", "provider", "model"]).optional(),
   http_status: z.number().int().min(100).max(599).optional(),
   provider_request_id: z.string().min(1).max(256).optional(),
@@ -249,6 +303,7 @@ export const artifactResolutionPolicySchema = z.strictObject({
   candidateFindings: z.json().optional(),
 });
 export const artifactResolutionExecutionSchema = z.strictObject({
+  review_profile: z.enum(["strict-evaluation", "routine-review"]).optional(),
   max_concurrency: count,
   heartbeat_interval_ms: count,
   shutdown_grace_period_ms: count,
@@ -340,6 +395,38 @@ export const artifactAttemptV1Schema = z.strictObject({
 });
 
 export const privatePayloadSchemas: Record<string, z.ZodType> = {
+  "reviewer.preflight": snapshotWorkloadSchema.extend({
+    lens_id: id,
+    model_runs: count,
+    required_passes: count,
+    required_provider_groups: count,
+    run_deadline_remaining_ms: count,
+    estimated_minimum_tool_turns: count,
+    limits_are_estimates: z.literal(true),
+    warnings: z.array(text.max(128)).max(8),
+  }),
+  "run.error": deliveryFailureSchema.extend({
+    reason: z.literal("output_failed"),
+    scope: z.literal("public_delivery"),
+    cancellation_initiator: z.literal("none"),
+  }),
+  "reviewer.draft": z
+    .strictObject({
+      kind: z.literal("unverified_result_draft"),
+      checkpoint_id: text.max(256),
+      attempt: count,
+      verified: z.literal(false),
+      page_index: count.optional(),
+      accepted_page_count: count,
+      candidate_ids: z.array(text.max(256)).max(256),
+      unresolved_obligations: z.array(text.max(1000)).max(256),
+      candidate: z.record(z.string(), z.unknown()).optional(),
+      validation_issues: failureDiagnosticsSchema.shape.validation_issues,
+      raw_excerpt: text.max(4096).optional(),
+    })
+    .refine(
+      (value) => Buffer.byteLength(JSON.stringify(value), "utf8") <= 256 * 1024,
+    ),
   request: reviewRequestV3Schema,
   resolution: artifactResolutionSchema,
   context: z.strictObject({
@@ -404,9 +491,8 @@ export const privatePayloadSchemas: Record<string, z.ZodType> = {
       )
       .max(10),
   }),
-  "reviewer.coverage": artifactCoverageV1Schema.extend({
-    snapshot_identity: runSnapshotIdentitySchema.optional(),
-  }),
+  "reviewer.coverage": artifactCoverageV3Schema,
+  "run.snapshot_manifest": snapshotManifestChunkSchema,
   "reviewer.result_page": z
     .strictObject({
       index: count,

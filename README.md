@@ -1,9 +1,9 @@
 # Review Mesh
 
-[v9.3.0](docs/releases/v9.3.0.md) protects active artifacts, retains verified
-recovery copies and adds `review-mesh recover RUN_ID --artifact PATH` for missing
-managed artifacts. Storage failures are explicit; intact registered backups
-remain readable after primary-file loss.
+[v9.4.0](docs/releases/v9.4.0.md) fixes timeout cancellation cascades, delivers
+required source ranges deterministically, preserves evidence and candidate
+findings across retries, and renders complete structured diagnostics. Snapshot
+manifests are shared across reviewers; strict evidence and quorum remain enforced.
 
 The [v9.2.0 pilot fixes](docs/releases/v9.2.0.md) add recoverable coverage reads,
 admission-based execution budgets, retained-conversation page repair, compact

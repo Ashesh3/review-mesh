@@ -24,12 +24,15 @@ import {
   type ResultPageCollector,
 } from "../results/result-pages.js";
 import { createReadOnlyFileTools } from "./file-tools.js";
+import { providerErrorBody } from "./provider-error-body.js";
+import { InspectionSession } from "./inspection-session.js";
 import {
   acknowledgeInitialDiffDelivery,
   isRepairablePageError,
   pageRepairMessage,
   failedPageRepair,
   MAX_PAGE_SCHEMA_REPAIRS,
+  recordResultPageDraft,
 } from "./sdk-pages.js";
 import {
   adapterFailure,
@@ -287,7 +290,7 @@ const EXACT_READ_ONLY_TOOLS = [
     function: {
       name: "read_file",
       description:
-        "Read an exact byte range from the pinned workspace snapshot. Content is base64 and earns observed coverage only when the complete response is admitted unchanged.",
+        "Read an exact byte range from the pinned workspace snapshot. Content is UTF-8 where the range is decodable, otherwise base64. Coverage requires unchanged delivery.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -1610,6 +1613,11 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
   private readonly activeWorkspaces = new Set<ReadOnlyWorkspace>();
   private readonly nonStreamingSessions = new Set<string>();
   private progressSequence = 0;
+  private readonly inspectionSessions = new WeakMap<
+    object,
+    InspectionSession
+  >();
+  private readonly admittedInspection = new Map<string, InspectionSession>();
 
   constructor(
     private readonly registration: OpenAICompatibleRegistration,
@@ -1755,7 +1763,15 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         ...(contentTypes === undefined ? {} : { content_types: contentTypes }),
       };
       if (!response.ok) {
-        await response.body?.cancel().catch(() => undefined);
+        Object.assign(
+          diagnostics,
+          await providerErrorBody(
+            response,
+            controller.signal,
+            typeof init.body === "string" ? init.body : undefined,
+            configuration.apiKey,
+          ),
+        );
         dispose();
         throw new ProviderRequestError(
           providerFailureForStatus(response.status, operation, diagnostics),
@@ -2237,6 +2253,12 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     failureDiagnostics: Partial<AdapterFailureDiagnostics> = {},
     onProgress?: (progress: ChatProgress) => void,
   ): Promise<ChatResponse> {
+    failureDiagnostics = {
+      ...(typeof body.model === "string" ? { model: body.model } : {}),
+      operation_phase: body.tools === undefined ? "finalization" : "inspection",
+      request_bytes: Buffer.byteLength(JSON.stringify(body)),
+      ...failureDiagnostics,
+    };
     if (
       "messages" in body &&
       Array.isArray(body.messages) &&
@@ -2266,6 +2288,22 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           "provider_response_invalid" ||
         error.failure.diagnostics.http_status !== 200
       ) {
+        if (error instanceof ProviderRequestError) {
+          throw new ProviderRequestError(
+            sanitizeAdapterFailure(
+              error.failure.reason,
+              error.failure.message,
+              error.failure.retryable,
+              {
+                ...error.failure,
+                diagnostics: {
+                  ...failureDiagnostics,
+                  ...error.failure.diagnostics,
+                },
+              },
+            ),
+          );
+        }
         throw error;
       }
       retriedEnvelope = true;
@@ -2287,6 +2325,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           throw new ProviderRequestError({
             ...retryError.failure,
             diagnostics: {
+              ...failureDiagnostics,
               ...retryError.failure.diagnostics,
               attempt_count: 2,
               retry_outcome: "exhausted",
@@ -2306,13 +2345,27 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           : undefined;
       if (Array.isArray(choices) && choices.length === 0) {
         retriedEnvelope = true;
-        response = await this.chatResponse(
-          configuration,
-          signal,
-          sessionId,
-          body,
-          onProgress,
-        );
+        try {
+          response = await this.chatResponse(
+            configuration,
+            signal,
+            sessionId,
+            body,
+            onProgress,
+          );
+        } catch (error) {
+          if (error instanceof ProviderRequestError)
+            throw new ProviderRequestError({
+              ...error.failure,
+              diagnostics: {
+                ...failureDiagnostics,
+                ...error.failure.diagnostics,
+                attempt_count: 2,
+                retry_outcome: "exhausted",
+              },
+            });
+          throw error;
+        }
         parsed = chatResponseSchema.safeParse(response.value);
         if (parsed.success) {
           response.diagnostics = {
@@ -2360,6 +2413,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         ),
       );
     }
+    this.admittedInspection.get(sessionId)?.acknowledge();
     return {
       message: parsed.data.choices[0]!.message,
       diagnostics: {
@@ -2615,6 +2669,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     let attempt = 1;
     let pageSpools: ResultSpool[] = [];
     const recorded = new WeakSet<ResultSpool>();
+    let durableDraft = false;
     const pageIndices = new WeakMap<ResultSpool, number>();
     const retain = async (spool: ResultSpool): Promise<string | undefined> => {
       try {
@@ -2640,13 +2695,15 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           throwIfAborted(input.signal);
           if (this.now() >= deadline) {
             throw new ProviderRequestError(
-              adapterFailure.timeout(
+              adapterFailure.invalidResult(
                 "Structured result page production exceeded its bounded deadline.",
-                true,
+                false,
                 {
+                  fallback_eligible: true,
+                  circuit_qualifying: false,
                   diagnostics: {
                     failure_stage: "structured_result_deadline",
-                    scope: "provider",
+                    scope: "model",
                   },
                 },
               ),
@@ -2665,13 +2722,15 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
             throwIfAborted(input.signal);
             if (this.now() >= deadline)
               throw new ProviderRequestError(
-                adapterFailure.timeout(
+                adapterFailure.invalidResult(
                   "Structured result page production exceeded its bounded deadline.",
-                  true,
+                  false,
                   {
+                    fallback_eligible: true,
+                    circuit_qualifying: false,
                     diagnostics: {
                       failure_stage: "structured_result_deadline",
-                      scope: "provider",
+                      scope: "model",
                     },
                   },
                 ),
@@ -2792,6 +2851,10 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
                   validationIssues: error.validationIssues,
                 });
                 recorded.add(pageSpool);
+                if (await recordResultPageDraft(input, collector, error, raw)) {
+                  durableDraft = true;
+                  error.artifactRef = "reviewer.draft";
+                }
               }
               if (isRepairablePageError(error)) {
                 if (repairs >= MAX_PAGE_SCHEMA_REPAIRS) {
@@ -2871,13 +2934,46 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         };
         return;
       } catch (error) {
+        if (
+          await recordResultPageDraft(
+            input,
+            collector,
+            error instanceof ResultPageError ? error : undefined,
+          )
+        )
+          durableDraft = true;
+        // A completed collection with an underfilled final item page can be
+        // repaired in place. Earlier exact pages and candidate obligations stay.
+        const targeted =
+          error instanceof ResultPageError &&
+          error.reason === "invalid_result" &&
+          attempt < this.finalizationAttempts
+            ? collector.repairAssembly()
+            : undefined;
+        if (targeted !== undefined) {
+          const retainedCount = targeted.nextRequest().pageIndex;
+          await Promise.all(
+            pageSpools.slice(retainedCount).map((spool) => retain(spool)),
+          );
+          pageSpools = pageSpools.slice(0, retainedCount);
+          collector = targeted;
+          attempt += 1;
+          yield {
+            type: "progress",
+            phase: "schema_repair",
+            message: `Repairing incomplete result page ${retainedCount + 1} while preserving validated candidates.`,
+          };
+          continue;
+        }
         const retainedRefs = await Promise.all(
           [
             ...pageSpools,
             ...(activePageSpool === undefined ? [] : [activePageSpool]),
           ].map((spool) => retain(spool).catch(() => undefined)),
         );
-        const artifactRef = retainedRefs.find((ref) => ref !== undefined);
+        const artifactRef = durableDraft
+          ? "reviewer.draft"
+          : retainedRefs.find((ref) => ref !== undefined);
         pageSpools = [];
         let failure =
           error instanceof ResultPageError
@@ -2914,7 +3010,9 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
             ...failure,
             diagnostics: {
               ...failure.diagnostics,
-              artifact_ref: failure.diagnostics?.artifact_ref ?? artifactRef,
+              artifact_ref: durableDraft
+                ? "reviewer.draft"
+                : (failure.diagnostics?.artifact_ref ?? artifactRef),
               checkpoint_id: collector.nextRequest().resultId,
             },
           };
@@ -2925,7 +3023,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
           failure.diagnostics?.repair_outcome !== "failed" &&
           configuredPages !== undefined
         ) {
-          collector = createResultPageCollector(configuredPages);
+          collector = collector.restart();
           attempt += 1;
           yield {
             type: "progress",
@@ -2974,8 +3072,12 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     const coverageTools =
       input.coverage === undefined
         ? undefined
-        : createReadOnlyFileTools({ ledger: input.coverage });
-    const sessionId = this.sessionIdFactory();
+        : createReadOnlyFileTools({ ledger: input.coverage, readable: true });
+    const retained =
+      input.coverage === undefined
+        ? undefined
+        : this.inspectionSessions.get(input.coverage);
+    let session: InspectionSession;
     const system = [
       input.prompt.system,
       "# TRUSTED TOOL POLICY",
@@ -2989,11 +3091,20 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     ].join("\n\n");
     let messages: ChatMessage[];
     try {
-      messages = boundedInitialMessages(
-        system,
-        input.prompt.user,
-        this.maxConversationBytes,
-      );
+      session = retained?.matches(input)
+        ? retained
+        : new InspectionSession(
+            input,
+            boundedInitialMessages(
+              system,
+              input.prompt.user,
+              this.maxConversationBytes,
+            ),
+            this.sessionIdFactory(),
+          );
+      messages = session.messages;
+      if (input.coverage !== undefined)
+        this.inspectionSessions.set(input.coverage, session);
     } catch (error) {
       const failure =
         error instanceof ProviderRequestError
@@ -3007,6 +3118,8 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
       return;
     }
 
+    const sessionId = session.sessionId;
+    this.admittedInspection.set(sessionId, session);
     yield {
       type: "progress",
       phase: "reviewing",
@@ -3015,198 +3128,238 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
     };
 
     try {
+      const preflightFailure = session.preflight(
+        this.maxConversationBytes -
+          finalizationReserve(this.maxConversationBytes),
+        this.maxTurns,
+      );
+      if (preflightFailure) throw new ProviderRequestError(preflightFailure);
       let inspectionBudgetReached = false;
-      let initialRequestAdmitted = false;
+      let initialRequestAdmitted = session.turns > 0;
       let coverageRepairRounds = 0;
-      let coverageRepairTurns = 0;
-      for (let turn = 0; turn < this.maxTurns; turn += 1) {
-        if (coverageRepairRounds > 0) coverageRepairTurns += 1;
-        const exchange = this.observableChat(
-          configuration,
-          input.signal,
-          sessionId,
-          {
-            model: input.reviewer.model,
-            ...(input.reviewer.effort === undefined
-              ? {}
-              : { reasoning_effort: input.reviewer.effort }),
-            messages,
-            tools:
-              coverageTools === undefined
-                ? READ_ONLY_TOOLS
-                : EXACT_READ_ONLY_TOOLS,
-            tool_choice: turn === 0 ? "required" : "auto",
-            max_tokens: 8_192,
-          },
-          {},
-        );
-        for await (const event of exchange.progress) {
-          yield {
-            type: "progress",
-            phase: event.byteCount === 0 ? "response" : "transport",
-            message:
-              event.byteCount === 0
-                ? "The provider admitted an inspection response boundary."
-                : "The provider streamed new inspection bytes.",
-            identity: event.identity,
-            byteCount: event.byteCount,
-          };
-        }
-        const chatResponse = await exchange.response;
-        if (!initialRequestAdmitted) {
-          initialRequestAdmitted = true;
-          if (messages[1]?.content === input.prompt.user)
-            acknowledgeInitialDiffDelivery(input);
-        }
-        const message = chatResponse.message;
+      for (let turn = session.turns; turn <= this.maxTurns; turn += 1) {
         const reserve = finalizationReserve(this.maxConversationBytes);
-        const assistant = boundedAssistantMessage(
-          message,
-          this.maxConversationBytes - reserve - conversationBytes(messages),
-        );
-        messages.push(assistant.message);
-        if (
-          assistant.truncated ||
-          conversationBytes(messages) > this.maxConversationBytes - reserve
-        ) {
-          inspectionBudgetReached = true;
-        }
-        const toolCalls = assistant.toolCalls;
-        if (toolCalls.length > MAX_TOOL_CALLS_PER_TURN) {
+        if (turn > 0 || retained === session)
+          await session.deliver(this.maxConversationBytes - reserve);
+        yield {
+          type: "progress",
+          phase: "reviewing",
+          message: `Inspection ${Math.min(turn, this.maxTurns)}/${this.maxTurns}; ${input.coverage?.summary().inspected_count ?? 0} files inspected.`,
+          inspection: session.telemetry(this.maxTurns),
+        };
+        if (turn === this.maxTurns && session.missing().length > 0)
           throw new ProviderRequestError(
-            adapterFailure.protocolViolation(
-              "The OpenAI-compatible endpoint returned too many inspection tool calls.",
+            session.failure(
+              "inspection_budget_exhausted",
+              this.maxTurns,
+              "Required source ranges remain after the inspection turn budget.",
             ),
           );
-        }
-        if (toolCalls.length > 0) {
-          for (const entry of toolCalls) {
-            const call = entry.call;
-            if (inspectionBudgetReached) {
-              messages.push({
-                role: "tool",
-                tool_call_id: call.id,
-                content: JSON.stringify({
-                  error: entry.executable
-                    ? "The bounded inspection context is full. Return the final reviewer result now."
-                    : "The inspection tool arguments exceeded the safe input limit.",
-                  truncated: true,
-                }),
-              });
-              continue;
-            }
-            const result: ExecutedToolResult = !entry.executable
-              ? {
-                  response: {
-                    error:
-                      "The inspection tool arguments exceeded the safe input limit.",
-                    truncated: true,
-                  },
-                }
-              : await this.runTool(
-                  workspace,
-                  coverageTools,
-                  call.function.name,
-                  call.function.arguments,
-                  input.signal,
-                );
-            const exactContent = JSON.stringify(result.response);
-            const toolMessage = {
-              role: "tool",
-              tool_call_id: call.id,
-              content:
-                result.acknowledgeDelivered === undefined
-                  ? boundedToolResult(result.response, this.maxToolResultBytes)
-                  : exactContent,
-            };
-            if (
-              conversationBytes([...messages, toolMessage]) >
-              this.maxConversationBytes
-            ) {
-              inspectionBudgetReached = true;
-              toolMessage.content = JSON.stringify({
-                error:
-                  "The bounded inspection context is full. Return the final reviewer result now.",
-                truncated: true,
-              });
-            }
-            messages.push(toolMessage);
-            if (toolMessage.content === exactContent) {
-              result.acknowledgeDelivered?.(toolMessage.content);
-            }
-          }
-          yield {
-            type: "activity",
-            message:
-              "The reviewer completed a bounded read-only inspection step.",
-            identity: `${sessionId}:tools:${turn}`,
-          };
-          if (!inspectionBudgetReached && coverageRepairTurns < 8) continue;
-          messages.push({
-            role: "user",
-            content:
-              "The bounded inspection context is full. Do not call more tools. Return the final reviewer result now using the evidence already collected.",
-          });
-        }
-
-        const coverageStatus = input.coverage?.status();
-        if (
-          !inspectionBudgetReached &&
-          coverageRepairTurns < 8 &&
-          coverageRepairRounds < 2 &&
-          coverageStatus?.proof_kind === "observed" &&
-          !coverageStatus.complete &&
-          coverageStatus.deficits.some(
-            (entry) => entry.missing_byte_ranges.length > 0,
-          )
-        ) {
-          coverageRepairRounds += 1;
-          const repair = {
-            role: "user",
-            content: `Before finalization, repair the remaining observed coverage using only targeted read_file calls. Preserve your review and findings. At most ${8 - coverageRepairTurns} inspection turns remain. Core coverage status: ${JSON.stringify(coverageStatus)}`,
-          };
-          if (
-            conversationBytes([...messages, repair]) <=
-            this.maxConversationBytes - reserve
-          ) {
-            messages.push(repair);
+        if (turn < this.maxTurns) {
+          const exchange = this.observableChat(
+            configuration,
+            input.signal,
+            sessionId,
+            {
+              model: input.reviewer.model,
+              ...(input.reviewer.effort === undefined
+                ? {}
+                : { reasoning_effort: input.reviewer.effort }),
+              messages,
+              tools:
+                coverageTools === undefined
+                  ? READ_ONLY_TOOLS
+                  : EXACT_READ_ONLY_TOOLS,
+              tool_choice: turn === 0 ? "required" : "auto",
+              max_tokens: 8_192,
+            },
+            {
+              inspection_turn: turn + 1,
+              maximum_inspection_turns: this.maxTurns,
+              remaining_inspection_turns: this.maxTurns - turn - 1,
+            },
+          );
+          for await (const event of exchange.progress) {
             yield {
               type: "progress",
-              phase: "coverage_repair",
+              phase: event.byteCount === 0 ? "response" : "transport",
               message:
-                "Inspecting the remaining required snapshot ranges before finalization.",
-              identity: `${sessionId}:coverage-repair:${coverageRepairRounds}`,
+                event.byteCount === 0
+                  ? "The provider admitted an inspection response boundary."
+                  : "The provider streamed new inspection bytes.",
+              identity: event.identity,
+              byteCount: event.byteCount,
             };
-            continue;
           }
-        }
-        if (!inspectionBudgetReached)
-          messages.push({
-            role: "user",
-            content:
-              "Return the final reviewer result now. Do not call tools. Follow the supplied JSON Schema exactly.",
-          });
-        else if (conversationBytes(messages) > this.maxConversationBytes) {
+          const chatResponse = await exchange.response;
+          session.turns = turn + 1;
+          yield {
+            type: "progress",
+            phase: "reviewing",
+            message: `Source delivery acknowledged; ${input.coverage?.summary().inspected_count ?? 0} files inspected.`,
+            inspection: session.telemetry(this.maxTurns),
+          };
+          if (!initialRequestAdmitted) {
+            initialRequestAdmitted = true;
+            if (messages[1]?.content === input.prompt.user)
+              acknowledgeInitialDiffDelivery(input);
+          }
+          const message = chatResponse.message;
+          const assistant = boundedAssistantMessage(
+            message,
+            this.maxConversationBytes - reserve - conversationBytes(messages),
+          );
+          messages.push(assistant.message);
           if (
-            !forceFinalization(
-              messages,
-              "The bounded inspection context is full. Return the final reviewer result now.",
-              this.maxConversationBytes,
-            )
+            assistant.truncated ||
+            conversationBytes(messages) > this.maxConversationBytes - reserve
           ) {
+            inspectionBudgetReached = true;
+          }
+          const toolCalls = assistant.toolCalls;
+          if (toolCalls.length > MAX_TOOL_CALLS_PER_TURN) {
             throw new ProviderRequestError(
-              adapterFailure.read(
-                "The configured conversation budget cannot fit a valid finalization request.",
+              adapterFailure.protocolViolation(
+                "The OpenAI-compatible endpoint returned too many inspection tool calls.",
               ),
             );
           }
-        } else if (toolCalls.length === 0) {
-          messages.push({
-            role: "user",
-            content:
-              "The bounded inspection context is full. Do not call more tools. Return the final reviewer result now using the evidence already collected.",
-          });
+          if (toolCalls.length > 0) {
+            for (const entry of toolCalls) {
+              const call = entry.call;
+              if (inspectionBudgetReached) {
+                messages.push({
+                  role: "tool",
+                  tool_call_id: call.id,
+                  content: JSON.stringify({
+                    error: entry.executable
+                      ? "The bounded inspection context is full. Return the final reviewer result now."
+                      : "The inspection tool arguments exceeded the safe input limit.",
+                    truncated: true,
+                  }),
+                });
+                continue;
+              }
+              const result: ExecutedToolResult = !entry.executable
+                ? {
+                    response: {
+                      error:
+                        "The inspection tool arguments exceeded the safe input limit.",
+                      truncated: true,
+                    },
+                  }
+                : await this.runTool(
+                    workspace,
+                    coverageTools,
+                    call.function.name,
+                    call.function.arguments,
+                    input.signal,
+                  );
+              const exactContent = JSON.stringify(result.response);
+              const toolMessage = {
+                role: "tool",
+                tool_call_id: call.id,
+                content:
+                  result.acknowledgeDelivered === undefined
+                    ? boundedToolResult(
+                        result.response,
+                        this.maxToolResultBytes,
+                      )
+                    : exactContent,
+              };
+              if (
+                conversationBytes([...messages, toolMessage]) >
+                this.maxConversationBytes - reserve
+              ) {
+                inspectionBudgetReached = true;
+                toolMessage.content = JSON.stringify({
+                  error:
+                    "The bounded inspection context is full. Return the final reviewer result now.",
+                  truncated: true,
+                });
+              }
+              messages.push(toolMessage);
+              if (toolMessage.content === exactContent) {
+                session.enqueue(result, toolMessage.content);
+              }
+            }
+            yield {
+              type: "activity",
+              message:
+                "The reviewer completed a bounded read-only inspection step.",
+              identity: `${sessionId}:tools:${turn}`,
+            };
+            if (!inspectionBudgetReached) continue;
+            messages.push({
+              role: "user",
+              content:
+                "The bounded inspection context is full. Do not call more tools. Return the final reviewer result now using the evidence already collected.",
+            });
+          }
+
+          const coverageStatus = input.coverage?.status();
+          if (
+            !inspectionBudgetReached &&
+            coverageStatus?.proof_kind === "observed" &&
+            session.missing().length > 0
+          ) {
+            coverageRepairRounds += 1;
+            const repair = {
+              role: "user",
+              content: `The host will deliver the remaining required source ranges. Preserve your analysis and findings; ${Math.max(0, this.maxTurns - session.turns)} inspection turns remain. Core coverage status: ${JSON.stringify(coverageStatus)}`,
+            };
+            if (
+              conversationBytes([...messages, repair]) <=
+              this.maxConversationBytes - reserve
+            ) {
+              messages.push(repair);
+              yield {
+                type: "progress",
+                phase: "coverage_repair",
+                message:
+                  "Inspecting the remaining required snapshot ranges before finalization.",
+                identity: `${sessionId}:coverage-repair:${coverageRepairRounds}`,
+              };
+              continue;
+            }
+          }
+          if (!inspectionBudgetReached)
+            messages.push({
+              role: "user",
+              content:
+                "Return the final reviewer result now. Do not call tools. Follow the supplied JSON Schema exactly.",
+            });
+          else if (conversationBytes(messages) > this.maxConversationBytes) {
+            if (
+              input.coverage !== undefined ||
+              !forceFinalization(
+                messages,
+                "The bounded inspection context is full. Return the final reviewer result now.",
+                this.maxConversationBytes,
+              )
+            ) {
+              throw new ProviderRequestError(
+                adapterFailure.read(
+                  "The configured conversation budget cannot fit a valid finalization request.",
+                ),
+              );
+            }
+          } else if (toolCalls.length === 0) {
+            messages.push({
+              role: "user",
+              content:
+                "The bounded inspection context is full. Do not call more tools. Return the final reviewer result now using the evidence already collected.",
+            });
+          }
         }
+        if (session.missing().length > 0)
+          throw new ProviderRequestError(
+            session.failure(
+              "inspection_budget_exhausted",
+              this.maxTurns,
+              "Required source ranges do not fit the inspection context.",
+            ),
+          );
         yield {
           type: "progress",
           phase: "validating",
@@ -3252,13 +3405,15 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
         while (finalizationAttempt <= this.finalizationAttempts) {
           throwIfAborted(input.signal);
           if (this.now() >= finalizationDeadline) {
-            lastFinalizationFailure = adapterFailure.timeout(
+            lastFinalizationFailure = adapterFailure.invalidResult(
               "Structured result production exceeded its bounded deadline.",
-              true,
+              false,
               {
+                fallback_eligible: true,
+                circuit_qualifying: false,
                 diagnostics: {
                   failure_stage: "structured_result_deadline",
-                  scope: "provider",
+                  scope: "model",
                 },
               },
             );
@@ -3359,6 +3514,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
                 this.maxConversationBytes
               ) {
                 if (
+                  input.coverage !== undefined ||
                   !forceFinalization(
                     finalizationMessages,
                     "The invalid final result could not be repaired within the bounded context.",
@@ -3529,8 +3685,10 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
 
       yield {
         type: "failure",
-        failure: adapterFailure.timeout(
-          "The OpenAI-compatible reviewer exceeded its bounded inspection turn limit.",
+        failure: session.failure(
+          "inspection_budget_exhausted",
+          this.maxTurns,
+          "The local inspection turn budget was exhausted.",
         ),
         isolation,
       };
@@ -3544,6 +3702,7 @@ class OpenAICompatibleAdapter implements ReviewAdapter {
             );
       yield { type: "failure", failure, isolation };
     } finally {
+      this.admittedInspection.delete(sessionId);
       await workspace.dispose().catch(() => undefined);
       this.activeWorkspaces.delete(workspace);
     }

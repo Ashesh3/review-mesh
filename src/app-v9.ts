@@ -9,7 +9,10 @@ import { resolveContext, ReviewScopeError } from "./context/resolve.js";
 import { createGitRunner } from "./context/git.js";
 import { reviewRequestV2Schema } from "./protocol/schemas.js";
 import { reviewRequestV3Schema } from "./protocol/v9.js";
-import { createV9EventWriter } from "./protocol/v9-event-writer.js";
+import {
+  createV9EventWriter,
+  PublicDeliveryError,
+} from "./protocol/v9-event-writer.js";
 import {
   createManagedRunArtifact,
   copyVerifiedArtifact,
@@ -292,11 +295,12 @@ export async function runV9Application(
         );
       }
     },
-    observe: (outcome) =>
+    observe: (outcome, failure) =>
       observePublicStream({
         runsDirectory: paths.runsDirectory,
         runId,
         outcome,
+        ...(failure ? { failure } : {}),
       }),
   });
   const controlAbort = new AbortController();
@@ -325,7 +329,9 @@ export async function runV9Application(
       error instanceof Error ? error.message : "The review failed.",
       error instanceof RunArtifactError
         ? { details: error.diagnosticDetails }
-        : {},
+        : error instanceof PublicDeliveryError
+          ? { details: error.details }
+          : {},
     );
     return options.signal.aborted ? 4 : 3;
   } finally {

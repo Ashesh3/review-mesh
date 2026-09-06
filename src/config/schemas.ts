@@ -1,5 +1,9 @@
 import { z } from "zod";
 import {
+  reviewProfilePolicy,
+  type ReviewProfile,
+} from "../orchestrator/review-feasibility.js";
+import {
   isolationPolicySchema,
   type IsolationPolicy,
   type JsonValue,
@@ -437,6 +441,7 @@ const requiredReadinessSelectors = [
 
 const executionV7Schema = executionV6Schema
   .extend({
+    review_profile: z.enum(["strict-evaluation", "routine-review"]).optional(),
     heartbeat_interval_ms: positiveInteger.min(1_000).max(300_000),
     deadline_mode: z.enum(["adaptive", "fixed"]),
     run_deadline_ms: positiveInteger.min(60_000).max(14_400_000).optional(),
@@ -506,7 +511,7 @@ function validateV7Lens(
   }
 }
 
-const reviewerProfileV7Schema = z
+const reviewerProfileV7StructuralSchema = z
   .strictObject({
     ...reviewerProfileBaseShape,
     ...lensPolicyV7Shape,
@@ -518,40 +523,81 @@ const reviewerProfileV7Schema = z
       .optional(),
   })
   .superRefine(validateInstructionSource)
-  .superRefine(validateV7Lens)
-  .superRefine((profile, ctx) => {
-    if ((profile.pass_quorum ?? 1) > 1)
-      ctx.addIssue({
-        code: "custom",
-        message: "pass quorum cannot exceed model run count",
-      });
-    if ((profile.minimum_provider_groups ?? 1) > 1)
-      ctx.addIssue({
-        code: "custom",
-        message:
-          "minimum provider groups exceeds the distinct configured provider groups",
-      });
-    if (profile.adjudication === "required")
-      ctx.addIssue({
-        code: "custom",
-        message: "required adjudication needs a multi-model agent",
-      });
-  });
+  .superRefine(validateV7Lens);
 
-const multiModelReviewerProfileV7Schema = z
+function addSingleModelPolicyIssues(
+  profile: {
+    pass_quorum?: number | undefined;
+    minimum_provider_groups?: number | undefined;
+    adjudication?: "off" | "required" | undefined;
+  },
+  ctx: z.RefinementCtx,
+): void {
+  if ((profile.pass_quorum ?? 1) > 1)
+    ctx.addIssue({
+      code: "custom",
+      message: "pass quorum cannot exceed model run count",
+    });
+  if ((profile.minimum_provider_groups ?? 1) > 1)
+    ctx.addIssue({
+      code: "custom",
+      message:
+        "minimum provider groups exceeds the distinct configured provider groups",
+    });
+  if (profile.adjudication === "required")
+    ctx.addIssue({
+      code: "custom",
+      message: "required adjudication needs a multi-model agent",
+    });
+}
+
+const reviewerProfileV7Schema = reviewerProfileV7StructuralSchema.superRefine(
+  addSingleModelPolicyIssues,
+);
+
+const multiModelReviewerProfileV7StructuralSchema = z
   .strictObject({
     ...reviewerProfileBaseShape,
     ...lensPolicyV7Shape,
     model_runs: modelRunsSchema,
   })
   .superRefine(validateInstructionSource)
-  .superRefine(validateV7Lens)
-  .superRefine(addMultiModelPolicyIssues);
+  .superRefine(validateV7Lens);
+
+const multiModelReviewerProfileV7Schema =
+  multiModelReviewerProfileV7StructuralSchema.superRefine(
+    addMultiModelPolicyIssues,
+  );
+const agentProfileV7StructuralSchema = z.union([
+  reviewerProfileV7StructuralSchema,
+  multiModelReviewerProfileV7StructuralSchema,
+]);
 
 export const agentProfileV7Schema = z.union([
   reviewerProfileV7Schema,
   multiModelReviewerProfileV7Schema,
 ]);
+
+export function effectiveV7AgentPolicy<
+  T extends z.infer<typeof agentProfileV7StructuralSchema>,
+>(agent: T, selected?: ReviewProfile): T {
+  if (!selected) return agent;
+  const groups =
+    "model_runs" in agent ? new Set(profileProviderGroups(agent)).size : 1;
+  const count = "model_runs" in agent ? agent.model_runs.length : 1;
+  const policy = reviewProfilePolicy(
+    selected,
+    count,
+    groups,
+    agent.allow_zero_outage_tolerance,
+  );
+  return {
+    ...agent,
+    pass_quorum: policy.passQuorum,
+    minimum_provider_groups: policy.minimumProviderGroups,
+    allow_zero_outage_tolerance: policy.allowZeroOutageTolerance,
+  };
+}
 
 const diagnosticsSchema = z.strictObject({
   persist_runs: z.boolean(),
@@ -745,13 +791,29 @@ export const trustedConfigV7Schema = z
     execution: executionV7Schema,
     diagnostics: diagnosticsV7Schema,
     adapters: z.record(nonEmptyString, adapterRegistrationSchema),
-    agents: z.record(nonEmptyString, agentProfileV7Schema),
+    agents: z.record(nonEmptyString, agentProfileV7StructuralSchema),
     defaults: z.strictObject({ agents: uniqueAgentIds }).optional(),
     projects: z.record(projectNameSchema, projectConfigSchema).optional(),
   })
   .superRefine((config, ctx) => {
     validateProviderConcentration(config, ctx);
     for (const [agentId, profile] of Object.entries(config.agents)) {
+      const effective = effectiveV7AgentPolicy(
+        profile,
+        config.execution.review_profile,
+      );
+      const policyContext: z.RefinementCtx = {
+        ...ctx,
+        addIssue: (issue) =>
+          ctx.addIssue(
+            typeof issue === "string"
+              ? { code: "custom", path: ["agents", agentId], message: issue }
+              : { ...issue, path: ["agents", agentId, ...(issue.path ?? [])] },
+          ),
+      };
+      if ("model_runs" in effective)
+        addMultiModelPolicyIssues(effective, policyContext);
+      else addSingleModelPolicyIssues(effective, policyContext);
       const candidateIds =
         "model_runs" in profile
           ? profile.model_runs.map((run) => `${agentId}::${run.id}`)
@@ -913,6 +975,7 @@ export interface ResolvedConfig {
     lens_ids: string[];
   }>;
   execution: TrustedConfigV1["execution"] & {
+    review_profile?: "strict-evaluation" | "routine-review" | undefined;
     distribute_primaries: boolean;
     allow_provider_concentration: boolean;
     default_provider_concurrency: number;

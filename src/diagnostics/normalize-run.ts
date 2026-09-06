@@ -13,8 +13,14 @@ import type {
   ReviewerResultV4,
   V9RunOutcome,
 } from "../protocol/v9.js";
+import type { DeliveryFailure } from "../protocol/v9-event-writer.js";
 import { runOutcome } from "../protocol/concise.js";
 import { readRunArtifact } from "./run-artifact.js";
+import {
+  readCoverageManifests,
+  type RunSnapshotManifest,
+} from "./coverage-records.js";
+import type { RunSnapshotIdentity } from "../context/change-coverage.js";
 import {
   type ArtifactReference,
   type PublicStreamOutcome,
@@ -34,6 +40,8 @@ export interface NormalizedReviewer {
   reason?: string;
   terminal?: Record<string, unknown>;
   coverage?: Record<string, unknown>[];
+  snapshot_ref?: string;
+  snapshot_identity?: RunSnapshotIdentity;
 }
 export interface NormalizedRun {
   run_id: string;
@@ -52,6 +60,7 @@ export interface NormalizedRun {
   artifact: ArtifactReference;
   digest_status: "verified" | "final_digest_unavailable";
   observed_public_stream?: PublicStreamOutcome;
+  public_delivery_failure?: DeliveryFailure;
   artifact_resolution?: {
     source: "primary" | "alternate";
     primary_path: string;
@@ -66,6 +75,7 @@ export interface NormalizedRun {
   context?: Record<string, unknown>;
   resolution?: Record<string, unknown>;
   records: Record<string, unknown>[];
+  snapshot_manifests?: Record<string, RunSnapshotManifest>;
   warnings: Array<Record<string, unknown>>;
 }
 function object(value: unknown): Record<string, unknown> | undefined {
@@ -145,6 +155,7 @@ export async function readNormalizedRun(
     expectedSha256?: string;
     expectedIdentity?: ArtifactIdentity;
     observedPublicStream?: PublicStreamOutcome;
+    publicDeliveryFailure?: DeliveryFailure;
     bestEffort?: boolean;
     allowActive?: boolean;
   } = {},
@@ -259,6 +270,30 @@ export async function readNormalizedRun(
       .filter((record) => record.record === "reviewer.terminal")
       .map((record) => [String(record.reviewer_id), object(record.data) ?? {}]),
   );
+  const manifests = readCoverageManifests(artifact.records, artifact.active);
+  const coverageByReviewer = new Map<string, Record<string, unknown>[]>();
+  const snapshotByReviewer = new Map<
+    string,
+    { snapshot_ref?: string; snapshot_identity?: RunSnapshotIdentity }
+  >();
+  for (const record of artifact.records) {
+    if (record.record !== "reviewer.coverage") continue;
+    const reviewerId = String(record.reviewer_id);
+    const data = object(record.data)!;
+    const entries = coverageByReviewer.get(reviewerId) ?? [];
+    entries.push(...(data.entries as Record<string, unknown>[]));
+    coverageByReviewer.set(reviewerId, entries);
+    if (typeof data.snapshot_ref === "string")
+      snapshotByReviewer.set(reviewerId, {
+        snapshot_ref: data.snapshot_ref,
+        snapshot_identity: manifests.get(data.snapshot_ref)!.identity,
+      });
+    else if (object(data.snapshot_identity))
+      snapshotByReviewer.set(reviewerId, {
+        snapshot_identity:
+          data.snapshot_identity as unknown as RunSnapshotIdentity,
+      });
+  }
   const reviewers: NormalizedReviewer[] = artifact.results.map((item) => {
     const terminal = terminals.get(item.reviewer_id);
     return {
@@ -275,17 +310,8 @@ export async function readNormalizedRun(
         ? { reason: terminal.reason }
         : {}),
       ...(terminal === undefined ? {} : { terminal }),
-      coverage: artifact.records
-        .filter(
-          (record) =>
-            record.record === "reviewer.coverage" &&
-            record.reviewer_id === item.reviewer_id,
-        )
-        .flatMap((record) =>
-          Array.isArray(object(record.data)?.entries)
-            ? (object(record.data)!.entries as Record<string, unknown>[])
-            : [],
-        ),
+      coverage: coverageByReviewer.get(item.reviewer_id) ?? [],
+      ...snapshotByReviewer.get(item.reviewer_id),
     };
   });
   for (const [id, terminal] of terminals) {
@@ -296,6 +322,10 @@ export async function readNormalizedRun(
         typeof terminal.lens_id === "string" ? terminal.lens_id : lens(id),
       status: terminal.status === "skipped" ? "skipped" : "incomplete",
       terminal,
+      ...(coverageByReviewer.has(id)
+        ? { coverage: coverageByReviewer.get(id)! }
+        : {}),
+      ...snapshotByReviewer.get(id),
       ...(typeof terminal.reason === "string"
         ? { reason: terminal.reason }
         : {}),
@@ -413,11 +443,15 @@ export async function readNormalizedRun(
     ...(options.observedPublicStream === undefined
       ? {}
       : { observed_public_stream: options.observedPublicStream }),
+    ...(options.publicDeliveryFailure === undefined
+      ? {}
+      : { public_delivery_failure: options.publicDeliveryFailure }),
     summary: artifact.summary,
     ...(request === undefined ? {} : { request }),
     ...(context === undefined ? {} : { context }),
     ...(resolution === undefined ? {} : { resolution }),
     records: artifact.records,
+    snapshot_manifests: Object.fromEntries(manifests),
     warnings: Array.isArray(resolution?.warnings)
       ? resolution.warnings
           .map(object)

@@ -24,6 +24,8 @@ const FAILURE_CODES = new Set<AdapterFailureCode>([
   "streaming_unsupported",
   "result_page_too_large",
   "structured_page_limit_exceeded",
+  "inspection_budget_exhausted",
+  "inspection_acquisition_failed",
 ]);
 const CORRELATION_HEADER_NAMES = new Set([
   "x-request-id",
@@ -57,7 +59,9 @@ export type AdapterFailureCode =
   | "response_too_large"
   | "streaming_unsupported"
   | "result_page_too_large"
-  | "structured_page_limit_exceeded";
+  | "structured_page_limit_exceeded"
+  | "inspection_budget_exhausted"
+  | "inspection_acquisition_failed";
 
 export type AdapterRetryOutcome = "not_attempted" | "succeeded" | "exhausted";
 
@@ -91,6 +95,23 @@ export interface AdapterFailureDiagnostics {
   correlation_headers?: Record<string, string>;
   retry_blocked_by_circuit?: boolean;
   circuit_caused_by_reviewer_id?: string;
+  circuit_cause?: {
+    reviewer_id: string;
+    attempt: number;
+    reason: string;
+    at: string;
+    failure_code?: string;
+  };
+  model?: string;
+  operation_phase?: string;
+  inspection_turn?: number;
+  maximum_inspection_turns?: number;
+  remaining_inspection_turns?: number;
+  request_bytes?: number;
+  provider_error_code?: string;
+  provider_error_message?: string;
+  error_body_truncated?: boolean;
+  error_body_unavailable?: boolean;
   finish_reason?: string;
   content_types?: string[];
   response_bytes?: number;
@@ -144,6 +165,7 @@ const defaultFallbackEligibility: Partial<
   output_truncated: true,
   provider_response_invalid: true,
   timeout: true,
+  provider_timeout: true,
   process_crashed: true,
   protocol_violation: true,
   invalid_result: true,
@@ -331,6 +353,79 @@ function sanitizeDiagnostics(
       : undefined;
   const responseStructure = sanitizeResponseStructure(input.response_structure);
   const diagnostics: AdapterFailureDiagnostics = {
+    ...Object.fromEntries(
+      [
+        ["model", sanitizedText(input.model, 256)],
+        ["operation_phase", sanitizedText(input.operation_phase, 64)],
+        ["provider_error_code", sanitizedText(input.provider_error_code, 128)],
+        [
+          "provider_error_message",
+          sanitizedText(input.provider_error_message, 512),
+        ],
+        [
+          "inspection_turn",
+          finiteInteger(input.inspection_turn, 0, Number.MAX_SAFE_INTEGER),
+        ],
+        [
+          "maximum_inspection_turns",
+          finiteInteger(
+            input.maximum_inspection_turns,
+            0,
+            Number.MAX_SAFE_INTEGER,
+          ),
+        ],
+        [
+          "remaining_inspection_turns",
+          finiteInteger(
+            input.remaining_inspection_turns,
+            0,
+            Number.MAX_SAFE_INTEGER,
+          ),
+        ],
+        [
+          "request_bytes",
+          finiteInteger(input.request_bytes, 0, Number.MAX_SAFE_INTEGER),
+        ],
+        [
+          "error_body_truncated",
+          typeof input.error_body_truncated === "boolean"
+            ? input.error_body_truncated
+            : undefined,
+        ],
+        [
+          "error_body_unavailable",
+          typeof input.error_body_unavailable === "boolean"
+            ? input.error_body_unavailable
+            : undefined,
+        ],
+      ].filter(([, value]) => value !== undefined),
+    ),
+    ...(input.circuit_cause !== undefined &&
+    input.circuit_cause !== null &&
+    sanitizedText(input.circuit_cause.reviewer_id, 256) !== undefined &&
+    finiteInteger(input.circuit_cause.attempt, 1, Number.MAX_SAFE_INTEGER) !==
+      undefined &&
+    sanitizedText(input.circuit_cause.reason, 128) !== undefined &&
+    typeof input.circuit_cause.at === "string" &&
+    Number.isFinite(Date.parse(input.circuit_cause.at))
+      ? {
+          circuit_cause: {
+            reviewer_id: sanitizedText(input.circuit_cause.reviewer_id, 256)!,
+            attempt: input.circuit_cause.attempt,
+            reason: sanitizedText(input.circuit_cause.reason, 128)!,
+            at: new Date(input.circuit_cause.at).toISOString(),
+            ...(sanitizedText(input.circuit_cause.failure_code, 128) ===
+            undefined
+              ? {}
+              : {
+                  failure_code: sanitizedText(
+                    input.circuit_cause.failure_code,
+                    128,
+                  )!,
+                }),
+          },
+        }
+      : {}),
     ...(sanitizedText(input.checkpoint_id, 256) === undefined
       ? {}
       : { checkpoint_id: sanitizedText(input.checkpoint_id, 256)! }),
