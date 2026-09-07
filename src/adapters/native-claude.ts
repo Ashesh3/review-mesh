@@ -268,6 +268,9 @@ export function createNativeClaudeAdapter(
     pathToClaudeCodeExecutable: settings.executable ?? runtime().executablePath,
     env: environment,
     settingSources: [],
+    // Start native compaction before full-file tool results consume the 200K
+    // window. The SDK retains its summary/output reserves and owns all turns.
+    settings: { autoCompactEnabled: true, autoCompactWindow: 128000 },
     strictMcpConfig: true,
     mcpServers: {},
     plugins: [],

@@ -503,6 +503,10 @@ it("keeps Claude's native tools and uses one SDK session even for a terminal pro
   expect(calls).toBe(1);
   expect(options?.tools).toEqual(["Read", "Glob", "Grep"]);
   expect(options?.mcpServers).toEqual({});
+  expect(options?.settings).toMatchObject({
+    autoCompactEnabled: true,
+    autoCompactWindow: 128000,
+  });
   expect(options?.env?.ANTHROPIC_API_KEY).toBe("test-only");
   expect(options?.env?.ANTHROPIC_BASE_URL).toBe(
     "http://127.0.0.1:34567/vendor-prefix",
