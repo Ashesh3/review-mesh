@@ -12,6 +12,11 @@ import { loadCopilotSdkModule } from "../copilot/runtime.js";
 import { resolveSdkRuntime, type SdkRuntime } from "../runtime/sdk-runtime.js";
 import { sendCopilotReviewAndWait } from "../runtime/copilot-completion.js";
 import { createCopilotProgressTracker } from "../runtime/copilot-progress.js";
+import {
+  createNativeContextFile,
+  nativeContextFileHint,
+} from "../runtime/native-context.js";
+import type { ResolvedContext } from "../context/resolve.js";
 import { validateNativeSubmission } from "../protocol/native-review.js";
 import { validateNativeAdjudicationSubmission } from "../protocol/native-submission.js";
 import { sanitizeReviewerOutput } from "../results/sanitize.js";
@@ -459,6 +464,11 @@ export function createNativeCopilotAdapter(
         lastOperation = "start";
         await abortable(value.start(), input.signal);
         input.signal.throwIfAborted();
+        const contextFile = await createNativeContextFile(
+          active.get(value)!.directory,
+          redactLiteralValues(input.context) as ResolvedContext,
+        );
+        input.signal.throwIfAborted();
         const schema =
           input.reviewer.policy?.mode === "adjudication"
             ? adjudicationResultV2Schema
@@ -468,7 +478,10 @@ export function createNativeCopilotAdapter(
           workingDirectory: input.context.workspace,
           configDirectory: active.get(value)!.directory,
           streaming: true,
-          systemMessage: { mode: "append", content: input.prompt.system },
+          systemMessage: {
+            mode: "append",
+            content: `${input.prompt.system}\n\n${nativeContextFileHint(contextFile)}`,
+          },
           enableConfigDiscovery: false,
           enableOnDemandInstructionDiscovery: false,
           enableFileHooks: false,

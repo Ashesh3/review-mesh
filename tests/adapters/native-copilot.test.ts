@@ -157,6 +157,7 @@ it("uses product Copilot login storage with isolated client and session state", 
   const root = await temporary();
   let options: CopilotClientOptions | undefined,
     sessionConfig: SessionConfig | undefined;
+  let contextFile: string | undefined;
   const adapter = createNativeCopilotAdapter(
     { type: "copilot", use_logged_in_user: true },
     {
@@ -173,6 +174,17 @@ it("uses product Copilot login storage with isolated client and session state", 
           async forceStop() {},
           async createSession(config: SessionConfig) {
             sessionConfig = config;
+            const file = (await readdir(config.configDirectory!)).find((name) =>
+              /^native-context-[a-f0-9]{64}\.json$/.test(name),
+            );
+            expect(file).toBeDefined();
+            contextFile = join(config.configDirectory!, file!);
+            expect(config.systemMessage).toMatchObject({
+              content: expect.stringContaining("After compaction"),
+            });
+            expect(
+              JSON.parse(await readFile(contextFile, "utf8")).context.workspace,
+            ).toBe("F:/fixture");
             const listeners = new Set<(event: SessionEvent) => void>();
             return {
               on(handler: (event: SessionEvent) => void) {
@@ -197,6 +209,10 @@ it("uses product Copilot login storage with isolated client and session state", 
   expect(options?.useLoggedInUser).toBe(true);
   expect(sessionConfig?.configDirectory).toBe(options?.workingDirectory);
   expect(sessionConfig?.configDirectory).not.toBe(options?.baseDirectory);
+  expect(contextFile).toBeDefined();
+  await expect(readFile(contextFile!)).rejects.toMatchObject({
+    code: "ENOENT",
+  });
   await expect(readdir(options!.baseDirectory!)).resolves.toBeDefined();
   await expect(readdir(options!.workingDirectory!)).rejects.toMatchObject({
     code: "ENOENT",
