@@ -62,6 +62,18 @@ it.runIf(process.env.REVIEW_MESH_VERIFY_SDK_RUNTIME === "1")(
       event("content_block_start", {
         type: "content_block_start",
         index: 0,
+        content_block: { type: "thinking", thinking: "" },
+      });
+      for (let index = 0; index < 2; index++)
+        event("content_block_delta", {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "thinking_delta", thinking: "", estimated_tokens: 32 },
+        });
+      event("content_block_stop", { type: "content_block_stop", index: 0 });
+      event("content_block_start", {
+        type: "content_block_start",
+        index: 1,
         content_block:
           block.type === "text"
             ? { type: "text", text: "" }
@@ -69,7 +81,7 @@ it.runIf(process.env.REVIEW_MESH_VERIFY_SDK_RUNTIME === "1")(
       });
       event("content_block_delta", {
         type: "content_block_delta",
-        index: 0,
+        index: 1,
         delta:
           block.type === "text"
             ? { type: "text_delta", text: block.text }
@@ -78,7 +90,7 @@ it.runIf(process.env.REVIEW_MESH_VERIFY_SDK_RUNTIME === "1")(
                 partial_json: JSON.stringify(block.input),
               },
       });
-      event("content_block_stop", { type: "content_block_stop", index: 0 });
+      event("content_block_stop", { type: "content_block_stop", index: 1 });
       event("message_delta", {
         type: "message_delta",
         delta: {
@@ -203,6 +215,19 @@ it.runIf(process.env.REVIEW_MESH_VERIFY_SDK_RUNTIME === "1")(
         type: "result",
         result: providerResult,
       });
+      const activity = events.filter((event) => event.type === "activity");
+      expect(
+        activity.filter((event) =>
+          event.identity?.startsWith("claude:thinking:"),
+        ),
+      ).toHaveLength(8);
+      expect(
+        activity.some(
+          (event) =>
+            event.identity?.startsWith("claude:output:") &&
+            (event.byteCount ?? 0) > 0,
+        ),
+      ).toBe(true);
       expect(JSON.stringify(events)).not.toContain(summary);
     } finally {
       await adapter.forceCleanup?.();

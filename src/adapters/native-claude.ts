@@ -80,6 +80,9 @@ function claudeActivityTracker() {
     string,
     { identity: string; bytes: number; frames: Set<string> }
   >();
+  let thinking:
+    | { message: string; block: number; tokens: number; bucket: number }
+    | undefined;
   let compacting: string | undefined;
   let boundary = "initial";
   return (message: SDKMessage): Activity[] => {
@@ -123,6 +126,18 @@ function claudeActivityTracker() {
           (streams.has(lane) || streams.size < 64)
         )
           streams.set(lane, { identity, bytes: 0, frames: new Set() });
+        if (lane === "main") thinking = undefined;
+      } else if (event.type === "content_block_start" && lane === "main") {
+        const stream = streams.get(lane);
+        thinking =
+          stream && event.content_block.type === "thinking"
+            ? {
+                message: stream.identity,
+                block: event.index,
+                tokens: 0,
+                bucket: 0,
+              }
+            : undefined;
       } else if (event.type === "content_block_delta") {
         const stream = streams.get(lane);
         const text =
@@ -130,7 +145,9 @@ function claudeActivityTracker() {
             ? event.delta.text
             : event.delta.type === "thinking_delta"
               ? event.delta.thinking
-              : undefined;
+              : event.delta.type === "input_json_delta"
+                ? event.delta.partial_json
+                : undefined;
         if (stream && text) {
           // Count content locally; never publish source text or model reasoning.
           if (!stream.frames.has(message.uuid)) {
@@ -144,7 +161,35 @@ function claudeActivityTracker() {
           }
           report(stream.identity, "Claude output streaming.", stream.bytes);
         }
-      } else if (event.type === "message_stop") streams.delete(lane);
+      } else if (event.type === "message_stop") {
+        streams.delete(lane);
+        if (lane === "main") thinking = undefined;
+      }
+    } else if (
+      message.type === "system" &&
+      message.subtype === "thinking_tokens" &&
+      thinking
+    ) {
+      const tokens = message.estimated_tokens;
+      const delta = message.estimated_tokens_delta;
+      // This SDK estimate advances from provider thinking_delta frames, never
+      // elapsed time. Bucket it separately from bytes and ignore repeated totals.
+      if (
+        Number.isSafeInteger(tokens) &&
+        Number.isSafeInteger(delta) &&
+        delta > 0 &&
+        tokens > thinking.tokens
+      ) {
+        thinking.tokens = tokens;
+        const bucket = Math.floor(tokens / 32);
+        if (bucket > thinking.bucket && bucket <= 4096) {
+          thinking.bucket = bucket;
+          report(
+            `claude:thinking:${thinking.message}:${thinking.block}:${bucket}`,
+            "Claude estimated thinking progress.",
+          );
+        }
+      }
     } else if (
       message.type === "system" &&
       message.subtype === "status" &&

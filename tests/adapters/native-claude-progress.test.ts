@@ -127,6 +127,95 @@ it("counts streaming output without exposing text or treating envelope IDs as ne
   expect(JSON.stringify(events)).not.toContain("assistant-message");
 });
 
+it("counts growing streamed tool arguments without publishing their contents or refreshing on duplicates", async () => {
+  const partial = '{"path":"private-source.ts","findings":';
+  const events = await activities([
+    {
+      type: "stream_event",
+      uuid: "start",
+      event: { type: "message_start", message: { id: "tool-message" } },
+    },
+    {
+      type: "stream_event",
+      uuid: "json-1",
+      event: {
+        type: "content_block_delta",
+        delta: { type: "input_json_delta", partial_json: partial },
+      },
+    },
+    {
+      type: "stream_event",
+      uuid: "json-2",
+      event: {
+        type: "content_block_delta",
+        delta: { type: "input_json_delta", partial_json: "[]}" },
+      },
+    },
+    {
+      type: "stream_event",
+      uuid: "json-2",
+      event: {
+        type: "content_block_delta",
+        delta: { type: "input_json_delta", partial_json: "[]}" },
+      },
+    },
+    { type: "tool_progress", uuid: "status", elapsed_time_seconds: 10 },
+  ]);
+  expect(events[1]).toMatchObject({
+    identity: expect.stringMatching(/^claude:output:/),
+    byteCount: Buffer.byteLength(partial),
+  });
+  expect(events[2]).toMatchObject({
+    identity: events[1]!.identity,
+    byteCount: Buffer.byteLength(partial) + 3,
+  });
+  expect(events[3]?.byteCount).toBe(events[2]?.byteCount);
+  expect(events[4]?.identity).toBeUndefined();
+  expect(JSON.stringify(events)).not.toContain("private-source.ts");
+});
+
+it("recognizes advancing provider thinking estimates without treating token counts as bytes or pings as progress", async () => {
+  const thinking = (tokens: number, delta: number) => ({
+    type: "system",
+    subtype: "thinking_tokens",
+    estimated_tokens: tokens,
+    estimated_tokens_delta: delta,
+  });
+  const events = await activities([
+    thinking(64, 64),
+    {
+      type: "stream_event",
+      uuid: "start",
+      event: { type: "message_start", message: { id: "thinking-message" } },
+    },
+    {
+      type: "stream_event",
+      uuid: "block",
+      event: {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "thinking", thinking: "" },
+      },
+    },
+    thinking(32, 32),
+    thinking(64, 32),
+    thinking(64, 32),
+    thinking(48, 16),
+    thinking(80, 16),
+    { type: "system", subtype: "status", status: "requesting" },
+    thinking(96, 16),
+  ]);
+  expect(events[0]?.identity).toBeUndefined();
+  expect(events[3]?.identity).toMatch(/^claude:thinking:/);
+  expect(events[4]?.identity).toMatch(/^claude:thinking:/);
+  expect(events[4]?.identity).not.toBe(events[3]?.identity);
+  expect(
+    events.slice(5, 9).every((event) => event.identity === undefined),
+  ).toBe(true);
+  expect(events[9]?.identity).not.toBe(events[4]?.identity);
+  expect(events.every((event) => event.byteCount === undefined)).toBe(true);
+});
+
 it("reports compaction completion once by boundary while repeated compacting statuses stay bounded", async () => {
   const events = await activities([
     {
