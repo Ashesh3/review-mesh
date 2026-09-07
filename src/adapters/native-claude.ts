@@ -12,6 +12,7 @@ import { join } from "node:path";
 import type { AdapterRegistration } from "../config/schemas.js";
 import { resolveSdkRuntime, type SdkRuntime } from "../runtime/sdk-runtime.js";
 import { createClaudeProcessOwner } from "../runtime/claude-process.js";
+import { createClaudeSummaryTransport } from "../runtime/claude-summary-transport.js";
 import {
   createNativeContextFile,
   nativeContextFileHint,
@@ -566,6 +567,8 @@ export function createNativeClaudeAdapter(
       } = { controller, processes: createClaudeProcessOwner() };
       active.add(state);
       let home: string | undefined;
+      let summaryTransport:
+        Awaited<ReturnType<typeof createClaudeSummaryTransport>> | undefined;
       let stderr = "";
       const redactions = Object.values(runtimeEnvironment).filter(
         (value): value is string =>
@@ -606,7 +609,25 @@ export function createNativeClaudeAdapter(
           contextDirectory,
           input.context,
         );
-        const options = nativeOptions(controller, runtimeEnvironment);
+        summaryTransport = await createClaudeSummaryTransport({
+          baseUrl:
+            runtimeEnvironment.ANTHROPIC_BASE_URL ??
+            "https://api.anthropic.com",
+          apiKey: runtimeEnvironment.ANTHROPIC_API_KEY!,
+          signal: controller.signal,
+        });
+        redactions.push(summaryTransport.apiKey);
+        const childEnvironment = Object.fromEntries(
+          Object.entries(runtimeEnvironment).map(([key, value]) => [
+            key,
+            value === runtimeEnvironment.ANTHROPIC_API_KEY
+              ? summaryTransport!.apiKey
+              : value,
+          ]),
+        );
+        childEnvironment.ANTHROPIC_API_KEY = summaryTransport.apiKey;
+        childEnvironment.ANTHROPIC_BASE_URL = summaryTransport.baseUrl;
+        const options = nativeOptions(controller, childEnvironment);
         // dontAsk denies reads outside cwd before canUseTool; grant only the
         // host-owned context subdirectory, never the runtime configuration home.
         options.additionalDirectories = [await realpath(contextDirectory)];
@@ -723,9 +744,13 @@ export function createNativeClaudeAdapter(
         input.signal.removeEventListener("abort", abort);
         state.close?.();
         controller.abort();
-        await state.processes.close();
-        active.delete(state);
-        if (home) await removeClaudeHome(home);
+        try {
+          await state.processes.close();
+          active.delete(state);
+          if (home) await removeClaudeHome(home);
+        } finally {
+          await summaryTransport?.close();
+        }
       }
     },
     async forceCleanup() {

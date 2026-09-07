@@ -608,9 +608,10 @@ it("keeps Claude's native tools and uses one SDK session even for a terminal pro
   });
   expect(options?.settings).not.toHaveProperty("autoCompactWindow");
   expect(options?.env?.CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS).toBe("8000");
-  expect(options?.env?.ANTHROPIC_API_KEY).toBe("test-only");
-  expect(options?.env?.ANTHROPIC_BASE_URL).toBe(
-    "http://127.0.0.1:34567/vendor-prefix",
+  expect(options?.env?.ANTHROPIC_API_KEY).not.toBe("test-only");
+  expect(options?.env?.ANTHROPIC_API_KEY).toMatch(/^[a-f0-9]{64}$/);
+  expect(options?.env?.ANTHROPIC_BASE_URL).toMatch(
+    /^http:\/\/127\.0\.0\.1:\d+$/,
   );
   expect(events.at(-1)).toMatchObject({ type: "failure" });
 });

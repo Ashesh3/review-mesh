@@ -18,6 +18,7 @@ it.runIf(process.env.REVIEW_MESH_VERIFY_SDK_RUNTIME === "1")(
     let calls = 0;
     let compactions = 0;
     let schemaSeen = false;
+    let summaryToolsDisabled = false;
     const summary =
       "<summary>Required source.txt remains reviewed. Preserve all findings and finish with the final schema.</summary>";
     const providerResult = {
@@ -129,6 +130,7 @@ it.runIf(process.env.REVIEW_MESH_VERIFY_SDK_RUNTIME === "1")(
         );
         if (compact) {
           compactions++;
+          summaryToolsDisabled = body.tool_choice?.type === "none";
           send(response, { type: "text", text: summary }, 100);
         } else if (calls <= 3) {
           send(
@@ -202,8 +204,12 @@ it.runIf(process.env.REVIEW_MESH_VERIFY_SDK_RUNTIME === "1")(
         signal: AbortSignal.timeout(25000),
       }))
         events.push(event);
-      expect(schemaSeen).toBe(true);
+      expect(
+        schemaSeen,
+        JSON.stringify(events.filter((event) => event.type === "failure")),
+      ).toBe(true);
       expect(compactions).toBe(1);
+      expect(summaryToolsDisabled).toBe(true);
       expect(calls).toBe(5);
       expect(events).toContainEqual(
         expect.objectContaining({
