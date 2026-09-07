@@ -8,7 +8,7 @@ import {
   readFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createServer } from "node:http";
 import { createNativeCopilotAdapter } from "../../src/adapters/native-copilot.js";
 import {
@@ -35,6 +35,7 @@ import type {
 import { nativeResultJsonSchema } from "../../src/protocol/native-review.js";
 import { providerReviewerResultV4Schema } from "../../src/protocol/v9.js";
 import { sanitizeRunMetadata } from "../../src/results/sanitize.js";
+import { getAppPaths } from "../../src/config/paths.js";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -1011,6 +1012,7 @@ it.each([
   "adjudication",
   "scope-correction",
   "proof-correction",
+  "retained-context",
 ] as const)(
   "runs packaged Copilot %s file inspection and terminal submission against a loopback provider",
   async (mode) => {
@@ -1018,6 +1020,16 @@ it.each([
       workspace = join(root, "workspace");
     await mkdir(workspace);
     await writeFile(join(workspace, "a.ts"), "NATIVE_FILE_EVIDENCE");
+    let applicationDirectory = join(root, "application");
+    let retainedContextPath: string | undefined;
+    if (mode === "retained-context") {
+      const dataDirectory = dirname(getAppPaths().runsDirectory);
+      await mkdir(dataDirectory, { recursive: true });
+      applicationDirectory = await mkdtemp(
+        join(dataDirectory, "copilot-context-read-test-"),
+      );
+      roots.push(applicationDirectory);
+    }
     if (mode === "scope-correction")
       await writeFile(join(workspace, "b.ts"), "SECOND_FILE_EVIDENCE");
     const requests: Array<{
@@ -1053,13 +1065,41 @@ it.each([
           return;
         }
         const scopeCorrection = mode === "scope-correction";
+        if (mode === "retained-context" && requests.length === 1) {
+          const system = body.messages
+            .filter(
+              (message: any) =>
+                message.role === "system" || message.role === "developer",
+            )
+            .map((message: any) =>
+              typeof message.content === "string"
+                ? message.content
+                : JSON.stringify(message.content),
+            )
+            .join("\n");
+          const reference =
+            /The complete original review context is retained in ("(?:\\.|[^"\\])*") \(SHA-256/.exec(
+              system,
+            );
+          retainedContextPath = reference
+            ? JSON.parse(reference[1]!)
+            : undefined;
+        }
         const name =
-          requests.length === 1 || (scopeCorrection && requests.length === 3)
+          requests.length === 1 ||
+          (scopeCorrection && requests.length === 3) ||
+          (mode === "retained-context" && requests.length === 2)
             ? "view"
             : "submit_review";
         const args =
           name === "view"
-            ? { path: join(workspace, requests.length === 3 ? "b.ts" : "a.ts") }
+            ? {
+                path:
+                  mode === "retained-context" && requests.length === 1
+                    ? (retainedContextPath ??
+                      join(workspace, "missing-context.json"))
+                    : join(workspace, requests.length === 3 ? "b.ts" : "a.ts"),
+              }
             : mode === "adjudication" || mode === "proof-correction"
               ? {
                   schema_version: "2",
@@ -1151,7 +1191,7 @@ it.each([
     );
     const port = (server.address() as { port: number }).port;
     const adapter = createNativeCopilotAdapter(registration, {
-      applicationDataDirectory: join(root, "application"),
+      applicationDataDirectory: applicationDirectory,
       environment: {
         ...process.env,
         URL: `http://127.0.0.1:${port}/v1`,
@@ -1159,6 +1199,8 @@ it.each([
       },
     });
     const input = reviewInput(workspace, AbortSignal.timeout(20000));
+    if (mode === "retained-context")
+      input.context.instructions = "RETAINED_ORIGINAL_CONTEXT_FROM_APPDATA";
     if (mode === "scope-correction") {
       input.context.review_scope = { mode: "changes", source: "request" };
       input.context.git = {
@@ -1260,8 +1302,34 @@ it.each([
         ).toEqual(["CANDIDATE-001", "CANDIDATE-002"]);
       }
       expect(requests).toHaveLength(
-        mode === "scope-correction" ? 4 : mode === "proof-correction" ? 3 : 2,
+        mode === "scope-correction"
+          ? 4
+          : mode === "proof-correction" || mode === "retained-context"
+            ? 3
+            : 2,
       );
+      if (mode === "retained-context") {
+        expect(retainedContextPath).toBeDefined();
+        expect(retainedContextPath).toContain(
+          join(applicationDirectory, "runtime", "copilot-native"),
+        );
+        expect(retainedContextPath).not.toContain(workspace);
+        const firstToolReply = requests[1]!.body.messages.filter(
+          (message: any) => message.role === "tool",
+        );
+        expect(JSON.stringify(firstToolReply)).toContain(
+          "RETAINED_ORIGINAL_CONTEXT_FROM_APPDATA",
+        );
+        expect(JSON.stringify(firstToolReply)).toContain(
+          "review-mesh.native-context",
+        );
+        expect(JSON.stringify(firstToolReply)).not.toMatch(
+          /permission denied|access denied|not permitted/i,
+        );
+        await expect(readFile(retainedContextPath!)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      }
       if (mode === "proof-correction")
         expect(JSON.stringify(requests[2]!.body.messages)).toContain(
           "line_out_of_range",
@@ -1292,14 +1360,16 @@ it.each([
       );
       for (const forbidden of ["bash", "powershell", "edit", "create"])
         expect(tools).not.toContain(forbidden);
-      expect(JSON.stringify(requests[1]!.body.messages)).toContain(
-        "NATIVE_FILE_EVIDENCE",
-      );
+      expect(
+        JSON.stringify(
+          requests[mode === "retained-context" ? 2 : 1]!.body.messages,
+        ),
+      ).toContain("NATIVE_FILE_EVIDENCE");
       expect(await readFile(join(workspace, "a.ts"), "utf8")).toBe(
         "NATIVE_FILE_EVIDENCE",
       );
       expect(
-        await readdir(join(root, "application", "runtime", "copilot-native")),
+        await readdir(join(applicationDirectory, "runtime", "copilot-native")),
       ).toEqual([]);
     } finally {
       await adapter.forceCleanup?.();
