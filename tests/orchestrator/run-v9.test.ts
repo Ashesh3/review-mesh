@@ -2,6 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as realDelay } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runV9Review, type V9RunInput } from "../../src/orchestrator/run-v9.js";
 import { AdapterRegistry } from "../../src/adapters/registry.js";
@@ -10,6 +11,21 @@ import type { ReviewerResultV4 } from "../../src/protocol/v9.js";
 import type { ReviewAdapter } from "../../src/adapters/types.js";
 
 const roots: string[] = [];
+async function awaitFilesystemEvent<T>(event: Promise<T>): Promise<T> {
+  // Wait for actual admission/close while filesystem I/O uses real time. Keep
+  // scheduler time fixed so disk latency cannot consume the deadline under test.
+  const guard = new AbortController();
+  try {
+    return await Promise.race([
+      event,
+      realDelay(5000, undefined, { signal: guard.signal }).then(() => {
+        throw new Error("Snapshot I/O did not settle within five seconds");
+      }),
+    ]);
+  } finally {
+    guard.abort();
+  }
+}
 afterEach(async () => {
   for (const root of roots.splice(0))
     await rm(root, { recursive: true, force: true });
@@ -1263,6 +1279,10 @@ describe("v9 run orchestration", () => {
       base.config.reviewers = reviewers;
       const registry = new AdapterRegistry();
       let fallbackCalls = 0;
+      let admit!: () => void;
+      const admitted = new Promise<void>((resolve) => {
+        admit = resolve;
+      });
       registry.register("command", (registration) => ({
         id: registration.type === "command" ? registration.command : "test",
         async probe() {
@@ -1299,6 +1319,7 @@ describe("v9 run orchestration", () => {
             };
             return;
           }
+          admit();
           while (!input.signal.aborted) {
             await new Promise((resolve) => setTimeout(resolve, 400));
             yield {
@@ -1311,8 +1332,7 @@ describe("v9 run orchestration", () => {
         },
       }));
       const records: Array<Record<string, unknown>> = [];
-      let completion: Awaited<ReturnType<typeof runV9Review>> | undefined;
-      runV9Review({
+      const run = runV9Review({
         runId: "no-progress",
         config: base.config,
         context: resolvedContext({
@@ -1337,12 +1357,11 @@ describe("v9 run orchestration", () => {
         },
         recordResult: async () => undefined,
         now: () => Date.now(),
-      }).then((value) => {
-        completion = value;
       });
-      for (let index = 0; index < 100 && completion === undefined; index += 1)
-        await vi.advanceTimersByTimeAsync(100);
-      expect(completion?.exitCode).toBe(0);
+      await awaitFilesystemEvent(admitted);
+      await vi.advanceTimersByTimeAsync(2000);
+      const completion = await awaitFilesystemEvent(run);
+      expect(completion.exitCode).toBe(0);
       expect(fallbackCalls).toBe(1);
       expect(records).toEqual(
         expect.arrayContaining([
@@ -1535,7 +1554,10 @@ describe("v9 run orchestration", () => {
         },
       };
       const registry = new AdapterRegistry();
-      let admitted = false;
+      let admit!: () => void;
+      const admitted = new Promise<void>((resolve) => {
+        admit = resolve;
+      });
       registry.register("command", () => ({
         id: "cancel",
         async probe() {
@@ -1551,7 +1573,7 @@ describe("v9 run orchestration", () => {
           };
         },
         async *run(input) {
-          admitted = true;
+          admit();
           await new Promise<void>((resolve) => {
             input.signal.addEventListener("abort", () => resolve(), {
               once: true,
@@ -1561,8 +1583,7 @@ describe("v9 run orchestration", () => {
       }));
       const caller = new AbortController();
       const records: Array<Record<string, unknown>> = [];
-      let completion: Awaited<ReturnType<typeof runV9Review>> | undefined;
-      runV9Review({
+      const run = runV9Review({
         runId: "cancel-precedence",
         config: base.config,
         context: resolvedContext({
@@ -1587,18 +1608,11 @@ describe("v9 run orchestration", () => {
         },
         recordResult: async () => undefined,
         now: () => Date.now(),
-      }).then((value) => {
-        completion = value;
       });
-      for (let index = 0; index < 100 && !admitted; index += 1)
-        await vi.advanceTimersByTimeAsync(0);
-      for (let index = 0; index < 100 && !admitted; index += 1)
-        await vi.advanceTimersByTimeAsync(1);
-      expect(admitted).toBe(true);
+      await awaitFilesystemEvent(admitted);
       caller.abort(new Error("caller cancelled"));
-      for (let index = 0; index < 100 && completion === undefined; index += 1)
-        await vi.advanceTimersByTimeAsync(0);
-      expect(completion?.exitCode).toBe(4);
+      const completion = await awaitFilesystemEvent(run);
+      expect(completion.exitCode).toBe(4);
       expect(records).toEqual(
         expect.arrayContaining([
           expect.objectContaining({
