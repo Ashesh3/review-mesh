@@ -57,6 +57,7 @@ import {
   createNativeProgressWatchdog,
   NativeNoProgressError,
 } from "./native-progress.js";
+import { createNativeActivityRecorder } from "./native-activity.js";
 
 type NativeJob = {
   reviewer: ResolvedReviewer;
@@ -444,6 +445,7 @@ export async function runNativeReview(input: V9RunInput) {
     );
     let release: (() => void) | undefined,
       progress: ReturnType<typeof createNativeProgressWatchdog> | undefined,
+      activity: ReturnType<typeof createNativeActivityRecorder> | undefined,
       terminal:
         Extract<AdapterEvent, { type: "result" | "failure" }> | undefined;
     let capabilities: Awaited<ReturnType<ReviewAdapter["probe"]>> | undefined;
@@ -509,6 +511,10 @@ export async function runNativeReview(input: V9RunInput) {
         timeoutMs: execution.no_progress_timeout_ms ?? 300_000,
         signal: child.signal,
         onTimeout: (error) => child.abort(error),
+      });
+      activity = createNativeActivityRecorder({
+        reviewerId: reviewer.id,
+        startedAt: job.startedAt,
       });
       clearTimeout(expiry);
       const attemptDeadline = Math.min(
@@ -649,25 +655,18 @@ export async function runNativeReview(input: V9RunInput) {
             terminal = event;
             continue;
           }
-          const message = sanitizePublicText(event.message);
           if (meaningful) job.lastProgressAt = now();
           job.activityCount++;
-          if (message)
-            await input.record({
-              record: "reviewer.activity",
-              reviewer_id: reviewer.id,
-              data: {
-                reviewer_id: reviewer.id,
-                phase: "reviewing",
-                at: now(),
-                message,
-                meaningful_progress: meaningful,
-              },
-            });
+          for (const record of activity.record(event, meaningful, now()))
+            await input.record(record);
         }
       } finally {
         if (child.signal.aborted)
           void iterator.return?.().catch(() => undefined);
+        for (const record of activity.finish(
+          progress.snapshot().identityOverflow,
+        ))
+          await input.record(record);
       }
       if (terminal?.type === "failure") {
         await disposition(
