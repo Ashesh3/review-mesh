@@ -32,6 +32,9 @@ export type AdjudicationValidationIssue =
   | "cited_evidence_location_required"
   | "cited_evidence_context_required"
   | "adjusted_finding_required"
+  | "adjusted_evidence_required"
+  | "adjusted_evidence_location_required"
+  | "adjusted_evidence_context_required"
   | "ordered_execution_proof_required"
   | "ordered_execution_steps_invalid"
   | "ordered_execution_citation_required"
@@ -357,6 +360,18 @@ export function validateAdjudication(
         decision.adjusted_finding === undefined
       ) {
         issues.push("adjusted_finding_required");
+      }
+      if (decision.decision === "adjusted" && decision.adjusted_finding) {
+        const evidence = decision.adjusted_finding.evidence;
+        if (evidence.length === 0) issues.push("adjusted_evidence_required");
+        if (!evidence.every(concreteCitation))
+          issues.push("adjusted_evidence_location_required");
+        if (
+          !evidence.every((citation) =>
+            contextBoundCitation(citation, candidate, context, anchored),
+          )
+        )
+          issues.push("adjusted_evidence_context_required");
       }
       if (
         decision.decision !== "rejected" &&

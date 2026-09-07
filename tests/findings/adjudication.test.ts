@@ -89,6 +89,72 @@ function adjudication(
 }
 
 describe("validateAdjudication", () => {
+  it("requires adjusted evidence to remain in the verified candidate proof chain", () => {
+    const source = candidate();
+    source.actionable_findings[0]!.category = "correctness";
+    const anchor = source.actionable_findings[0]!.evidence[0]!;
+    const {
+      id: _id,
+      category: _category,
+      verification: _verification,
+      change_impact: _changeImpact,
+      ...adjusted
+    } = source.actionable_findings[0]!;
+    adjusted.evidence = [
+      {
+        path: "src/support.ts",
+        start_line: 1,
+        end_line: 1,
+        detail: "The supporting call controls this defect.",
+      },
+    ];
+    const judge = adjudication({
+      source_finding_id: "enum-post-ingest",
+      decision: "adjusted",
+      rationale: "Corrected supporting location",
+      cited_evidence: [anchor],
+      adjusted_finding: adjusted,
+      unverified_assumptions: [],
+      base_head_comparison: {
+        base: { behavior: "Old", citation: anchor },
+        head: { behavior: "New", citation: anchor },
+        impact: "Changed",
+      },
+    });
+    const value = context();
+    expect(
+      validateAdjudication(source, judge, value).decisions[0],
+    ).toMatchObject({
+      gate_eligible: false,
+      issues: expect.arrayContaining(["adjusted_evidence_context_required"]),
+    });
+    value.evidenceVerification!.by_source_finding_id[
+      "enum-post-ingest"
+    ]!.verified_citations = [
+      {
+        side: "head",
+        path: "src/support.ts",
+        start_line: 1,
+        end_line: 1,
+        sha256: "a".repeat(64),
+      },
+    ];
+    expect(
+      validateAdjudication(source, judge, value).decisions[0],
+    ).toMatchObject({
+      gate_eligible: true,
+      effective_decision: "adjusted",
+      issues: [],
+    });
+    judge.decisions[0]!.adjusted_finding!.evidence = [];
+    expect(
+      validateAdjudication(source, judge, value).decisions[0],
+    ).toMatchObject({
+      gate_eligible: false,
+      issues: expect.arrayContaining(["adjusted_evidence_required"]),
+    });
+  });
+
   it("allows exact verified supporting citations when the decision remains anchored to the candidate", () => {
     const source = candidate();
     source.actionable_findings[0]!.category = "correctness";

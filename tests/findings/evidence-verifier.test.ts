@@ -68,6 +68,61 @@ afterEach(async () => {
 });
 
 describe("verifyAdjudicationEvidence", () => {
+  it("verifies the effective adjusted citations instead of reusing only the original proof", async () => {
+    const workspace = await fixture();
+    const judge = result();
+    judge.decisions[0]!.decision = "adjusted";
+    judge.decisions[0]!.adjusted_finding = {
+      severity: "medium",
+      title: "Adjusted",
+      description: "Adjusted claim",
+      evidence: [
+        {
+          path: "src/missing.ts",
+          start_line: 999,
+          end_line: 999,
+          detail: "Adjusted location",
+        },
+      ],
+      suggested_direction: "Fix",
+      confidence: "high",
+      classification: "confirmed_defect",
+      external_assumptions: [],
+    };
+    const invalid = await verifyAdjudicationEvidence({
+      workspace,
+      adjudicationResult: judge,
+    });
+    expect(invalid.by_source_finding_id.candidate).toMatchObject({
+      verified: false,
+      failures: ["read_failed"],
+    });
+    await writeFile(join(workspace, "src", "support.ts"), "supporting code\n");
+    judge.decisions[0]!.adjusted_finding.evidence = [
+      {
+        path: "src/support.ts",
+        start_line: 1,
+        end_line: 1,
+        detail: "Adjusted supporting evidence",
+      },
+    ];
+    const valid = await verifyAdjudicationEvidence({
+      workspace,
+      adjudicationResult: judge,
+    });
+    expect(valid.by_source_finding_id.candidate).toMatchObject({
+      verified: true,
+      verified_citations: expect.arrayContaining([
+        expect.objectContaining({
+          side: "head",
+          path: "src/support.ts",
+          start_line: 1,
+          end_line: 1,
+        }),
+      ]),
+    });
+  });
+
   it("verifies an old renamed path at the pinned base instead of the current head", async () => {
     const repository = await createGitFixture();
     const gitRunner = createGitRunner();

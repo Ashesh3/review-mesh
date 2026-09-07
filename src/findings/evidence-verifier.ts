@@ -135,6 +135,12 @@ function citations(
       ...citation,
       side: "head" as const,
     })),
+    ...(result.decision === "adjusted"
+      ? (result.adjusted_finding?.evidence ?? []).map((citation) => ({
+          ...citation,
+          side: "head" as const,
+        }))
+      : []),
     ...(result.ordered_execution_proof?.steps.map((step) => ({
       ...step.citation,
       side: "head" as const,
