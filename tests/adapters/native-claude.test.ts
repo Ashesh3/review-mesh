@@ -3,6 +3,7 @@ import {
   access,
   mkdtemp,
   readFile,
+  realpath,
   readdir,
   rm,
   writeFile,
@@ -57,10 +58,20 @@ it("keeps the original context readable through a system pointer after compactio
       query: ({ options }) =>
         (async function* () {
           system = String(options.systemPrompt);
-          const files = await readdir(options.env!.CLAUDE_CONFIG_DIR!);
-          const file = files.find((name) => name.startsWith("native-context-"));
+          const contextDirectory = options.additionalDirectories?.[0];
+          expect(contextDirectory).toBe(
+            await realpath(
+              join(options.env!.CLAUDE_CONFIG_DIR!, "review-context"),
+            ),
+          );
+          expect(options.additionalDirectories).toHaveLength(1);
+          const files = await readdir(contextDirectory!);
+          const file = files.find(
+            (name) =>
+              name.startsWith("native-context-") && name.endsWith(".json"),
+          );
           if (file) {
-            retainedPath = join(options.env!.CLAUDE_CONFIG_DIR!, file);
+            retainedPath = join(contextDirectory!, file);
             // Reading is the SDK's native tool boundary; no reconstructed prompt is needed.
             retained = JSON.parse(await readFile(retainedPath, "utf8"));
           }
@@ -596,11 +607,107 @@ it("keeps Claude's native tools and uses one SDK session even for a terminal pro
     autoCompactEnabled: true,
     autoCompactWindow: 128000,
   });
+  expect(options?.env?.CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS).toBe("8000");
   expect(options?.env?.ANTHROPIC_API_KEY).toBe("test-only");
   expect(options?.env?.ANTHROPIC_BASE_URL).toBe(
     "http://127.0.0.1:34567/vendor-prefix",
   );
   expect(events.at(-1)).toMatchObject({ type: "failure" });
+});
+
+it("tells the model which native Read ranges remain instead of silently treating a token-capped page as a full file", async () => {
+  let options: Options | undefined;
+  const adapter = createNativeClaudeAdapter(
+    { type: "claude", api_key_env: "KEY" },
+    {
+      environment: { KEY: "fixture" },
+      runtime: () => ({
+        executablePath: "fixture",
+        pathEntries: [],
+        sdkVersion: "fixture",
+        runtimeVersion: "fixture",
+        mode: "managed_process",
+      }),
+      query: (input) => {
+        options = input.options;
+        return (async function* () {})();
+      },
+    },
+  );
+  for await (const _event of adapter.run({
+    runId: "fixture",
+    reviewer: resolvedReviewer({ adapter: { type: "claude" } }),
+    context: resolvedContext(),
+    prompt: {
+      system: "Read all required files.",
+      user: "Read",
+      combined: "Read",
+    },
+    resultJsonSchema: { type: "object" },
+    isolationPolicy: "prefer_enforced",
+    signal: new AbortController().signal,
+  })) {
+    /* drain */
+  }
+  const hook = options?.hooks?.PostToolUse?.find(
+    (entry) => entry.matcher === "Read",
+  )?.hooks[0];
+  expect(hook).toBeDefined();
+  const makeInput = (
+    startLine: number,
+    numLines: number,
+    totalLines: number,
+    truncatedByTokenCap = false,
+  ) =>
+    ({
+      hook_event_name: "PostToolUse",
+      tool_name: "Read",
+      tool_use_id: "read-id",
+      session_id: "fixture",
+      transcript_path: "fixture",
+      cwd: "fixture",
+      tool_input: { file_path: "source.ts" },
+      tool_response: {
+        type: "text",
+        file: {
+          filePath: "source.ts",
+          content: "private source bytes",
+          startLine,
+          numLines,
+          totalLines,
+          truncatedByTokenCap,
+        },
+      },
+    }) as const;
+  const partial = await hook!(makeInput(1, 160, 1500, true), "read-id", {
+    signal: new AbortController().signal,
+  });
+  expect(partial).toMatchObject({
+    hookSpecificOutput: {
+      hookEventName: "PostToolUse",
+      additionalContext: expect.stringContaining("offset=161"),
+    },
+  });
+  expect(JSON.stringify(partial)).toContain("1500");
+  expect(JSON.stringify(partial)).not.toContain("private source bytes");
+  const end = await hook!(makeInput(1481, 20, 1500), "read-id", {
+    signal: new AbortController().signal,
+  });
+  expect(JSON.stringify(end)).toContain("end of file");
+  expect(JSON.stringify(end)).toContain("earlier gaps");
+  const invalid = await hook!(makeInput(1490, 20, 1500), "read-id", {
+    signal: new AbortController().signal,
+  });
+  expect(invalid).toEqual({});
+  const longLine = await hook!(makeInput(1, 1, 1, true), "read-id", {
+    signal: new AbortController().signal,
+  });
+  expect(JSON.stringify(longLine)).toContain(
+    "Long-line content may be missing",
+  );
+  expect(JSON.stringify(longLine)).not.toContain(
+    "range reaches the end of file",
+  );
 });
 
 it("rejects native success without structured output", async () => {

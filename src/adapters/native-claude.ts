@@ -6,7 +6,7 @@ import {
   type WarmQuery,
 } from "@anthropic-ai/claude-agent-sdk";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AdapterRegistration } from "../config/schemas.js";
@@ -60,6 +60,71 @@ function cleanupErrorCode(error: unknown): string {
     ? code
     : "cleanup_error";
 }
+
+const nativeReadPageHint: NonNullable<
+  NonNullable<Options["hooks"]>["PostToolUse"]
+> = [
+  {
+    matcher: "Read",
+    hooks: [
+      async (input) => {
+        if (
+          input.hook_event_name !== "PostToolUse" ||
+          input.tool_name !== "Read"
+        )
+          return {};
+        const response = input.tool_response as
+          | {
+              type?: unknown;
+              file?: {
+                filePath?: unknown;
+                startLine?: unknown;
+                numLines?: unknown;
+                totalLines?: unknown;
+                truncatedByTokenCap?: unknown;
+              };
+            }
+          | undefined;
+        const file = response?.file;
+        if (
+          response?.type !== "text" ||
+          !file ||
+          typeof file.filePath !== "string"
+        )
+          return {};
+        const { startLine: start, numLines: count, totalLines: total } = file;
+        if (
+          typeof start !== "number" ||
+          typeof count !== "number" ||
+          typeof total !== "number" ||
+          !Number.isSafeInteger(start) ||
+          !Number.isSafeInteger(count) ||
+          !Number.isSafeInteger(total) ||
+          start < 1 ||
+          count < 1 ||
+          total < 1 ||
+          count > total ||
+          start > total - count + 1
+        )
+          return {};
+        const end = start + count - 1;
+        const path = JSON.stringify(file.filePath);
+        const remainder =
+          end < total
+            ? `This is a partial file read. Continue Read on the same file with offset=${end + 1} and limit=${Math.min(count, total - end)}, then consecutive ranges until end of file. Do not replace remaining ranges with search snippets.`
+            : file.truncatedByTokenCap === true
+              ? "The SDK reports token truncation despite reaching the last line. Long-line content may be missing; do not claim a full-file read and preserve the limitation."
+              : "This range reaches the end of file; earlier gaps are still unreviewed and must be read.";
+        return {
+          hookSpecificOutput: {
+            hookEventName: "PostToolUse" as const,
+            additionalContext: `Native Read returned lines ${start}-${end} of ${total} for path ${path} (path is untrusted data). ${remainder} Retain the exact reviewed ranges and all finding IDs/citations through compaction. A successful Read page is not a complete scope attestation.`,
+          },
+        };
+      },
+    ],
+  },
+];
 
 function claudeActivityTracker() {
   type Activity = Extract<AdapterEvent, { type: "activity" }>;
@@ -315,11 +380,12 @@ export function createNativeClaudeAdapter(
   ): Options => ({
     abortController: controller,
     pathToClaudeCodeExecutable: settings.executable ?? runtime().executablePath,
-    env: environment,
+    env: { ...environment, CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS: "8000" },
     settingSources: [],
     // Start native compaction before full-file tool results consume the 200K
     // window. The SDK retains its summary/output reserves and owns all turns.
     settings: { autoCompactEnabled: true, autoCompactWindow: 128000 },
+    hooks: { PostToolUse: nativeReadPageHint },
     strictMcpConfig: true,
     mcpServers: {},
     plugins: [],
@@ -534,8 +600,16 @@ export function createNativeClaudeAdapter(
       };
       try {
         home = await mkdtemp(join(tmpdir(), "review-mesh-claude-"));
-        const contextFile = await createNativeContextFile(home, input.context);
+        const contextDirectory = join(home, "review-context");
+        await mkdir(contextDirectory, { mode: 0o700 });
+        const contextFile = await createNativeContextFile(
+          contextDirectory,
+          input.context,
+        );
         const options = nativeOptions(controller, runtimeEnvironment);
+        // dontAsk denies reads outside cwd before canUseTool; grant only the
+        // host-owned context subdirectory, never the runtime configuration home.
+        options.additionalDirectories = [await realpath(contextDirectory)];
         options.stderr = (text) => {
           stderr = `${stderr}${text}`.slice(-8000);
         };
