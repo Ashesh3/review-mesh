@@ -3,6 +3,7 @@ import {
   startup,
   type Options,
   type SDKMessage,
+  type WarmQuery,
 } from "@anthropic-ai/claude-agent-sdk";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -31,6 +32,30 @@ interface Dependencies {
   }) => AsyncIterable<SDKMessage>;
 }
 
+async function removeClaudeHome(home: string): Promise<void> {
+  // Bun's Windows fs.rm currently ignores Node's maxRetries/retryDelay.
+  // Retain the existing five-retry linear budget after owned processes stop.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await rm(home, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (!["EBUSY", "EPERM"].includes(code ?? "") || attempt >= 5) throw error;
+      await new Promise<void>((resolve) =>
+        setTimeout(resolve, 100 * (attempt + 1)),
+      );
+    }
+  }
+}
+
+function cleanupErrorCode(error: unknown): string {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === "string" && /^E[A-Z0-9_]{1,30}$/.test(code)
+    ? code
+    : "cleanup_error";
+}
+
 /** Vendor strict draft-07 validation rejects our host-only UTF-8 annotations. */
 function claudeOutputSchema(
   schema: Record<string, unknown>,
@@ -57,6 +82,7 @@ export function createNativeClaudeAdapter(
     controller: AbortController;
     close?: () => void;
     processes: ReturnType<typeof createClaudeProcessOwner>;
+    stop?: () => Promise<void>;
   }>();
   const runtime = dependencies.runtime ?? (() => resolveSdkRuntime("claude"));
   const nativeQuery = dependencies.query ?? query;
@@ -172,38 +198,85 @@ export function createNativeClaudeAdapter(
           "Claude SDK requires an explicitly allowed ANTHROPIC_API_KEY or supported provider credentials.";
       else if (signal.aborted) message = "Claude probe cancelled.";
       else {
-        const controller = new AbortController(),
-          abort = () => controller.abort(signal.reason);
+        const controller = new AbortController();
         const processes = createClaudeProcessOwner();
-        const state = { controller, processes };
+        let stopping: Promise<void> | undefined;
+        let cancelled = false;
+        const stop = () =>
+          (stopping ??= (async () => {
+            try {
+              // Claude's Windows IDE discovery can leave tasklist/findstr
+              // grandchildren holding cwd after EOF closes the runtime root.
+              // A probe has no review output to drain: stop its tree first.
+              await processes.close({ terminateTree: true });
+            } finally {
+              controller.abort(signal.reason);
+            }
+          })());
+        const cancel = () => {
+          cancelled = true;
+          return stop();
+        };
+        const abort = () => {
+          // The same promise is awaited below, including cleanup failures.
+          void cancel().catch(() => undefined);
+        };
+        const state = { controller, processes, stop: cancel };
         active.add(state);
         let home: string | undefined;
+        let warm: WarmQuery | undefined;
         signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) abort();
         try {
           home = await mkdtemp(join(tmpdir(), "review-mesh-claude-probe-"));
           const options = nativeOptions(controller, runtimeEnvironment!);
           options.spawnClaudeCodeProcess = processes.spawn;
           options.env = { ...options.env, CLAUDE_CONFIG_DIR: home };
           options.cwd = home;
-          const warm = await startup({ options, initializeTimeoutMs: 15000 });
-          warm.close();
-          await warm[Symbol.asyncDispose]();
-          await processes.close();
-          available = true;
+          warm = await startup({ options, initializeTimeoutMs: 15000 });
+          available = !cancelled;
         } catch {
-          message = "Claude SDK runtime initialization failed.";
+          message = cancelled
+            ? "Claude probe cancelled."
+            : "Claude SDK runtime initialization failed.";
         } finally {
+          const cleanupFailures: string[] = [];
+          let stopped = false;
+          try {
+            await stop();
+            stopped = true;
+          } catch (error) {
+            cleanupFailures.push(
+              `Claude probe process cleanup failed (${cleanupErrorCode(error)}).`,
+            );
+          }
+          try {
+            warm?.close();
+            await warm?.[Symbol.asyncDispose]();
+          } catch (error) {
+            cleanupFailures.push(
+              `Claude probe SDK cleanup failed (${cleanupErrorCode(error)}).`,
+            );
+          }
+          if (stopped) active.delete(state);
+          if (home && stopped) {
+            try {
+              await removeClaudeHome(home);
+            } catch (error) {
+              cleanupFailures.push(
+                `Claude probe directory cleanup failed (${cleanupErrorCode(error)}).`,
+              );
+            }
+          }
           signal.removeEventListener("abort", abort);
-          controller.abort();
-          await processes.close();
-          active.delete(state);
-          if (home)
-            await rm(home, {
-              recursive: true,
-              force: true,
-              maxRetries: 5,
-              retryDelay: 100,
-            });
+          if (cancelled) {
+            available = false;
+            message = "Claude probe cancelled.";
+          }
+          if (cleanupFailures.length > 0) {
+            available = false;
+            message = [message, ...cleanupFailures].filter(Boolean).join(" ");
+          }
         }
       }
       return {
@@ -410,18 +483,16 @@ export function createNativeClaudeAdapter(
         controller.abort();
         await state.processes.close();
         active.delete(state);
-        if (home)
-          await rm(home, {
-            recursive: true,
-            force: true,
-            maxRetries: 5,
-            retryDelay: 100,
-          });
+        if (home) await removeClaudeHome(home);
       }
     },
     async forceCleanup() {
       await Promise.all(
         [...active].map(async (state) => {
+          if (state.stop) {
+            await state.stop();
+            return;
+          }
           state.close?.();
           state.controller.abort();
           await state.processes.close();
