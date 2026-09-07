@@ -1,121 +1,76 @@
 import { expect, it } from "vitest";
 import { createNativeSubmissionGuard } from "../../src/runtime/native-submission-guard.js";
 import { resolvedContext, resolvedReviewer } from "../helpers/fixtures.js";
-import type { ProviderReviewerResultV4 } from "../../src/protocol/v9.js";
-import type { AdapterDiagnostic } from "../../src/adapters/types.js";
-
-function report(): ProviderReviewerResultV4 {
-  return {
+import type {
+  AdjudicationResultV2,
+  ProviderReviewerResultV4,
+} from "../../src/protocol/v9.js";
+it("accepts optional partial attestation and permits a revised review", async () => {
+  const guard = createNativeSubmissionGuard({
+    reviewer: resolvedReviewer(),
+    context: resolvedContext(),
+    signal: new AbortController().signal,
+  });
+  const value: ProviderReviewerResultV4 = {
     schema_version: "4",
-    verdict: "fail",
-    summary: "Retain original finding",
-    review_markdown: "Full report",
+    verdict: "pass",
+    summary: "Native conclusion",
+    review_markdown: "Review",
+    actionable_findings: [],
     informational_notes: [],
     native_scope_attestation: {
-      complete: true,
-      reviewed_paths: ["a.ts", "b.ts"],
-      limitations: [],
+      complete: false,
+      reviewed_paths: [],
+      limitations: ["Optional old metadata"],
     },
-    actionable_findings: [
+  };
+  expect(await guard.validate(value)).toEqual({ accepted: true });
+  const { native_scope_attestation: _attestation, ...revised } = value;
+  expect(await guard.validate(revised)).toEqual({ accepted: true });
+});
+it("allows the agent to revise a previously incomplete adjudication decision", async () => {
+  const reviewer = resolvedReviewer({
+    policy: {
+      mode: "adjudication",
+      candidateFindings: [{ id: "one" }, { id: "two" }],
+      passQuorum: 1,
+      minimumProviderGroups: 1,
+      adjudication: "required",
+      gateMinimumSeverity: "medium",
+      gateMinimumConfidence: "medium",
+    },
+  });
+  const guard = createNativeSubmissionGuard({
+    reviewer,
+    context: resolvedContext(),
+    signal: new AbortController().signal,
+  });
+  const value: AdjudicationResultV2 = {
+    schema_version: "2",
+    kind: "review-mesh.adjudication-result",
+    verdict: "fail",
+    review_markdown: "Original assessment",
+    summary: "Assessment",
+    actionable_findings: [],
+    informational_notes: [],
+    decisions: [
       {
-        id: "f1",
-        severity: "high",
-        confidence: "high",
-        classification: "confirmed_defect",
-        title: "Retained finding",
-        description: "Original claim",
-        evidence: [
-          { path: "a.ts", start_line: 1, end_line: 1, detail: "Evidence" },
-        ],
-        suggested_direction: "Correct original claim",
-        external_assumptions: [],
-        category: "correctness",
-        verification: "Read source",
-        claim: {
-          trigger: "Trigger",
-          affected_behavior: "Behavior",
-          outcome: "Outcome",
-        },
+        source_finding_id: "one",
+        decision: "confirmed",
+        rationale: "Initial conclusion",
+        cited_evidence: [],
+        unverified_assumptions: [],
       },
     ],
   };
-}
-
-it("preserves rejected findings when additional native-read validation catches a false complete attestation", async () => {
-  let inspected = false;
-  const drafts: AdapterDiagnostic[] = [];
-  const guard = createNativeSubmissionGuard({
-    reviewer: resolvedReviewer(),
-    context: resolvedContext({
-      review_scope: { mode: "full", source: "request" },
-    }),
-    signal: new AbortController().signal,
-    recordDiagnostic: async (draft) => {
-      drafts.push(draft);
-    },
-    validateAdditional: () =>
-      inspected
-        ? { accepted: true }
-        : { accepted: false, message: "Native reads do not cover b.ts." },
-  });
-  const original = report();
-  expect(await guard.validate(original)).toEqual({
-    accepted: false,
-    message: "Native reads do not cover b.ts.",
-  });
-  inspected = true;
-  expect(
-    await guard.validate({
-      ...original,
-      verdict: "pass",
-      actionable_findings: [],
-    }),
-  ).toMatchObject({ accepted: false, message: expect.stringContaining("f1") });
-  expect(drafts).toContainEqual(
-    expect.objectContaining({
-      kind: "unverified_result_draft",
-      candidate_ids: ["f1"],
-      candidate: expect.objectContaining({
-        actionable_findings: original.actionable_findings,
-      }),
-    }),
-  );
-  expect(await guard.validate(original)).toEqual({ accepted: true });
-});
-
-it("keeps honest incomplete reports and preserves literal credential redaction", async () => {
-  const drafts: AdapterDiagnostic[] = [];
-  const value = report();
-  value.review_markdown = "Report private-fixture-secret";
-  const redact = (input: unknown): unknown =>
-    JSON.parse(
-      JSON.stringify(input).replaceAll("private-fixture-secret", "[redacted]"),
-    );
-  const guard = createNativeSubmissionGuard({
-    reviewer: resolvedReviewer(),
-    context: resolvedContext({
-      review_scope: { mode: "full", source: "request" },
-    }),
-    signal: new AbortController().signal,
-    recordDiagnostic: async (draft) => {
-      drafts.push(draft);
-    },
-    redactLiteralValues: redact,
-    validateAdditional: (result) =>
-      result.schema_version === "4" && result.native_scope_attestation?.complete
-        ? { accepted: false, message: "missing b.ts" }
-        : { accepted: true },
-  });
   expect(await guard.validate(value)).toMatchObject({ accepted: false });
-  expect(JSON.stringify(drafts)).not.toContain("private-fixture-secret");
-  expect(
-    await guard.validate({
-      ...value,
-      native_scope_attestation: {
-        complete: false,
-        reviewed_paths: ["a.ts"],
-        limitations: ["b.ts could not be read"],
-      },
-    }),
-  ).toEqual({ accepted: true });
+  value.verdict = "pass";
+  value.decisions = ["one", "two"].map((id) => ({
+    source_finding_id: id,
+    decision: "rejected",
+    rationale: "Revised after further inspection",
+    cited_evidence: [],
+    unverified_assumptions: [],
+  }));
+  expect(await guard.validate(value)).toEqual({ accepted: true });
 });

@@ -1,5 +1,6 @@
 import { createServer, type ServerResponse } from "node:http";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execa } from "execa";
 import { join } from "node:path";
 import { expect, it } from "vitest";
 import { createNativeClaudeAdapter } from "../../src/adapters/native-claude.js";
@@ -7,23 +8,35 @@ import { nativeResultJsonSchema } from "../../src/protocol/native-review.js";
 import { resolvedContext, resolvedReviewer } from "../helpers/fixtures.js";
 
 it.runIf(process.env.REVIEW_MESH_VERIFY_SDK_RUNTIME === "1")(
-  "follows native page metadata through the entire large file without losing source lines",
+  "reads retained context and lets native Bash inspect Git while denying repository writes",
   async () => {
     // Use the project directory: the vendor protects files under profile/AppData.
     const workspace = await mkdtemp(
       join(import.meta.dirname, "paging-fixture-"),
     );
-    const lines = Array.from(
-      { length: 1200 },
-      (_, index) =>
-        `${String(index + 1).padStart(4, "0")} controlled source ${"text ".repeat(26)}`,
-    );
-    const content = lines.join("\n") + "\n";
-    await writeFile(join(workspace, "source.txt"), content);
+    await execa("git", ["init", "--initial-branch=main"], { cwd: workspace });
+    await execa("git", ["config", "user.name", "Read Only Fixture"], {
+      cwd: workspace,
+    });
+    await execa("git", ["config", "user.email", "fixture@example.test"], {
+      cwd: workspace,
+    });
+    await writeFile(join(workspace, "source.txt"), "GIT_BASE_MARKER\n");
+    await execa("git", ["add", "source.txt"], { cwd: workspace });
+    await execa("git", ["commit", "-m", "Git read-only fixture"], {
+      cwd: workspace,
+    });
+    await writeFile(join(workspace, "source.txt"), "GIT_HEAD_MARKER\n");
     let calls = 0;
-    let readCalls = 0;
-    let pagedHints = 0;
-    let finalMarker = false;
+    const commands = [
+      "git status --short",
+      "git diff -- source.txt",
+      "git log -1 --format=%s",
+      "git show HEAD:source.txt",
+      "echo CHANGED > blocked-write.txt",
+    ];
+    const gitOutputs: string[] = [];
+    let writeDenied = false;
     let contextReadable = false;
     let diffPath: string | undefined;
     let diffReadable = false;
@@ -31,13 +44,11 @@ it.runIf(process.env.REVIEW_MESH_VERIFY_SDK_RUNTIME === "1")(
     const originalDiff =
       "diff --git a/source.txt b/source.txt\n--- a/source.txt\n+++ b/source.txt\n@@ -1 +1 @@\n-ORIGINAL_DIFF_FIRST_MARKER\n+ORIGINAL_DIFF_LAST_MARKER\n";
     let fixtureFailure: string | undefined;
-    const observed = new Map<number, string>();
-    const pageBytes: number[] = [];
     const expected = {
       schema_version: "4",
       verdict: "pass",
-      review_markdown: "Complete paged fixture review.",
-      summary: "Every fixture line inspected.",
+      review_markdown: "Complete native Git fixture review.",
+      summary: "Read-only Git commands inspected the fixture.",
       actionable_findings: [],
       informational_notes: [],
       native_scope_attestation: {
@@ -181,9 +192,9 @@ it.runIf(process.env.REVIEW_MESH_VERIFY_SDK_RUNTIME === "1")(
               throw new Error(
                 "Native Read could not read the retained diff companion",
               );
-            readCalls++;
-            stream(response, "Read", {
-              file_path: join(workspace, "source.txt"),
+            stream(response, "Bash", {
+              command: commands[0],
+              description: "Inspect Git status",
             });
             return;
           }
@@ -194,39 +205,24 @@ it.runIf(process.env.REVIEW_MESH_VERIFY_SDK_RUNTIME === "1")(
           const result = blocks.findLast(
             (block: { type: string }) => block.type === "tool_result",
           );
-          if (!result || result.is_error)
-            throw new Error("Native read did not succeed");
           const text =
-            typeof result.content === "string"
+            typeof result?.content === "string"
               ? result.content
-              : JSON.stringify(result.content);
-          pageBytes.push(Buffer.byteLength(text));
-          for (const line of text.split("\n")) {
-            const match = /^\d+\t(\d{4} controlled source .*)$/.exec(line);
-            if (match) observed.set(Number(match[1]!.slice(0, 4)), match[1]!);
-          }
-          finalMarker ||= text.includes(lines.at(-1)!);
-          const hint = blocks.findLast(
-            (block: { type: string; text?: string }) =>
-              block.type === "text" &&
-              block.text?.includes("Native Read returned lines"),
-          )?.text;
-          if (!hint)
-            throw new Error("Native partial page lacked a paging obligation");
-          const next = /offset=(\d+) and limit=(\d+)/.exec(hint);
-          if (next) {
-            pagedHints++;
-            readCalls++;
-            stream(response, "Read", {
-              file_path: join(workspace, "source.txt"),
-              offset: Number(next[1]),
-              limit: Number(next[2]),
+              : JSON.stringify(result?.content);
+          const commandIndex = calls - 4;
+          if (commandIndex < 4) {
+            if (!result || result.is_error)
+              throw new Error(
+                `Read-only Git command ${commandIndex} was denied: ${text}`,
+              );
+            gitOutputs.push(text);
+          } else writeDenied = result?.is_error === true;
+          if (commandIndex + 1 < commands.length)
+            stream(response, "Bash", {
+              command: commands[commandIndex + 1],
+              description: "Inspect Git fixture",
             });
-          } else {
-            if (!hint.includes("end of file"))
-              throw new Error("Missing explicit end-of-file guidance");
-            stream(response, "StructuredOutput", expected);
-          }
+          else stream(response, "StructuredOutput", expected);
         } catch (error) {
           fixtureFailure =
             error instanceof Error ? error.message : "Fixture failed";
@@ -290,9 +286,9 @@ it.runIf(process.env.REVIEW_MESH_VERIFY_SDK_RUNTIME === "1")(
         }),
         prompt: {
           system:
-            "Read the entire file in consecutive native pages and preserve findings.",
-          user: "Read source.txt fully.",
-          combined: "Read fully.",
+            "Review the fixture with native read-only tools and Git. Do not change files.",
+          user: "Inspect the Git change and report a review.",
+          combined: "Review Git change.",
         },
         resultJsonSchema: nativeResultJsonSchema(reviewer),
         isolationPolicy: "prefer_enforced",
@@ -305,12 +301,18 @@ it.runIf(process.env.REVIEW_MESH_VERIFY_SDK_RUNTIME === "1")(
       expect(fixtureFailure).toBeUndefined();
       expect(contextReadable).toBe(true);
       expect(diffReadable).toBe(true);
-      expect(readCalls).toBeGreaterThan(3);
-      expect(pagedHints).toBe(readCalls - 1);
-      expect(Math.max(...pageBytes)).toBeLessThan(40 * 1024);
-      expect(observed.size).toBe(lines.length);
-      expect([...observed.values()]).toEqual(lines);
-      expect(finalMarker).toBe(true);
+      expect(gitOutputs).toHaveLength(4);
+      expect(gitOutputs[0]).toContain("source.txt");
+      expect(gitOutputs[1]).toContain("+GIT_HEAD_MARKER");
+      expect(gitOutputs[2]).toContain("Git read-only fixture");
+      expect(gitOutputs[3]).toContain("GIT_BASE_MARKER");
+      expect(writeDenied).toBe(true);
+      await expect(
+        access(join(workspace, "blocked-write.txt")),
+      ).rejects.toThrow();
+      expect(await readFile(join(workspace, "source.txt"), "utf8")).toBe(
+        "GIT_HEAD_MARKER\n",
+      );
       expect(events.at(-1)).toMatchObject({ type: "result", result: expected });
     } finally {
       controller.abort();

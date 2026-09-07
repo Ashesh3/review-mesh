@@ -235,7 +235,7 @@ export async function describeTool(options: DescribeToolOptions = {}) {
       },
       retry: {
         native_inheritance: "rerun_all" as const,
-        native_coverage_basis: "model_attested" as const,
+        native_coverage_basis: "agent_selected" as const,
         legacy_command_inheritance: "verified_compatible_results" as const,
       },
       review_scope: {
@@ -283,7 +283,7 @@ export async function describeTool(options: DescribeToolOptions = {}) {
           {
             command: "review-mesh config export --json",
             reason:
-              'Migrate the retired adapter to type "sdk" with explicitly selected native_attested coverage. Preserve the exact models and supported provider environment references.',
+              'Migrate the retired adapter to type "sdk". Preserve the exact models and supported provider environment references; native agents choose their review inspection without per-file read receipts.',
           },
         ]
       : configuration.valid

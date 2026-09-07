@@ -309,12 +309,6 @@ export function createNativeCopilotAdapter(
         reviewer: input.reviewer,
         context: input.context,
         signal: input.signal,
-        ...(input.recordDiagnostic
-          ? { recordDiagnostic: input.recordDiagnostic }
-          : {}),
-        redactLiteralValues,
-        sanitizeMessage: safe,
-        diagnosticPrefix: "native-copilot-submission",
       });
       let lastOperation = "initialize";
       let failureDetails: AdapterFailureDiagnostics | undefined;
@@ -385,16 +379,16 @@ export function createNativeCopilotAdapter(
           enableFileHooks: false,
           enableSkills: false,
           enableSessionStore: false,
-          enableHostGitOperations: false,
+          enableHostGitOperations: true,
           availableTools: [
             "builtin:view",
             "builtin:grep",
             "builtin:glob",
+            "builtin:bash",
+            "builtin:powershell",
             "custom:submit_review",
           ],
           excludedTools: [
-            "builtin:bash",
-            "builtin:powershell",
             "builtin:edit",
             "builtin:create",
             "builtin:apply_patch",
@@ -404,10 +398,19 @@ export function createNativeCopilotAdapter(
           instructionDirectories: [],
           remoteSession: "off",
           infiniteSessions: { enabled: true },
-          onPermissionRequest: (request) =>
-            request.kind === "read" && !request.managedApprovalRequired
+          onPermissionRequest: (request) => {
+            const readOnly =
+              request.kind === "read" ||
+              (request.kind === "shell" &&
+                request.commands.length > 0 &&
+                request.commands.every((command) => command.readOnly) &&
+                !request.hasWriteFileRedirection &&
+                request.possibleUrls.length === 0 &&
+                !request.requestSandboxBypass);
+            return readOnly && !request.managedApprovalRequired
               ? { kind: "approve-once" }
-              : { kind: "reject", feedback: "Read-only review" },
+              : { kind: "reject", feedback: "Read-only review" };
+          },
           tools: [
             {
               name: "submit_review",
@@ -479,6 +482,14 @@ export function createNativeCopilotAdapter(
           () => undefined,
         );
         session = await abortable(creation, input.signal);
+        input.signal.throwIfAborted();
+        // Empty SDK sessions omit the CLI's script-safety setup. Enable the
+        // runtime's own command classification before exposing shell execution.
+        lastOperation = "configureScriptSafety";
+        await abortable(
+          session.rpc.options.update({ enableScriptSafety: true }),
+          input.signal,
+        );
         input.signal.throwIfAborted();
         session.on((event) => {
           if (event.type === "session.error") {

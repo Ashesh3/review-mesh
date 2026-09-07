@@ -64,7 +64,8 @@ it("preserves the complete original diff and context as immutable untrusted revi
   const bytes = await readFile(file.path);
   const stored = JSON.parse(bytes.toString("utf8"));
   expect(stored.context).toEqual(context);
-  expect(stored.required_changed_paths).toEqual(["source.ts", "test.ts"]);
+  expect(stored.changed_paths).toEqual(["source.ts", "test.ts"]);
+  expect(stored).not.toHaveProperty("required_changed_paths");
   expect(bytes.length).toBeGreaterThan(147 * 1024);
   expect(file.sha256).toBe(createHash("sha256").update(bytes).digest("hex"));
   expect(basename(file.path)).toBe(`native-context-${file.sha256}.json`);
@@ -81,6 +82,7 @@ it("preserves the complete original diff and context as immutable untrusted revi
   expect(hint).toContain("untrusted review data");
   expect(hint).toContain("read-only");
   expect(hint).not.toContain(diff);
+  expect(hint).not.toMatch(/required paths|consecutive.*ranges/);
   if (process.platform !== "win32")
     expect((await stat(file.path)).mode & 0o777).toBe(0o440);
   await expect(createNativeContextFile(root, context)).rejects.toThrow();

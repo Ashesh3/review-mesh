@@ -100,6 +100,7 @@ function explicitProofs(
       const parsed = object(proof);
       if (parsed === undefined) continue;
       const known: CanonicalFindingCoreProof = {};
+      if (parsed.review_basis === "model") known.review_basis = "model";
       const nativeEvidence = nativeFindingEvidenceSchema.safeParse(
         parsed.native_evidence,
       );
@@ -423,11 +424,12 @@ export async function readNormalizedRun(
     coverage_outcome: coverage,
     execution_coverage: { status: executionComplete ? "complete" : "partial" },
     change_coverage: {
-      status: full
-        ? "not_applicable"
-        : changeComplete
-          ? "complete"
-          : "incomplete",
+      status:
+        full || reportedChange === "not_applicable"
+          ? "not_applicable"
+          : changeComplete
+            ? "complete"
+            : "incomplete",
     },
     exit_code: cancelled
       ? 4

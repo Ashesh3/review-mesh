@@ -195,12 +195,7 @@ async function run(options: {
           schema_version: "4",
           verdict: options.finding ? "fail" : "pass",
           summary: "Native review",
-          review_markdown: "Inspected the whole file",
-          native_scope_attestation: {
-            complete: true,
-            reviewed_paths: ["source.ts"],
-            limitations: [],
-          },
+          review_markdown: "Reviewed the changes using the configured lens.",
           informational_notes: [],
           actionable_findings: options.finding
             ? [
@@ -334,7 +329,7 @@ it("does not call strict execution complete when any configured adjudicator fail
   );
 });
 
-it("does not let a later contradictory strict adjudication erase verified findings", async () => {
+it("preserves differing model assessments without calling completed reviews an execution failure", async () => {
   const { result, received } = await run({
     profile: "strict-evaluation",
     finding: true,
@@ -343,24 +338,24 @@ it("does not let a later contradictory strict adjudication erase verified findin
   expect(received).toHaveLength(40);
   expect(result.canonical.counts.raw_source_findings).toBe(8);
   expect(result.canonical.counts.gate_eligible_subfindings).toBe(1);
-  expect(result.summary.coverage_outcome).toBe("partial");
+  expect(result.summary.coverage_outcome).toBe("complete");
   expect(result.summary.warnings).toContain("adjudication_disagreement");
 });
 
-it("does not hide an invalid strict adjudicator proof behind a later valid decision", async () => {
+it("accepts native adjudication without independently rechecking its citations", async () => {
   const { result } = await run({
     profile: "strict-evaluation",
     finding: true,
     proofIssueAt: 3,
   });
   expect(result.summary).toMatchObject({
-    model_runs: { completed: 32, incomplete: 8, skipped: 0 },
-    coverage_outcome: "partial",
+    model_runs: { completed: 40, incomplete: 0, skipped: 0 },
+    coverage_outcome: "complete",
   });
   expect(result.canonical.counts.gate_eligible_subfindings).toBe(1);
 });
 
-it("retains a verified strict finding when another adjudicator downgrades its gate classification", async () => {
+it("retains a reported strict finding and the later adjudicator's differing classification", async () => {
   const { result } = await run({
     profile: "strict-evaluation",
     finding: true,
@@ -368,7 +363,7 @@ it("retains a verified strict finding when another adjudicator downgrades its ga
   });
   expect(result.canonical.counts.gate_eligible_subfindings).toBe(1);
   expect(result.summary).toMatchObject({
-    coverage_outcome: "partial",
+    coverage_outcome: "complete",
     warnings: ["adjudication_disagreement"],
   });
 });

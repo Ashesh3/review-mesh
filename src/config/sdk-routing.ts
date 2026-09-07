@@ -44,7 +44,7 @@ export function routeSdkReviewers(config: ResolvedConfig): ResolvedConfig {
       const registration = reviewer.adapter;
       if (registration.type === "openai_compatible")
         throw new Error(
-          `Reviewer ${reviewer.id} uses retired raw inference. Change its adapter type to "sdk" and explicitly select change_coverage.proof = "native_attested". SDKs use their supported provider protocols.`,
+          `Reviewer ${reviewer.id} uses retired raw inference. Change its adapter type to "sdk" and configure the selected SDK's supported provider protocol.`,
         );
       if (registration.type === "command") return reviewer;
       const harness = sdkForModel(reviewer.model);
@@ -57,11 +57,8 @@ export function routeSdkReviewers(config: ResolvedConfig): ResolvedConfig {
         throw new Error(
           `Reviewer ${reviewer.id}: OpenAI models use codex, Claude/Anthropic models use claude, and other models use copilot; ${reviewer.model} requires ${harness}.`,
         );
-      const proof = reviewer.policy?.changeCoverage?.proof;
-      if (proof !== undefined && proof !== "native_attested")
-        throw new Error(
-          `Reviewer ${reviewer.id} requires ${proof} snapshot proof. Native SDK review uses live-worktree model attestation; explicitly migrate change_coverage.proof to "native_attested".`,
-        );
+      // Preserve legacy coverage configuration without converting it into native
+      // file-read obligations. Native agents choose their own review inspection.
       const { type: _type, ...settings } = registration;
       const adapter = { ...settings, type: harness } as AdapterRegistration;
       return {

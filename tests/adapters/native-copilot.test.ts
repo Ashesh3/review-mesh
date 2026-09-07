@@ -21,6 +21,7 @@ import type {
   SessionConfig,
   CopilotClientOptions,
   SessionEvent,
+  PermissionRequest,
 } from "@github/copilot-sdk";
 import {
   CopilotClient as RealCopilotClient,
@@ -34,7 +35,6 @@ import type {
 } from "../../src/adapters/types.js";
 import { nativeResultJsonSchema } from "../../src/protocol/native-review.js";
 import { providerReviewerResultV4Schema } from "../../src/protocol/v9.js";
-import { sanitizeRunMetadata } from "../../src/results/sanitize.js";
 import { getAppPaths } from "../../src/config/paths.js";
 
 const roots: string[] = [];
@@ -181,13 +181,14 @@ it("uses product Copilot login storage with isolated client and session state", 
             expect(file).toBeDefined();
             contextFile = join(config.configDirectory!, file!);
             expect(config.systemMessage).toMatchObject({
-              content: expect.stringContaining("After compaction"),
+              content: expect.stringContaining("after compaction"),
             });
             expect(
               JSON.parse(await readFile(contextFile, "utf8")).context.workspace,
             ).toBe("F:/fixture");
             const listeners = new Set<(event: SessionEvent) => void>();
             return {
+              rpc: { options: { async update() {} } },
               on(handler: (event: SessionEvent) => void) {
                 listeners.add(handler);
                 return () => listeners.delete(handler);
@@ -218,6 +219,105 @@ it("uses product Copilot login storage with isolated client and session state", 
   await expect(readdir(options!.workingDirectory!)).rejects.toMatchObject({
     code: "ENOENT",
   });
+});
+
+it("exposes native read and Git tools while honoring SDK read-only shell decisions", async () => {
+  let config: SessionConfig | undefined;
+  const updates: unknown[] = [];
+  const adapter = createNativeCopilotAdapter(registration, {
+    runtime: fakeRuntime,
+    environment: { URL: "http://127.0.0.1:1", KEY: "fixture" },
+    applicationDataDirectory: await temporary(),
+    createClient: () =>
+      ({
+        async start() {},
+        async stop() {
+          return [];
+        },
+        async forceStop() {},
+        async createSession(value: SessionConfig) {
+          config = value;
+          const listeners = new Set<(event: SessionEvent) => void>();
+          return {
+            rpc: {
+              options: {
+                async update(value: unknown) {
+                  updates.push(value);
+                },
+              },
+            },
+            on(handler: (event: SessionEvent) => void) {
+              listeners.add(handler);
+              return () => listeners.delete(handler);
+            },
+            async send() {
+              expect(updates).toEqual([{ enableScriptSafety: true }]);
+              for (const handler of listeners)
+                handler({ type: "session.idle", data: {} } as SessionEvent);
+              return "sent";
+            },
+            async disconnect() {},
+            async abort() {},
+          };
+        },
+      }) as unknown as CopilotClient,
+  });
+  await collect(adapter.run(reviewInput()));
+  expect(config?.availableTools).toEqual(
+    expect.arrayContaining([
+      "builtin:view",
+      "builtin:grep",
+      "builtin:glob",
+      "builtin:bash",
+      "builtin:powershell",
+    ]),
+  );
+  expect(config?.excludedTools).toEqual(
+    expect.arrayContaining([
+      "builtin:edit",
+      "builtin:create",
+      "builtin:apply_patch",
+    ]),
+  );
+  expect(config?.enableHostGitOperations).toBe(true);
+  expect(updates).toEqual([{ enableScriptSafety: true }]);
+  const readonly: PermissionRequest = {
+    kind: "shell",
+    canOfferSessionApproval: false,
+    commands: [{ identifier: "git", readOnly: true }],
+    fullCommandText: "git diff HEAD~1 HEAD",
+    hasWriteFileRedirection: false,
+    intention: "Inspect Git diff",
+    possiblePaths: [],
+    possibleUrls: [],
+  };
+  const decide = (request: PermissionRequest) =>
+    config!.onPermissionRequest!(request, { sessionId: "fixture" });
+  for (const command of [
+    "git diff HEAD~1 HEAD",
+    "git log -5",
+    "git show HEAD:source.ts",
+    "git status --short",
+  ])
+    expect(
+      await decide({ ...readonly, fullCommandText: command }),
+    ).toMatchObject({ kind: "approve-once" });
+  for (const request of [
+    { ...readonly, commands: [{ identifier: "git", readOnly: false }] },
+    { ...readonly, commands: [] },
+    {
+      ...readonly,
+      commands: [
+        ...readonly.commands,
+        { identifier: "write", readOnly: false },
+      ],
+    },
+    { ...readonly, hasWriteFileRedirection: true },
+    { ...readonly, possibleUrls: [{ url: "https://provider.invalid" }] },
+    { ...readonly, requestSandboxBypass: true },
+    { ...readonly, managedApprovalRequired: true },
+  ])
+    expect(await decide(request)).toMatchObject({ kind: "reject" });
 });
 
 it("starts simultaneous packaged clients sharing the product login home", async () => {
@@ -332,6 +432,7 @@ it.each(["create", "start", "session", "model"] as const)(
               await never();
             }
             return {
+              rpc: { options: { async update() {} } },
               on() {
                 return () => {};
               },
@@ -458,6 +559,7 @@ it("does not restart a reviewer after a terminal SDK request failure", async () 
         async forceStop() {},
         async createSession() {
           return {
+            rpc: { options: { async update() {} } },
             on() {
               return () => {};
             },
@@ -505,6 +607,7 @@ it.each(["session.error", "sendAndWait", "createSession"] as const)(
             if (operation === "createSession")
               throw new TypeError(providerMessage);
             return {
+              rpc: { options: { async update() {} } },
               on(handler: (event: SessionEvent) => void) {
                 listeners.add(handler);
                 return () => listeners.delete(handler);
@@ -600,6 +703,7 @@ it("returns repairable typed failures with schema paths without raw arguments", 
           )!;
           const listeners = new Set<(event: SessionEvent) => void>();
           return {
+            rpc: { options: { async update() {} } },
             on(handler: (event: SessionEvent) => void) {
               listeners.add(handler);
               return () => listeners.delete(handler);
@@ -658,14 +762,14 @@ it("returns repairable typed failures with schema paths without raw arguments", 
 });
 
 it.each(["small", "large", "many"] as const)(
-  "retains %s rejected findings and never turns an incomplete finding report into a clean repair",
+  "preserves a %s native report without requiring a per-file inspection ledger",
   async (size) => {
     const drafts: unknown[] = [];
     let sends = 0;
     const original = {
       ...failResult("retained-finding"),
       review_markdown:
-        "Retained narrative contains private-credential and encoded%2Fcredential." +
+        "Complete native assessment." +
         (size === "large" ? "Unicode preservation: é漢🙂\n".repeat(16000) : ""),
       actionable_findings: (size === "many"
         ? Array.from(
@@ -715,6 +819,7 @@ it.each(["small", "large", "many"] as const)(
               )!;
               const listeners = new Set<(event: SessionEvent) => void>();
               return {
+                rpc: { options: { async update() {} } },
                 on(handler: (event: SessionEvent) => void) {
                   listeners.add(handler);
                   return () => listeners.delete(handler);
@@ -772,54 +877,9 @@ it.each(["small", "large", "many"] as const)(
       drafts.push(draft);
     };
     const events = await collect(adapter.run(input));
-    expect(events.at(-1)).toMatchObject({
-      type: "failure",
-      failure: { reason: "invalid_result" },
-    });
-    expect(events.some((event) => event.type === "result")).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: "result", result: original });
     expect(sends).toBe(1);
-    if (size === "small")
-      expect(drafts).toContainEqual(
-        expect.objectContaining({
-          kind: "unverified_result_draft",
-          candidate_ids: ["retained-finding"],
-          candidate: expect.objectContaining({
-            actionable_findings: original.actionable_findings,
-          }),
-        }),
-      );
-    if (size !== "small") {
-      const fragments = (
-        drafts as Array<{ candidate?: Record<string, any> }>
-      ).filter(
-        (draft) =>
-          draft.candidate?.kind === "native_rejected_submission_fragment" &&
-          draft.candidate.report_id === "native-copilot-submission-1",
-      );
-      expect(fragments.length).toBeGreaterThan(0);
-      const raw = fragments
-        .map(
-          (draft) =>
-            (sanitizeRunMetadata(draft) as typeof draft).candidate!
-              .report_fragment,
-        )
-        .join("");
-      const restored = JSON.parse(raw);
-      expect(restored).toEqual({
-        ...original,
-        review_markdown: original.review_markdown
-          .replaceAll("private-credential", "[redacted]")
-          .replaceAll("encoded%2Fcredential", "[redacted]"),
-      });
-      for (const fragment of fragments)
-        expect(
-          Buffer.byteLength(JSON.stringify(fragment), "utf8"),
-        ).toBeLessThan(256 * 1024);
-    }
-    expect(JSON.stringify(drafts)).not.toContain("private-credential");
-    expect(JSON.stringify(drafts)).not.toContain("encoded%2Fcredential");
-    for (const draft of drafts as Array<{ candidate_ids: string[] }>)
-      expect(draft.candidate_ids.length).toBeLessThanOrEqual(256);
+    expect(drafts).toEqual([]);
   },
 );
 
@@ -871,7 +931,7 @@ it("aborts a packaged Copilot request and releases the runtime state directory",
   }
 }, 20000);
 
-it("prevents proof repair from silently rejecting a claim but accepts an explicit unresolved adjustment", async () => {
+it("returns the native adjudicator's complete assessment without a host proof-repair loop", async () => {
   const workspace = await temporary();
   await writeFile(join(workspace, "a.ts"), "return oldValue;");
   const source = {
@@ -924,6 +984,7 @@ it("prevents proof repair from silently rejecting a claim but accepts an explici
           const listeners = new Set<(event: SessionEvent) => void>();
           const submit = config.tools![0]!;
           return {
+            rpc: { options: { async update() {} } },
             on(handler: (event: SessionEvent) => void) {
               listeners.add(handler);
               return () => listeners.delete(handler);
@@ -988,22 +1049,15 @@ it("prevents proof repair from silently rejecting a claim but accepts an explici
     gateMinimumConfidence: "medium",
   };
   const events = await collect(adapter.run(input));
-  expect(outcomes[0]).toMatchObject({ resultType: "failure" });
+  expect(outcomes[0]).toMatchObject({ resultType: "success" });
   expect(outcomes[1]).toMatchObject({
     resultType: "failure",
-    textResultForLlm: expect.stringContaining("claim"),
+    textResultForLlm: expect.stringContaining("already submitted"),
   });
-  expect(outcomes[2]).toMatchObject({ resultType: "success" });
+  expect(outcomes[2]).toMatchObject({ resultType: "failure" });
   expect(events.at(-1)).toMatchObject({
     type: "result",
-    result: {
-      decisions: [
-        {
-          decision: "adjusted",
-          adjusted_finding: { classification: "needs_verification" },
-        },
-      ],
-    },
+    result: reply,
   });
 });
 
@@ -1301,13 +1355,7 @@ it.each([
           schema.properties.decisions.items.properties.source_finding_id.enum,
         ).toEqual(["CANDIDATE-001", "CANDIDATE-002"]);
       }
-      expect(requests).toHaveLength(
-        mode === "scope-correction"
-          ? 4
-          : mode === "proof-correction" || mode === "retained-context"
-            ? 3
-            : 2,
-      );
+      expect(requests).toHaveLength(mode === "retained-context" ? 3 : 2);
       if (mode === "retained-context") {
         expect(retainedContextPath).toBeDefined();
         expect(retainedContextPath).toContain(
@@ -1331,18 +1379,12 @@ it.each([
         });
       }
       if (mode === "proof-correction")
-        expect(JSON.stringify(requests[2]!.body.messages)).toContain(
-          "line_out_of_range",
-        );
+        expect(events.at(-1)).toMatchObject({ type: "result" });
       if (mode === "scope-correction") {
-        expect(JSON.stringify(requests[2]!.body.messages)).toContain("b.ts");
-        expect(JSON.stringify(requests[3]!.body.messages)).toContain(
-          "SECOND_FILE_EVIDENCE",
-        );
         expect(events.at(-1)).toMatchObject({
           type: "result",
           result: {
-            native_scope_attestation: { reviewed_paths: ["a.ts", "b.ts"] },
+            native_scope_attestation: { reviewed_paths: ["a.ts"] },
           },
         });
         expect(await readFile(join(workspace, "b.ts"), "utf8")).toBe(
@@ -1358,7 +1400,7 @@ it.each([
       expect(tools).toEqual(
         expect.arrayContaining(["view", "grep", "glob", "submit_review"]),
       );
-      for (const forbidden of ["bash", "powershell", "edit", "create"])
+      for (const forbidden of ["edit", "create"])
         expect(tools).not.toContain(forbidden);
       expect(
         JSON.stringify(
@@ -1429,6 +1471,7 @@ it("lets the Copilot runtime drive submission and preserves all structured findi
             expect(submit.isTerminal).toBe(true);
             const listeners = new Set<(event: SessionEvent) => void>();
             return {
+              rpc: { options: { async update() {} } },
               async send() {
                 sends++;
                 await submit.handler!(result, {} as never);

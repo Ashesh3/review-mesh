@@ -109,6 +109,7 @@ export const canonicalRawFindingSchema = z.strictObject({
 });
 
 export const canonicalFindingCoreProofSchema = z.strictObject({
+  review_basis: z.literal("model").optional(),
   native_evidence: nativeFindingEvidenceSchema.optional(),
   evidence_verified: z.boolean().optional(),
   source_coverage_verified: z.boolean().optional(),

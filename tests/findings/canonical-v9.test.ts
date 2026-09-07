@@ -66,6 +66,23 @@ function proofs(
 }
 
 describe("v9 canonical findings", () => {
+  it("uses explicit model review provenance without inventing file-read or evidence proof", () => {
+    const finding = source("reliability::native", "model-finding", {
+      provenance: "reviewer_result_v4",
+    });
+    const modelProof = { review_basis: "model" as const };
+    const canonical = canonicalizeFindings([finding], {
+      proofBySourceRef: { [finding.source_ref]: modelProof },
+    });
+    expect(canonical.counts.gate_eligible_subfindings).toBe(1);
+    expect(modelProof).toEqual({ review_basis: "model" });
+    expect(
+      canonicalizeFindings(
+        [{ ...finding, classification: "needs_verification" }],
+        { proofBySourceRef: { [finding.source_ref]: modelProof } },
+      ).counts.needs_verification_subfindings,
+    ).toBe(1);
+  });
   it("collapses compatible duplicates while a shared root only groups distinct atomics", () => {
     const first = source("reliability::one", "stale-a", {
       root_issue_id: "publish-transaction",

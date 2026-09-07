@@ -611,7 +611,6 @@ export async function runCli(
                     "native_review_v1"
                       ? [
                           "native_schema_submission",
-                          "native_scope_attestation",
                           "native_execution_artifact",
                           "retry_rerun_all",
                         ]

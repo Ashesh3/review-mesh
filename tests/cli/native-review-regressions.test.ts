@@ -95,6 +95,7 @@ type Scenario =
   | "duplicate_result"
   | "malformed_result_cleanup_error"
   | "adjudication_missing"
+  | "adjudication_missing_adjustment"
   | "adjudication_adjusted"
   | "adjudication_ordered";
 async function run(scenario: Scenario) {
@@ -300,7 +301,8 @@ agents = ["review"]
                   {
                     source_finding_id: candidate.id,
                     decision:
-                      scenario === "adjudication_adjusted"
+                      scenario === "adjudication_adjusted" ||
+                      scenario === "adjudication_missing_adjustment"
                         ? "adjusted"
                         : "confirmed",
                     rationale: "Validated the cited behavior.",
@@ -425,19 +427,28 @@ agents = ["review"]
   };
 }
 
-it("gates a native finding with explicit model attestation and validated citations", async () => {
+it("retains a model-reported native finding without claiming host-verified evidence", async () => {
   const r = await run("finding");
   expect(r.errors).toBe("");
   expect(r.code).toBe(1);
   expect(r.report?.canonical.counts.gate_eligible_subfindings).toBe(1);
+  expect(
+    r.report?.records.find((record) => record.record === "run.findings")?.data,
+  ).toMatchObject({
+    proof_by_source_ref: {
+      "review#f1": { review_basis: "model" },
+    },
+  });
 });
-it("keeps missing native attestation inconclusive and retains the report", async () => {
+it("completes a usable native review without any read attestation", async () => {
   const r = await run("missing_attestation");
-  expect(r.code).toBe(3);
+  expect(r.code).toBe(0);
   expect(r.report?.reviewers[0]?.result?.review_markdown).toBe(
     "Complete native review",
   );
-  expect(r.report?.run_outcome).toBe("inconclusive");
+  expect(r.report?.run_outcome).toBe("clear");
+  expect(r.report?.reviewers[0]?.status).toBe("completed");
+  expect(r.report?.change_coverage.status).toBe("not_applicable");
 });
 it("honors explicit completed scope while preserving informational review caveats", async () => {
   const r = await run("complete_scope_caveats");
@@ -457,12 +468,12 @@ it("honors explicit completed scope while preserving informational review caveat
     },
   });
 });
-it("keeps explicitly incomplete scope inconclusive regardless of limitation wording", async () => {
+it("preserves optional scope caveats without rejecting the agent's completed review", async () => {
   const r = await run("incomplete_scope_caveats");
   expect(r.errors).toBe("");
-  expect(r.code).toBe(3);
-  expect(r.report?.run_outcome).toBe("inconclusive");
-  expect(r.report?.reviewers[0]?.status).toBe("incomplete");
+  expect(r.code).toBe(1);
+  expect(r.report?.run_outcome).toBe("gate_findings");
+  expect(r.report?.reviewers[0]?.status).toBe("completed");
 });
 it("seals the artifact after stdout disconnects following a completed review", async () => {
   const r = await run("disconnect");
@@ -601,6 +612,15 @@ it("retains the full judge report when required candidate decisions are missing"
   expect(
     r.report?.reviewers.map((reviewer) => reviewer.result?.review_markdown),
   ).toContain("Complete judge narrative");
+});
+it("does not treat an adjusted decision with no replacement finding as a usable adjudication", async () => {
+  const r = await run("adjudication_missing_adjustment");
+  expect(r.code).toBe(3);
+  expect(
+    r.report?.reviewers.find((reviewer) =>
+      reviewer.reviewer_id.endsWith("::judge"),
+    )?.status,
+  ).toBe("incomplete");
 });
 it("applies adjudicator severity adjustments before computing gate findings", async () => {
   const r = await run("adjudication_adjusted");

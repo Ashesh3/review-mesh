@@ -17,7 +17,7 @@ import {
 } from "../helpers/fixtures.js";
 
 it.each(["unresolved", "upgrade-after-downgrade"] as const)(
-  "keeps %s adjudication inconclusive without erasing stronger verified evidence",
+  "preserves %s adjudication as review content rather than failed SDK execution",
   async (mode) => {
     const workspace = await mkdtemp(join(tmpdir(), "mesh-unresolved-audit-"));
     try {
@@ -171,9 +171,9 @@ it.each(["unresolved", "upgrade-after-downgrade"] as const)(
         expect(output.canonical.counts.needs_verification_subfindings).toBe(1);
       else expect(output.canonical.counts.gate_eligible_subfindings).toBe(1);
       expect(output.summary).toMatchObject({
-        run_outcome: "inconclusive",
-        coverage_outcome: "partial",
-        exit_code: 3,
+        run_outcome: mode === "unresolved" ? "clear" : "gate_findings",
+        coverage_outcome: "complete",
+        exit_code: mode === "unresolved" ? 0 : 1,
       });
     } finally {
       await rm(workspace, { recursive: true, force: true });

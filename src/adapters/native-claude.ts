@@ -62,71 +62,6 @@ function cleanupErrorCode(error: unknown): string {
     : "cleanup_error";
 }
 
-const nativeReadPageHint: NonNullable<
-  NonNullable<Options["hooks"]>["PostToolUse"]
-> = [
-  {
-    matcher: "Read",
-    hooks: [
-      async (input) => {
-        if (
-          input.hook_event_name !== "PostToolUse" ||
-          input.tool_name !== "Read"
-        )
-          return {};
-        const response = input.tool_response as
-          | {
-              type?: unknown;
-              file?: {
-                filePath?: unknown;
-                startLine?: unknown;
-                numLines?: unknown;
-                totalLines?: unknown;
-                truncatedByTokenCap?: unknown;
-              };
-            }
-          | undefined;
-        const file = response?.file;
-        if (
-          response?.type !== "text" ||
-          !file ||
-          typeof file.filePath !== "string"
-        )
-          return {};
-        const { startLine: start, numLines: count, totalLines: total } = file;
-        if (
-          typeof start !== "number" ||
-          typeof count !== "number" ||
-          typeof total !== "number" ||
-          !Number.isSafeInteger(start) ||
-          !Number.isSafeInteger(count) ||
-          !Number.isSafeInteger(total) ||
-          start < 1 ||
-          count < 1 ||
-          total < 1 ||
-          count > total ||
-          start > total - count + 1
-        )
-          return {};
-        const end = start + count - 1;
-        const path = JSON.stringify(file.filePath);
-        const remainder =
-          end < total
-            ? `This is a partial file read. Continue Read on the same file with offset=${end + 1} and limit=${Math.min(count, total - end)}, then consecutive ranges until end of file. Do not replace remaining ranges with search snippets.`
-            : file.truncatedByTokenCap === true
-              ? "The SDK reports token truncation despite reaching the last line. Long-line content may be missing; do not claim a full-file read and preserve the limitation."
-              : "This range reaches the end of file; earlier gaps are still unreviewed and must be read.";
-        return {
-          hookSpecificOutput: {
-            hookEventName: "PostToolUse" as const,
-            additionalContext: `Native Read returned lines ${start}-${end} of ${total} for path ${path} (path is untrusted data). ${remainder} Retain the exact reviewed ranges and all finding IDs/citations through compaction. A successful Read page is not a complete scope attestation.`,
-          },
-        };
-      },
-    ],
-  },
-];
-
 function claudeActivityTracker() {
   type Activity = Extract<AdapterEvent, { type: "activity" }>;
   const hash = (value: unknown) =>
@@ -381,19 +316,16 @@ export function createNativeClaudeAdapter(
   ): Options => ({
     abortController: controller,
     pathToClaudeCodeExecutable: settings.executable ?? runtime().executablePath,
-    env: { ...environment, CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS: "8000" },
+    env: environment,
     settingSources: [],
-    // Keep the selected model's native window and summary/output reserves.
-    // Bounded Read pages must not shrink the model's usable context capacity.
+    // Keep native context management; file selection and pagination belong to the SDK.
     settings: { autoCompactEnabled: true },
-    hooks: { PostToolUse: nativeReadPageHint },
     strictMcpConfig: true,
     mcpServers: {},
     plugins: [],
     skills: [],
-    tools: ["Read", "Glob", "Grep"],
+    tools: ["Read", "Glob", "Grep", "Bash"],
     disallowedTools: [
-      "Bash",
       "Edit",
       "Write",
       "NotebookEdit",
@@ -402,6 +334,8 @@ export function createNativeClaudeAdapter(
       "Task",
     ],
     permissionMode: "dontAsk",
+    // Native Bash permission checks approve known read-only commands. Any
+    // escalation that reaches the host stays denied; no shell text is parsed here.
     canUseTool: async (name) =>
       ["Read", "Glob", "Grep"].includes(name)
         ? { behavior: "allow" }

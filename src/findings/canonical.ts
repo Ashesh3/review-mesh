@@ -85,6 +85,8 @@ export interface CanonicalRawFinding {
   };
 }
 export interface CanonicalFindingCoreProof {
+  /** Native agent assessment, not an assertion of host-observed reads or proof. */
+  review_basis?: "model";
   native_evidence?: NativeFindingEvidence;
   evidence_verified?: boolean;
   source_coverage_verified?: boolean;
@@ -501,36 +503,38 @@ function eligibilityForSource(
   )
     reasons.add("adjudication_required");
   if (finding.adjudication === "rejected") reasons.add("adjudication_rejected");
-  const currentV4 = finding.provenance === "reviewer_result_v4";
-  const nativeEvidence = proof?.native_evidence;
-  if (
-    nativeEvidence?.contract === "native_review_v1"
-      ? !nativeEvidence.citation_valid
-      : currentV4
-        ? proof?.evidence_verified !== true
-        : proof?.evidence_verified === false
-  )
-    reasons.add("evidence_unverified");
-  const orderedProofRequired =
-    proof?.ordered_proof_required === true ||
-    (currentV4 &&
-      severityRank[finding.severity] >= severityRank.medium &&
-      orderedProofCategories.has(finding.category ?? "other"));
-  if (orderedProofRequired && proof?.ordered_proof_verified !== true)
-    reasons.add("ordered_proof_missing");
-  if (
-    proof?.change_impact_required === true &&
-    proof.change_impact_verified !== true
-  )
-    reasons.add("change_impact_unverified");
-  if (
-    nativeEvidence?.contract === "native_review_v1"
-      ? !nativeEvidence.scope_attested || !nativeEvidence.scope_related
-      : currentV4
-        ? proof?.source_coverage_verified !== true
-        : proof?.source_coverage_verified === false
-  )
-    reasons.add("source_coverage_unverified");
+  if (proof?.review_basis !== "model") {
+    const currentV4 = finding.provenance === "reviewer_result_v4";
+    const nativeEvidence = proof?.native_evidence;
+    if (
+      nativeEvidence?.contract === "native_review_v1"
+        ? !nativeEvidence.citation_valid
+        : currentV4
+          ? proof?.evidence_verified !== true
+          : proof?.evidence_verified === false
+    )
+      reasons.add("evidence_unverified");
+    const orderedProofRequired =
+      proof?.ordered_proof_required === true ||
+      (currentV4 &&
+        severityRank[finding.severity] >= severityRank.medium &&
+        orderedProofCategories.has(finding.category ?? "other"));
+    if (orderedProofRequired && proof?.ordered_proof_verified !== true)
+      reasons.add("ordered_proof_missing");
+    if (
+      proof?.change_impact_required === true &&
+      proof.change_impact_verified !== true
+    )
+      reasons.add("change_impact_unverified");
+    if (
+      nativeEvidence?.contract === "native_review_v1"
+        ? !nativeEvidence.scope_attested || !nativeEvidence.scope_related
+        : currentV4
+          ? proof?.source_coverage_verified !== true
+          : proof?.source_coverage_verified === false
+    )
+      reasons.add("source_coverage_unverified");
+  }
   if (proof?.out_of_scope === true) reasons.add("out_of_scope");
   if (proof?.policy_non_gating === true || finding.gate_eligible === false)
     reasons.add("policy_non_gating");

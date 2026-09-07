@@ -984,7 +984,7 @@ describe("native Codex isolation", () => {
     expect(recovered).toMatchObject({
       schema_version: "1",
       kind: "review-mesh.native-context",
-      required_changed_paths: ["source.ts"],
+      changed_paths: ["source.ts"],
       context: {
         instructions: "Check the original requested behavior.",
         caller_context: {

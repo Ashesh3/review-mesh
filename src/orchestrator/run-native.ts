@@ -13,9 +13,7 @@ import {
 import {
   buildNativeReviewPrompt,
   nativeResultJsonSchema,
-  createNativeChangeCoverage,
-  validateNativeEvidence,
-  nativeRequiredPaths,
+  createAgentSelectedChangeCoverage,
 } from "../protocol/native-review.js";
 import {
   providerReviewerResultV4Schema,
@@ -33,7 +31,6 @@ import {
   type CanonicalFindingCoreProof,
 } from "../findings/canonical.js";
 import { validateAdjudication } from "../findings/adjudication.js";
-import { verifyAdjudicationEvidence } from "../findings/evidence-verifier.js";
 import { evaluateRequiredInput } from "../context/required-input.js";
 import {
   changedPathMatchesGlob,
@@ -545,7 +542,7 @@ export async function runNativeReview(input: V9RunInput) {
           run_deadline_remaining_ms: Math.max(0, deadlineAt - now()),
           lens_deadline_remaining_ms: Math.max(0, lensDeadline - now()),
           progress_observable: capabilities.progress_observable === true,
-          proof: "native_attested",
+          proof: "unknown",
         },
       });
       const candidates = source
@@ -696,24 +693,10 @@ export async function runNativeReview(input: V9RunInput) {
       let incompleteAdjudication = false;
       const localProofs: Record<string, CanonicalFindingCoreProof> = {};
       if (result.schema_version === "4") {
-        const attestation = result.native_scope_attestation;
-        const relevant = nativeRequiredPaths(reviewer, input.context);
         final = reviewerResultV4Schema.parse({
           ...result,
-          change_coverage: createNativeChangeCoverage(input.context, {
-            scopeAttested: attestation?.complete === true,
-            inspectedPaths: attestation?.reviewed_paths ?? [],
-            relevantPaths: relevant,
-          }),
+          change_coverage: createAgentSelectedChangeCoverage(),
         });
-        Object.assign(
-          localProofs,
-          await validateNativeEvidence(
-            input.context.workspace,
-            final,
-            input.context,
-          ),
-        );
         const sourceRaw = buildCanonicalRawFindings({
           reviewer_id: reviewer.id,
           lens_id: lens(reviewer),
@@ -722,7 +705,7 @@ export async function runNativeReview(input: V9RunInput) {
         raw.push(...sourceRaw);
         for (const finding of sourceRaw) {
           localProofs[finding.finding_id] = {
-            ...localProofs[finding.finding_id],
+            review_basis: "model",
             adjudication_required: reviewer.policy?.adjudication === "required",
           };
           proofs[finding.source_ref] = {
@@ -737,22 +720,7 @@ export async function runNativeReview(input: V9RunInput) {
         });
         const outcome = validateAdjudication(sourceResult, final, {
           reviewScope: input.context.review_scope.mode,
-          evidenceVerification: await verifyAdjudicationEvidence({
-            workspace: input.context.workspace,
-            adjudicationResult: final,
-            ...(input.context.git.is_repository && input.context.git.merge_base
-              ? { baseRevision: input.context.git.merge_base }
-              : {}),
-            signal: child.signal,
-          }),
-          ...(input.context.git.is_repository
-            ? {
-                git: {
-                  changedFiles: input.context.git.changed_files,
-                  diff: input.context.git.diff,
-                },
-              }
-            : {}),
+          reviewBasis: "model",
         });
         adjudicationOutcomes.push({
           adjudicator_reviewer_id: reviewer.id,
@@ -791,8 +759,8 @@ export async function runNativeReview(input: V9RunInput) {
                 (priorAccepted !== nextAccepted || materiallyDifferent)
               ) {
                 disagreementLenses.add(lens(reviewer));
-                // Preserve verified defects instead of allowing a later vote to erase
-                // them. The disagreement remains explicit and the run inconclusive.
+                // Preserve differing model assessments in the report; disagreement
+                // is review content, not an SDK execution failure.
                 const thresholds = {
                   minimumSeverity:
                     reviewer.policy?.gateMinimumSeverity ?? ("medium" as const),
@@ -859,27 +827,16 @@ export async function runNativeReview(input: V9RunInput) {
                 };
               }
             }
-            const validDecision =
-              decision.issues.length === 0 &&
-              (decision.effective_decision === "confirmed" ||
-                decision.effective_decision === "adjusted");
             proofs[ref] = {
               ...proofs[ref],
               adjudication_required: !outcome.complete,
               policy_non_gating: !decision.gate_eligible,
-              ...(validDecision && decision.decision?.ordered_execution_proof
-                ? { ordered_proof_verified: true }
-                : {}),
-              ...(validDecision && decision.decision?.base_head_comparison
-                ? { change_impact_verified: true }
-                : {}),
             };
           }
         }
         incompleteAdjudication =
           !outcome.complete ||
-          (strictEvaluation &&
-            outcome.decisions.some((decision) => decision.issues.length > 0));
+          outcome.decisions.some((decision) => decision.issues.length > 0);
       }
       await input.recordResult(reviewer.id, final);
       completedResults++;
@@ -897,10 +854,7 @@ export async function runNativeReview(input: V9RunInput) {
             : {}),
           execution_mode: "managed_process",
           consistency_mode: "live_worktree",
-          coverage_basis:
-            result.schema_version === "4" && result.native_scope_attestation
-              ? "model_attested"
-              : "unknown",
+          coverage_basis: "agent_selected",
           sdk_completed: true,
           execution_fingerprint: reviewerConfigFingerprint(reviewer),
         },
@@ -942,19 +896,6 @@ export async function runNativeReview(input: V9RunInput) {
           "incomplete",
           "invalid_result",
           "Required adjudication is incomplete.",
-        );
-        return "incomplete";
-      }
-      if (
-        final.schema_version === "4" &&
-        final.change_coverage.status !== "complete" &&
-        final.change_coverage.status !== "not_applicable"
-      ) {
-        await disposition(
-          job,
-          "incomplete",
-          "change_coverage_incomplete",
-          "The SDK did not attest complete review of the requested scope.",
         );
         return "incomplete";
       }
@@ -1243,8 +1184,7 @@ export async function runNativeReview(input: V9RunInput) {
         }
         if (
           strictEvaluation &&
-          (members.some((job) => job.status !== "completed") ||
-            disagreementLenses.has(id))
+          members.some((job) => job.status !== "completed")
         )
           lensStates.set(id, "incomplete");
       }),
@@ -1279,25 +1219,11 @@ export async function runNativeReview(input: V9RunInput) {
       proofBySourceRef: proofs,
       gatePolicies,
     });
-    const unresolved =
-      canonical.counts.needs_verification_subfindings > 0 ||
-      canonical.atomics.some((f) =>
-        f.gate_eligibility.reasons.some((r) =>
-          [
-            "evidence_unverified",
-            "source_coverage_unverified",
-            "ordered_proof_missing",
-            "change_impact_unverified",
-            "adjudication_required",
-          ].includes(r),
-        ),
-      );
     const partial =
       Boolean(outputFailure) ||
       changed ||
       !initial.complete ||
       !final.complete ||
-      unresolved ||
       [...lensStates.values()].some(
         (s) => s === "incomplete" || s === "not_evaluated",
       );
@@ -1346,7 +1272,7 @@ export async function runNativeReview(input: V9RunInput) {
         (s) => s === "incomplete" || s === "not_evaluated",
       ).length,
       execution_coverage: { status: partial ? "partial" : "complete" },
-      change_coverage: { status: partial ? "incomplete" : "complete" },
+      change_coverage: { status: "not_applicable" },
       deadline,
       total_elapsed_ms: Math.max(0, now() - start),
       result_delivery: {

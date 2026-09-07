@@ -17,6 +17,8 @@ type JudgeDecision = AdjudicationDecision | AdjudicationDecisionV2;
 
 export interface AdjudicationValidationContext {
   reviewScope: "changes" | "full";
+  /** Native SDK agents own evidence evaluation; validate only usable decisions. */
+  reviewBasis?: "model";
   git?: {
     changedFiles: readonly string[];
     diff: string;
@@ -326,6 +328,27 @@ export function validateAdjudication(
       }
       const decision = matching[0]!;
       const issues: AdjudicationValidationIssue[] = [];
+      if (context.reviewBasis === "model") {
+        if (matching.length > 1) issues.push("duplicate_decision");
+        if (decision.decision === "adjusted" && !decision.adjusted_finding)
+          issues.push("adjusted_finding_required");
+        const effectiveFinding = adjustedFinding(candidate, decision);
+        return {
+          source_finding_id: candidate.id,
+          requested_decision: decision.decision,
+          effective_decision: issues.length
+            ? "needs_verification"
+            : decision.decision,
+          gate_eligible:
+            !issues.length &&
+            decision.decision !== "rejected" &&
+            (effectiveFinding ?? candidate).classification ===
+              "confirmed_defect",
+          issues,
+          decision,
+          ...(effectiveFinding ? { effective_finding: effectiveFinding } : {}),
+        };
+      }
       // Supporting code may extend the proof chain, but it cannot replace the
       // candidate/change anchor with an unrelated independently valid file.
       const anchored = [

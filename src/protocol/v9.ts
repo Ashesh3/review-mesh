@@ -422,18 +422,9 @@ function validateVerdict(
   value: {
     verdict: "pass" | "fail";
     actionable_findings: unknown[];
-    native_scope_attestation?: unknown;
   },
   ctx: z.RefinementCtx,
 ): void {
-  if (
-    value.native_scope_attestation === undefined &&
-    value.actionable_findings.length > 16
-  )
-    ctx.addIssue({
-      code: "custom",
-      message: "legacy v4 results cannot exceed 16 actionable findings",
-    });
   if (value.verdict === "pass" && value.actionable_findings.length !== 0)
     ctx.addIssue({
       code: "custom",

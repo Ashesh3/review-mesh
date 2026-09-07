@@ -89,6 +89,25 @@ function adjudication(
 }
 
 describe("validateAdjudication", () => {
+  it("accepts a native model assessment without mandatory ordered or base-head proofs", () => {
+    const result = adjudication({
+      source_finding_id: "enum-post-ingest",
+      decision: "confirmed",
+      rationale: "The model reviewed the relevant control flow.",
+      cited_evidence: [],
+      unverified_assumptions: [],
+    });
+    const outcome = validateAdjudication(candidate(), result, {
+      reviewScope: "changes",
+      reviewBasis: "model",
+    });
+    expect(outcome.complete).toBe(true);
+    expect(outcome.decisions[0]).toMatchObject({
+      effective_decision: "confirmed",
+      issues: [],
+      gate_eligible: true,
+    });
+  });
   it("requires adjusted evidence to remain in the verified candidate proof chain", () => {
     const source = candidate();
     source.actionable_findings[0]!.category = "correctness";

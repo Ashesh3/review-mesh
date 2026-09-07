@@ -16,13 +16,11 @@ import { resolvedReviewer, resolvedContext } from "../helpers/fixtures.js";
 import type { Options, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { createServer } from "node:http";
 import { nativeResultJsonSchema } from "../../src/protocol/native-review.js";
-
 it("keeps the original context readable through a system pointer after compaction and cleans it with the private home", async () => {
   let retainedPath: string | undefined;
   let system = "";
   let retained:
-    | { context: { git: { diff: string } }; required_changed_paths: string[] }
-    | undefined;
+    { context: { git: { diff: string } }; changed_paths: string[] } | undefined;
   const originalDiff =
     "diff --git a/source.ts b/source.ts\n--- a/source.ts\n+++ b/source.ts\n@@ -1 +1 @@\n-old\n+new\n";
   const context = resolvedContext({
@@ -101,9 +99,9 @@ it("keeps the original context readable through a system pointer after compactio
     /* drain */
   }
   expect(retained?.context.git.diff).toBe(originalDiff);
-  expect(retained?.required_changed_paths).toEqual(["source.ts", "support.ts"]);
+  expect(retained?.changed_paths).toEqual(["source.ts", "support.ts"]);
   expect(system).toContain("Trusted review instructions.");
-  expect(system).toContain("After compaction");
+  expect(system).toContain("after compaction");
   expect(system).toContain("native-context-");
   expect(retainedPath).toBeDefined();
   expect(existsSync(retainedPath!)).toBe(false);
@@ -643,7 +641,12 @@ it("keeps Claude's native tools and uses one SDK session even for a terminal pro
   }))
     events.push(event);
   expect(calls).toBe(1);
-  expect(options?.tools).toEqual(["Read", "Glob", "Grep"]);
+  expect(options?.tools).toEqual(["Read", "Glob", "Grep", "Bash"]);
+  expect(options?.disallowedTools).not.toContain("Bash");
+  expect(options?.disallowedTools).toEqual(
+    expect.arrayContaining(["Edit", "Write", "NotebookEdit"]),
+  );
+  expect(options?.permissionMode).toBe("dontAsk");
   expect(options?.mcpServers).toEqual({});
   expect(options?.settings).toMatchObject({
     autoCompactEnabled: true,
@@ -651,7 +654,7 @@ it("keeps Claude's native tools and uses one SDK session even for a terminal pro
   expect(options?.settings).not.toHaveProperty("autoCompactWindow");
   expect(options?.hooks?.PreCompact).toHaveLength(1);
   expect(options?.hooks?.PostCompact).toHaveLength(1);
-  expect(options?.env?.CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS).toBe("8000");
+  expect(options?.env?.CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS).toBeUndefined();
   expect(options?.env?.ANTHROPIC_API_KEY).not.toBe("test-only");
   expect(options?.env?.ANTHROPIC_API_KEY).toMatch(/^[a-f0-9]{64}$/);
   expect(options?.env?.ANTHROPIC_BASE_URL).toMatch(
@@ -660,7 +663,7 @@ it("keeps Claude's native tools and uses one SDK session even for a terminal pro
   expect(events.at(-1)).toMatchObject({ type: "failure" });
 });
 
-it("tells the model which native Read ranges remain instead of silently treating a token-capped page as a full file", async () => {
+it("uses native read-only permissions without directing the model's file pagination", async () => {
   let options: Options | undefined;
   const adapter = createNativeClaudeAdapter(
     { type: "claude", api_key_env: "KEY" },
@@ -694,65 +697,24 @@ it("tells the model which native Read ranges remain instead of silently treating
   })) {
     /* drain */
   }
-  const hook = options?.hooks?.PostToolUse?.find(
-    (entry) => entry.matcher === "Read",
-  )?.hooks[0];
-  expect(hook).toBeDefined();
-  const makeInput = (
-    startLine: number,
-    numLines: number,
-    totalLines: number,
-    truncatedByTokenCap = false,
-  ) =>
-    ({
-      hook_event_name: "PostToolUse",
-      tool_name: "Read",
-      tool_use_id: "read-id",
-      session_id: "fixture",
-      transcript_path: "fixture",
-      cwd: "fixture",
-      tool_input: { file_path: "source.ts" },
-      tool_response: {
-        type: "text",
-        file: {
-          filePath: "source.ts",
-          content: "private source bytes",
-          startLine,
-          numLines,
-          totalLines,
-          truncatedByTokenCap,
-        },
-      },
-    }) as const;
-  const partial = await hook!(makeInput(1, 160, 1500, true), "read-id", {
+  expect(options?.hooks?.PostToolUse).toBeUndefined();
+  expect(options?.env?.CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS).toBeUndefined();
+  const permission = options!.canUseTool!;
+  const details = {
     signal: new AbortController().signal,
-  });
-  expect(partial).toMatchObject({
-    hookSpecificOutput: {
-      hookEventName: "PostToolUse",
-      additionalContext: expect.stringContaining("offset=161"),
-    },
-  });
-  expect(JSON.stringify(partial)).toContain("1500");
-  expect(JSON.stringify(partial)).not.toContain("private source bytes");
-  const end = await hook!(makeInput(1481, 20, 1500), "read-id", {
-    signal: new AbortController().signal,
-  });
-  expect(JSON.stringify(end)).toContain("end of file");
-  expect(JSON.stringify(end)).toContain("earlier gaps");
-  const invalid = await hook!(makeInput(1490, 20, 1500), "read-id", {
-    signal: new AbortController().signal,
-  });
-  expect(invalid).toEqual({});
-  const longLine = await hook!(makeInput(1, 1, 1, true), "read-id", {
-    signal: new AbortController().signal,
-  });
-  expect(JSON.stringify(longLine)).toContain(
-    "Long-line content may be missing",
-  );
-  expect(JSON.stringify(longLine)).not.toContain(
-    "range reaches the end of file",
-  );
+    toolUseID: "fixture",
+    requestId: "fixture",
+  };
+  for (const name of ["Read", "Glob", "Grep"])
+    expect(
+      await permission(name, { file_path: "source.ts" }, details),
+    ).toMatchObject({ behavior: "allow" });
+  // The SDK approves known read-only Git commands itself. Anything reaching
+  // this fallback required approval and is not blanket-approved by the host.
+  for (const name of ["Bash", "Edit", "Write", "WebFetch"])
+    expect(
+      await permission(name, { command: "write to source.ts" }, details),
+    ).toMatchObject({ behavior: "deny" });
 });
 
 it("rejects native success without structured output", async () => {

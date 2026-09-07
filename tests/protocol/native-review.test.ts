@@ -95,14 +95,15 @@ describe("native review contract", () => {
     const prompt = native.buildNativeReviewPrompt(resolvedReviewer(), context);
     expect(prompt.user).not.toContain("ORIGINAL_RETAINED_DIFF_LINE");
     expect(prompt.user).toContain("retained_native_diff");
-    expect(prompt.system).toContain(
-      "Inspect the retained original diff with native read-only tools",
-    );
+    expect(prompt.system).toContain("retained original diff");
     expect(context.git.is_repository && context.git.diff).toBe(diff);
   });
-  it("lists concrete full-file obligations separately from supporting scope", async () => {
+  it("lets native reviewers choose inspection without attestation or read checklists", async () => {
     const native = await import("../../src/protocol/native-review.js");
     const reviewer = resolvedReviewer({
+      instruction_layers: [
+        { source: "trusted", content: "Configured review instructions" },
+      ],
       policy: {
         passQuorum: 1,
         minimumProviderGroups: 1,
@@ -110,7 +111,7 @@ describe("native review contract", () => {
         gateMinimumSeverity: "medium",
         gateMinimumConfidence: "medium",
         changeCoverage: {
-          relevantPaths: ["src/**"],
+          relevantPaths: ["**"],
           minimumInspection: "full_file",
           proof: "native_attested",
         },
@@ -119,14 +120,14 @@ describe("native review contract", () => {
     const context = resolvedContext({
       git: {
         is_repository: true,
-        root: "F:/Projects/demo",
-        branch: "main",
+        root: "F:/repo",
         head: "abc",
-        merge_base: "abc",
+        merge_base: "base",
+        branch: "feature",
         status_entries: [],
-        changed_files: ["test/worker.ts", "src/worker.ts", "src/support.ts"],
+        changed_files: ["a.ts", "b.ts"],
         diff_stat: "",
-        diff: "",
+        diff: "original-diff-marker",
         truncated: {
           status_entries: false,
           changed_files: false,
@@ -135,58 +136,55 @@ describe("native review contract", () => {
         },
       },
     });
-    expect(native.nativeRequiredPaths(reviewer, context)).toEqual([
-      "src/support.ts",
-      "src/worker.ts",
-    ]);
     const prompt = native.buildNativeReviewPrompt(reviewer, context);
-    expect(prompt.system).toContain("Read each required changed file in full");
-    expect(prompt.system).toContain(
-      "Follow each native tool's next-offset or continuation range",
+    expect(prompt.system).toContain("Configured review instructions");
+    expect(prompt.system).toContain("read-only");
+    expect(prompt.system).toContain("Git");
+    expect(prompt.system).toContain("plain-text");
+    expect(prompt.system).not.toMatch(
+      /mandatory|checklist|full.file inspection|Read each required|batch|next-offset|native_scope_attestation|ordered_execution_proof|base_head_comparison/,
     );
-    expect(prompt.system).toContain("DURABLE NATIVE REVIEW SCOPE");
-    expect(prompt.system).toContain(
-      '"required_paths": [\n    "src/support.ts",\n    "src/worker.ts"',
-    );
-    expect(prompt.system).toContain(
-      "Internal SDK compaction is not the final review answer",
-    );
-    expect(prompt.system).toContain(
-      "preserve the exact inspected and remaining path lists",
-    );
-    expect(prompt.system).toContain(
-      "Do not copy source files, full diffs, or earlier summaries",
-    );
-    expect(prompt.user).toContain("REQUIRED CHANGED PATH CHECKLIST");
-    expect(prompt.user).toContain(
-      '"required_paths": [\n    "src/support.ts",\n    "src/worker.ts"',
-    );
-    const partial = providerReviewerResultV4Schema.parse({
-      ...result(),
-      native_scope_attestation: {
-        complete: true,
-        reviewed_paths: ["src/worker.ts"],
-        limitations: [],
-      },
-    });
+    expect(prompt.user).toContain("original-diff-marker");
+    expect(prompt.user).toContain('"branch": "feature"');
+    const schema = native.nativeResultJsonSchema(reviewer);
+    expect(schema.required).not.toContain("native_scope_attestation");
+    expect(schema.properties).not.toHaveProperty("native_scope_attestation");
+    expect(schema.properties).not.toHaveProperty("coverage_attestation");
+    const { native_scope_attestation: _old, ...without } = result();
     expect(
-      native.validateNativeSubmission(reviewer, context, partial),
-    ).toMatchObject({
-      accepted: false,
-      message: expect.stringContaining("src/support.ts"),
+      native.validateNativeSubmission(
+        reviewer,
+        context,
+        providerReviewerResultV4Schema.parse(without),
+      ),
+    ).toEqual({ accepted: true });
+    for (const complete of [true, false])
+      expect(
+        native.validateNativeSubmission(
+          reviewer,
+          context,
+          providerReviewerResultV4Schema.parse({
+            ...result(),
+            native_scope_attestation: {
+              complete,
+              reviewed_paths: [],
+              limitations: ["Historical metadata only"],
+            },
+          }),
+        ),
+      ).toEqual({ accepted: true });
+  });
+
+  it("represents agent-selected inspection without an invented coverage claim", async () => {
+    const native = await import("../../src/protocol/native-review.js");
+    expect(native.createAgentSelectedChangeCoverage()).toEqual({
+      status: "not_applicable",
+      proof_kind: "unknown",
+      contract: "native_review_v1",
+      inspected_count: 0,
+      deficit_count: 0,
+      deficit_sample: [],
     });
-    partial.native_scope_attestation!.reviewed_paths.push("src/support.ts");
-    expect(native.validateNativeSubmission(reviewer, context, partial)).toEqual(
-      { accepted: true },
-    );
-    partial.native_scope_attestation = {
-      complete: false,
-      reviewed_paths: ["src/worker.ts"],
-      limitations: ["Supporting file could not be read."],
-    };
-    expect(native.validateNativeSubmission(reviewer, context, partial)).toEqual(
-      { accepted: true },
-    );
   });
 
   it("validates every native adjudication candidate without requiring an unrelated full review", async () => {
@@ -246,22 +244,22 @@ describe("native review contract", () => {
     });
     const prompt = native.buildNativeReviewPrompt(reviewer, context);
     expect(prompt.system).not.toContain("Review the declared changed paths");
-    expect(prompt.system).toContain("not a second full-scope review");
-    expect(prompt.system).toContain("DURABLE ADJUDICATION CANDIDATES");
+    expect(prompt.system).toContain("assigned candidate");
+    expect(prompt.system).toContain("ADJUDICATION CANDIDATES");
     expect(prompt.system).toContain('"id": "one"');
     expect(prompt.user).not.toContain("REQUIRED CHANGED PATH CHECKLIST");
   });
 
-  it("retains more than sixteen native findings while preserving the legacy limit", () => {
+  it("retains more than sixteen native findings without requiring scope attestation", () => {
     const value = result();
     value.actionable_findings = Array.from({ length: 17 }, (_, index) => ({
       ...structuredClone(finding),
       id: `f${index}`,
     })) as typeof value.actionable_findings;
     expect(providerReviewerResultV4Schema.safeParse(value).success).toBe(true);
-    const { native_scope_attestation: _attestation, ...legacy } = value;
-    expect(providerReviewerResultV4Schema.safeParse(legacy).success).toBe(
-      false,
+    const { native_scope_attestation: _attestation, ...unattested } = value;
+    expect(providerReviewerResultV4Schema.safeParse(unattested).success).toBe(
+      true,
     );
   });
 

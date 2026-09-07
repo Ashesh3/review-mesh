@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describeTool } from "../../src/discovery/description.js";
+import { renderHelp } from "../../src/discovery/help.js";
 import {
   serializeManagedConfig,
   type ManagedConfig,
@@ -109,7 +110,7 @@ describe("native discovery contract", () => {
       },
       retry: {
         native_inheritance: "rerun_all",
-        native_coverage_basis: "model_attested",
+        native_coverage_basis: "agent_selected",
       },
     });
     expect(output.protocol).not.toHaveProperty("provider_transport");
@@ -126,6 +127,15 @@ describe("native discovery contract", () => {
     expect(output.next_actions[0]?.command).toBe(
       "review-mesh config export --json",
     );
-    expect(output.next_actions[0]?.reason).toContain("native_attested");
+    expect(output.next_actions[0]?.reason).toContain('type "sdk"');
+    expect(output.next_actions[0]?.reason).not.toContain("native_attested");
+  });
+  it("describes native configuration without requiring legacy coverage proof or read receipts", () => {
+    for (const topic of ["config", "adapters", "config-file"] as const) {
+      const help = renderHelp(topic);
+      expect(help).not.toMatch(
+        /(?:requires?|select) (?:explicit(?:ly)? )?native_attested|explicitly select\s+change_coverage\.proof/i,
+      );
+    }
   });
 });
