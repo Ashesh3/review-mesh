@@ -35,7 +35,11 @@ import {
 import { validateAdjudication } from "../findings/adjudication.js";
 import { verifyAdjudicationEvidence } from "../findings/evidence-verifier.js";
 import { evaluateRequiredInput } from "../context/required-input.js";
-import { changedPathMatchesGlob, evaluatePassQuorum } from "./lens-policy.js";
+import {
+  changedPathMatchesGlob,
+  evaluatePassQuorum,
+  meetsGateThresholds,
+} from "./lens-policy.js";
 import { selectRunDeadline } from "./deadlines.js";
 import { boundedList, runOutcome } from "../protocol/concise.js";
 import { reviewerResultDigest } from "../results/digest.js";
@@ -790,7 +794,22 @@ export async function runNativeReview(input: V9RunInput) {
                 disagreementLenses.add(lens(reviewer));
                 // Preserve verified defects instead of allowing a later vote to erase
                 // them. The disagreement remains explicit and the run inconclusive.
-                if (priorAccepted) continue;
+                const thresholds = {
+                  minimumSeverity:
+                    reviewer.policy?.gateMinimumSeverity ?? ("medium" as const),
+                  minimumConfidence:
+                    reviewer.policy?.gateMinimumConfidence ??
+                    ("medium" as const),
+                };
+                const priorGate =
+                  priorAccepted &&
+                  priorFinding.classification === "confirmed_defect" &&
+                  meetsGateThresholds(priorFinding, thresholds);
+                const nextGate =
+                  nextAccepted &&
+                  nextFinding.classification === "confirmed_defect" &&
+                  meetsGateThresholds(nextFinding, thresholds);
+                if (priorAccepted && (priorGate || !nextGate)) continue;
               }
               if (
                 decision.issues.length > 0 ||
@@ -1261,17 +1280,19 @@ export async function runNativeReview(input: V9RunInput) {
       proofBySourceRef: proofs,
       gatePolicies,
     });
-    const unresolved = canonical.atomics.some((f) =>
-      f.gate_eligibility.reasons.some((r) =>
-        [
-          "evidence_unverified",
-          "source_coverage_unverified",
-          "ordered_proof_missing",
-          "change_impact_unverified",
-          "adjudication_required",
-        ].includes(r),
-      ),
-    );
+    const unresolved =
+      canonical.counts.needs_verification_subfindings > 0 ||
+      canonical.atomics.some((f) =>
+        f.gate_eligibility.reasons.some((r) =>
+          [
+            "evidence_unverified",
+            "source_coverage_unverified",
+            "ordered_proof_missing",
+            "change_impact_unverified",
+            "adjudication_required",
+          ].includes(r),
+        ),
+      );
     const partial =
       Boolean(outputFailure) ||
       changed ||

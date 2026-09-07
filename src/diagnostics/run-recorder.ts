@@ -513,7 +513,11 @@ async function readPinnedBytes(
   const handle = await open(
     path,
     constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
-  );
+  ).catch((error) => {
+    if (isNotFound(error)) return undefined;
+    throw error;
+  });
+  if (handle === undefined) return undefined;
   try {
     const opened = await handle.stat({ bigint: true });
     if (
@@ -551,6 +555,12 @@ async function readPinnedBytes(
       size: Number(opened.size),
       mtimeNs: String(opened.mtimeNs),
     };
+  } catch (error) {
+    // Another recorder can finish publication/remove its active pathname
+    // between enumeration, opening, and the final identity check. A vanished
+    // candidate grants no deletion authority, but does not fail this recorder.
+    if (isNotFound(error)) return undefined;
+    throw error;
   } finally {
     await handle.close();
   }
