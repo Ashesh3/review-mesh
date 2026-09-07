@@ -64,6 +64,42 @@ afterEach(async () => {
 });
 
 describe("native review contract", () => {
+  it("keeps a large original diff in the readable native context instead of duplicating it in every model prompt", async () => {
+    const native = await import("../../src/protocol/native-review.js");
+    const diff =
+      "diff --git a/source.ts b/source.ts\n" +
+      "+ORIGINAL_RETAINED_DIFF_LINE\n".repeat(6000);
+    const context = resolvedContext({
+      git: {
+        is_repository: true,
+        root: "F:/review",
+        head: "a".repeat(40),
+        branch: "review",
+        merge_base: "b".repeat(40),
+        status_entries: [],
+        changed_files: ["source.ts"],
+        diff_stat: "1 file",
+        diff,
+        raw_diff: {
+          byte_count: Buffer.byteLength(diff),
+          sha256: "c".repeat(64),
+        },
+        truncated: {
+          status_entries: false,
+          changed_files: false,
+          diff_stat: false,
+          diff: false,
+        },
+      },
+    });
+    const prompt = native.buildNativeReviewPrompt(resolvedReviewer(), context);
+    expect(prompt.user).not.toContain("ORIGINAL_RETAINED_DIFF_LINE");
+    expect(prompt.user).toContain("retained_native_diff");
+    expect(prompt.system).toContain(
+      "Inspect the retained original diff with native read-only tools",
+    );
+    expect(context.git.is_repository && context.git.diff).toBe(diff);
+  });
   it("lists concrete full-file obligations separately from supporting scope", async () => {
     const native = await import("../../src/protocol/native-review.js");
     const reviewer = resolvedReviewer({

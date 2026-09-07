@@ -143,9 +143,35 @@ export function buildNativeReviewPrompt(
 ): ReviewerPromptBundle {
   const { instructions, caller_context, ...discovered } = context;
   const adjudication = reviewer.policy?.mode === "adjudication";
+  const retainedDiff =
+    context.git.is_repository &&
+    Buffer.byteLength(context.git.diff, "utf8") > 32 * 1024;
+  const modelContext =
+    retainedDiff && context.git.is_repository
+      ? {
+          ...discovered,
+          git: {
+            ...context.git,
+            diff: {
+              source: "retained_native_diff",
+              byte_count: Buffer.byteLength(context.git.diff, "utf8"),
+              sha256: createHash("sha256")
+                .update(context.git.diff)
+                .digest("hex"),
+              instruction:
+                "Read the original plain-text .diff companion identified in the native context hint; contents were retained without source filtering.",
+            },
+          },
+        }
+      : discovered;
   const system = [
     "# REVIEW MESH INVARIANTS",
     "Inspect the live workspace using this SDK's approved read-only tools. Do not edit files, run tests or builds, or execute project programs. Read-only shell commands are permitted only when the selected SDK's sandbox permits them.",
+    ...(retainedDiff
+      ? [
+          "Inspect the retained original diff with native read-only tools before drawing change-impact conclusions. Large original diffs are not duplicated inline: their complete plain-text companion and SHA-256 are supplied in the persistent native context hint. Use consecutive ranges for relevant hunks and preserve old/head line coordinates; this changes delivery, not the required review scope or full-file inspection obligations.",
+        ]
+      : []),
     adjudication
       ? "This is candidate adjudication, not a second full-scope review. Inspect the supplied candidate claims, their cited paths and supporting code needed to decide them; do not start a new review of unrelated changed files."
       : context.review_scope.mode === "changes"
@@ -199,7 +225,7 @@ export function buildNativeReviewPrompt(
   ].join("\n\n");
   const user = [
     delimited("PROJECT CONTEXT", projectContext ?? null),
-    delimited("LIVE WORKTREE CONTEXT", discovered),
+    delimited("LIVE WORKTREE CONTEXT", modelContext),
     delimited("CALLER INSTRUCTIONS", instructions),
     delimited("CALLER CONTEXT", caller_context ?? null),
     ...(!adjudication && context.review_scope.mode === "changes"
