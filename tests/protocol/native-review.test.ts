@@ -105,6 +105,16 @@ describe("native review contract", () => {
     ]);
     const prompt = native.buildNativeReviewPrompt(reviewer, context);
     expect(prompt.system).toContain("Read each required changed file in full");
+    expect(prompt.system).toContain("DURABLE NATIVE REVIEW SCOPE");
+    expect(prompt.system).toContain(
+      '"required_paths": [\n    "src/support.ts",\n    "src/worker.ts"',
+    );
+    expect(prompt.system).toContain(
+      "Internal SDK compaction is not the final review answer",
+    );
+    expect(prompt.system).toContain(
+      "preserve the exact inspected and remaining path lists",
+    );
     expect(prompt.user).toContain("REQUIRED CHANGED PATH CHECKLIST");
     expect(prompt.user).toContain(
       '"required_paths": [\n    "src/support.ts",\n    "src/worker.ts"',
@@ -195,6 +205,8 @@ describe("native review contract", () => {
     const prompt = native.buildNativeReviewPrompt(reviewer, context);
     expect(prompt.system).not.toContain("Review the declared changed paths");
     expect(prompt.system).toContain("not a second full-scope review");
+    expect(prompt.system).toContain("DURABLE ADJUDICATION CANDIDATES");
+    expect(prompt.system).toContain('"id": "one"');
     expect(prompt.user).not.toContain("REQUIRED CHANGED PATH CHECKLIST");
   });
 
