@@ -154,6 +154,9 @@ describe("native review contract", () => {
     expect(prompt.system).toContain(
       "preserve the exact inspected and remaining path lists",
     );
+    expect(prompt.system).toContain(
+      "Do not copy source files, full diffs, or earlier summaries",
+    );
     expect(prompt.user).toContain("REQUIRED CHANGED PATH CHECKLIST");
     expect(prompt.user).toContain(
       '"required_paths": [\n    "src/support.ts",\n    "src/worker.ts"',
