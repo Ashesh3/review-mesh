@@ -1,4 +1,4 @@
-import { createServer, type Server } from "node:http";
+import { createServer, request as httpRequest, type Server } from "node:http";
 import { once } from "node:events";
 import { afterEach, expect, it } from "vitest";
 import { createClaudeSummaryTransport } from "../../src/runtime/claude-summary-transport.js";
@@ -382,3 +382,66 @@ it("aborts active upstream work and closes the listener idempotently", async () 
   expect(await pending).toBe("aborted");
   await expect(fetch(`${relay.baseUrl}/v1/messages`)).rejects.toThrow();
 });
+
+it("cancels the upstream response when the SDK disconnects during an SSE stream", async () => {
+  let disconnected!: () => void;
+  const upstreamClosed = new Promise<void>((resolve) => {
+    disconnected = resolve;
+  });
+  const firstFrame = 'event: message_start\ndata: {"type":"message_start"}\n\n';
+  const upstream = await listen(
+    createServer((_request, response) => {
+      response.once("close", disconnected);
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write(firstFrame);
+    }),
+  );
+  const relay = await createClaudeSummaryTransport({
+    baseUrl: upstream,
+    apiKey: "provider-secret",
+    signal: new AbortController().signal,
+  });
+  cleanups.push(relay.close);
+  const response = await fetch(`${relay.baseUrl}/v1/messages`, {
+    method: "POST",
+    headers: { "x-api-key": relay.apiKey },
+    body: '{"messages":[]}',
+  });
+  const reader = response.body!.getReader();
+  expect(new TextDecoder().decode((await reader.read()).value)).toBe(
+    firstFrame,
+  );
+  await reader.cancel();
+  await upstreamClosed;
+}, 5000);
+
+it("closes an incomplete SDK upload without forwarding it or leaving the socket open", async () => {
+  let calls = 0;
+  const upstream = await listen(
+    createServer((_request, response) => {
+      calls++;
+      response.end("unexpected");
+    }),
+  );
+  const relay = await createClaudeSummaryTransport({
+    baseUrl: upstream,
+    apiKey: "provider-secret",
+    signal: new AbortController().signal,
+  });
+  cleanups.push(relay.close);
+  const client = httpRequest(`${relay.baseUrl}/v1/messages`, {
+    method: "POST",
+    headers: { "x-api-key": relay.apiKey, "content-length": "1000" },
+  });
+  const closed = new Promise<void>((resolve) => {
+    client.once("error", () => {});
+    client.once("close", resolve);
+  });
+  await new Promise<void>((resolve, reject) => {
+    client.once("error", reject);
+    client.write('{"messages":', () => resolve());
+  });
+  await relay.close();
+  await closed;
+  expect(calls).toBe(0);
+}, 5000);
