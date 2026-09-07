@@ -13,7 +13,7 @@ afterEach(async () => {
   for (const root of roots.splice(0))
     await rm(root, { recursive: true, force: true });
 });
-async function fixture(retired: boolean) {
+async function fixture(retired: boolean, strict = false) {
   const root = await mkdtemp(join(tmpdir(), "mesh-native-description-"));
   roots.push(root);
   const workspace = join(root, "project");
@@ -22,6 +22,7 @@ async function fixture(retired: boolean) {
   const config: ManagedConfig = {
     schema_version: "7",
     execution: {
+      ...(strict ? { review_profile: "strict-evaluation" as const } : {}),
       max_concurrency: 1,
       heartbeat_interval_ms: 1000,
       shutdown_grace_period_ms: 1000,
@@ -70,6 +71,18 @@ async function fixture(retired: boolean) {
 }
 
 describe("native discovery contract", () => {
+  it("describes strict complete-roster execution instead of claiming early short circuits", async () => {
+    const output = await describeTool(await fixture(false, true));
+    expect(output.configuration).toMatchObject({
+      execution: { review_profile: "strict-evaluation" },
+    });
+    expect(output.protocol.model_fallback.stop_agent_after).toEqual([
+      "all_configured_models",
+    ]);
+    expect(output.protocol.model_fallback.advance_after).toContain(
+      "adjudication_completion",
+    );
+  });
   it("describes effective vendor routing and SDK ownership without promising model access", async () => {
     const output = await describeTool(await fixture(false));
     expect(output.configuration).toMatchObject({

@@ -173,8 +173,16 @@ export async function describeTool(options: DescribeToolOptions = {}) {
         advance_after: [
           "clean_pass_until_quorum",
           "operational_failure",
+          ...(configuration.valid &&
+          configuration.execution.review_profile === "strict-evaluation"
+            ? ["adjudication_completion"]
+            : []),
         ] as const,
-        stop_agent_after: ["confirmed_findings", "quorum"] as const,
+        stop_agent_after:
+          configuration.valid &&
+          configuration.execution.review_profile === "strict-evaluation"
+            ? (["all_configured_models"] as const)
+            : (["confirmed_findings", "quorum"] as const),
       },
       progress: {
         phases: [

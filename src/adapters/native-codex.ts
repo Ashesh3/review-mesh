@@ -1,4 +1,5 @@
 import { constants } from "node:fs";
+import { createHash } from "node:crypto";
 import { access, realpath } from "node:fs/promises";
 import { delimiter, dirname, isAbsolute } from "node:path";
 import {
@@ -96,6 +97,115 @@ function activity(event: ThreadEvent): string | undefined {
   if (event.item.type === "todo_list")
     return "Codex updated its review checklist.";
   if (event.item.type === "error") return "Codex reported a runtime notice.";
+}
+
+function progressIdentity(value: unknown): string | undefined {
+  let nodes = 0;
+  let remainingBytes = 1024 * 1024;
+  const countText = (text: string) => {
+    remainingBytes -= Buffer.byteLength(text, "utf8");
+    if (remainingBytes < 0)
+      throw new Error("Native tool identity exceeds the progress bound.");
+  };
+  const ancestors = new Set<object>();
+  const canonical = (input: unknown, depth = 0): unknown => {
+    if (++nodes > 16_384 || depth > 32)
+      throw new Error("Native tool identity exceeds the progress bound.");
+    if (typeof input === "string") countText(input);
+    if (input === null || typeof input !== "object") return input;
+    if (ancestors.has(input)) throw new Error("Cyclic native tool identity.");
+    ancestors.add(input);
+    try {
+      return Array.isArray(input)
+        ? input.map((item) => canonical(item, depth + 1))
+        : Object.fromEntries(
+            Object.keys(input)
+              .sort()
+              .map((key) => {
+                countText(key);
+                return [
+                  key,
+                  canonical((input as Record<string, unknown>)[key], depth + 1),
+                ];
+              }),
+          );
+    } finally {
+      ancestors.delete(input);
+    }
+  };
+  try {
+    const serialized = JSON.stringify(canonical(value));
+    if (Buffer.byteLength(serialized, "utf8") > 1024 * 1024) return;
+    return createHash("sha256").update(serialized).digest("hex");
+  } catch {
+    // Unusable telemetry cannot invalidate an otherwise complete native review.
+    return;
+  }
+}
+
+function inspectionProgress(
+  event: ThreadEvent,
+): Extract<AdapterEvent, { type: "activity" }> | undefined {
+  if (
+    event.type !== "item.started" &&
+    event.type !== "item.updated" &&
+    event.type !== "item.completed"
+  )
+    return;
+  const item = event.item;
+  let identity: unknown;
+  let bytes: number;
+  let message: string;
+  let complete = false;
+  if (item.type === "command_execution") {
+    identity = ["command", item.command];
+    bytes = Buffer.byteLength(item.aggregated_output);
+    message = "Codex inspected workspace command output.";
+    if (
+      item.status === "failed" ||
+      (item.exit_code !== undefined && item.exit_code !== 0)
+    )
+      return { type: "activity", message: "Codex workspace command failed." };
+    complete =
+      event.type === "item.completed" &&
+      item.status === "completed" &&
+      item.exit_code === 0;
+  } else if (item.type === "mcp_tool_call") {
+    identity = ["tool", item.server, item.tool, item.arguments];
+    message = "Codex inspected native tool output.";
+    if (item.status === "failed" || item.error !== undefined)
+      return { type: "activity", message: "Codex native tool failed." };
+    complete = event.type === "item.completed" && item.status === "completed";
+    try {
+      bytes =
+        item.result === undefined
+          ? 0
+          : Buffer.byteLength(JSON.stringify(item.result));
+    } catch {
+      return { type: "activity", message };
+    }
+  } else if (
+    item.type === "reasoning" ||
+    (item.type === "agent_message" && event.type === "item.updated")
+  ) {
+    identity = [item.type, item.id];
+    bytes = Buffer.byteLength(item.text);
+    message = "Codex produced native response activity.";
+  } else return;
+  const key = progressIdentity(identity);
+  if (key === undefined) return { type: "activity", message };
+  if (bytes === 0)
+    return {
+      type: "activity",
+      message,
+      ...(complete ? { identity: `codex:complete:${key}` } : {}),
+    };
+  return {
+    type: "activity",
+    identity: `codex:${key}`,
+    byteCount: bytes,
+    message,
+  };
 }
 
 class NativeCodexAdapter implements ReviewAdapter {
@@ -318,8 +428,12 @@ class NativeCodexAdapter implements ReviewAdapter {
               };
           continue;
         }
-        const message = activity(event);
-        if (message) yield { type: "activity", message };
+        const progress = inspectionProgress(event);
+        if (progress) yield progress;
+        else {
+          const message = activity(event);
+          if (message) yield { type: "activity", message };
+        }
       }
       if (controller.signal.aborted) {
         if (terminal?.type === "result")

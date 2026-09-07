@@ -55,6 +55,7 @@ export interface EffectiveConfigDescription {
     matched_project_name?: string;
   };
   execution: {
+    review_profile?: "strict-evaluation" | "routine-review" | undefined;
     max_concurrency: number;
     heartbeat_interval_ms: number;
     shutdown_grace_period_ms: number;

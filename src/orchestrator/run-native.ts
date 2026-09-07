@@ -8,12 +8,14 @@ import type { AdapterEvent, ReviewAdapter } from "../adapters/types.js";
 import {
   sanitizeAdapterFailure,
   sanitizePublicText,
+  type AdapterFailure,
 } from "../adapters/errors.js";
 import {
   buildNativeReviewPrompt,
   nativeResultJsonSchema,
   createNativeChangeCoverage,
   validateNativeEvidence,
+  nativeRequiredPaths,
 } from "../protocol/native-review.js";
 import {
   providerReviewerResultV4Schema,
@@ -37,13 +39,20 @@ import { changedPathMatchesGlob, evaluatePassQuorum } from "./lens-policy.js";
 import { selectRunDeadline } from "./deadlines.js";
 import { boundedList, runOutcome } from "../protocol/concise.js";
 import { reviewerResultDigest } from "../results/digest.js";
-import { sanitizeReviewerOutput } from "../results/sanitize.js";
+import {
+  sanitizeReviewerOutput,
+  sanitizeRunMetadata,
+} from "../results/sanitize.js";
 import { reviewerConfigFingerprint } from "../diagnostics/retry-v9.js";
 import {
   PublicDeliveryError,
   type V9EventDraft,
 } from "../protocol/v9-event-writer.js";
 import type { JsonValue } from "../protocol/schemas.js";
+import {
+  createNativeProgressWatchdog,
+  NativeNoProgressError,
+} from "./native-progress.js";
 
 type NativeJob = {
   reviewer: ResolvedReviewer;
@@ -57,6 +66,10 @@ type NativeJob = {
     | "terminal";
   mode: "full_review" | "adjudication";
   startedAt: number;
+  attemptDeadline: number;
+  lensDeadline: number;
+  lastProgressAt: number;
+  activityCount: number;
   result?: ReviewerResultV4 | AdjudicationResultV2;
   reason?: string;
   adapter?: ReviewAdapter;
@@ -226,11 +239,17 @@ export async function runNativeReview(input: V9RunInput) {
     phase: "queued",
     mode: "full_review",
     startedAt: start,
+    attemptDeadline: deadlineAt,
+    lensDeadline: deadlineAt,
+    lastProgressAt: start,
+    activityCount: 0,
   }));
   const lensStates = new Map<
     string,
     "passed" | "findings" | "incomplete" | "not_applicable" | "not_evaluated"
   >();
+  const strictEvaluation = execution.review_profile === "strict-evaluation";
+  const disagreementLenses = new Set<string>();
   const raw: CanonicalRawFinding[] = [],
     proofs: Record<string, CanonicalFindingCoreProof> = {},
     adjudicationOutcomes: Record<string, unknown>[] = [];
@@ -336,11 +355,30 @@ export async function runNativeReview(input: V9RunInput) {
     status: "incomplete" | "skipped",
     reason: string,
     message?: string,
+    failure?: AdapterFailure,
   ) => {
     const phase = job.phase;
     job.status = status;
     job.phase = "terminal";
     job.reason = reason;
+    if (status === "incomplete") {
+      const safeFailure = sanitizeAdapterFailure(
+        reason as V9IncompleteReason,
+        failure?.message ?? message ?? "Native review incomplete.",
+        failure?.retryable ?? false,
+        failure ?? {},
+      );
+      await input.record({
+        record: "reviewer.attempt",
+        reviewer_id: job.reviewer.id,
+        data: {
+          attempt: 1,
+          started_at: new Date(job.startedAt).toISOString(),
+          elapsed_ms: Math.max(0, now() - job.startedAt),
+          failure: safeFailure,
+        },
+      });
+    }
     await input.record({
       record: "reviewer.terminal",
       reviewer_id: job.reviewer.id,
@@ -395,11 +433,13 @@ export async function runNativeReview(input: V9RunInput) {
       deadlineAt,
       start + (reviewer.policy?.lensDeadlineMs ?? deadline.duration_ms),
     );
+    job.lensDeadline = lensDeadline;
     let expiry = setTimeout(
       () => child.abort(new Error("Lens deadline exceeded")),
       Math.max(0, lensDeadline - now()),
     );
     let release: (() => void) | undefined,
+      progress: ReturnType<typeof createNativeProgressWatchdog> | undefined,
       terminal:
         Extract<AdapterEvent, { type: "result" | "failure" }> | undefined;
     let capabilities: Awaited<ReturnType<ReviewAdapter["probe"]>> | undefined;
@@ -418,6 +458,8 @@ export async function runNativeReview(input: V9RunInput) {
         lensDeadline,
         probeStartedAt + (reviewer.attemptTimeoutMs ?? reviewer.timeoutMs),
       );
+      job.attemptDeadline = probeDeadline;
+      job.lastProgressAt = now();
       expiry = setTimeout(
         () => child.abort(new Error("Probe deadline exceeded")),
         Math.max(0, probeDeadline - now()),
@@ -459,11 +501,18 @@ export async function runNativeReview(input: V9RunInput) {
       job.startedAt = now();
       job.status = "running";
       job.phase = "reviewing";
+      progress = createNativeProgressWatchdog({
+        timeoutMs: execution.no_progress_timeout_ms ?? 300_000,
+        signal: child.signal,
+        onTimeout: (error) => child.abort(error),
+      });
       clearTimeout(expiry);
       const attemptDeadline = Math.min(
         lensDeadline,
         now() + (reviewer.attemptTimeoutMs ?? reviewer.timeoutMs),
       );
+      job.attemptDeadline = attemptDeadline;
+      job.lastProgressAt = now();
       expiry = setTimeout(
         () => child.abort(new Error("Reviewer deadline exceeded")),
         Math.max(0, attemptDeadline - now()),
@@ -541,6 +590,38 @@ export async function runNativeReview(input: V9RunInput) {
           resultJsonSchema: nativeResultJsonSchema(effectiveReviewer),
           isolationPolicy: reviewer.isolationPolicy,
           signal: child.signal,
+          recordDiagnostic: async (diagnostic) => {
+            const safe = sanitizeRunMetadata(diagnostic) as Record<
+              string,
+              unknown
+            >;
+            if (
+              diagnostic.kind === "adapter_exception" ||
+              diagnostic.kind === "provider_response"
+            ) {
+              await input.record({
+                record:
+                  diagnostic.kind === "adapter_exception"
+                    ? "reviewer.exception"
+                    : "reviewer.response",
+                reviewer_id: reviewer.id,
+                data: { attempt: 1, diagnostics: safe.diagnostics },
+              });
+              return;
+            }
+            if (diagnostic.kind === "unverified_result_draft") {
+              // Native adapters supply bounded, parsed drafts, not raw model transcripts.
+              if (Buffer.byteLength(JSON.stringify(safe), "utf8") > 256 * 1024)
+                throw new Error(
+                  "Native diagnostic exceeds the persistence bound; chunk the complete rejected submission.",
+                );
+              await input.record({
+                record: "reviewer.draft",
+                reviewer_id: reviewer.id,
+                data: { ...safe, attempt: 1, verified: false },
+              });
+            }
+          },
         })
         [Symbol.asyncIterator]();
       let lifecycleFailure: unknown;
@@ -558,12 +639,15 @@ export async function runNativeReview(input: V9RunInput) {
           }
           if (next.done) break;
           const event = next.value;
+          const meaningful = progress.record(event);
           if (event.type === "result" || event.type === "failure") {
             if (terminal) throw new Error("Duplicate SDK terminal result");
             terminal = event;
             continue;
           }
           const message = sanitizePublicText(event.message);
+          if (meaningful) job.lastProgressAt = now();
+          job.activityCount++;
           if (message)
             await input.record({
               record: "reviewer.activity",
@@ -573,7 +657,7 @@ export async function runNativeReview(input: V9RunInput) {
                 phase: "reviewing",
                 at: now(),
                 message,
-                meaningful_progress: true,
+                meaningful_progress: meaningful,
               },
             });
         }
@@ -585,10 +669,13 @@ export async function runNativeReview(input: V9RunInput) {
         await disposition(
           job,
           "incomplete",
-          terminal.failure.reason === "timeout"
-            ? "provider_timeout"
-            : terminal.failure.reason,
+          child.signal.reason instanceof NativeNoProgressError
+            ? "no_progress_timeout"
+            : terminal.failure.reason === "timeout"
+              ? "provider_timeout"
+              : terminal.failure.reason,
           terminal.failure.message,
+          terminal.failure,
         );
         return "incomplete";
       }
@@ -607,13 +694,7 @@ export async function runNativeReview(input: V9RunInput) {
       const localProofs: Record<string, CanonicalFindingCoreProof> = {};
       if (result.schema_version === "4") {
         const attestation = result.native_scope_attestation;
-        const relevant = input.context.git.is_repository
-          ? input.context.git.changed_files.filter((path) =>
-              (reviewer.policy?.changeCoverage?.relevantPaths ?? ["**"]).some(
-                (pattern) => changedPathMatchesGlob(pattern, path),
-              ),
-            )
-          : [];
+        const relevant = nativeRequiredPaths(reviewer, input.context);
         final = reviewerResultV4Schema.parse({
           ...result,
           change_coverage: createNativeChangeCoverage(input.context, {
@@ -652,6 +733,10 @@ export async function runNativeReview(input: V9RunInput) {
           evidenceVerification: await verifyAdjudicationEvidence({
             workspace: input.context.workspace,
             adjudicationResult: final,
+            ...(input.context.git.is_repository && input.context.git.merge_base
+              ? { baseRevision: input.context.git.merge_base }
+              : {}),
+            signal: child.signal,
           }),
           ...(input.context.git.is_repository
             ? {
@@ -674,6 +759,41 @@ export async function runNativeReview(input: V9RunInput) {
             (c) => c.candidate_id === decision.source_finding_id,
           )?.source_refs ?? []) {
             const finding = raw.find((f) => f.source_ref === ref);
+            if (
+              strictEvaluation &&
+              finding &&
+              finding.adjudication !== "unadjudicated" &&
+              finding.adjudication !== "needs_verification"
+            ) {
+              const priorAccepted =
+                finding.adjudication === "confirmed" ||
+                finding.adjudication === "adjusted";
+              const nextAccepted =
+                decision.effective_decision === "confirmed" ||
+                decision.effective_decision === "adjusted";
+              const priorFinding = finding.effective_finding ?? finding;
+              const nextFinding = decision.effective_finding ?? finding;
+              const materiallyDifferent =
+                priorAccepted &&
+                nextAccepted &&
+                (priorFinding.severity !== nextFinding.severity ||
+                  priorFinding.confidence !== nextFinding.confidence ||
+                  priorFinding.classification !== nextFinding.classification);
+              if (
+                decision.issues.length === 0 &&
+                (priorAccepted !== nextAccepted || materiallyDifferent)
+              ) {
+                disagreementLenses.add(lens(reviewer));
+                // Preserve verified defects instead of allowing a later vote to erase
+                // them. The disagreement remains explicit and the run inconclusive.
+                if (priorAccepted) continue;
+              }
+              if (
+                decision.issues.length > 0 ||
+                decision.effective_decision === "needs_verification"
+              )
+                continue;
+            }
             if (finding) {
               finding.adjudication = decision.effective_decision;
               if (
@@ -734,7 +854,10 @@ export async function runNativeReview(input: V9RunInput) {
             };
           }
         }
-        incompleteAdjudication = !outcome.complete;
+        incompleteAdjudication =
+          !outcome.complete ||
+          (strictEvaluation &&
+            outcome.decisions.some((decision) => decision.issues.length > 0));
       }
       await input.recordResult(reviewer.id, final);
       completedResults++;
@@ -848,15 +971,17 @@ export async function runNativeReview(input: V9RunInput) {
         child.signal.aborted
           ? input.signal.aborted
             ? "cancelled"
-            : now() >= deadlineAt
-              ? "run_deadline_exceeded"
-              : now() >= lensDeadline
-                ? "lens_deadline_exceeded"
-                : job.phase === "probing"
-                  ? "probe_deadline_exceeded"
-                  : job.phase === "queued"
-                    ? "queue_deadline_exceeded"
-                    : "provider_timeout"
+            : child.signal.reason instanceof NativeNoProgressError
+              ? "no_progress_timeout"
+              : now() >= deadlineAt
+                ? "run_deadline_exceeded"
+                : now() >= lensDeadline
+                  ? "lens_deadline_exceeded"
+                  : job.phase === "probing"
+                    ? "probe_deadline_exceeded"
+                    : job.phase === "queued"
+                      ? "queue_deadline_exceeded"
+                      : "provider_timeout"
           : "invalid_result",
         error instanceof Error ? error.message : "SDK review failed",
         false,
@@ -864,6 +989,7 @@ export async function runNativeReview(input: V9RunInput) {
       await disposition(job, "incomplete", failure.reason, failure.message);
       return "incomplete";
     } finally {
+      progress?.close();
       clearTimeout(expiry);
       controller.signal.removeEventListener("abort", abort);
       child.abort();
@@ -886,6 +1012,44 @@ export async function runNativeReview(input: V9RunInput) {
         ...(input.retry ? { parent_run_id: input.retry.parentRunId } : {}),
       },
     });
+    heartbeat = setInterval(() => {
+      if (pendingHeartbeat || outputFailure) return;
+      pendingHeartbeat = emit({
+        event: "suite.heartbeat",
+        data: {
+          elapsed_ms: Math.max(0, now() - start),
+          active: jobs
+            .filter((job) => job.status === "running")
+            .slice(0, 8)
+            .map((job) => ({
+              reviewer_id: job.reviewer.id,
+              lens_id: lens(job.reviewer),
+              mode: job.mode,
+              attempt: 1,
+              maximum_attempts: 1,
+              phase: job.phase,
+              attempt_elapsed_ms: Math.max(0, now() - job.startedAt),
+              lens_elapsed_ms: Math.max(0, now() - start),
+              run_deadline_remaining_ms: Math.max(0, deadlineAt - now()),
+              lens_deadline_remaining_ms: Math.max(0, job.lensDeadline - now()),
+              attempt_deadline_remaining_ms: Math.max(
+                0,
+                job.attemptDeadline - now(),
+              ),
+              last_progress_age_ms: Math.max(0, now() - job.lastProgressAt),
+              coalesced_activity_count: job.activityCount,
+            })),
+          active_count: active,
+          model_runs: counts(),
+
+          run_deadline_remaining_ms: Math.max(0, deadlineAt - now()),
+        },
+      })
+        .catch(() => undefined)
+        .finally(() => {
+          pendingHeartbeat = undefined;
+        });
+    }, execution.heartbeat_interval_ms);
     const initial = await workspaceIdentity(
       input.context.workspace,
       controller.signal,
@@ -965,24 +1129,7 @@ export async function runNativeReview(input: V9RunInput) {
         detail_ref: "resolution",
       },
     });
-    heartbeat = setInterval(() => {
-      if (pendingHeartbeat || outputFailure) return;
-      pendingHeartbeat = emit({
-        event: "suite.heartbeat",
-        data: {
-          elapsed_ms: Math.max(0, now() - start),
-          active: [],
-          active_count: active,
-          minimal: true,
-          detail_ref: "resolution",
-          run_deadline_remaining_ms: Math.max(0, deadlineAt - now()),
-        },
-      })
-        .catch(() => undefined)
-        .finally(() => {
-          pendingHeartbeat = undefined;
-        });
-    }, execution.heartbeat_interval_ms);
+
     await Promise.all(
       [...chains].map(async ([id, members]) => {
         const reviewer = members[0]!.reviewer;
@@ -1060,7 +1207,7 @@ export async function runNativeReview(input: V9RunInput) {
               done = true;
             }
           }
-          if (done) {
+          if (done && !strictEvaluation) {
             for (const rest of members.slice(i + 1))
               await disposition(
                 rest,
@@ -1072,6 +1219,12 @@ export async function runNativeReview(input: V9RunInput) {
             break;
           }
         }
+        if (
+          strictEvaluation &&
+          (members.some((job) => job.status !== "completed") ||
+            disagreementLenses.has(id))
+        )
+          lensStates.set(id, "incomplete");
       }),
     );
     if (persistenceFailure) throw persistenceFailure;
@@ -1161,6 +1314,10 @@ export async function runNativeReview(input: V9RunInput) {
             ? 1
             : 0,
       ...findingCounts,
+      ...(execution.review_profile
+        ? { review_profile: execution.review_profile }
+        : {}),
+      model_runs: counts(),
       incomplete_lenses: [...lensStates.values()].filter(
         (s) => s === "incomplete" || s === "not_evaluated",
       ).length,
@@ -1182,7 +1339,10 @@ export async function runNativeReview(input: V9RunInput) {
       total_exclusions: exclusions.total,
       omitted_exclusions_count: exclusions.omitted,
       exclusions_digest: exclusions.sha256,
-      warnings: changed ? ["workspace_changed_during_review"] : [],
+      warnings: [
+        ...(changed ? ["workspace_changed_during_review"] : []),
+        ...(disagreementLenses.size ? ["adjudication_disagreement"] : []),
+      ],
       deficit_samples: [],
     };
     await input.record({
