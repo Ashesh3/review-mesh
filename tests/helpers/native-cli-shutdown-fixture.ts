@@ -40,6 +40,7 @@ purpose = "Review"
 instructions = "Review the fixture"
 isolation = "prefer_enforced"
 timeout_ms = 60000
+${scenario === "deadline" ? "lens_deadline_ms = 1000" : ""}
 kind = "generic"
 required_input = []
 adjudication = "off"
@@ -96,6 +97,8 @@ registry.register("copilot", () =>
                 if (method === "session.destroy") disconnects++;
                 if (method !== "session.send") return {};
                 sends++;
+                if (scenario === "deadline")
+                  return { messageId: "fixture-message" };
                 setImmediate(async () => {
                   if (scenario === "cancel") {
                     signals.emit("SIGINT");

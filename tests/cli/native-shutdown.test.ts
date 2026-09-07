@@ -36,6 +36,7 @@ it.each(
         ["complete", 0],
         ["error", 3],
         ["cancel", 4],
+        ["deadline", 3],
       ] as const
     ).map(([scenario, expectedCode]) => ({ runtime, scenario, expectedCode })),
   ),
