@@ -89,6 +89,121 @@ function adjudication(
 }
 
 describe("validateAdjudication", () => {
+  it("allows exact verified supporting citations when the decision remains anchored to the candidate", () => {
+    const source = candidate();
+    source.actionable_findings[0]!.category = "correctness";
+    const anchor = source.actionable_findings[0]!.evidence[0]!;
+    const supporting = {
+      path: "src/helper.ts",
+      start_line: 100,
+      end_line: 105,
+      detail: "The helper controls the cited changed call.",
+    };
+    const judge = adjudication({
+      source_finding_id: "enum-post-ingest",
+      decision: "confirmed",
+      rationale: "The changed call invokes this supporting path.",
+      cited_evidence: [anchor, supporting],
+      unverified_assumptions: [],
+    });
+    const proof = {
+      by_source_finding_id: {
+        "enum-post-ingest": {
+          verified: true,
+          failures: [],
+          verified_citations: [
+            {
+              side: "head" as const,
+              path: supporting.path,
+              start_line: 100,
+              end_line: 105,
+              sha256: "a".repeat(64),
+            },
+          ],
+        },
+      },
+    };
+    expect(
+      validateAdjudication(
+        source,
+        judge,
+        context({ reviewScope: "full", evidenceVerification: proof }),
+      ).decisions[0],
+    ).toMatchObject({
+      effective_decision: "confirmed",
+      gate_eligible: true,
+      issues: [],
+    });
+    proof.by_source_finding_id[
+      "enum-post-ingest"
+    ].verified_citations[0]!.end_line = 104;
+    expect(
+      validateAdjudication(
+        source,
+        judge,
+        context({ reviewScope: "full", evidenceVerification: proof }),
+      ).decisions[0],
+    ).toMatchObject({
+      effective_decision: "needs_verification",
+      issues: expect.arrayContaining(["cited_evidence_context_required"]),
+    });
+    proof.by_source_finding_id[
+      "enum-post-ingest"
+    ].verified_citations[0]!.end_line = 105;
+    judge.decisions[0]!.cited_evidence = [supporting];
+    expect(
+      validateAdjudication(
+        source,
+        judge,
+        context({ reviewScope: "full", evidenceVerification: proof }),
+      ).decisions[0],
+    ).toMatchObject({
+      effective_decision: "needs_verification",
+      issues: expect.arrayContaining(["cited_evidence_context_required"]),
+    });
+  });
+
+  it("uses the old filename for base comparison across a rename", () => {
+    const source = candidate();
+    source.actionable_findings[0]!.category = "correctness";
+    const head = source.actionable_findings[0]!.evidence[0]!;
+    const judge = adjudication({
+      source_finding_id: "enum-post-ingest",
+      decision: "confirmed",
+      rationale: "Renamed code changed behavior.",
+      cited_evidence: [head],
+      base_head_comparison: {
+        base: {
+          behavior: "Old",
+          citation: {
+            path: "src/old-ingest.ts",
+            start_line: 40,
+            end_line: 45,
+            detail: "Old source.",
+          },
+        },
+        head: { behavior: "New", citation: head },
+        impact: "Changed",
+      },
+      unverified_assumptions: [],
+    });
+    const value = validateAdjudication(
+      source,
+      judge,
+      context({
+        git: {
+          changedFiles: ["src/ingest.ts"],
+          diff: "diff --git a/src/old-ingest.ts b/src/ingest.ts\n--- a/src/old-ingest.ts\n+++ b/src/ingest.ts\n@@ -40,6 +40,6 @@\n",
+        },
+      }),
+    );
+    expect(value.decisions[0]).toMatchObject({
+      effective_decision: "confirmed",
+      gate_eligible: true,
+      issues: [],
+    });
+  });
+
   it("validates all 80 v2 decisions without losing v4 claim or proof fields", () => {
     const actionable_findings = Array.from({ length: 80 }, (_, index) => ({
       id: `candidate-${index}`,

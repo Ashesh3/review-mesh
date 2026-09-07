@@ -180,10 +180,12 @@ interface DiffRanges {
 function parseDiffRanges(diff: string): DiffRanges {
   const ranges: DiffRanges = { old: new Map(), head: new Map() };
   let path: string | undefined;
+  let oldPath: string | undefined;
   for (const line of diff.split(/\r?\n/u)) {
     const file = /^diff --git a\/(.+) b\/(.+)$/u.exec(line);
     if (file !== null) {
       path = file[2];
+      oldPath = file[1];
       continue;
     }
     const hunk = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/u.exec(line);
@@ -192,9 +194,9 @@ function parseDiffRanges(diff: string): DiffRanges {
     const oldCount = Number(hunk[2] ?? "1");
     const headStart = Number(hunk[3]);
     const headCount = Number(hunk[4] ?? "1");
-    if (oldCount > 0) {
-      ranges.old.set(path, [
-        ...(ranges.old.get(path) ?? []),
+    if (oldCount > 0 && oldPath) {
+      ranges.old.set(oldPath, [
+        ...(ranges.old.get(oldPath) ?? []),
         { start: oldStart, end: oldStart + oldCount - 1 },
       ]);
     }
@@ -249,16 +251,31 @@ function contextBoundCitation(
   },
   candidate: CandidateFinding,
   context: AdjudicationValidationContext,
+  allowVerifiedSupporting = false,
 ): boolean {
   if (!concreteCitation(citation)) return false;
   if (withinCandidateEvidence(citation, candidate)) return true;
+  if (allowVerifiedSupporting) {
+    const verified =
+      context.evidenceVerification?.by_source_finding_id[candidate.id];
+    if (
+      verified?.verified &&
+      verified.verified_citations?.some(
+        (proof) =>
+          proof.side === "head" &&
+          proof.path === citation.path &&
+          proof.start_line <= citation.start_line! &&
+          proof.end_line >= (citation.end_line ?? citation.start_line!) &&
+          /^[a-f0-9]{64}$/.test(proof.sha256),
+      )
+    )
+      return true;
+  }
   const git = context.git;
   if (git === undefined || !git.changedFiles.includes(citation.path!))
     return false;
   const ranges = parseDiffRanges(git.diff);
-  return (
-    withinRanges(citation, ranges.old) || withinRanges(citation, ranges.head)
-  );
+  return withinRanges(citation, ranges.head);
 }
 
 function adjustedFinding(
@@ -306,6 +323,14 @@ export function validateAdjudication(
       }
       const decision = matching[0]!;
       const issues: AdjudicationValidationIssue[] = [];
+      // Supporting code may extend the proof chain, but it cannot replace the
+      // candidate/change anchor with an unrelated independently valid file.
+      const anchored = [
+        ...decision.cited_evidence,
+        ...(decision.ordered_execution_proof?.steps.map(
+          (step) => step.citation,
+        ) ?? []),
+      ].some((citation) => contextBoundCitation(citation, candidate, context));
       if (matching.length > 1) issues.push("duplicate_decision");
       if (
         decision.decision !== "rejected" &&
@@ -322,7 +347,7 @@ export function validateAdjudication(
       if (
         decision.decision !== "rejected" &&
         !decision.cited_evidence.every((citation) =>
-          contextBoundCitation(citation, candidate, context),
+          contextBoundCitation(citation, candidate, context, anchored),
         )
       ) {
         issues.push("cited_evidence_context_required");
@@ -346,7 +371,7 @@ export function validateAdjudication(
             issues.push("ordered_execution_citation_required");
           if (
             !decision.ordered_execution_proof.steps.every((step) =>
-              contextBoundCitation(step.citation, candidate, context),
+              contextBoundCitation(step.citation, candidate, context, anchored),
             )
           )
             issues.push("ordered_execution_context_required");
@@ -358,6 +383,7 @@ export function validateAdjudication(
               decision.ordered_execution_proof.failure_point.citation ?? {},
               candidate,
               context,
+              anchored,
             )
           )
             issues.push("failure_point_context_required");

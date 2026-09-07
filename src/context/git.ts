@@ -37,6 +37,8 @@ interface GitExecuteOptions {
   cancelSignal?: AbortSignal;
   env: Readonly<Record<string, string>>;
   maxBuffer: number;
+  encoding?: "latin1";
+  stripFinalNewline?: false;
 }
 
 export type GitExecutor = (
@@ -55,7 +57,12 @@ export interface GitRunResult {
 export interface GitRunner {
   run(
     args: readonly string[],
-    options: { cwd: string; signal?: AbortSignal },
+    options: {
+      cwd: string;
+      signal?: AbortSignal;
+      /** Binary-safe latin1 transport with no trimming; decode with Buffer.from(stdout, 'latin1'). */
+      preserveOutput?: boolean;
+    },
   ): Promise<GitRunResult>;
 }
 
@@ -63,7 +70,7 @@ export function createGitRunner(
   execute: GitExecutor = execa as unknown as GitExecutor,
 ): GitRunner {
   return {
-    async run(args, { cwd, signal }) {
+    async run(args, { cwd, signal, preserveOutput }) {
       const result = await execute("git", [...TRUSTED_GIT_CONFIG, ...args], {
         cwd,
         reject: false,
@@ -73,6 +80,9 @@ export function createGitRunner(
         // Read-only discovery bounds data again before it becomes manifest data.
         // This limits process buffering in the exceptional case as well.
         maxBuffer: 1_048_576,
+        ...(preserveOutput
+          ? { encoding: "latin1" as const, stripFinalNewline: false as const }
+          : {}),
       });
       return {
         stdout: result.stdout,
