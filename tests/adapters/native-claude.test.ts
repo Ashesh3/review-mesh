@@ -333,6 +333,48 @@ it("returns the complete structured review and native attestation from one SDK r
   ]);
 });
 
+it.each([
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLAUDE_CODE_USE_FOUNDRY",
+])(
+  "preserves native %s authentication without inserting an API-key relay",
+  async (provider) => {
+    let captured: Options | undefined;
+    const adapter = createNativeClaudeAdapter(
+      { type: "claude", env_allowlist: [provider] },
+      {
+        environment: { [provider]: "1" },
+        runtime: () => ({
+          executablePath: "fixture",
+          pathEntries: [],
+          sdkVersion: "fixture",
+          runtimeVersion: "fixture",
+          mode: "managed_process",
+        }),
+        query: ({ options }) => {
+          captured = options;
+          return (async function* () {})();
+        },
+      },
+    );
+    for await (const _event of adapter.run({
+      runId: "provider-fixture",
+      reviewer: resolvedReviewer({ adapter: { type: "claude" } }),
+      context: resolvedContext(),
+      prompt: { system: "Review", user: "Review", combined: "Review" },
+      resultJsonSchema: { type: "object" },
+      isolationPolicy: "prefer_enforced",
+      signal: new AbortController().signal,
+    })) {
+      /* drain */
+    }
+    expect(captured?.env?.[provider]).toBe("1");
+    expect(captured?.env?.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(captured?.env?.ANTHROPIC_BASE_URL).toBeUndefined();
+  },
+);
+
 it("returns cancelled without starting the SDK when cancellation predates admission", async () => {
   let calls = 0;
   const adapter = createNativeClaudeAdapter(

@@ -609,24 +609,36 @@ export function createNativeClaudeAdapter(
           contextDirectory,
           input.context,
         );
-        summaryTransport = await createClaudeSummaryTransport({
-          baseUrl:
-            runtimeEnvironment.ANTHROPIC_BASE_URL ??
-            "https://api.anthropic.com",
-          apiKey: runtimeEnvironment.ANTHROPIC_API_KEY!,
-          signal: controller.signal,
-        });
-        redactions.push(summaryTransport.apiKey);
-        const childEnvironment = Object.fromEntries(
-          Object.entries(runtimeEnvironment).map(([key, value]) => [
-            key,
-            value === runtimeEnvironment.ANTHROPIC_API_KEY
-              ? summaryTransport!.apiKey
-              : value,
-          ]),
+        let childEnvironment = runtimeEnvironment;
+        const nativeCloud = [
+          "CLAUDE_CODE_USE_BEDROCK",
+          "CLAUDE_CODE_USE_VERTEX",
+          "CLAUDE_CODE_USE_FOUNDRY",
+        ].some(
+          (name) =>
+            runtimeEnvironment[name] === "1" ||
+            runtimeEnvironment[name] === "true",
         );
-        childEnvironment.ANTHROPIC_API_KEY = summaryTransport.apiKey;
-        childEnvironment.ANTHROPIC_BASE_URL = summaryTransport.baseUrl;
+        if (!nativeCloud && runtimeEnvironment.ANTHROPIC_API_KEY) {
+          summaryTransport = await createClaudeSummaryTransport({
+            baseUrl:
+              runtimeEnvironment.ANTHROPIC_BASE_URL ??
+              "https://api.anthropic.com",
+            apiKey: runtimeEnvironment.ANTHROPIC_API_KEY,
+            signal: controller.signal,
+          });
+          redactions.push(summaryTransport.apiKey);
+          childEnvironment = Object.fromEntries(
+            Object.entries(runtimeEnvironment).map(([key, value]) => [
+              key,
+              value === runtimeEnvironment.ANTHROPIC_API_KEY
+                ? summaryTransport!.apiKey
+                : value,
+            ]),
+          );
+          childEnvironment.ANTHROPIC_API_KEY = summaryTransport.apiKey;
+          childEnvironment.ANTHROPIC_BASE_URL = summaryTransport.baseUrl;
+        }
         const options = nativeOptions(controller, childEnvironment);
         // dontAsk denies reads outside cwd before canUseTool; grant only the
         // host-owned context subdirectory, never the runtime configuration home.
