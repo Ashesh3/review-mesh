@@ -269,7 +269,7 @@ async function run(options: {
 }
 
 it("executes all forty strict jobs after early findings while retaining required adjudication", async () => {
-  const { result, received } = await run({
+  const { result, received, records } = await run({
     profile: "strict-evaluation",
     finding: true,
   });
@@ -288,6 +288,23 @@ it("executes all forty strict jobs after early findings while retaining required
   expect(result.exitCode).toBe(1);
   expect(result.canonical.counts.raw_source_findings).toBe(8);
   expect(result.canonical.counts.gate_eligible_subfindings).toBe(1);
+  expect(
+    records.filter(
+      (record) =>
+        record.record === "reviewer.terminal" &&
+        (record.data as { mode?: string }).mode === "full_review",
+    ),
+  ).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        data: expect.objectContaining({
+          finding_proofs: {
+            f1: expect.objectContaining({ adjudication_required: true }),
+          },
+        }),
+      }),
+    ]),
+  );
 });
 
 it("does not call strict execution complete when any configured adjudicator fails", async () => {

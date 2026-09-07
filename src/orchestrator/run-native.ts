@@ -717,11 +717,15 @@ export async function runNativeReview(input: V9RunInput) {
           result: final,
         });
         raw.push(...sourceRaw);
-        for (const finding of sourceRaw)
-          proofs[finding.source_ref] = {
+        for (const finding of sourceRaw) {
+          localProofs[finding.finding_id] = {
             ...localProofs[finding.finding_id],
             adjudication_required: reviewer.policy?.adjudication === "required",
           };
+          proofs[finding.source_ref] = {
+            ...localProofs[finding.finding_id],
+          };
+        }
       } else {
         final = result;
         const sourceResult = reviewerResultV4Schema.parse({
