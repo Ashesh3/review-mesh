@@ -1,5 +1,12 @@
 import { expect, it } from "vitest";
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +15,88 @@ import { resolvedReviewer, resolvedContext } from "../helpers/fixtures.js";
 import type { Options, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { createServer } from "node:http";
 import { nativeResultJsonSchema } from "../../src/protocol/native-review.js";
+
+it("keeps the original context readable through a system pointer after compaction and cleans it with the private home", async () => {
+  let retainedPath: string | undefined;
+  let system = "";
+  let retained:
+    | { context: { git: { diff: string } }; required_changed_paths: string[] }
+    | undefined;
+  const originalDiff =
+    "diff --git a/source.ts b/source.ts\n--- a/source.ts\n+++ b/source.ts\n@@ -1 +1 @@\n-old\n+new\n";
+  const context = resolvedContext({
+    git: {
+      is_repository: true,
+      root: "F:/fixture",
+      branch: "main",
+      head: "a".repeat(40),
+      merge_base: "b".repeat(40),
+      status_entries: [],
+      changed_files: ["source.ts", "support.ts"],
+      diff_stat: "",
+      diff: originalDiff,
+      truncated: {
+        status_entries: false,
+        changed_files: false,
+        diff_stat: false,
+        diff: false,
+      },
+    },
+  });
+  const adapter = createNativeClaudeAdapter(
+    { type: "claude", api_key_env: "KEY" },
+    {
+      environment: { KEY: "fixture" },
+      runtime: () => ({
+        executablePath: "fixture",
+        pathEntries: [],
+        sdkVersion: "fixture",
+        runtimeVersion: "fixture",
+        mode: "managed_process",
+      }),
+      query: ({ options }) =>
+        (async function* () {
+          system = String(options.systemPrompt);
+          const files = await readdir(options.env!.CLAUDE_CONFIG_DIR!);
+          const file = files.find((name) => name.startsWith("native-context-"));
+          if (file) {
+            retainedPath = join(options.env!.CLAUDE_CONFIG_DIR!, file);
+            // Reading is the SDK's native tool boundary; no reconstructed prompt is needed.
+            retained = JSON.parse(await readFile(retainedPath, "utf8"));
+          }
+          yield {
+            type: "system",
+            subtype: "compact_boundary",
+            uuid: "00000000-0000-0000-0000-000000000001",
+            session_id: "00000000-0000-0000-0000-000000000002",
+            compact_metadata: { trigger: "auto", pre_tokens: 100000 },
+          } as SDKMessage;
+        })(),
+    },
+  );
+  for await (const _event of adapter.run({
+    runId: "fixture",
+    reviewer: resolvedReviewer({ adapter: { type: "claude" } }),
+    context,
+    prompt: {
+      system: "Trusted review instructions.",
+      user: "Original context was compacted.",
+      combined: "Review",
+    },
+    resultJsonSchema: { type: "object" },
+    isolationPolicy: "prefer_enforced",
+    signal: new AbortController().signal,
+  })) {
+    /* drain */
+  }
+  expect(retained?.context.git.diff).toBe(originalDiff);
+  expect(retained?.required_changed_paths).toEqual(["source.ts", "support.ts"]);
+  expect(system).toContain("Trusted review instructions.");
+  expect(system).toContain("After compaction");
+  expect(system).toContain("native-context-");
+  expect(retainedPath).toBeDefined();
+  expect(existsSync(retainedPath!)).toBe(false);
+});
 
 it("keeps bounded sanitized SDK errors without leaking selected credential values", async () => {
   const diagnostics: unknown[] = [];

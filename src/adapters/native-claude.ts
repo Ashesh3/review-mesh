@@ -13,6 +13,10 @@ import type { AdapterRegistration } from "../config/schemas.js";
 import { resolveSdkRuntime, type SdkRuntime } from "../runtime/sdk-runtime.js";
 import { createClaudeProcessOwner } from "../runtime/claude-process.js";
 import {
+  createNativeContextFile,
+  nativeContextFileHint,
+} from "../runtime/native-context.js";
+import {
   providerReviewerResultV4Schema,
   adjudicationResultV2Schema,
 } from "../protocol/v9.js";
@@ -485,6 +489,7 @@ export function createNativeClaudeAdapter(
       };
       try {
         home = await mkdtemp(join(tmpdir(), "review-mesh-claude-"));
+        const contextFile = await createNativeContextFile(home, input.context);
         const options = nativeOptions(controller, runtimeEnvironment);
         options.stderr = (text) => {
           stderr = `${stderr}${text}`.slice(-8000);
@@ -508,7 +513,7 @@ export function createNativeClaudeAdapter(
         options.env = { ...options.env, CLAUDE_CONFIG_DIR: home };
         options.cwd = input.context.workspace;
         options.model = input.reviewer.model;
-        options.systemPrompt = input.prompt.system;
+        options.systemPrompt = `${input.prompt.system}\n\n${nativeContextFileHint(contextFile)}`;
         options.outputFormat = {
           type: "json_schema",
           schema: claudeOutputSchema(input.resultJsonSchema),
