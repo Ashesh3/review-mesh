@@ -6,6 +6,7 @@ import {
   providerReviewerResultV4Schema,
   reviewerResultV4Schema,
   type ActionableFindingV4,
+  type AdjudicationResultV2,
 } from "../../src/protocol/v9.js";
 import {
   buildCanonicalRawFindings,
@@ -63,16 +64,202 @@ afterEach(async () => {
 });
 
 describe("native review contract", () => {
-  it("retains more than sixteen native findings while preserving the legacy limit", () => {
+  it("keeps a large original diff in the readable native context instead of duplicating it in every model prompt", async () => {
+    const native = await import("../../src/protocol/native-review.js");
+    const diff =
+      "diff --git a/source.ts b/source.ts\n" +
+      "+ORIGINAL_RETAINED_DIFF_LINE\n".repeat(6000);
+    const context = resolvedContext({
+      git: {
+        is_repository: true,
+        root: "F:/review",
+        head: "a".repeat(40),
+        branch: "review",
+        merge_base: "b".repeat(40),
+        status_entries: [],
+        changed_files: ["source.ts"],
+        diff_stat: "1 file",
+        diff,
+        raw_diff: {
+          byte_count: Buffer.byteLength(diff),
+          sha256: "c".repeat(64),
+        },
+        truncated: {
+          status_entries: false,
+          changed_files: false,
+          diff_stat: false,
+          diff: false,
+        },
+      },
+    });
+    const prompt = native.buildNativeReviewPrompt(resolvedReviewer(), context);
+    expect(prompt.user).not.toContain("ORIGINAL_RETAINED_DIFF_LINE");
+    expect(prompt.user).toContain("retained_native_diff");
+    expect(prompt.system).toContain("retained original diff");
+    expect(context.git.is_repository && context.git.diff).toBe(diff);
+  });
+  it("lets native reviewers choose inspection without attestation or read checklists", async () => {
+    const native = await import("../../src/protocol/native-review.js");
+    const reviewer = resolvedReviewer({
+      instruction_layers: [
+        { source: "trusted", content: "Configured review instructions" },
+      ],
+      policy: {
+        passQuorum: 1,
+        minimumProviderGroups: 1,
+        adjudication: "required",
+        gateMinimumSeverity: "medium",
+        gateMinimumConfidence: "medium",
+        changeCoverage: {
+          relevantPaths: ["**"],
+          minimumInspection: "full_file",
+          proof: "native_attested",
+        },
+      },
+    });
+    const context = resolvedContext({
+      git: {
+        is_repository: true,
+        root: "F:/repo",
+        head: "abc",
+        merge_base: "base",
+        branch: "feature",
+        status_entries: [],
+        changed_files: ["a.ts", "b.ts"],
+        diff_stat: "",
+        diff: "original-diff-marker",
+        truncated: {
+          status_entries: false,
+          changed_files: false,
+          diff_stat: false,
+          diff: false,
+        },
+      },
+    });
+    const prompt = native.buildNativeReviewPrompt(reviewer, context);
+    expect(prompt.system).toContain("Configured review instructions");
+    expect(prompt.system).toContain("read-only");
+    expect(prompt.system).toContain("Git");
+    expect(prompt.system).toContain("plain-text");
+    expect(prompt.system).not.toMatch(
+      /mandatory|checklist|full.file inspection|Read each required|batch|next-offset|native_scope_attestation|ordered_execution_proof|base_head_comparison/,
+    );
+    expect(prompt.user).toContain("original-diff-marker");
+    expect(prompt.user).toContain('"branch": "feature"');
+    const schema = native.nativeResultJsonSchema(reviewer);
+    expect(schema.required).not.toContain("native_scope_attestation");
+    expect(schema.properties).not.toHaveProperty("native_scope_attestation");
+    expect(schema.properties).not.toHaveProperty("coverage_attestation");
+    const { native_scope_attestation: _old, ...without } = result();
+    expect(
+      native.validateNativeSubmission(
+        reviewer,
+        context,
+        providerReviewerResultV4Schema.parse(without),
+      ),
+    ).toEqual({ accepted: true });
+    for (const complete of [true, false])
+      expect(
+        native.validateNativeSubmission(
+          reviewer,
+          context,
+          providerReviewerResultV4Schema.parse({
+            ...result(),
+            native_scope_attestation: {
+              complete,
+              reviewed_paths: [],
+              limitations: ["Historical metadata only"],
+            },
+          }),
+        ),
+      ).toEqual({ accepted: true });
+  });
+
+  it("represents agent-selected inspection without an invented coverage claim", async () => {
+    const native = await import("../../src/protocol/native-review.js");
+    expect(native.createAgentSelectedChangeCoverage()).toEqual({
+      status: "not_applicable",
+      proof_kind: "unknown",
+      contract: "native_review_v1",
+      inspected_count: 0,
+      deficit_count: 0,
+      deficit_sample: [],
+    });
+  });
+
+  it("validates every native adjudication candidate without requiring an unrelated full review", async () => {
+    const native = await import("../../src/protocol/native-review.js");
+    const reviewer = resolvedReviewer({
+      policy: {
+        mode: "adjudication",
+        candidateFindings: [{ id: "one" }, { id: "two" }],
+        passQuorum: 1,
+        minimumProviderGroups: 1,
+        adjudication: "required",
+        gateMinimumSeverity: "medium",
+        gateMinimumConfidence: "medium",
+      },
+    });
+    const decision = {
+      source_finding_id: "one",
+      decision: "rejected" as const,
+      rationale: "The cited behavior is unchanged.",
+      cited_evidence: [],
+      unverified_assumptions: [],
+    };
+    const report: AdjudicationResultV2 = {
+      schema_version: "2",
+      kind: "review-mesh.adjudication-result",
+      verdict: "pass",
+      review_markdown: "Checked the candidates",
+      summary: "No defects",
+      actionable_findings: [],
+      decisions: [decision],
+      informational_notes: [],
+    };
+    const context = resolvedContext();
+    expect(
+      native.validateNativeSubmission(reviewer, context, report),
+    ).toMatchObject({
+      accepted: false,
+      message: expect.stringContaining("two"),
+    });
+    report.decisions.push({ ...decision, source_finding_id: "two" });
+    expect(native.validateNativeSubmission(reviewer, context, report)).toEqual({
+      accepted: true,
+    });
+    report.decisions.push(decision);
+    expect(
+      native.validateNativeSubmission(reviewer, context, report),
+    ).toMatchObject({
+      accepted: false,
+      message: expect.stringContaining("duplicate"),
+    });
+    report.decisions = [{ ...decision, source_finding_id: "unknown" }];
+    expect(
+      native.validateNativeSubmission(reviewer, context, report),
+    ).toMatchObject({
+      accepted: false,
+      message: expect.stringContaining("unknown"),
+    });
+    const prompt = native.buildNativeReviewPrompt(reviewer, context);
+    expect(prompt.system).not.toContain("Review the declared changed paths");
+    expect(prompt.system).toContain("assigned candidate");
+    expect(prompt.system).toContain("ADJUDICATION CANDIDATES");
+    expect(prompt.system).toContain('"id": "one"');
+    expect(prompt.user).not.toContain("REQUIRED CHANGED PATH CHECKLIST");
+  });
+
+  it("retains more than sixteen native findings without requiring scope attestation", () => {
     const value = result();
     value.actionable_findings = Array.from({ length: 17 }, (_, index) => ({
       ...structuredClone(finding),
       id: `f${index}`,
     })) as typeof value.actionable_findings;
     expect(providerReviewerResultV4Schema.safeParse(value).success).toBe(true);
-    const { native_scope_attestation: _attestation, ...legacy } = value;
-    expect(providerReviewerResultV4Schema.safeParse(legacy).success).toBe(
-      false,
+    const { native_scope_attestation: _attestation, ...unattested } = value;
+    expect(providerReviewerResultV4Schema.safeParse(unattested).success).toBe(
+      true,
     );
   });
 

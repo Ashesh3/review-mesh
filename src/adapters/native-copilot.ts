@@ -1,3 +1,4 @@
+import { createNativeSubmissionGuard } from "../runtime/native-submission-guard.js";
 import type {
   CopilotClient,
   CopilotClientOptions,
@@ -9,6 +10,13 @@ import { getAppPaths } from "../config/paths.js";
 import type { AdapterRegistration } from "../config/schemas.js";
 import { loadCopilotSdkModule } from "../copilot/runtime.js";
 import { resolveSdkRuntime, type SdkRuntime } from "../runtime/sdk-runtime.js";
+import { sendCopilotReviewAndWait } from "../runtime/copilot-completion.js";
+import { createCopilotProgressTracker } from "../runtime/copilot-progress.js";
+import {
+  createNativeContextFile,
+  nativeContextFileHint,
+} from "../runtime/native-context.js";
+import type { ResolvedContext } from "../context/resolve.js";
 import {
   providerReviewerResultV4Schema,
   adjudicationResultV2Schema,
@@ -19,7 +27,11 @@ import {
   type AdapterEvent,
   type AdapterReviewInput,
 } from "./types.js";
-import { adapterFailure, sanitizePublicText } from "./errors.js";
+import {
+  adapterFailure,
+  sanitizePublicText,
+  type AdapterFailureDiagnostics,
+} from "./errors.js";
 
 function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -67,6 +79,43 @@ export function createNativeCopilotAdapter(
     Object.hasOwn(environment, name) && typeof environment[name] === "string"
       ? environment[name]
       : undefined;
+  const redactions = [settings.api_key_env, ...(settings.env_allowlist ?? [])]
+    .flatMap((name) => {
+      const value = name ? ownEnvironment(name) : undefined;
+      return value ? [value, encodeURIComponent(value)] : [];
+    })
+    .sort((a, b) => b.length - a.length);
+  const safe = (value: unknown) =>
+    typeof value === "string"
+      ? sanitizePublicText(
+          redactions
+            .reduce(
+              (text, secret) => text.split(secret).join("[redacted]"),
+              value,
+            )
+            .replace(/https?:\/\/[^\s"'<>]+/giu, "[redacted-url]")
+            .replace(
+              /(["'](?:authorization|api[_-]?key|access[_-]?token|auth|client[_-]?secret|password|secret|accountkey|token)["']\s*:\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/giu,
+              '$1"[redacted]"',
+            ),
+        )
+      : undefined;
+  const redactLiteralValues = (value: unknown): unknown => {
+    if (typeof value === "string")
+      return redactions.reduce(
+        (text, secret) => text.split(secret).join("[redacted]"),
+        value,
+      );
+    if (Array.isArray(value)) return value.map(redactLiteralValues);
+    if (value && typeof value === "object")
+      return Object.fromEntries(
+        Object.entries(value).map(([key, child]) => [
+          key,
+          redactLiteralValues(child),
+        ]),
+      );
+    return value;
+  };
   const provider = () => {
     if (!settings.base_url_env) {
       if (settings.api_key_env)
@@ -205,7 +254,7 @@ export function createNativeCopilotAdapter(
       } catch (error) {
         message =
           error instanceof Error
-            ? sanitizePublicText(error.message)
+            ? safe(error.message)
             : "Copilot SDK runtime initialization failed.";
       } finally {
         if (value) await close(value);
@@ -249,11 +298,49 @@ export function createNativeCopilotAdapter(
       let wake: (() => void) | undefined,
         done = false,
         failed = false,
+        submissionFeedback: string | undefined,
         submitted:
           | ReturnType<typeof providerReviewerResultV4Schema.parse>
           | ReturnType<typeof adjudicationResultV2Schema.parse>
           | undefined;
       const events: AdapterEvent[] = [];
+      const trackProgress = createCopilotProgressTracker();
+      const submissionGuard = createNativeSubmissionGuard({
+        reviewer: input.reviewer,
+        context: input.context,
+        signal: input.signal,
+      });
+      let lastOperation = "initialize";
+      let failureDetails: AdapterFailureDiagnostics | undefined;
+      const captureException = (error: unknown) => {
+        failureDetails ??= {
+          failure_stage: "native_copilot",
+          last_operation: lastOperation,
+          exception_name:
+            (error instanceof Error ? safe(error.name) : undefined) ?? "Error",
+          exception_message:
+            safe(error instanceof Error ? error.message : error) ??
+            "Copilot SDK operation failed.",
+        };
+      };
+      const failure = async () => {
+        const detail =
+          failureDetails?.provider_error_message ??
+          failureDetails?.exception_message;
+        const result = adapterFailure.processCrashed(
+          detail
+            ? `Copilot SDK review failed: ${detail}`
+            : "Copilot SDK review failed.",
+          false,
+          failureDetails ? { diagnostics: failureDetails } : {},
+        );
+        if (result.diagnostics)
+          await input.recordDiagnostic?.({
+            kind: "adapter_exception",
+            diagnostics: result.diagnostics,
+          });
+        return result;
+      };
       const push = (event: AdapterEvent) => {
         events.push(event);
         wake?.();
@@ -263,9 +350,16 @@ export function createNativeCopilotAdapter(
           yield { type: "failure", failure: adapterFailure.cancelled() };
           return;
         }
+        lastOperation = "createClient";
         value = await client(input.signal, runtime());
         input.signal.throwIfAborted();
+        lastOperation = "start";
         await abortable(value.start(), input.signal);
+        input.signal.throwIfAborted();
+        const contextFile = await createNativeContextFile(
+          active.get(value)!.directory,
+          redactLiteralValues(input.context) as ResolvedContext,
+        );
         input.signal.throwIfAborted();
         const schema =
           input.reviewer.policy?.mode === "adjudication"
@@ -276,22 +370,25 @@ export function createNativeCopilotAdapter(
           workingDirectory: input.context.workspace,
           configDirectory: active.get(value)!.directory,
           streaming: true,
-          systemMessage: { mode: "append", content: input.prompt.system },
+          systemMessage: {
+            mode: "append",
+            content: `${input.prompt.system}\n\n${nativeContextFileHint(contextFile)}`,
+          },
           enableConfigDiscovery: false,
           enableOnDemandInstructionDiscovery: false,
           enableFileHooks: false,
           enableSkills: false,
           enableSessionStore: false,
-          enableHostGitOperations: false,
+          enableHostGitOperations: true,
           availableTools: [
             "builtin:view",
             "builtin:grep",
             "builtin:glob",
+            "builtin:bash",
+            "builtin:powershell",
             "custom:submit_review",
           ],
           excludedTools: [
-            "builtin:bash",
-            "builtin:powershell",
             "builtin:edit",
             "builtin:create",
             "builtin:apply_patch",
@@ -301,10 +398,19 @@ export function createNativeCopilotAdapter(
           instructionDirectories: [],
           remoteSession: "off",
           infiniteSessions: { enabled: true },
-          onPermissionRequest: (request) =>
-            request.kind === "read" && !request.managedApprovalRequired
+          onPermissionRequest: (request) => {
+            const readOnly =
+              request.kind === "read" ||
+              (request.kind === "shell" &&
+                request.commands.length > 0 &&
+                request.commands.every((command) => command.readOnly) &&
+                !request.hasWriteFileRedirection &&
+                request.possibleUrls.length === 0 &&
+                !request.requestSandboxBypass);
+            return readOnly && !request.managedApprovalRequired
               ? { kind: "approve-once" }
-              : { kind: "reject", feedback: "Read-only review" },
+              : { kind: "reject", feedback: "Read-only review" };
+          },
           tools: [
             {
               name: "submit_review",
@@ -314,19 +420,41 @@ export function createNativeCopilotAdapter(
               isTerminal: true,
               skipPermission: true,
               defer: "never",
-              handler: (args) => {
+              handler: async (args) => {
                 const parsed = schema.safeParse(args);
-                if (!parsed.success)
+                if (!parsed.success) {
+                  const issues = parsed.error.issues
+                    .slice(0, 12)
+                    .map((issue) => {
+                      const path = issue.path.map(String).join(".") || "<root>";
+                      const expected =
+                        issue.code === "invalid_type"
+                          ? `; expected ${issue.expected}`
+                          : "";
+                      return `${safe(path) ?? "<field>"}: ${issue.code}${expected}`;
+                    });
+                  submissionFeedback = `Review does not satisfy the required schema: ${issues.join("; ")}. Provide all required fields and preserve every finding and candidate decision.`;
                   return {
                     resultType: "failure",
-                    error:
-                      "Review does not satisfy the required schema; provide all required fields.",
+                    textResultForLlm: submissionFeedback,
+                    error: submissionFeedback,
                   };
+                }
                 if (submitted)
                   return {
                     resultType: "failure",
+                    textResultForLlm: "Review was already submitted.",
                     error: "Review was already submitted.",
                   };
+                const validation = await submissionGuard.validate(parsed.data);
+                if (!validation.accepted) {
+                  submissionFeedback = validation.message;
+                  return {
+                    resultType: "failure",
+                    textResultForLlm: submissionFeedback,
+                    error: submissionFeedback,
+                  };
+                }
                 submitted = parsed.data;
                 return {
                   resultType: "success",
@@ -344,6 +472,7 @@ export function createNativeCopilotAdapter(
               }
             : {}),
         };
+        lastOperation = "createSession";
         const creation = value.createSession(config);
         void creation.then(
           (late) => {
@@ -354,34 +483,56 @@ export function createNativeCopilotAdapter(
         );
         session = await abortable(creation, input.signal);
         input.signal.throwIfAborted();
+        // Empty SDK sessions omit the CLI's script-safety setup. Enable the
+        // runtime's own command classification before exposing shell execution.
+        lastOperation = "configureScriptSafety";
+        await abortable(
+          session.rpc.options.update({ enableScriptSafety: true }),
+          input.signal,
+        );
+        input.signal.throwIfAborted();
         session.on((event) => {
-          if (event.type === "session.error") failed = true;
-          if (
-            [
-              "tool.execution_start",
-              "tool.execution_complete",
-              "assistant.turn_start",
-              "session.compaction_start",
-              "session.compaction_complete",
-            ].includes(event.type)
-          )
-            push({
-              type: "activity",
-              message: `Copilot ${event.type.replaceAll(".", " ")}.`,
-            });
+          if (event.type === "session.error") {
+            failed = true;
+            failureDetails ??= {
+              failure_stage: "native_copilot",
+              last_operation: "session.error",
+              exception_name: safe(event.data.errorType) ?? "Error",
+              provider_error_message:
+                safe(event.data.message) ?? "Copilot SDK session failed.",
+              ...(event.data.errorCode
+                ? {
+                    provider_error_code:
+                      safe(event.data.errorCode) ?? "unknown",
+                  }
+                : {}),
+              ...(event.data.providerCallId
+                ? {
+                    provider_request_id:
+                      safe(event.data.providerCallId) ?? "unknown",
+                  }
+                : {}),
+              ...(event.data.statusCode === undefined
+                ? {}
+                : { http_status: event.data.statusCode }),
+            };
+          }
+          const progress = trackProgress(event);
+          if (progress) push(progress);
         });
-        const pending = abortable(
-          session.sendAndWait(
-            {
-              prompt: `${input.prompt.user}\n\nSubmit the final result with submit_review.`,
-              agentMode: "interactive",
-            },
-            input.reviewer.timeoutMs,
-          ),
+        lastOperation = "sendAndWait";
+        const pending = sendCopilotReviewAndWait(
+          session,
+          {
+            prompt: `${input.prompt.user}\n\nSubmit the final result with submit_review.`,
+            agentMode: "interactive",
+          },
+          input.reviewer.timeoutMs,
           input.signal,
         )
-          .catch(() => {
+          .catch((error: unknown) => {
             failed = true;
+            captureException(error);
           })
           .finally(() => {
             done = true;
@@ -401,15 +552,15 @@ export function createNativeCopilotAdapter(
         else if (failed)
           yield {
             type: "failure",
-            failure: adapterFailure.processCrashed(
-              "Copilot SDK review failed.",
-            ),
+            failure: await failure(),
           };
         else if (!submitted)
           yield {
             type: "failure",
             failure: adapterFailure.invalidResult(
-              "Copilot ended without submitting a structured review.",
+              submissionFeedback
+                ? `Copilot could not submit a valid review: ${safe(submissionFeedback)}`
+                : "Copilot ended without submitting a structured review.",
             ),
           };
         else
@@ -418,12 +569,13 @@ export function createNativeCopilotAdapter(
             result: submitted,
             isolation: "runtime_read_only",
           };
-      } catch {
+      } catch (error) {
+        captureException(error);
         yield {
           type: "failure",
           failure: input.signal.aborted
             ? adapterFailure.cancelled()
-            : adapterFailure.processCrashed("Copilot SDK review failed."),
+            : await failure(),
         };
       } finally {
         input.signal.removeEventListener("abort", abort);

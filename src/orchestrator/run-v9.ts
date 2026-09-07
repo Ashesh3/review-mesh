@@ -1359,6 +1359,11 @@ export async function runV9Review(input: V9RunInput) {
             const verification = await verifyAdjudicationEvidence({
               workspace: input.context.workspace,
               adjudicationResult: final,
+              ...(input.context.git.is_repository &&
+              input.context.git.merge_base
+                ? { baseRevision: input.context.git.merge_base }
+                : {}),
+              signal: child.signal,
             });
             const outcome = validateAdjudication(adjudicationResult!, final, {
               reviewScope: input.context.review_scope.mode,

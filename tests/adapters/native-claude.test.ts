@@ -1,5 +1,13 @@
 import { expect, it } from "vitest";
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdtemp,
+  readFile,
+  realpath,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +16,96 @@ import { resolvedReviewer, resolvedContext } from "../helpers/fixtures.js";
 import type { Options, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { createServer } from "node:http";
 import { nativeResultJsonSchema } from "../../src/protocol/native-review.js";
+it("keeps the original context readable through a system pointer after compaction and cleans it with the private home", async () => {
+  let retainedPath: string | undefined;
+  let system = "";
+  let retained:
+    { context: { git: { diff: string } }; changed_paths: string[] } | undefined;
+  const originalDiff =
+    "diff --git a/source.ts b/source.ts\n--- a/source.ts\n+++ b/source.ts\n@@ -1 +1 @@\n-old\n+new\n";
+  const context = resolvedContext({
+    git: {
+      is_repository: true,
+      root: "F:/fixture",
+      branch: "main",
+      head: "a".repeat(40),
+      merge_base: "b".repeat(40),
+      status_entries: [],
+      changed_files: ["source.ts", "support.ts"],
+      diff_stat: "",
+      diff: originalDiff,
+      truncated: {
+        status_entries: false,
+        changed_files: false,
+        diff_stat: false,
+        diff: false,
+      },
+    },
+  });
+  const adapter = createNativeClaudeAdapter(
+    { type: "claude", api_key_env: "KEY" },
+    {
+      environment: { KEY: "fixture" },
+      runtime: () => ({
+        executablePath: "fixture",
+        pathEntries: [],
+        sdkVersion: "fixture",
+        runtimeVersion: "fixture",
+        mode: "managed_process",
+      }),
+      query: ({ options }) =>
+        (async function* () {
+          system = String(options.systemPrompt);
+          const contextDirectory = options.additionalDirectories?.[0];
+          expect(contextDirectory).toBe(
+            await realpath(
+              join(options.env!.CLAUDE_CONFIG_DIR!, "review-context"),
+            ),
+          );
+          expect(options.additionalDirectories).toHaveLength(1);
+          const files = await readdir(contextDirectory!);
+          const file = files.find(
+            (name) =>
+              name.startsWith("native-context-") && name.endsWith(".json"),
+          );
+          if (file) {
+            retainedPath = join(contextDirectory!, file);
+            // Reading is the SDK's native tool boundary; no reconstructed prompt is needed.
+            retained = JSON.parse(await readFile(retainedPath, "utf8"));
+          }
+          yield {
+            type: "system",
+            subtype: "compact_boundary",
+            uuid: "00000000-0000-0000-0000-000000000001",
+            session_id: "00000000-0000-0000-0000-000000000002",
+            compact_metadata: { trigger: "auto", pre_tokens: 100000 },
+          } as SDKMessage;
+        })(),
+    },
+  );
+  for await (const _event of adapter.run({
+    runId: "fixture",
+    reviewer: resolvedReviewer({ adapter: { type: "claude" } }),
+    context,
+    prompt: {
+      system: "Trusted review instructions.",
+      user: "Original context was compacted.",
+      combined: "Review",
+    },
+    resultJsonSchema: { type: "object" },
+    isolationPolicy: "prefer_enforced",
+    signal: new AbortController().signal,
+  })) {
+    /* drain */
+  }
+  expect(retained?.context.git.diff).toBe(originalDiff);
+  expect(retained?.changed_paths).toEqual(["source.ts", "support.ts"]);
+  expect(system).toContain("Trusted review instructions.");
+  expect(system).toContain("after compaction");
+  expect(system).toContain("native-context-");
+  expect(retainedPath).toBeDefined();
+  expect(existsSync(retainedPath!)).toBe(false);
+});
 
 it("keeps bounded sanitized SDK errors without leaking selected credential values", async () => {
   const diagnostics: unknown[] = [];
@@ -232,6 +330,48 @@ it("returns the complete structured review and native attestation from one SDK r
     { type: "result", result, isolation: "runtime_read_only" },
   ]);
 });
+
+it.each([
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLAUDE_CODE_USE_FOUNDRY",
+])(
+  "preserves native %s authentication without inserting an API-key relay",
+  async (provider) => {
+    let captured: Options | undefined;
+    const adapter = createNativeClaudeAdapter(
+      { type: "claude", env_allowlist: [provider] },
+      {
+        environment: { [provider]: "1" },
+        runtime: () => ({
+          executablePath: "fixture",
+          pathEntries: [],
+          sdkVersion: "fixture",
+          runtimeVersion: "fixture",
+          mode: "managed_process",
+        }),
+        query: ({ options }) => {
+          captured = options;
+          return (async function* () {})();
+        },
+      },
+    );
+    for await (const _event of adapter.run({
+      runId: "provider-fixture",
+      reviewer: resolvedReviewer({ adapter: { type: "claude" } }),
+      context: resolvedContext(),
+      prompt: { system: "Review", user: "Review", combined: "Review" },
+      resultJsonSchema: { type: "object" },
+      isolationPolicy: "prefer_enforced",
+      signal: new AbortController().signal,
+    })) {
+      /* drain */
+    }
+    expect(captured?.env?.[provider]).toBe("1");
+    expect(captured?.env?.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(captured?.env?.ANTHROPIC_BASE_URL).toBeUndefined();
+  },
+);
 
 it("returns cancelled without starting the SDK when cancellation predates admission", async () => {
   let calls = 0;
@@ -501,13 +641,80 @@ it("keeps Claude's native tools and uses one SDK session even for a terminal pro
   }))
     events.push(event);
   expect(calls).toBe(1);
-  expect(options?.tools).toEqual(["Read", "Glob", "Grep"]);
+  expect(options?.tools).toEqual(["Read", "Glob", "Grep", "Bash"]);
+  expect(options?.disallowedTools).not.toContain("Bash");
+  expect(options?.disallowedTools).toEqual(
+    expect.arrayContaining(["Edit", "Write", "NotebookEdit"]),
+  );
+  expect(options?.permissionMode).toBe("dontAsk");
   expect(options?.mcpServers).toEqual({});
-  expect(options?.env?.ANTHROPIC_API_KEY).toBe("test-only");
-  expect(options?.env?.ANTHROPIC_BASE_URL).toBe(
-    "http://127.0.0.1:34567/vendor-prefix",
+  expect(options?.settings).toMatchObject({
+    autoCompactEnabled: true,
+  });
+  expect(options?.settings).not.toHaveProperty("autoCompactWindow");
+  expect(options?.hooks?.PreCompact).toHaveLength(1);
+  expect(options?.hooks?.PostCompact).toHaveLength(1);
+  expect(options?.env?.CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS).toBeUndefined();
+  expect(options?.env?.ANTHROPIC_API_KEY).not.toBe("test-only");
+  expect(options?.env?.ANTHROPIC_API_KEY).toMatch(/^[a-f0-9]{64}$/);
+  expect(options?.env?.ANTHROPIC_BASE_URL).toMatch(
+    /^http:\/\/127\.0\.0\.1:\d+$/,
   );
   expect(events.at(-1)).toMatchObject({ type: "failure" });
+});
+
+it("uses native read-only permissions without directing the model's file pagination", async () => {
+  let options: Options | undefined;
+  const adapter = createNativeClaudeAdapter(
+    { type: "claude", api_key_env: "KEY" },
+    {
+      environment: { KEY: "fixture" },
+      runtime: () => ({
+        executablePath: "fixture",
+        pathEntries: [],
+        sdkVersion: "fixture",
+        runtimeVersion: "fixture",
+        mode: "managed_process",
+      }),
+      query: (input) => {
+        options = input.options;
+        return (async function* () {})();
+      },
+    },
+  );
+  for await (const _event of adapter.run({
+    runId: "fixture",
+    reviewer: resolvedReviewer({ adapter: { type: "claude" } }),
+    context: resolvedContext(),
+    prompt: {
+      system: "Read all required files.",
+      user: "Read",
+      combined: "Read",
+    },
+    resultJsonSchema: { type: "object" },
+    isolationPolicy: "prefer_enforced",
+    signal: new AbortController().signal,
+  })) {
+    /* drain */
+  }
+  expect(options?.hooks?.PostToolUse).toBeUndefined();
+  expect(options?.env?.CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS).toBeUndefined();
+  const permission = options!.canUseTool!;
+  const details = {
+    signal: new AbortController().signal,
+    toolUseID: "fixture",
+    requestId: "fixture",
+  };
+  for (const name of ["Read", "Glob", "Grep"])
+    expect(
+      await permission(name, { file_path: "source.ts" }, details),
+    ).toMatchObject({ behavior: "allow" });
+  // The SDK approves known read-only Git commands itself. Anything reaching
+  // this fallback required approval and is not blanket-approved by the host.
+  for (const name of ["Bash", "Edit", "Write", "WebFetch"])
+    expect(
+      await permission(name, { command: "write to source.ts" }, details),
+    ).toMatchObject({ behavior: "deny" });
 });
 
 it("rejects native success without structured output", async () => {

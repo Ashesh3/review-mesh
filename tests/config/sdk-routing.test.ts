@@ -147,29 +147,37 @@ describe("SDK model routing", () => {
     expect(() => routeSdkReviewers(config)).toThrow(/Claude.*claude/i);
   });
 
-  it("requires explicit migration of old snapshot coverage", () => {
-    const config = resolvedConfig({
-      reviewers: [
-        resolvedReviewer({
-          model: "gpt-5.6",
-          adapter: { type: "sdk" },
-          policy: {
-            applicability: { mode: "always" },
-            requiredCallerContext: [],
-            passQuorum: 1,
-            minimumProviderGroups: 1,
-            adjudication: "off",
-            gateMinimumSeverity: "medium",
-            gateMinimumConfidence: "medium",
-            changeCoverage: {
-              relevantPaths: ["**"],
-              minimumInspection: "full_file",
-              proof: "observed",
+  it.each(["observed", "attested", "native_attested"] as const)(
+    "routes SDK reviewers without turning legacy %s coverage settings into native read obligations",
+    (proof) => {
+      const config = resolvedConfig({
+        reviewers: [
+          resolvedReviewer({
+            model: "gpt-5.6",
+            adapter: { type: "sdk" },
+            policy: {
+              applicability: { mode: "always" },
+              requiredCallerContext: [],
+              passQuorum: 1,
+              minimumProviderGroups: 1,
+              adjudication: "off",
+              gateMinimumSeverity: "medium",
+              gateMinimumConfidence: "medium",
+              changeCoverage: {
+                relevantPaths: ["**"],
+                minimumInspection: "full_file",
+                proof,
+              },
             },
-          },
-        }),
-      ],
-    });
-    expect(() => routeSdkReviewers(config)).toThrow(/native_attested/);
-  });
+          }),
+        ],
+      });
+      const routed = routeSdkReviewers(config);
+      expect(routed.reviewers[0]?.adapter.type).toBe("codex");
+      expect(routed.reviewers[0]?.runtime.execution_contract).toBe(
+        "native_review_v1",
+      );
+      expect(routed.reviewers[0]?.policy).toEqual(config.reviewers[0]?.policy);
+    },
+  );
 });

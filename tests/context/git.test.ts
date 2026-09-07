@@ -2,6 +2,24 @@ import { describe, expect, it, vi } from "vitest";
 import { createGitRunner, type GitExecutor } from "../../src/context/git.js";
 
 describe("createGitRunner", () => {
+  it("preserves exact blob bytes and final newline when the evidence reader requests them", async () => {
+    const execute = vi
+      .fn<GitExecutor>()
+      .mockResolvedValue({ stdout: "\xff\n", stderr: "", exitCode: 0 });
+    const output = await createGitRunner(execute).run(
+      ["cat-file", "blob", "a".repeat(40)],
+      { cwd: "C:\\workspace", preserveOutput: true },
+    );
+    expect(execute.mock.calls[0]?.[2]).toMatchObject({
+      encoding: "latin1",
+      stripFinalNewline: false,
+      maxBuffer: 1_048_576,
+    });
+    expect(Buffer.from(output.stdout, "latin1")).toEqual(
+      Buffer.from([0xff, 0x0a]),
+    );
+  });
+
   it("runs Git with trusted helper-disabling arguments and environment", async () => {
     const execute = vi.fn<GitExecutor>().mockResolvedValue({
       stdout: "ok",

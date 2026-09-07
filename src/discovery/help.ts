@@ -352,8 +352,9 @@ effective/describe redact them.
 
 Schema-v7 saves require every lens to declare applicability.mode as always or
 changed_paths and to include required_input, even when it is empty (legacy
-required_context migrates to required_input). Native SDK agents explicitly select
-change_coverage.proof = "native_attested". Multi-lens suites that
+required_context migrates to required_input). Native SDK agents choose their own
+inspection; legacy change_coverage settings do not impose file-read obligations.
+Multi-lens suites that
 concentrate every primary on one provider require
 execution.allow_provider_concentration=true. Multi-provider lenses with zero
 provider-outage tolerance require allow_zero_outage_tolerance=true on the lens.
@@ -459,7 +460,8 @@ guarantee account access or vendor support. Use structured doctor to verify the
 selected runtime, model and credentials. Explicit native types must match the
 model family. Store API key/base URL environment-variable names, never values.
 The retired openai_compatible raw-inference type can be inspected for migration,
-but cannot start a review. Migrate to sdk and explicitly select native_attested.
+but cannot start a review. Migrate to sdk with the supported provider protocol;
+native file selection does not require coverage proof or read receipts.
 
 Every agent chooses a required default adapter plus either one exact model and
 optional effort, or ordered model_runs with explicit run ids, exact models,
@@ -534,9 +536,9 @@ For autonomous changes, use export/apply with revision compare-and-swap:
 Export contains instruction and runtime fields and should be treated as
 sensitive. Readers/export migrate legacy v1-v5 documents in memory. Apply
 accepts one complete schema-v1 through schema-v7 document, not a patch; legacy
-inputs are migrated and saved canonically as v7. Native execution additionally
-requires explicit native_attested coverage and a supported SDK route; retired
-raw inference settings remain available for inspection, not execution. Use
+inputs are migrated and saved canonically as v7. Native execution requires a
+supported SDK route; legacy coverage settings do not control agent-selected reads.
+Retired raw inference settings remain available for inspection, not execution. Use
 'review-mesh schema config --json' and 'review-mesh config --help' for exact
 details.
 `,

@@ -11,7 +11,10 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
+import { createGitRunner, type GitRunner } from "../../src/context/git.js";
+import { createGitFixture } from "../fixtures/git-repo.js";
 import {
   MAX_EVIDENCE_BYTES_PER_PATH,
   verifyAdjudicationEvidence,
@@ -65,6 +68,266 @@ afterEach(async () => {
 });
 
 describe("verifyAdjudicationEvidence", () => {
+  it("verifies the effective adjusted citations instead of reusing only the original proof", async () => {
+    const workspace = await fixture();
+    const judge = result();
+    judge.decisions[0]!.decision = "adjusted";
+    judge.decisions[0]!.adjusted_finding = {
+      severity: "medium",
+      title: "Adjusted",
+      description: "Adjusted claim",
+      evidence: [
+        {
+          path: "src/missing.ts",
+          start_line: 999,
+          end_line: 999,
+          detail: "Adjusted location",
+        },
+      ],
+      suggested_direction: "Fix",
+      confidence: "high",
+      classification: "confirmed_defect",
+      external_assumptions: [],
+    };
+    const invalid = await verifyAdjudicationEvidence({
+      workspace,
+      adjudicationResult: judge,
+    });
+    expect(invalid.by_source_finding_id.candidate).toMatchObject({
+      verified: false,
+      failures: ["read_failed"],
+    });
+    await writeFile(join(workspace, "src", "support.ts"), "supporting code\n");
+    judge.decisions[0]!.adjusted_finding.evidence = [
+      {
+        path: "src/support.ts",
+        start_line: 1,
+        end_line: 1,
+        detail: "Adjusted supporting evidence",
+      },
+    ];
+    const valid = await verifyAdjudicationEvidence({
+      workspace,
+      adjudicationResult: judge,
+    });
+    expect(valid.by_source_finding_id.candidate).toMatchObject({
+      verified: true,
+      verified_citations: expect.arrayContaining([
+        expect.objectContaining({
+          side: "head",
+          path: "src/support.ts",
+          start_line: 1,
+          end_line: 1,
+        }),
+      ]),
+    });
+  });
+
+  it("verifies an old renamed path at the pinned base instead of the current head", async () => {
+    const repository = await createGitFixture();
+    const gitRunner = createGitRunner();
+    const oldBytes = "old one\nold two\nold three\nold four\n";
+    try {
+      await repository.write("src/old.ts", oldBytes);
+      await repository.stage("src/old.ts");
+      await gitRunner.run(["commit", "-m", "Base evidence fixture"], {
+        cwd: repository.path,
+      });
+      const base = await gitRunner.run(["rev-parse", "HEAD"], {
+        cwd: repository.path,
+      });
+      await rm(join(repository.path, "src", "old.ts"));
+      await repository.write("src/new.ts", "new one\n");
+      const judge = result("src/new.ts", 1);
+      judge.decisions[0]!.base_head_comparison = {
+        base: {
+          behavior: "Old behavior",
+          citation: {
+            path: "src/old.ts",
+            start_line: 4,
+            end_line: 4,
+            detail: "Old fourth line",
+          },
+        },
+        head: {
+          behavior: "New behavior",
+          citation: {
+            path: "src/new.ts",
+            start_line: 1,
+            end_line: 1,
+            detail: "New first line",
+          },
+        },
+        impact: "Renamed and shortened.",
+      };
+      const verification = await verifyAdjudicationEvidence({
+        workspace: repository.path,
+        adjudicationResult: judge,
+        baseRevision: base.stdout.trim(),
+        gitRunner,
+      });
+      expect(verification.by_source_finding_id.candidate).toMatchObject({
+        verified: true,
+        failures: [],
+        verified_citations: expect.arrayContaining([
+          {
+            side: "base",
+            path: "src/old.ts",
+            start_line: 4,
+            end_line: 4,
+            source_revision: base.stdout.trim(),
+            sha256: createHash("sha256").update(oldBytes).digest("hex"),
+          },
+          {
+            side: "head",
+            path: "src/new.ts",
+            start_line: 1,
+            end_line: 1,
+            sha256: createHash("sha256").update("new one\n").digest("hex"),
+          },
+        ]),
+      });
+    } finally {
+      await repository.dispose();
+    }
+  });
+
+  it("does not claim the base citation is verified without its exact source revision", async () => {
+    const workspace = await fixture();
+    const judge = result();
+    judge.decisions[0]!.base_head_comparison = {
+      base: {
+        behavior: "Old",
+        citation: judge.decisions[0]!.cited_evidence[0]!,
+      },
+      head: {
+        behavior: "New",
+        citation: judge.decisions[0]!.cited_evidence[0]!,
+      },
+      impact: "Changed",
+    };
+    const verification = await verifyAdjudicationEvidence({
+      workspace,
+      adjudicationResult: judge,
+    });
+    expect(verification.by_source_finding_id.candidate).toMatchObject({
+      verified: false,
+      failures: ["base_revision_unavailable"],
+    });
+  });
+
+  it("does not treat a trailing newline as an additional cited line", async () => {
+    const workspace = await fixture();
+    const verification = await verifyAdjudicationEvidence({
+      workspace,
+      adjudicationResult: result("src/ingest.ts", 4),
+    });
+    expect(verification.by_source_finding_id.candidate).toMatchObject({
+      verified: false,
+      failures: ["line_out_of_range"],
+    });
+  });
+
+  it.each([
+    "unsafe-path",
+    "moving-ref",
+    "symlink",
+    "truncated-blob",
+    "missing-base-line",
+  ])("fails closed for %s while checking base evidence", async (failure) => {
+    const workspace = await fixture();
+    const judge = result();
+    judge.decisions[0]!.base_head_comparison = {
+      base: {
+        behavior: "Old",
+        citation: {
+          path: failure === "unsafe-path" ? "../outside.ts" : "src/ingest.ts",
+          start_line: failure === "missing-base-line" ? 99 : 1,
+          end_line: failure === "missing-base-line" ? 99 : 1,
+          detail: "Old",
+        },
+      },
+      head: {
+        behavior: "New",
+        citation: judge.decisions[0]!.cited_evidence[0]!,
+      },
+      impact: "Changed",
+    };
+    const run = vi
+      .fn<GitRunner["run"]>()
+      .mockResolvedValueOnce({
+        stdout: `${failure === "symlink" ? "120000" : "100644"} blob ${"b".repeat(40)}\tsrc/ingest.ts\0`,
+        stderr: "",
+        exitCode: 0,
+      })
+      .mockResolvedValueOnce({
+        stdout: "old\n",
+        stderr: "",
+        exitCode: 0,
+        ...(failure === "truncated-blob" ? { outputTruncated: true } : {}),
+      });
+    const verification = await verifyAdjudicationEvidence({
+      workspace,
+      adjudicationResult: judge,
+      baseRevision: failure === "moving-ref" ? "main" : "a".repeat(40),
+      gitRunner: { run },
+    });
+    expect(verification.by_source_finding_id.candidate?.verified).toBe(false);
+    if (failure === "unsafe-path" || failure === "moving-ref")
+      expect(run).not.toHaveBeenCalled();
+    if (failure === "symlink") expect(run).toHaveBeenCalledTimes(1);
+    if (failure === "truncated-blob")
+      expect(verification.by_source_finding_id.candidate?.failures).toContain(
+        "evidence_too_large",
+      );
+    if (failure === "missing-base-line")
+      expect(verification.by_source_finding_id.candidate?.failures).toContain(
+        "line_out_of_range",
+      );
+    if (run.mock.calls.length > 0)
+      expect(run.mock.calls[0]?.[0]).toEqual([
+        "--no-replace-objects",
+        "ls-tree",
+        "-z",
+        "a".repeat(40),
+        "--",
+        ":(literal)src/ingest.ts",
+      ]);
+  });
+
+  it("does not let one invalid range poison another candidate sharing the file", async () => {
+    const workspace = await fixture();
+    const judge = result("src/ingest.ts", 99);
+    judge.decisions.push({
+      ...result().decisions[0]!,
+      source_finding_id: "valid",
+    });
+    const verification = await verifyAdjudicationEvidence({
+      workspace,
+      adjudicationResult: judge,
+    });
+    expect(verification.by_source_finding_id.candidate?.verified).toBe(false);
+    expect(verification.by_source_finding_id.valid?.verified).toBe(true);
+  });
+
+  it("fails closed if the same file is overwritten during evidence reading", async () => {
+    const workspace = await fixture();
+    const verification = await verifyAdjudicationEvidence({
+      workspace,
+      adjudicationResult: result(),
+      beforeIdentityCheck: async () => {
+        await writeFile(
+          join(workspace, "src", "ingest.ts"),
+          "changed longer content\n",
+        );
+      },
+    });
+    expect(verification.by_source_finding_id.candidate).toMatchObject({
+      verified: false,
+      failures: ["identity_changed"],
+    });
+  });
+
   it("confirms stable existing full-scope file and line citations", async () => {
     const workspace = await fixture();
     const verification = await verifyAdjudicationEvidence({

@@ -864,6 +864,9 @@ export async function runReviewRound({
         : await verifyAdjudicationEvidence({
             workspace: context.workspace,
             adjudicationResult,
+            ...(context.git.is_repository && context.git.merge_base
+              ? { baseRevision: context.git.merge_base }
+              : {}),
           }).catch(() => ({ by_source_finding_id: {} }));
     const validationContext =
       evidenceVerification === undefined

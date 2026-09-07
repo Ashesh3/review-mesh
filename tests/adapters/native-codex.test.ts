@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
+import { parse as parseToml } from "smol-toml";
 import { resolvedContext, resolvedReviewer } from "../helpers/fixtures.js";
 import { nativeResultJsonSchema } from "../../src/protocol/native-review.js";
 import type {
@@ -79,6 +80,51 @@ async function collect(stream: AsyncIterable<AdapterEvent>) {
   return values;
 }
 
+async function progressFor(events: readonly ThreadEvent[]) {
+  const { createNativeCodexAdapter } =
+    await import("../../src/adapters/native-codex.js");
+  const root = await temporary();
+  const adapter = createNativeCodexAdapter(
+    { type: "codex", api_key_env: "KEY" },
+    {
+      applicationDataDirectory: join(root, "app"),
+      environment: { KEY: "fixture" },
+      createClient: () =>
+        ({
+          startThread: () => ({
+            runStreamed: async () => ({
+              events: (async function* () {
+                yield* events;
+                yield {
+                  type: "item.completed",
+                  item: {
+                    id: "result",
+                    type: "agent_message",
+                    text: JSON.stringify(result()),
+                  },
+                };
+                yield {
+                  type: "turn.completed",
+                  usage: {
+                    input_tokens: 1,
+                    cached_input_tokens: 0,
+                    output_tokens: 1,
+                  },
+                };
+              })(),
+            }),
+          }),
+        }) as never,
+    },
+  );
+  const output = await collect(adapter.run(await input(root)));
+  expect(output.at(-1)?.type).toBe("result");
+  return output.filter(
+    (event): event is Extract<AdapterEvent, { type: "activity" }> =>
+      event.type === "activity",
+  );
+}
+
 function assertStrictSchema(schema: Record<string, any>): void {
   expect(schema).not.toHaveProperty("$schema");
   expect(schema).not.toHaveProperty("const");
@@ -100,6 +146,207 @@ function assertStrictSchema(schema: Record<string, any>): void {
 }
 
 describe("native Codex isolation", () => {
+  it("canonicalizes equivalent MCP arguments for repeated inspection progress", async () => {
+    const args = [
+      { path: "PRIVATE_PATH", range: { end: 10, start: 1 } },
+      { range: { start: 1, end: 10 }, path: "PRIVATE_PATH" },
+      { path: "PRIVATE_PATH", range: { start: 11, end: 20 } },
+    ];
+    const progress = await progressFor(
+      args.map((arguments_, index) => ({
+        type: "item.completed",
+        item: {
+          id: `tool-${index}`,
+          type: "mcp_tool_call",
+          server: "fixture",
+          tool: "read",
+          arguments: arguments_,
+          status: "completed",
+          result: { content: [], structured_content: "PRIVATE_OUTPUT" },
+        },
+      })),
+    );
+    expect(progress[0]?.identity).toMatch(/^codex:/);
+    expect(progress[1]?.identity).toBe(progress[0]?.identity);
+    expect(progress[2]?.identity).not.toBe(progress[0]?.identity);
+    expect(JSON.stringify(progress)).not.toMatch(/PRIVATE_PATH|PRIVATE_OUTPUT/);
+  });
+
+  it("credits distinct successful empty commands once without crediting failed or pending commands", async () => {
+    const definitions = [
+      { command: "read empty-first", status: "completed", exit_code: 0 },
+      { command: "read empty-first", status: "completed", exit_code: 0 },
+      { command: "read empty-second", status: "completed", exit_code: 0 },
+      { command: "read failed", status: "failed", exit_code: 1 },
+      { command: "read pending", status: "in_progress" },
+    ] as const;
+    const progress = await progressFor(
+      definitions.map((definition, index) => ({
+        type:
+          definition.status === "in_progress"
+            ? "item.started"
+            : "item.completed",
+        item: {
+          id: `command-${index}`,
+          type: "command_execution",
+          aggregated_output: "",
+          ...definition,
+        },
+      })),
+    );
+    const { createNativeProgressWatchdog } =
+      await import("../../src/orchestrator/native-progress.js");
+    const watchdog = createNativeProgressWatchdog({
+      timeoutMs: 10000,
+      signal: new AbortController().signal,
+      onTimeout: () => {},
+    });
+    try {
+      expect(progress.map((event) => watchdog.record(event))).toEqual([
+        true,
+        false,
+        true,
+        false,
+        false,
+      ]);
+      expect(progress[0]?.byteCount).toBeUndefined();
+      expect(progress[0]?.identity).toContain(":complete:");
+    } finally {
+      watchdog.close();
+    }
+  });
+
+  it("credits successful empty MCP completions but does not credit failed MCP responses", async () => {
+    const progress = await progressFor([
+      {
+        type: "item.completed",
+        item: {
+          id: "ok",
+          type: "mcp_tool_call",
+          server: "fixture",
+          tool: "read",
+          arguments: { path: "empty" },
+          status: "completed",
+        },
+      },
+      {
+        type: "item.completed",
+        item: {
+          id: "bad",
+          type: "mcp_tool_call",
+          server: "fixture",
+          tool: "read",
+          arguments: { path: "denied" },
+          status: "failed",
+          error: { message: "PRIVATE_ERROR" },
+        },
+      },
+    ]);
+    expect(progress[0]?.identity).toContain(":complete:");
+    expect(progress[0]?.byteCount).toBeUndefined();
+    expect(progress[1]?.identity).toBeUndefined();
+    expect(JSON.stringify(progress)).not.toContain("PRIVATE_ERROR");
+  });
+
+  it("keeps malformed or oversized MCP identities diagnostic-only", async () => {
+    const cycle: Record<string, unknown> = {};
+    cycle.next = cycle;
+    const progress = await progressFor(
+      [cycle, { path: "x".repeat(1024 * 1024 + 1) }].map(
+        (arguments_, index) => ({
+          type: "item.completed",
+          item: {
+            id: `tool-${index}`,
+            type: "mcp_tool_call",
+            server: "fixture",
+            tool: "read",
+            arguments: arguments_,
+            status: "completed",
+            result: { content: [], structured_content: "fixture" },
+          },
+        }),
+      ),
+    );
+    expect(progress).toHaveLength(2);
+    expect(progress.every((event) => event.identity === undefined)).toBe(true);
+  });
+
+  it("tracks semantic inspection progress without exposing command output or reasoning text", async () => {
+    const { createNativeCodexAdapter } =
+      await import("../../src/adapters/native-codex.js");
+    const root = await temporary();
+    const command = "Get-Content PRIVATE_FILE";
+    const adapter = createNativeCodexAdapter(
+      { type: "codex", api_key_env: "KEY" },
+      {
+        applicationDataDirectory: join(root, "app"),
+        environment: { KEY: "fixture" },
+        createClient: () =>
+          ({
+            startThread: () => ({
+              runStreamed: async () => ({
+                events: (async function* () {
+                  for (const id of ["first", "repeat"])
+                    yield {
+                      type: "item.completed",
+                      item: {
+                        id,
+                        type: "command_execution",
+                        command,
+                        aggregated_output: "PRIVATE_BYTES",
+                        exit_code: 0,
+                        status: "completed",
+                      },
+                    };
+                  yield {
+                    type: "item.updated",
+                    item: {
+                      id: "reason",
+                      type: "reasoning",
+                      text: "PRIVATE_THOUGHT",
+                    },
+                  };
+                  yield {
+                    type: "item.completed",
+                    item: {
+                      id: "message",
+                      type: "agent_message",
+                      text: JSON.stringify(result()),
+                    },
+                  };
+                  yield {
+                    type: "turn.completed",
+                    usage: {
+                      input_tokens: 1,
+                      cached_input_tokens: 0,
+                      output_tokens: 1,
+                    },
+                  };
+                })(),
+              }),
+            }),
+          }) as never,
+      },
+    );
+    const output = await collect(adapter.run(await input(root)));
+    const activity = output.filter((event) => event.type === "activity");
+    expect(activity[0]).toMatchObject({
+      identity: expect.stringMatching(/^codex:/),
+      byteCount: 13,
+    });
+    expect(activity[1]).toMatchObject({
+      identity: activity[0]!.identity,
+      byteCount: 13,
+    });
+    expect(activity[2]).toMatchObject({
+      identity: expect.stringMatching(/^codex:/),
+      byteCount: 15,
+    });
+    expect(JSON.stringify(activity)).not.toMatch(
+      /PRIVATE_FILE|PRIVATE_BYTES|PRIVATE_THOUGHT/,
+    );
+    expect(output.at(-1)?.type).toBe("result");
+  });
   it("projects both native result schemas to strict required objects and normalizes only optional nulls", async () => {
     const { codexOutputBoundary } =
       await import("../../src/adapters/codex-output.js");
@@ -630,6 +877,137 @@ describe("native Codex isolation", () => {
     expect(JSON.stringify(argumentsPolicy ?? {})).not.toContain(
       "TRUSTED_LONG_POLICY",
     );
+  });
+
+  it("keeps original review context readable from pinned policy after the user turn is compacted", async () => {
+    const { createNativeCodexAdapter } =
+      await import("../../src/adapters/native-codex.js");
+    const root = await temporary();
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    await writeFile(join(workspace, "source.ts"), "NEW_VALUE\n");
+    let runtimeDirectory = "";
+    let contextPath = "";
+    let persistentPolicy = "";
+    let recovered: Record<string, any> | undefined;
+    const adapter = createNativeCodexAdapter(
+      { type: "codex", api_key_env: "KEY" },
+      {
+        applicationDataDirectory: join(root, "app"),
+        environment: { KEY: "NEVER_WRITE_REAL_AUTH" },
+        createClient: (options) =>
+          ({
+            startThread: (threadOptions: { workingDirectory: string }) => ({
+              async runStreamed() {
+                // Model lost the first user message. Use only persistent developer
+                // policy and the file it identifies to reconstruct the original task.
+                runtimeDirectory = threadOptions.workingDirectory;
+                persistentPolicy = String(
+                  parseToml(
+                    await readFile(
+                      join(options.env!.CODEX_HOME!, "config.toml"),
+                      "utf8",
+                    ),
+                  ).developer_instructions,
+                );
+                const files = (await readdir(runtimeDirectory)).filter((name) =>
+                  /^native-context-[a-f0-9]{64}\.json$/.test(name),
+                );
+                if (files[0]) {
+                  contextPath = join(runtimeDirectory, files[0]);
+                  recovered = JSON.parse(await readFile(contextPath, "utf8"));
+                }
+                return {
+                  events: (async function* () {
+                    yield {
+                      type: "item.completed",
+                      item: {
+                        id: "final",
+                        type: "agent_message",
+                        text: JSON.stringify(result()),
+                      },
+                    };
+                    yield {
+                      type: "turn.completed",
+                      usage: {
+                        input_tokens: 1,
+                        cached_input_tokens: 0,
+                        output_tokens: 1,
+                      },
+                    };
+                  })(),
+                };
+              },
+            }),
+          }) as never,
+      },
+    );
+    const review = await input(workspace);
+    const originalDiff =
+      "diff --git a/source.ts b/source.ts\n@@ -1 +1 @@\n-OLD_VALUE\n+NEW_VALUE\n";
+    review.context = resolvedContext({
+      workspace,
+      instructions: "Check the original requested behavior.",
+      caller_context: {
+        ticket: "ORIGINAL_REQUEST_CONTEXT",
+        api_key: "REDACT_THIS_CONTEXT_SECRET",
+      },
+      request: { schema_version: "3", request_id: "original-request" },
+      review_scope: {
+        mode: "changes",
+        source: "request",
+        base: "PINNED_BASE",
+        head: "PINNED_HEAD",
+      },
+      git: {
+        is_repository: true,
+        root: workspace,
+        branch: "fixture",
+        head: "PINNED_HEAD",
+        merge_base: "PINNED_BASE",
+        status_entries: [],
+        changed_files: ["source.ts"],
+        diff_stat: "1 file changed",
+        diff: originalDiff,
+        truncated: {
+          status_entries: false,
+          changed_files: false,
+          diff_stat: false,
+          diff: false,
+        },
+      },
+    });
+    review.prompt.user =
+      "This first user turn is intentionally unavailable after compaction.";
+    const events = await collect(adapter.run(review));
+    expect(events.at(-1)?.type).toBe("result");
+    expect(recovered).toMatchObject({
+      schema_version: "1",
+      kind: "review-mesh.native-context",
+      changed_paths: ["source.ts"],
+      context: {
+        instructions: "Check the original requested behavior.",
+        caller_context: {
+          ticket: "ORIGINAL_REQUEST_CONTEXT",
+          api_key: "[redacted]",
+        },
+        request: { request_id: "original-request" },
+        git: {
+          diff: originalDiff,
+          head: "PINNED_HEAD",
+          merge_base: "PINNED_BASE",
+        },
+      },
+    });
+    expect(contextPath).not.toBe("");
+    expect(persistentPolicy).toContain(JSON.stringify(contextPath));
+    expect(persistentPolicy).toContain("TRUSTED_REVIEW_POLICY");
+    expect(JSON.stringify({ recovered, persistentPolicy })).not.toMatch(
+      /NEVER_WRITE_REAL_AUTH|REDACT_THIS_CONTEXT_SECRET/,
+    );
+    expect(contextPath.startsWith(workspace)).toBe(false);
+    await expect(access(runtimeDirectory)).rejects.toThrow();
+    expect(await readdir(workspace)).toEqual(["source.ts"]);
   });
 
   it("runs one native SDK turn with isolated project content, schema output and a denied workspace write", async () => {

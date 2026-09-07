@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describeTool } from "../../src/discovery/description.js";
+import { renderHelp } from "../../src/discovery/help.js";
 import {
   serializeManagedConfig,
   type ManagedConfig,
@@ -13,7 +14,7 @@ afterEach(async () => {
   for (const root of roots.splice(0))
     await rm(root, { recursive: true, force: true });
 });
-async function fixture(retired: boolean) {
+async function fixture(retired: boolean, strict = false) {
   const root = await mkdtemp(join(tmpdir(), "mesh-native-description-"));
   roots.push(root);
   const workspace = join(root, "project");
@@ -22,6 +23,7 @@ async function fixture(retired: boolean) {
   const config: ManagedConfig = {
     schema_version: "7",
     execution: {
+      ...(strict ? { review_profile: "strict-evaluation" as const } : {}),
       max_concurrency: 1,
       heartbeat_interval_ms: 1000,
       shutdown_grace_period_ms: 1000,
@@ -70,6 +72,18 @@ async function fixture(retired: boolean) {
 }
 
 describe("native discovery contract", () => {
+  it("describes strict complete-roster execution instead of claiming early short circuits", async () => {
+    const output = await describeTool(await fixture(false, true));
+    expect(output.configuration).toMatchObject({
+      execution: { review_profile: "strict-evaluation" },
+    });
+    expect(output.protocol.model_fallback.stop_agent_after).toEqual([
+      "all_configured_models",
+    ]);
+    expect(output.protocol.model_fallback.advance_after).toContain(
+      "adjudication_completion",
+    );
+  });
   it("describes effective vendor routing and SDK ownership without promising model access", async () => {
     const output = await describeTool(await fixture(false));
     expect(output.configuration).toMatchObject({
@@ -96,7 +110,7 @@ describe("native discovery contract", () => {
       },
       retry: {
         native_inheritance: "rerun_all",
-        native_coverage_basis: "model_attested",
+        native_coverage_basis: "agent_selected",
       },
     });
     expect(output.protocol).not.toHaveProperty("provider_transport");
@@ -113,6 +127,15 @@ describe("native discovery contract", () => {
     expect(output.next_actions[0]?.command).toBe(
       "review-mesh config export --json",
     );
-    expect(output.next_actions[0]?.reason).toContain("native_attested");
+    expect(output.next_actions[0]?.reason).toContain('type "sdk"');
+    expect(output.next_actions[0]?.reason).not.toContain("native_attested");
+  });
+  it("describes native configuration without requiring legacy coverage proof or read receipts", () => {
+    for (const topic of ["config", "adapters", "config-file"] as const) {
+      const help = renderHelp(topic);
+      expect(help).not.toMatch(
+        /(?:requires?|select) (?:explicit(?:ly)? )?native_attested|explicitly select\s+change_coverage\.proof/i,
+      );
+    }
   });
 });

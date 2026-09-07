@@ -1031,6 +1031,73 @@ describe("report and findings commands", () => {
     process.exitCode = undefined;
   });
 
+  it("lists native structured review readiness without a file-attestation check in a plain doctor probe", async () => {
+    const root = await mkdtemp(join(tmpdir(), "review-mesh-doctor-agent-led-"));
+    roots.push(root);
+    const workspace = join(root, "demo");
+    const configFile = join(root, "config.toml");
+    await mkdir(workspace);
+    const config: ManagedConfig = {
+      schema_version: "5",
+      execution: {
+        max_concurrency: 1,
+        heartbeat_interval_ms: 1000,
+        shutdown_grace_period_ms: 100,
+      },
+      diagnostics: { persist_runs: false, max_runs: 1 },
+      adapters: { native: { type: "sdk" } },
+      agents: {
+        review: {
+          adapter: "native",
+          model: "gpt-fixture",
+          purpose: "Review",
+          instructions: "Review this branch.",
+          isolation: "prefer_enforced",
+          timeout_ms: 1000,
+        },
+      },
+      defaults: { agents: ["review"] },
+      projects: {},
+    };
+    await writeFile(configFile, serializeManagedConfig(config));
+    const registry = new AdapterRegistry();
+    registry.register("codex", () => ({
+      id: "codex",
+      async probe() {
+        return {
+          available: true,
+          authenticated: true,
+          model_available: true,
+          streaming: true,
+          cancellation: true,
+          maximumIsolation: "runtime_read_only",
+        };
+      },
+      async *run() {
+        throw new Error("A plain probe must not start a review.");
+      },
+    }));
+    const stdout = stream();
+    await runCli(process, {
+      argv: ["doctor", workspace],
+      output: stdout,
+      error: stream(),
+      configFile,
+      adapterRegistry: registry,
+    });
+    const result = JSON.parse(await output(stdout));
+    expect(result.probe_ready).toBe(true);
+    expect(
+      result.reviewers[0].checks.map((entry: { name: string }) => entry.name),
+    ).toEqual([
+      "readiness",
+      "native_schema_submission",
+      "native_execution_artifact",
+      "retry_rerun_all",
+    ]);
+    process.exitCode = undefined;
+  });
+
   it("fails doctor selection cleanly when no exact reviewer matches", async () => {
     const root = await mkdtemp(join(tmpdir(), "review-mesh-doctor-empty-"));
     roots.push(root);

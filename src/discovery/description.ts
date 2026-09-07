@@ -173,8 +173,16 @@ export async function describeTool(options: DescribeToolOptions = {}) {
         advance_after: [
           "clean_pass_until_quorum",
           "operational_failure",
+          ...(configuration.valid &&
+          configuration.execution.review_profile === "strict-evaluation"
+            ? ["adjudication_completion"]
+            : []),
         ] as const,
-        stop_agent_after: ["confirmed_findings", "quorum"] as const,
+        stop_agent_after:
+          configuration.valid &&
+          configuration.execution.review_profile === "strict-evaluation"
+            ? (["all_configured_models"] as const)
+            : (["confirmed_findings", "quorum"] as const),
       },
       progress: {
         phases: [
@@ -227,7 +235,7 @@ export async function describeTool(options: DescribeToolOptions = {}) {
       },
       retry: {
         native_inheritance: "rerun_all" as const,
-        native_coverage_basis: "model_attested" as const,
+        native_coverage_basis: "agent_selected" as const,
         legacy_command_inheritance: "verified_compatible_results" as const,
       },
       review_scope: {
@@ -275,7 +283,7 @@ export async function describeTool(options: DescribeToolOptions = {}) {
           {
             command: "review-mesh config export --json",
             reason:
-              'Migrate the retired adapter to type "sdk" with explicitly selected native_attested coverage. Preserve the exact models and supported provider environment references.',
+              'Migrate the retired adapter to type "sdk". Preserve the exact models and supported provider environment references; native agents choose their review inspection without per-file read receipts.',
           },
         ]
       : configuration.valid

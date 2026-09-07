@@ -108,6 +108,7 @@ export const artifactCoverageV3Schema = z
       "Coverage must reference a manifest or contain a legacy identity, not both.",
   });
 const proof = z.strictObject({
+  review_basis: z.literal("model").optional(),
   native_evidence: nativeFindingEvidenceSchema.optional(),
   evidence_verified: z.boolean().optional(),
   source_coverage_verified: z.boolean().optional(),
@@ -480,7 +481,12 @@ export const privatePayloadSchemas: Record<string, z.ZodType> = {
     runtime_version: text.min(1).max(128).optional(),
     execution_mode: z.literal("managed_process"),
     consistency_mode: z.literal("live_worktree"),
-    coverage_basis: z.enum(["model_attested", "native_observed", "unknown"]),
+    coverage_basis: z.enum([
+      "agent_selected",
+      "model_attested",
+      "native_observed",
+      "unknown",
+    ]),
     sdk_completed: z.boolean(),
     execution_fingerprint: digest.optional(),
     scope_digest: digest.optional(),

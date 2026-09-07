@@ -1,7 +1,15 @@
 import { createHash } from "node:crypto";
 import packageMetadata from "../../package.json" with { type: "json" };
 import { spawn } from "node:child_process";
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import vm from "node:vm";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -25,6 +33,12 @@ const linuxExecutable = join(
   "review-mesh-linux-x64",
 );
 const verifyStandalone = process.env.REVIEW_MESH_VERIFY_STANDALONE === "1";
+const platformSelection =
+  process.env.REVIEW_MESH_VERIFY_STANDALONE_PLATFORMS ?? "windows,linux";
+const requestedPlatforms =
+  platformSelection === "windows"
+    ? (["Windows"] as const)
+    : (["Windows", "Linux"] as const);
 const roots: string[] = [];
 
 interface PlatformRunner {
@@ -339,12 +353,87 @@ afterEach(async () => {
   );
 });
 
-describe.skipIf(!verifyStandalone)("standalone release executables", () => {
-  it("executes the exact Windows and Linux v9 binaries with the full artifact contract", async () => {
-    const runners = await Promise.all([windowsRunner(), linuxRunner()]);
-    expect(runners.every((runner) => runner !== undefined)).toBe(true);
+describe("standalone verification selection", () => {
+  async function invokeVerifier(args: string[], ambient = "windows") {
+    const source = (
+      await readFile(join(projectRoot, "scripts/verify-standalone.mjs"), "utf8")
+    )
+      .replace(/^import[^\n]*\n/gm, "")
+      .replace("import.meta.url", '"file:///verify-standalone.mjs"');
+    let invocation:
+      | { command: string; args: string[]; options: { env: NodeJS.ProcessEnv } }
+      | undefined;
+    const childProcess = {
+      execPath: "/node",
+      argv: ["/node", "/verify", ...args],
+      cwd: () => projectRoot,
+      env: { REVIEW_MESH_VERIFY_STANDALONE_PLATFORMS: ambient },
+      exitCode: undefined as number | undefined,
+    };
+    vm.runInNewContext(source, {
+      process: childProcess,
+      createRequire: () =>
+        Object.assign(() => undefined, {
+          resolve: () => "/vitest/package.json",
+        }),
+      dirname,
+      join,
+      spawnSync(
+        command: string,
+        childArgs: string[],
+        options: { env: NodeJS.ProcessEnv },
+      ) {
+        invocation = { command, args: childArgs, options };
+        return { status: 0 };
+      },
+    });
+    return { invocation, code: childProcess.exitCode };
+  }
 
-    for (const runner of runners as PlatformRunner[]) {
+  it("keeps default verification requiring both artifacts regardless of ambient selection", async () => {
+    const result = await invokeVerifier([]);
+    expect(result.invocation?.options.env).toMatchObject({
+      REVIEW_MESH_VERIFY_STANDALONE: "1",
+      REVIEW_MESH_VERIFY_STANDALONE_PLATFORMS: "windows,linux",
+    });
+    expect(result.code).toBe(0);
+  });
+
+  it("forwards the explicit Windows-only contract without skipping the requested artifact", async () => {
+    const result = await invokeVerifier(["--windows-only"]);
+    expect(
+      result.invocation?.options.env.REVIEW_MESH_VERIFY_STANDALONE_PLATFORMS,
+    ).toBe("windows");
+    expect(packageMetadata.scripts["verify:standalone:windows"]).toContain(
+      "verify-standalone.mjs --windows-only",
+    );
+  });
+
+  it("rejects unknown platform options rather than falling back to a partial verification", async () => {
+    await expect(invokeVerifier(["--linux-only"])).rejects.toThrow("Usage:");
+  });
+});
+
+describe.skipIf(!verifyStandalone)("standalone release executables", () => {
+  it(`executes the exact requested ${requestedPlatforms.join(" and ")} v10 binaries with the full artifact contract`, async () => {
+    if (!["windows", "windows,linux"].includes(platformSelection))
+      throw new Error(
+        `Unsupported standalone verification platforms: ${platformSelection}`,
+      );
+    const runners = await Promise.all(
+      requestedPlatforms.map(async (name) => {
+        const runner = await (name === "Windows"
+          ? windowsRunner()
+          : linuxRunner());
+        if (!runner)
+          throw new Error(
+            `${name} standalone verification was requested, but its artifact or execution environment is unavailable.`,
+          );
+        return runner;
+      }),
+    );
+
+    for (const runner of runners) {
       const fixture = await runner.createFixture();
       expect(Buffer.byteLength(expectedReview, "utf8"), runner.name).toBe(
         256 * 1_024,

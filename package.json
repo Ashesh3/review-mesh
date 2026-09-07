@@ -1,6 +1,6 @@
 {
   "name": "review-mesh",
-  "version": "10.0.0",
+  "version": "10.1.0",
   "private": true,
   "files": [
     "dist/review-mesh.mjs",
@@ -20,7 +20,7 @@
     "build:standalone": "node scripts/build-standalone.mjs",
     "build:standalone:windows": "node scripts/build-standalone.mjs --windows-only",
     "verify:standalone": "npm run build:standalone && node scripts/verify-standalone.mjs",
-    "verify:standalone:windows": "npm run build:standalone:windows && node scripts/verify-standalone.mjs",
+    "verify:standalone:windows": "npm run build:standalone:windows && node scripts/verify-standalone.mjs --windows-only",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "test": "vitest run",
     "test:live": "vitest run tests/live --testTimeout=600000",

@@ -159,6 +159,9 @@ it("executes the routed SDK through the public application without snapshot/page
   expect(r.received[0]!.coverage).toBeUndefined();
   expect(r.received[0]!.resultPages).toBeUndefined();
   expect(r.received[0]!.reviewer.adapter.type).toBe("codex");
+  expect(
+    r.events.find((event) => event.event === "reviewer.started")?.data.proof,
+  ).toBe("unknown");
   expect(r.events.at(-1)).toMatchObject({
     event: "run.completed",
     data: { run_outcome: "clear" },

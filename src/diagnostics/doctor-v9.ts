@@ -61,7 +61,9 @@ export async function runDoctorV9(
     ]);
     await writeFile(
       join(workspace, path),
-      "Review Mesh doctor. Read this changed file with the provided tool before returning a pass.\n",
+      native
+        ? "Review Mesh doctor. Native review fixture change.\n"
+        : "Review Mesh doctor. Read this changed file with the provided tool before returning a pass.\n",
     );
     const runId = `doctor-${randomUUID()}`;
     const paths = { runsDirectory };
@@ -71,20 +73,18 @@ export async function runDoctorV9(
         workspace,
         project_name: "review-mesh-doctor",
         instructions: native
-          ? "Inspect review-mesh-doctor.txt and its Git diff with the native SDK's approved read-only tools. Return the supplied complete structured result and attest the inspected scope."
+          ? "Review this small Git change using the supplied branch context and your native read-only workspace and Git tools as needed. Choose the relevant inspection yourself and return a usable review in the supplied structured result schema. Do not modify the workspace or run tests/builds."
           : "Read review-mesh-doctor.txt with the provided read tool, inspect the supplied Git diff, then produce the required result pages.",
         review_scope: { mode: "changes", base: "HEAD" },
       },
       git,
       signal,
     });
-    const proof = native
-      ? "native_attested"
-      : (reviewer.policy?.changeCoverage?.proof ??
-        (reviewer.adapter.type === "command" ||
-        reviewer.adapter.type === "codex"
-          ? "attested"
-          : "observed"));
+    const proof =
+      reviewer.policy?.changeCoverage?.proof ??
+      (reviewer.adapter.type === "command" || reviewer.adapter.type === "codex"
+        ? "attested"
+        : "observed");
     const syntheticReviewer: ResolvedReviewer = {
       ...reviewer,
       id: "doctor",
@@ -108,11 +108,15 @@ export async function runDoctorV9(
         adjudication: "off",
         gateMinimumSeverity: "medium",
         gateMinimumConfidence: "medium",
-        changeCoverage: {
-          relevantPaths: ["**"],
-          minimumInspection: "full_file",
-          proof,
-        },
+        ...(native
+          ? {}
+          : {
+              changeCoverage: {
+                relevantPaths: ["**"],
+                minimumInspection: "full_file" as const,
+                proof,
+              },
+            }),
       },
     };
     const syntheticConfig: ResolvedConfig = {
@@ -236,6 +240,9 @@ export async function runDoctorV9(
       { expectedSha256: openedArtifact.publishedReference!.sha256 },
     );
     if (native) {
+      // Findings are a completed review outcome, not an SDK readiness failure.
+      const executionCompleted =
+        completion.exitCode === 0 || completion.exitCode === 1;
       const persistedResult = persisted.results.find(
         (record) => record.reviewer_id === "doctor",
       );
@@ -259,13 +266,8 @@ export async function runDoctorV9(
         execution.harness === reviewer.adapter.type &&
         execution.model === reviewer.model &&
         typeof execution.execution_fingerprint === "string";
-      const scope = result?.native_scope_attestation;
-      const scopeAttested =
-        scope?.complete === true &&
-        scope.reviewed_paths.includes(path) &&
-        result?.change_coverage.status === "complete";
       let rerunVerified = false;
-      if (completion.exitCode === 0) {
+      if (executionCompleted) {
         const retry = await prepareV9Retry({
           runsDirectory,
           parentRunId: runId,
@@ -296,12 +298,6 @@ export async function runDoctorV9(
           required: false,
         },
         { name: "native_schema_submission", passed: submitted },
-        {
-          name: "native_scope_attestation",
-          passed: scopeAttested,
-          message:
-            "Scope completion is model-attested; Review Mesh does not claim observed source reads.",
-        },
         { name: "native_execution_artifact", passed: executionVerified },
         {
           name: "retry_rerun_all",
@@ -316,9 +312,7 @@ export async function runDoctorV9(
             ? "authentication"
             : lastFailure.reason === "model_unavailable"
               ? "model"
-              : lastFailure.reason === "read_failure"
-                ? "native_scope_attestation"
-                : "native_schema_submission";
+              : "native_schema_submission";
         const check = checks.find((entry) => entry.name === stage)!;
         check.passed = false;
         check.message = lastFailure.message;
@@ -326,10 +320,10 @@ export async function runDoctorV9(
       }
       return {
         ready:
-          completion.exitCode === 0 &&
+          executionCompleted &&
           checks.every((check) => check.required === false || check.passed),
-        readiness_scope: "end_to_end_native_attested",
-        proof_kind: "native_attested",
+        readiness_scope: "end_to_end_native_review",
+        proof_kind: "unknown",
         checks,
         run_id: runId,
         artifact: openedArtifact.publishedReference!.path,

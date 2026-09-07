@@ -16,7 +16,7 @@ import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { execa } from "execa";
 import { runLegacyReviewApplication as runReviewApplication } from "../../src/app-legacy.js";
 import {
@@ -247,23 +247,99 @@ function startCompiledCli(
 function startOpenCli(
   fixture: CliFixture,
   imports: readonly string[] = [],
+  pauseFirstOutput = false,
 ): ChildProcessWithoutNullStreams {
-  return spawn(
+  const ready = `data:text/javascript,${encodeURIComponent(`
+    const write = process.stdout.write;
+    process.stdout.write = function (...args) {
+      process.stdout.write = write;
+      process.once("message", () => {
+        process.disconnect?.();
+        write.apply(this, args);
+      });
+      process.send?.({ event: "fixture.ready_for_output" });
+      return true;
+    };
+  `)}`;
+  const child = spawn(
     process.execPath,
     [
       "--import",
       "tsx",
       ...imports.flatMap((url) => ["--import", url]),
+      ...(pauseFirstOutput ? ["--import", ready] : []),
       cliEntry,
       "review",
     ],
     {
       cwd: projectRoot,
       env: fixture.env,
+      stdio: pauseFirstOutput ? ["pipe", "pipe", "pipe", "ipc"] : "pipe",
+      windowsHide: true,
+    },
+  );
+  // The IPC overload loses the non-null stdio type despite the explicit pipes.
+  if (!child.stdin || !child.stdout || !child.stderr) {
+    child.kill();
+    throw new Error("CLI fixture did not expose its configured stdio pipes");
+  }
+  return child as ChildProcessWithoutNullStreams;
+}
+
+async function runSchemaCli(args: readonly string[]): Promise<ProcessResult> {
+  const root = await mkdtemp(join(tmpdir(), "review-mesh-schema-cli-"));
+  temporaryRoots.push(root);
+  const child = spawn(
+    process.execPath,
+    ["--import", "tsx", cliEntry, "schema", ...args],
+    {
+      cwd: projectRoot,
+      env: isolatedEnvironment(root),
       stdio: "pipe",
       windowsHide: true,
     },
   );
+  child.stdin.end();
+  return collectProcess(child);
+}
+
+async function waitForOutputReady(
+  child: ChildProcessWithoutNullStreams,
+): Promise<void> {
+  await new Promise<void>((resolveReady, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.removeListener("error", onError);
+      child.removeListener("close", onClose);
+      child.removeListener("message", onMessage);
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onClose = () =>
+      onError(new Error("CLI exited before attempting public output"));
+    const onMessage = (message: unknown) => {
+      if (
+        (message as { event?: string } | undefined)?.event !==
+        "fixture.ready_for_output"
+      )
+        return;
+      cleanup();
+      resolveReady();
+    };
+    const timer = setTimeout(() => {
+      child.kill();
+      onError(
+        new Error(
+          "CLI did not reach its first public write within ten seconds",
+        ),
+      );
+    }, 10000);
+    child.once("error", onError);
+    child.once("close", onClose);
+    child.on("message", onMessage);
+  });
 }
 
 async function collectProcess(
@@ -504,30 +580,31 @@ describe("review-mesh review", () => {
     process.exitCode = undefined;
   });
 
-  it("prints authoritative Zod-derived schemas", async () => {
-    const fixture = await createFixture();
-    for (const name of [
-      "request",
-      "events",
-      "run-status",
-      "result",
-      "config",
-      "config-apply",
-      "diagnostic",
-      "command-adapter-event",
-    ]) {
-      const result = await runCli(fixture, ["schema", name, "--json"], "");
-      expect(result).toMatchObject({ exitCode: 0, stderr: "" });
-      const document = JSON.parse(result.stdout) as {
-        name: string;
-        schema: Record<string, unknown>;
-      };
-      expect(document.name).toBe(name);
-      expect(document.schema.$schema).toBe(
-        "http://json-schema.org/draft-07/schema#",
-      );
-    }
-    const listed = await runCli(fixture, ["schema", "list"], "");
+  it.each([
+    "request",
+    "events",
+    "run-status",
+    "result",
+    "config",
+    "config-apply",
+    "diagnostic",
+    "command-adapter-event",
+  ])("prints the authoritative Zod-derived %s schema", async (name) => {
+    const result = await runSchemaCli([name, "--json"]);
+    expect(result).toMatchObject({ exitCode: 0, stderr: "" });
+    const document = JSON.parse(result.stdout) as {
+      name: string;
+      schema: Record<string, unknown>;
+    };
+    expect(document.name).toBe(name);
+    expect(document.schema.$schema).toBe(
+      "http://json-schema.org/draft-07/schema#",
+    );
+  });
+
+  it("lists the available schema commands", async () => {
+    const listed = await runSchemaCli(["list"]);
+    expect(listed).toMatchObject({ exitCode: 0, signal: null, stderr: "" });
     const schemaList = JSON.parse(listed.stdout) as {
       schemas: Array<{ name: string; command: string }>;
     };
@@ -653,29 +730,34 @@ describe("review-mesh review", () => {
     process.exitCode = undefined;
   });
 
-  it("runs the compiled CLI with valid JSONL and a passed terminal", async () => {
-    const build = await new Promise<ProcessResult>((resolveBuild, reject) => {
+  describe("compiled CLI", () => {
+    beforeAll(async () => {
       const child = spawn(process.execPath, [tscCli, "-p", "tsconfig.json"], {
         cwd: projectRoot,
         env: process.env,
         stdio: "pipe",
         windowsHide: true,
       });
-      void collectProcess(child).then(resolveBuild, reject);
-    });
-    expect(build).toMatchObject({ exitCode: 0, signal: null });
-    const fixture = await createFixture(["pass"]);
+      expect(await collectProcess(child)).toMatchObject({
+        exitCode: 0,
+        signal: null,
+      });
+    }, 20_000);
 
-    const result = await collectProcess(startCompiledCli(fixture));
-    const events = parseEvents(result.stdout);
-    const completed = events.at(-1);
+    it("runs the compiled CLI with valid JSONL and a passed terminal", async () => {
+      const fixture = await createFixture(["pass"]);
 
-    expect(result).toMatchObject({ exitCode: 0, signal: null, stderr: "" });
-    expect(completed?.event).toBe("run.completed");
-    if (completed?.event !== "run.completed")
-      throw new Error("missing completion");
-    expect(completed.data).toMatchObject({ status: "passed", exit_code: 0 });
-  }, 20_000);
+      const result = await collectProcess(startCompiledCli(fixture));
+      const events = parseEvents(result.stdout);
+      const completed = events.at(-1);
+
+      expect(result).toMatchObject({ exitCode: 0, signal: null, stderr: "" });
+      expect(completed?.event).toBe("run.completed");
+      if (completed?.event !== "run.completed")
+        throw new Error("missing completion");
+      expect(completed.data).toMatchObject({ status: "passed", exit_code: 0 });
+    }, 20_000);
+  });
 
   it("persists only to the injected application-data runs directory when enabled", async () => {
     const fixture = await createFixture(
@@ -1276,11 +1358,18 @@ describe("review-mesh review", () => {
 
   it("exits 3 with one sanitized diagnostic when the stdout consumer closes", async () => {
     const fixture = await createFixture(["pass"]);
-    const child = startOpenCli(fixture);
-    child.stdout.destroy();
+    const child = startOpenCli(fixture, [], true);
+    const ready = waitForOutputReady(child);
     child.stdin.end(fixture.request);
-
-    const result = await collectProcessWithin(child, 5000);
+    await ready;
+    const pipeClosed = new Promise<void>((resolveClosed) =>
+      child.stdout.once("close", resolveClosed),
+    );
+    child.stdout.destroy();
+    await pipeClosed;
+    const completed = collectProcessWithin(child, 5000);
+    child.send({ event: "fixture.release_output" });
+    const result = await completed;
 
     expect(result.exitCode).toBe(3);
     expect(result.signal).toBeNull();

@@ -3,13 +3,20 @@ import {
   startup,
   type Options,
   type SDKMessage,
+  type WarmQuery,
 } from "@anthropic-ai/claude-agent-sdk";
-import { mkdtemp, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AdapterRegistration } from "../config/schemas.js";
 import { resolveSdkRuntime, type SdkRuntime } from "../runtime/sdk-runtime.js";
 import { createClaudeProcessOwner } from "../runtime/claude-process.js";
+import { createClaudeSummaryTransport } from "../runtime/claude-summary-transport.js";
+import {
+  createNativeContextFile,
+  nativeContextFileHint,
+} from "../runtime/native-context.js";
 import {
   providerReviewerResultV4Schema,
   adjudicationResultV2Schema,
@@ -29,6 +36,194 @@ interface Dependencies {
     prompt: string;
     options: Options;
   }) => AsyncIterable<SDKMessage>;
+}
+
+async function removeClaudeHome(home: string): Promise<void> {
+  // Bun's Windows fs.rm currently ignores Node's maxRetries/retryDelay.
+  // Retain the existing five-retry linear budget after owned processes stop.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await rm(home, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (!["EBUSY", "EPERM"].includes(code ?? "") || attempt >= 5) throw error;
+      await new Promise<void>((resolve) =>
+        setTimeout(resolve, 100 * (attempt + 1)),
+      );
+    }
+  }
+}
+
+function cleanupErrorCode(error: unknown): string {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === "string" && /^E[A-Z0-9_]{1,30}$/.test(code)
+    ? code
+    : "cleanup_error";
+}
+
+function claudeActivityTracker() {
+  type Activity = Extract<AdapterEvent, { type: "activity" }>;
+  const hash = (value: unknown) =>
+    createHash("sha256")
+      .update(
+        JSON.stringify(value, (_key, nested: unknown) =>
+          nested && typeof nested === "object" && !Array.isArray(nested)
+            ? Object.fromEntries(
+                Object.entries(nested).sort(([a], [b]) => a.localeCompare(b)),
+              )
+            : nested,
+        ),
+      )
+      .digest("hex");
+  const tools = new Map<string, string>();
+  const streams = new Map<
+    string,
+    { identity: string; bytes: number; frames: Set<string> }
+  >();
+  let thinking:
+    | { message: string; block: number; tokens: number; bucket: number }
+    | undefined;
+  let compacting: string | undefined;
+  let boundary = "initial";
+  return (message: SDKMessage): Activity[] => {
+    const progress: Activity[] = [];
+    const report = (identity: string, text: string, byteCount?: number) => {
+      progress.push({
+        type: "activity",
+        identity,
+        message: text,
+        ...(byteCount === undefined ? {} : { byteCount }),
+      });
+    };
+    if (message.type === "assistant") {
+      for (const block of message.message.content) {
+        if (block.type !== "tool_use") continue;
+        const identity = hash({ tool: block.name, input: block.input });
+        if (tools.size < 4096 || tools.has(block.id))
+          tools.set(block.id, identity);
+        report(`claude:tool:${identity}`, "Claude native tool started.");
+      }
+    } else if (
+      message.type === "user" &&
+      Array.isArray(message.message.content)
+    ) {
+      for (const block of message.message.content) {
+        if (block.type !== "tool_result" || block.is_error) continue;
+        const identity = tools.get(block.tool_use_id);
+        if (identity)
+          report(
+            `claude:tool-result:${identity}`,
+            "Claude native tool completed.",
+          );
+      }
+    } else if (message.type === "stream_event") {
+      const lane = message.parent_tool_use_id ?? "main";
+      const event = message.event;
+      if (event.type === "message_start") {
+        const identity = `claude:output:${hash(event.message.id)}`;
+        if (
+          streams.get(lane)?.identity !== identity &&
+          (streams.has(lane) || streams.size < 64)
+        )
+          streams.set(lane, { identity, bytes: 0, frames: new Set() });
+        if (lane === "main") thinking = undefined;
+      } else if (event.type === "content_block_start" && lane === "main") {
+        const stream = streams.get(lane);
+        thinking =
+          stream && event.content_block.type === "thinking"
+            ? {
+                message: stream.identity,
+                block: event.index,
+                tokens: 0,
+                bucket: 0,
+              }
+            : undefined;
+      } else if (event.type === "content_block_delta") {
+        const stream = streams.get(lane);
+        const text =
+          event.delta.type === "text_delta"
+            ? event.delta.text
+            : event.delta.type === "thinking_delta"
+              ? event.delta.thinking
+              : event.delta.type === "input_json_delta"
+                ? event.delta.partial_json
+                : undefined;
+        if (stream && text) {
+          // Count content locally; never publish source text or model reasoning.
+          if (!stream.frames.has(message.uuid)) {
+            if (stream.frames.size >= 4096)
+              stream.frames.delete(stream.frames.values().next().value!);
+            stream.frames.add(message.uuid);
+            stream.bytes = Math.min(
+              Number.MAX_SAFE_INTEGER,
+              stream.bytes + Buffer.byteLength(text, "utf8"),
+            );
+          }
+          report(stream.identity, "Claude output streaming.", stream.bytes);
+        }
+      } else if (event.type === "message_stop") {
+        streams.delete(lane);
+        if (lane === "main") thinking = undefined;
+      }
+    } else if (
+      message.type === "system" &&
+      message.subtype === "thinking_tokens" &&
+      thinking
+    ) {
+      const tokens = message.estimated_tokens;
+      const delta = message.estimated_tokens_delta;
+      // This SDK estimate advances from provider thinking_delta frames, never
+      // elapsed time. Bucket it separately from bytes and ignore repeated totals.
+      if (
+        Number.isSafeInteger(tokens) &&
+        Number.isSafeInteger(delta) &&
+        delta > 0 &&
+        tokens > thinking.tokens
+      ) {
+        thinking.tokens = tokens;
+        const bucket = Math.floor(tokens / 32);
+        if (bucket > thinking.bucket && bucket <= 4096) {
+          thinking.bucket = bucket;
+          report(
+            `claude:thinking:${thinking.message}:${thinking.block}:${bucket}`,
+            "Claude estimated thinking progress.",
+          );
+        }
+      }
+    } else if (
+      message.type === "system" &&
+      message.subtype === "status" &&
+      message.status === "compacting"
+    ) {
+      compacting ??= hash(boundary);
+      report(
+        `claude:compaction-start:${compacting}`,
+        "Claude context compaction started.",
+      );
+    } else if (
+      message.type === "system" &&
+      message.subtype === "compact_boundary"
+    ) {
+      boundary = hash(message.uuid);
+      compacting = undefined;
+      report(
+        `claude:compaction-complete:${boundary}`,
+        "Claude context compaction completed.",
+      );
+    }
+    return progress.length > 0
+      ? progress
+      : [
+          {
+            type: "activity",
+            message:
+              message.type === "system"
+                ? "Claude runtime activity."
+                : "Claude review activity.",
+          },
+        ];
+  };
 }
 
 /** Vendor strict draft-07 validation rejects our host-only UTF-8 annotations. */
@@ -57,6 +252,7 @@ export function createNativeClaudeAdapter(
     controller: AbortController;
     close?: () => void;
     processes: ReturnType<typeof createClaudeProcessOwner>;
+    stop?: () => Promise<void>;
   }>();
   const runtime = dependencies.runtime ?? (() => resolveSdkRuntime("claude"));
   const nativeQuery = dependencies.query ?? query;
@@ -122,13 +318,14 @@ export function createNativeClaudeAdapter(
     pathToClaudeCodeExecutable: settings.executable ?? runtime().executablePath,
     env: environment,
     settingSources: [],
+    // Keep native context management; file selection and pagination belong to the SDK.
+    settings: { autoCompactEnabled: true },
     strictMcpConfig: true,
     mcpServers: {},
     plugins: [],
     skills: [],
-    tools: ["Read", "Glob", "Grep"],
+    tools: ["Read", "Glob", "Grep", "Bash"],
     disallowedTools: [
-      "Bash",
       "Edit",
       "Write",
       "NotebookEdit",
@@ -137,6 +334,8 @@ export function createNativeClaudeAdapter(
       "Task",
     ],
     permissionMode: "dontAsk",
+    // Native Bash permission checks approve known read-only commands. Any
+    // escalation that reaches the host stays denied; no shell text is parsed here.
     canUseTool: async (name) =>
       ["Read", "Glob", "Grep"].includes(name)
         ? { behavior: "allow" }
@@ -172,38 +371,85 @@ export function createNativeClaudeAdapter(
           "Claude SDK requires an explicitly allowed ANTHROPIC_API_KEY or supported provider credentials.";
       else if (signal.aborted) message = "Claude probe cancelled.";
       else {
-        const controller = new AbortController(),
-          abort = () => controller.abort(signal.reason);
+        const controller = new AbortController();
         const processes = createClaudeProcessOwner();
-        const state = { controller, processes };
+        let stopping: Promise<void> | undefined;
+        let cancelled = false;
+        const stop = () =>
+          (stopping ??= (async () => {
+            try {
+              // Claude's Windows IDE discovery can leave tasklist/findstr
+              // grandchildren holding cwd after EOF closes the runtime root.
+              // A probe has no review output to drain: stop its tree first.
+              await processes.close({ terminateTree: true });
+            } finally {
+              controller.abort(signal.reason);
+            }
+          })());
+        const cancel = () => {
+          cancelled = true;
+          return stop();
+        };
+        const abort = () => {
+          // The same promise is awaited below, including cleanup failures.
+          void cancel().catch(() => undefined);
+        };
+        const state = { controller, processes, stop: cancel };
         active.add(state);
         let home: string | undefined;
+        let warm: WarmQuery | undefined;
         signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) abort();
         try {
           home = await mkdtemp(join(tmpdir(), "review-mesh-claude-probe-"));
           const options = nativeOptions(controller, runtimeEnvironment!);
           options.spawnClaudeCodeProcess = processes.spawn;
           options.env = { ...options.env, CLAUDE_CONFIG_DIR: home };
           options.cwd = home;
-          const warm = await startup({ options, initializeTimeoutMs: 15000 });
-          warm.close();
-          await warm[Symbol.asyncDispose]();
-          await processes.close();
-          available = true;
+          warm = await startup({ options, initializeTimeoutMs: 15000 });
+          available = !cancelled;
         } catch {
-          message = "Claude SDK runtime initialization failed.";
+          message = cancelled
+            ? "Claude probe cancelled."
+            : "Claude SDK runtime initialization failed.";
         } finally {
+          const cleanupFailures: string[] = [];
+          let stopped = false;
+          try {
+            await stop();
+            stopped = true;
+          } catch (error) {
+            cleanupFailures.push(
+              `Claude probe process cleanup failed (${cleanupErrorCode(error)}).`,
+            );
+          }
+          try {
+            warm?.close();
+            await warm?.[Symbol.asyncDispose]();
+          } catch (error) {
+            cleanupFailures.push(
+              `Claude probe SDK cleanup failed (${cleanupErrorCode(error)}).`,
+            );
+          }
+          if (stopped) active.delete(state);
+          if (home && stopped) {
+            try {
+              await removeClaudeHome(home);
+            } catch (error) {
+              cleanupFailures.push(
+                `Claude probe directory cleanup failed (${cleanupErrorCode(error)}).`,
+              );
+            }
+          }
           signal.removeEventListener("abort", abort);
-          controller.abort();
-          await processes.close();
-          active.delete(state);
-          if (home)
-            await rm(home, {
-              recursive: true,
-              force: true,
-              maxRetries: 5,
-              retryDelay: 100,
-            });
+          if (cancelled) {
+            available = false;
+            message = "Claude probe cancelled.";
+          }
+          if (cleanupFailures.length > 0) {
+            available = false;
+            message = [message, ...cleanupFailures].filter(Boolean).join(" ");
+          }
         }
       }
       return {
@@ -255,6 +501,9 @@ export function createNativeClaudeAdapter(
       } = { controller, processes: createClaudeProcessOwner() };
       active.add(state);
       let home: string | undefined;
+      let summaryTransport:
+        Awaited<ReturnType<typeof createClaudeSummaryTransport>> | undefined;
+      let compacting = false;
       let stderr = "";
       const redactions = Object.values(runtimeEnvironment).filter(
         (value): value is string =>
@@ -289,7 +538,71 @@ export function createNativeClaudeAdapter(
       };
       try {
         home = await mkdtemp(join(tmpdir(), "review-mesh-claude-"));
-        const options = nativeOptions(controller, runtimeEnvironment);
+        const contextDirectory = join(home, "review-context");
+        await mkdir(contextDirectory, { mode: 0o700 });
+        const contextFile = await createNativeContextFile(
+          contextDirectory,
+          input.context,
+        );
+        let childEnvironment = runtimeEnvironment;
+        const nativeCloud = [
+          "CLAUDE_CODE_USE_BEDROCK",
+          "CLAUDE_CODE_USE_VERTEX",
+          "CLAUDE_CODE_USE_FOUNDRY",
+        ].some(
+          (name) =>
+            runtimeEnvironment[name] === "1" ||
+            runtimeEnvironment[name] === "true",
+        );
+        if (!nativeCloud && runtimeEnvironment.ANTHROPIC_API_KEY) {
+          summaryTransport = await createClaudeSummaryTransport({
+            baseUrl:
+              runtimeEnvironment.ANTHROPIC_BASE_URL ??
+              "https://api.anthropic.com",
+            apiKey: runtimeEnvironment.ANTHROPIC_API_KEY,
+            signal: controller.signal,
+            isCompacting: () => compacting,
+          });
+          redactions.push(summaryTransport.apiKey);
+          childEnvironment = Object.fromEntries(
+            Object.entries(runtimeEnvironment).map(([key, value]) => [
+              key,
+              value === runtimeEnvironment.ANTHROPIC_API_KEY
+                ? summaryTransport!.apiKey
+                : value,
+            ]),
+          );
+          childEnvironment.ANTHROPIC_API_KEY = summaryTransport.apiKey;
+          childEnvironment.ANTHROPIC_BASE_URL = summaryTransport.baseUrl;
+        }
+        const options = nativeOptions(controller, childEnvironment);
+        if (summaryTransport)
+          options.hooks = {
+            ...options.hooks,
+            PreCompact: [
+              {
+                hooks: [
+                  async () => {
+                    compacting = true;
+                    return {};
+                  },
+                ],
+              },
+            ],
+            PostCompact: [
+              {
+                hooks: [
+                  async () => {
+                    compacting = false;
+                    return {};
+                  },
+                ],
+              },
+            ],
+          };
+        // dontAsk denies reads outside cwd before canUseTool; grant only the
+        // host-owned context subdirectory, never the runtime configuration home.
+        options.additionalDirectories = [await realpath(contextDirectory)];
         options.stderr = (text) => {
           stderr = `${stderr}${text}`.slice(-8000);
         };
@@ -312,7 +625,7 @@ export function createNativeClaudeAdapter(
         options.env = { ...options.env, CLAUDE_CONFIG_DIR: home };
         options.cwd = input.context.workspace;
         options.model = input.reviewer.model;
-        options.systemPrompt = input.prompt.system;
+        options.systemPrompt = `${input.prompt.system}\n\n${nativeContextFileHint(contextFile)}`;
         options.outputFormat = {
           type: "json_schema",
           schema: claudeOutputSchema(input.resultJsonSchema),
@@ -328,19 +641,14 @@ export function createNativeClaudeAdapter(
             (stream.close as () => void)();
           };
         let result = false;
+        const activity = claudeActivityTracker();
         for await (const message of stream) {
           if (controller.signal.aborted) {
             yield { type: "failure", failure: adapterFailure.cancelled() };
             return;
           }
           if (message.type !== "result") {
-            yield {
-              type: "activity",
-              message:
-                message.type === "system"
-                  ? "Claude runtime activity."
-                  : "Claude review activity.",
-            };
+            yield* activity(message);
             continue;
           }
           result = true;
@@ -408,20 +716,22 @@ export function createNativeClaudeAdapter(
         input.signal.removeEventListener("abort", abort);
         state.close?.();
         controller.abort();
-        await state.processes.close();
-        active.delete(state);
-        if (home)
-          await rm(home, {
-            recursive: true,
-            force: true,
-            maxRetries: 5,
-            retryDelay: 100,
-          });
+        try {
+          await state.processes.close();
+          active.delete(state);
+          if (home) await removeClaudeHome(home);
+        } finally {
+          await summaryTransport?.close();
+        }
       }
     },
     async forceCleanup() {
       await Promise.all(
         [...active].map(async (state) => {
+          if (state.stop) {
+            await state.stop();
+            return;
+          }
           state.close?.();
           state.controller.abort();
           await state.processes.close();
