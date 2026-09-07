@@ -5,6 +5,7 @@ import {
   type SDKMessage,
   type WarmQuery,
 } from "@anthropic-ai/claude-agent-sdk";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -54,6 +55,125 @@ function cleanupErrorCode(error: unknown): string {
   return typeof code === "string" && /^E[A-Z0-9_]{1,30}$/.test(code)
     ? code
     : "cleanup_error";
+}
+
+function claudeActivityTracker() {
+  type Activity = Extract<AdapterEvent, { type: "activity" }>;
+  const hash = (value: unknown) =>
+    createHash("sha256")
+      .update(
+        JSON.stringify(value, (_key, nested: unknown) =>
+          nested && typeof nested === "object" && !Array.isArray(nested)
+            ? Object.fromEntries(
+                Object.entries(nested).sort(([a], [b]) => a.localeCompare(b)),
+              )
+            : nested,
+        ),
+      )
+      .digest("hex");
+  const tools = new Map<string, string>();
+  const streams = new Map<
+    string,
+    { identity: string; bytes: number; frames: Set<string> }
+  >();
+  let compacting: string | undefined;
+  let boundary = "initial";
+  return (message: SDKMessage): Activity[] => {
+    const progress: Activity[] = [];
+    const report = (identity: string, text: string, byteCount?: number) => {
+      progress.push({
+        type: "activity",
+        identity,
+        message: text,
+        ...(byteCount === undefined ? {} : { byteCount }),
+      });
+    };
+    if (message.type === "assistant") {
+      for (const block of message.message.content) {
+        if (block.type !== "tool_use") continue;
+        const identity = hash({ tool: block.name, input: block.input });
+        if (tools.size < 4096 || tools.has(block.id))
+          tools.set(block.id, identity);
+        report(`claude:tool:${identity}`, "Claude native tool started.");
+      }
+    } else if (
+      message.type === "user" &&
+      Array.isArray(message.message.content)
+    ) {
+      for (const block of message.message.content) {
+        if (block.type !== "tool_result" || block.is_error) continue;
+        const identity = tools.get(block.tool_use_id);
+        if (identity)
+          report(
+            `claude:tool-result:${identity}`,
+            "Claude native tool completed.",
+          );
+      }
+    } else if (message.type === "stream_event") {
+      const lane = message.parent_tool_use_id ?? "main";
+      const event = message.event;
+      if (event.type === "message_start") {
+        const identity = `claude:output:${hash(event.message.id)}`;
+        if (
+          streams.get(lane)?.identity !== identity &&
+          (streams.has(lane) || streams.size < 64)
+        )
+          streams.set(lane, { identity, bytes: 0, frames: new Set() });
+      } else if (event.type === "content_block_delta") {
+        const stream = streams.get(lane);
+        const text =
+          event.delta.type === "text_delta"
+            ? event.delta.text
+            : event.delta.type === "thinking_delta"
+              ? event.delta.thinking
+              : undefined;
+        if (stream && text) {
+          // Count content locally; never publish source text or model reasoning.
+          if (!stream.frames.has(message.uuid)) {
+            if (stream.frames.size >= 4096)
+              stream.frames.delete(stream.frames.values().next().value!);
+            stream.frames.add(message.uuid);
+            stream.bytes = Math.min(
+              Number.MAX_SAFE_INTEGER,
+              stream.bytes + Buffer.byteLength(text, "utf8"),
+            );
+          }
+          report(stream.identity, "Claude output streaming.", stream.bytes);
+        }
+      } else if (event.type === "message_stop") streams.delete(lane);
+    } else if (
+      message.type === "system" &&
+      message.subtype === "status" &&
+      message.status === "compacting"
+    ) {
+      compacting ??= hash(boundary);
+      report(
+        `claude:compaction-start:${compacting}`,
+        "Claude context compaction started.",
+      );
+    } else if (
+      message.type === "system" &&
+      message.subtype === "compact_boundary"
+    ) {
+      boundary = hash(message.uuid);
+      compacting = undefined;
+      report(
+        `claude:compaction-complete:${boundary}`,
+        "Claude context compaction completed.",
+      );
+    }
+    return progress.length > 0
+      ? progress
+      : [
+          {
+            type: "activity",
+            message:
+              message.type === "system"
+                ? "Claude runtime activity."
+                : "Claude review activity.",
+          },
+        ];
+  };
 }
 
 /** Vendor strict draft-07 validation rejects our host-only UTF-8 annotations. */
@@ -401,19 +521,14 @@ export function createNativeClaudeAdapter(
             (stream.close as () => void)();
           };
         let result = false;
+        const activity = claudeActivityTracker();
         for await (const message of stream) {
           if (controller.signal.aborted) {
             yield { type: "failure", failure: adapterFailure.cancelled() };
             return;
           }
           if (message.type !== "result") {
-            yield {
-              type: "activity",
-              message:
-                message.type === "system"
-                  ? "Claude runtime activity."
-                  : "Claude review activity.",
-            };
+            yield* activity(message);
             continue;
           }
           result = true;
