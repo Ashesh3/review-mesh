@@ -105,6 +105,9 @@ describe("native review contract", () => {
     ]);
     const prompt = native.buildNativeReviewPrompt(reviewer, context);
     expect(prompt.system).toContain("Read each required changed file in full");
+    expect(prompt.system).toContain(
+      "Follow each native tool's next-offset or continuation range",
+    );
     expect(prompt.system).toContain("DURABLE NATIVE REVIEW SCOPE");
     expect(prompt.system).toContain(
       '"required_paths": [\n    "src/support.ts",\n    "src/worker.ts"',
