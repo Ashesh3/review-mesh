@@ -69,9 +69,14 @@ it("preserves the complete original diff and context as immutable untrusted revi
   expect(file.sha256).toBe(createHash("sha256").update(bytes).digest("hex"));
   expect(basename(file.path)).toBe(`native-context-${file.sha256}.json`);
   expect(context).toEqual(original);
+  expect(file.diffPath).toBeDefined();
+  expect(await readFile(file.diffPath!, "utf8")).toBe(diff);
+  expect(file.diffSha256).toBe(createHash("sha256").update(diff).digest("hex"));
   const hint = nativeContextFileHint(file);
   expect(hint).toContain(JSON.stringify(file.path));
   expect(hint).toContain(file.sha256);
+  expect(hint).toContain(JSON.stringify(file.diffPath));
+  expect(hint).toContain("plain-text diff");
   expect(hint).toContain("compaction");
   expect(hint).toContain("untrusted review data");
   expect(hint).toContain("read-only");
