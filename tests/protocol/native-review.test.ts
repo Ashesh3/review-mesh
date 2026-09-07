@@ -6,6 +6,7 @@ import {
   providerReviewerResultV4Schema,
   reviewerResultV4Schema,
   type ActionableFindingV4,
+  type AdjudicationResultV2,
 } from "../../src/protocol/v9.js";
 import {
   buildCanonicalRawFindings,
@@ -63,6 +64,140 @@ afterEach(async () => {
 });
 
 describe("native review contract", () => {
+  it("lists concrete full-file obligations separately from supporting scope", async () => {
+    const native = await import("../../src/protocol/native-review.js");
+    const reviewer = resolvedReviewer({
+      policy: {
+        passQuorum: 1,
+        minimumProviderGroups: 1,
+        adjudication: "required",
+        gateMinimumSeverity: "medium",
+        gateMinimumConfidence: "medium",
+        changeCoverage: {
+          relevantPaths: ["src/**"],
+          minimumInspection: "full_file",
+          proof: "native_attested",
+        },
+      },
+    });
+    const context = resolvedContext({
+      git: {
+        is_repository: true,
+        root: "F:/Projects/demo",
+        branch: "main",
+        head: "abc",
+        merge_base: "abc",
+        status_entries: [],
+        changed_files: ["test/worker.ts", "src/worker.ts", "src/support.ts"],
+        diff_stat: "",
+        diff: "",
+        truncated: {
+          status_entries: false,
+          changed_files: false,
+          diff_stat: false,
+          diff: false,
+        },
+      },
+    });
+    expect(native.nativeRequiredPaths(reviewer, context)).toEqual([
+      "src/support.ts",
+      "src/worker.ts",
+    ]);
+    const prompt = native.buildNativeReviewPrompt(reviewer, context);
+    expect(prompt.system).toContain("Read each required changed file in full");
+    expect(prompt.user).toContain("REQUIRED CHANGED PATH CHECKLIST");
+    expect(prompt.user).toContain(
+      '"required_paths": [\n    "src/support.ts",\n    "src/worker.ts"',
+    );
+    const partial = providerReviewerResultV4Schema.parse({
+      ...result(),
+      native_scope_attestation: {
+        complete: true,
+        reviewed_paths: ["src/worker.ts"],
+        limitations: [],
+      },
+    });
+    expect(
+      native.validateNativeSubmission(reviewer, context, partial),
+    ).toMatchObject({
+      accepted: false,
+      message: expect.stringContaining("src/support.ts"),
+    });
+    partial.native_scope_attestation!.reviewed_paths.push("src/support.ts");
+    expect(native.validateNativeSubmission(reviewer, context, partial)).toEqual(
+      { accepted: true },
+    );
+    partial.native_scope_attestation = {
+      complete: false,
+      reviewed_paths: ["src/worker.ts"],
+      limitations: ["Supporting file could not be read."],
+    };
+    expect(native.validateNativeSubmission(reviewer, context, partial)).toEqual(
+      { accepted: true },
+    );
+  });
+
+  it("validates every native adjudication candidate without requiring an unrelated full review", async () => {
+    const native = await import("../../src/protocol/native-review.js");
+    const reviewer = resolvedReviewer({
+      policy: {
+        mode: "adjudication",
+        candidateFindings: [{ id: "one" }, { id: "two" }],
+        passQuorum: 1,
+        minimumProviderGroups: 1,
+        adjudication: "required",
+        gateMinimumSeverity: "medium",
+        gateMinimumConfidence: "medium",
+      },
+    });
+    const decision = {
+      source_finding_id: "one",
+      decision: "rejected" as const,
+      rationale: "The cited behavior is unchanged.",
+      cited_evidence: [],
+      unverified_assumptions: [],
+    };
+    const report: AdjudicationResultV2 = {
+      schema_version: "2",
+      kind: "review-mesh.adjudication-result",
+      verdict: "pass",
+      review_markdown: "Checked the candidates",
+      summary: "No defects",
+      actionable_findings: [],
+      decisions: [decision],
+      informational_notes: [],
+    };
+    const context = resolvedContext();
+    expect(
+      native.validateNativeSubmission(reviewer, context, report),
+    ).toMatchObject({
+      accepted: false,
+      message: expect.stringContaining("two"),
+    });
+    report.decisions.push({ ...decision, source_finding_id: "two" });
+    expect(native.validateNativeSubmission(reviewer, context, report)).toEqual({
+      accepted: true,
+    });
+    report.decisions.push(decision);
+    expect(
+      native.validateNativeSubmission(reviewer, context, report),
+    ).toMatchObject({
+      accepted: false,
+      message: expect.stringContaining("duplicate"),
+    });
+    report.decisions = [{ ...decision, source_finding_id: "unknown" }];
+    expect(
+      native.validateNativeSubmission(reviewer, context, report),
+    ).toMatchObject({
+      accepted: false,
+      message: expect.stringContaining("unknown"),
+    });
+    const prompt = native.buildNativeReviewPrompt(reviewer, context);
+    expect(prompt.system).not.toContain("Review the declared changed paths");
+    expect(prompt.system).toContain("not a second full-scope review");
+    expect(prompt.user).not.toContain("REQUIRED CHANGED PATH CHECKLIST");
+  });
+
   it("retains more than sixteen native findings while preserving the legacy limit", () => {
     const value = result();
     value.actionable_findings = Array.from({ length: 17 }, (_, index) => ({

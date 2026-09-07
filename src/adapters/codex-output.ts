@@ -56,10 +56,12 @@ export function codexOutputBoundary(input: Schema): {
         target.additionalProperties = false;
       } else if (key === "required" || key === "additionalProperties") {
         if (!record(source.properties)) target[key] = value;
-      } else if (key === "items" && Array.isArray(value)) {
-        if (value.length !== 0 || source.maxItems !== 0)
+      } else if (key === "items" && source.maxItems === 0) {
+        if (Array.isArray(value) && value.length !== 0)
           throw new Error("Codex output does not support tuple schemas.");
         target.items = { type: "null" };
+      } else if (key === "items" && Array.isArray(value)) {
+        throw new Error("Codex output does not support tuple schemas.");
       } else if (
         ["anyOf", "oneOf", "allOf", "prefixItems"].includes(key) &&
         Array.isArray(value)
