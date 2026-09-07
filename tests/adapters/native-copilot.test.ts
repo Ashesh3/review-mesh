@@ -854,7 +854,148 @@ it("aborts a packaged Copilot request and releases the runtime state directory",
   }
 }, 20000);
 
-it.each(["review", "adjudication", "scope-correction"] as const)(
+it("prevents proof repair from silently rejecting a claim but accepts an explicit unresolved adjustment", async () => {
+  const workspace = await temporary();
+  await writeFile(join(workspace, "a.ts"), "return oldValue;");
+  const source = {
+    ...failResult("candidate").actionable_findings[0]!,
+    evidence: [{ path: "a.ts", start_line: 1, end_line: 1, detail: "Return" }],
+    claim: {
+      trigger: "Change",
+      affected_behavior: "Old return",
+      outcome: "Stale value",
+    },
+  };
+  const reply = {
+    schema_version: "2",
+    kind: "review-mesh.adjudication-result",
+    verdict: "fail",
+    review_markdown: "Original claim",
+    summary: "Claim",
+    actionable_findings: [],
+    informational_notes: [],
+    decisions: [
+      {
+        source_finding_id: "candidate",
+        decision: "confirmed",
+        rationale: "Checked source",
+        cited_evidence: [
+          {
+            path: "a.ts",
+            start_line: 99,
+            end_line: 99,
+            detail: "Invalid line",
+          },
+        ],
+        unverified_assumptions: [],
+      },
+    ],
+  };
+  const outcomes: unknown[] = [];
+  const adapter = createNativeCopilotAdapter(registration, {
+    runtime: fakeRuntime,
+    environment: { URL: "http://127.0.0.1:1", KEY: "fixture" },
+    applicationDataDirectory: await temporary(),
+    createClient: () =>
+      ({
+        async start() {},
+        async stop() {
+          return [];
+        },
+        async forceStop() {},
+        async createSession(config: SessionConfig) {
+          const listeners = new Set<(event: SessionEvent) => void>();
+          const submit = config.tools![0]!;
+          return {
+            on(handler: (event: SessionEvent) => void) {
+              listeners.add(handler);
+              return () => listeners.delete(handler);
+            },
+            async abort() {},
+            async disconnect() {},
+            async send() {
+              outcomes.push(await submit.handler!(reply, {} as never));
+              outcomes.push(
+                await submit.handler!(
+                  {
+                    ...reply,
+                    verdict: "pass",
+                    decisions: [
+                      {
+                        ...reply.decisions[0],
+                        decision: "rejected",
+                        cited_evidence: [],
+                      },
+                    ],
+                  },
+                  {} as never,
+                ),
+              );
+              const { id: _id, ...adjusted } = source;
+              outcomes.push(
+                await submit.handler!(
+                  {
+                    ...reply,
+                    decisions: [
+                      {
+                        ...reply.decisions[0],
+                        decision: "adjusted",
+                        adjusted_finding: {
+                          ...adjusted,
+                          classification: "needs_verification",
+                          external_assumptions: ["Proof cannot be established"],
+                        },
+                        unverified_assumptions: ["Proof cannot be established"],
+                      },
+                    ],
+                  },
+                  {} as never,
+                ),
+              );
+              for (const listener of listeners)
+                listener({ type: "session.idle", data: {} } as SessionEvent);
+              return "message";
+            },
+          };
+        },
+      }) as unknown as CopilotClient,
+  });
+  const input = reviewInput(workspace);
+  input.reviewer.policy = {
+    mode: "adjudication",
+    candidateFindings: [source] as never,
+    passQuorum: 1,
+    minimumProviderGroups: 1,
+    adjudication: "required",
+    gateMinimumSeverity: "medium",
+    gateMinimumConfidence: "medium",
+  };
+  const events = await collect(adapter.run(input));
+  expect(outcomes[0]).toMatchObject({ resultType: "failure" });
+  expect(outcomes[1]).toMatchObject({
+    resultType: "failure",
+    textResultForLlm: expect.stringContaining("claim"),
+  });
+  expect(outcomes[2]).toMatchObject({ resultType: "success" });
+  expect(events.at(-1)).toMatchObject({
+    type: "result",
+    result: {
+      decisions: [
+        {
+          decision: "adjusted",
+          adjusted_finding: { classification: "needs_verification" },
+        },
+      ],
+    },
+  });
+});
+
+it.each([
+  "review",
+  "adjudication",
+  "scope-correction",
+  "proof-correction",
+] as const)(
   "runs packaged Copilot %s file inspection and terminal submission against a loopback provider",
   async (mode) => {
     const root = await temporary(),
@@ -903,24 +1044,31 @@ it.each(["review", "adjudication", "scope-correction"] as const)(
         const args =
           name === "view"
             ? { path: join(workspace, requests.length === 3 ? "b.ts" : "a.ts") }
-            : mode === "adjudication"
+            : mode === "adjudication" || mode === "proof-correction"
               ? {
                   schema_version: "2",
                   kind: "review-mesh.adjudication-result",
-                  verdict: "pass",
+                  verdict: mode === "proof-correction" ? "fail" : "pass",
                   review_markdown: "Full loopback native report",
                   summary: "Both supplied candidates were checked",
                   actionable_findings: [],
                   decisions: ["CANDIDATE-001", "CANDIDATE-002"].map((id) => ({
                     source_finding_id: id,
-                    decision: "rejected",
+                    decision:
+                      mode === "proof-correction" ? "confirmed" : "rejected",
                     rationale:
                       "The candidate's alleged behavior is absent from the inspected file.",
                     cited_evidence: [
                       {
                         path: "a.ts",
-                        start_line: 1,
-                        end_line: 1,
+                        start_line:
+                          mode === "proof-correction" && requests.length === 2
+                            ? 99
+                            : 1,
+                        end_line:
+                          mode === "proof-correction" && requests.length === 2
+                            ? 99
+                            : 1,
                         detail: "NATIVE_FILE_EVIDENCE",
                       },
                     ],
@@ -1015,12 +1163,28 @@ it.each(["review", "adjudication", "scope-correction"] as const)(
         },
       };
     }
-    if (mode === "adjudication") {
+    if (mode === "adjudication" || mode === "proof-correction") {
       input.reviewer = resolvedReviewer({
         ...input.reviewer,
         policy: {
           mode: "adjudication",
-          candidateFindings: [{ id: "CANDIDATE-001" }, { id: "CANDIDATE-002" }],
+          candidateFindings: ["CANDIDATE-001", "CANDIDATE-002"].map((id) => ({
+            ...failResult(id).actionable_findings[0],
+            id,
+            evidence: [
+              {
+                path: "a.ts",
+                start_line: 1,
+                end_line: 1,
+                detail: "NATIVE_FILE_EVIDENCE",
+              },
+            ],
+            claim: {
+              trigger: "Trigger",
+              affected_behavior: "Behavior",
+              outcome: "Outcome",
+            },
+          })) as never,
           passQuorum: 1,
           minimumProviderGroups: 1,
           adjudication: "required",
@@ -1047,7 +1211,7 @@ it.each(["review", "adjudication", "scope-correction"] as const)(
         type: "result",
         result: { review_markdown: "Full loopback native report" },
       });
-      if (mode === "adjudication") {
+      if (mode === "adjudication" || mode === "proof-correction") {
         expect(events.at(-1)).toMatchObject({
           type: "result",
           result: {
@@ -1079,7 +1243,13 @@ it.each(["review", "adjudication", "scope-correction"] as const)(
           schema.properties.decisions.items.properties.source_finding_id.enum,
         ).toEqual(["CANDIDATE-001", "CANDIDATE-002"]);
       }
-      expect(requests).toHaveLength(mode === "scope-correction" ? 4 : 2);
+      expect(requests).toHaveLength(
+        mode === "scope-correction" ? 4 : mode === "proof-correction" ? 3 : 2,
+      );
+      if (mode === "proof-correction")
+        expect(JSON.stringify(requests[2]!.body.messages)).toContain(
+          "line_out_of_range",
+        );
       if (mode === "scope-correction") {
         expect(JSON.stringify(requests[2]!.body.messages)).toContain("b.ts");
         expect(JSON.stringify(requests[3]!.body.messages)).toContain(

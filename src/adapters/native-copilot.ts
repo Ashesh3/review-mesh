@@ -13,10 +13,12 @@ import { resolveSdkRuntime, type SdkRuntime } from "../runtime/sdk-runtime.js";
 import { sendCopilotReviewAndWait } from "../runtime/copilot-completion.js";
 import { createCopilotProgressTracker } from "../runtime/copilot-progress.js";
 import { validateNativeSubmission } from "../protocol/native-review.js";
+import { validateNativeAdjudicationSubmission } from "../protocol/native-submission.js";
 import { sanitizeReviewerOutput } from "../results/sanitize.js";
 import {
   providerReviewerResultV4Schema,
   adjudicationResultV2Schema,
+  type AdjudicationDecisionV2,
 } from "../protocol/v9.js";
 import {
   buildAllowlistedEnvironment,
@@ -304,6 +306,48 @@ export function createNativeCopilotAdapter(
       const events: AdapterEvent[] = [];
       const trackProgress = createCopilotProgressTracker();
       const retainedFindings = new Map<string, string>();
+      const retainedDecisions = new Map<
+        string,
+        { kind: string; core: string; unresolvedCore: string }
+      >();
+      const decisionCore = (
+        decision: AdjudicationDecisionV2,
+        unresolved = false,
+      ) => {
+        const source = Array.isArray(input.reviewer.policy?.candidateFindings)
+          ? input.reviewer.policy.candidateFindings.find(
+              (value) =>
+                typeof value === "object" &&
+                value !== null &&
+                !Array.isArray(value) &&
+                value.id === decision.source_finding_id,
+            )
+          : undefined;
+        const finding = (decision.adjusted_finding ?? source ?? {}) as Record<
+          string,
+          unknown
+        >;
+        const claim = finding.claim as Record<string, unknown> | undefined;
+        return createHash("sha256")
+          .update(
+            JSON.stringify([
+              finding.severity,
+              finding.title,
+              finding.description,
+              finding.suggested_direction,
+              finding.category,
+              finding.root_issue_id,
+              finding.change_impact,
+              claim?.trigger,
+              claim?.affected_behavior,
+              claim?.outcome,
+              ...(unresolved
+                ? []
+                : [finding.classification, finding.confidence]),
+            ]),
+          )
+          .digest("hex");
+      };
       let rejectedSubmissionCount = 0;
       const recordRejectedSubmission = async (
         result: NonNullable<typeof submitted>,
@@ -489,6 +533,41 @@ export function createNativeCopilotAdapter(
                     error: "Review was already submitted.",
                   };
                 if (
+                  parsed.data.schema_version === "2" &&
+                  retainedDecisions.size
+                ) {
+                  const changed = parsed.data.decisions.filter((decision) => {
+                    const previous = retainedDecisions.get(
+                      decision.source_finding_id,
+                    );
+                    if (!previous) return false;
+                    const unresolved =
+                      decision.decision === "adjusted" &&
+                      decision.adjusted_finding?.classification ===
+                        "needs_verification" &&
+                      (decision.unverified_assumptions.length > 0 ||
+                        decision.adjusted_finding.external_assumptions.length >
+                          0);
+                    return unresolved
+                      ? previous.unresolvedCore !== decisionCore(decision, true)
+                      : previous.kind !== decision.decision ||
+                          previous.core !== decisionCore(decision);
+                  });
+                  if (changed.length) {
+                    submissionFeedback =
+                      "Proof correction must preserve the original candidate claims and decisions. Correct citations and proof only; if a claim cannot be substantiated, keep that claim as an adjusted needs_verification finding with an explicit reason. Do not reject or drop claims to bypass proof checks.";
+                    await recordRejectedSubmission(
+                      parsed.data,
+                      submissionFeedback,
+                    );
+                    return {
+                      resultType: "failure",
+                      textResultForLlm: submissionFeedback,
+                      error: submissionFeedback,
+                    };
+                  }
+                }
+                if (
                   parsed.data.schema_version === "4" &&
                   retainedFindings.size
                 ) {
@@ -516,13 +595,29 @@ export function createNativeCopilotAdapter(
                     };
                   }
                 }
-                const validation = validateNativeSubmission(
-                  input.reviewer,
-                  input.context,
-                  parsed.data,
-                );
+                const validation =
+                  parsed.data.schema_version === "2"
+                    ? await validateNativeAdjudicationSubmission(
+                        input.reviewer,
+                        input.context,
+                        parsed.data,
+                        input.signal,
+                      )
+                    : validateNativeSubmission(
+                        input.reviewer,
+                        input.context,
+                        parsed.data,
+                      );
                 if (!validation.accepted) {
                   submissionFeedback = validation.message;
+                  if (parsed.data.schema_version === "2")
+                    for (const decision of parsed.data.decisions)
+                      if (!retainedDecisions.has(decision.source_finding_id))
+                        retainedDecisions.set(decision.source_finding_id, {
+                          kind: decision.decision,
+                          core: decisionCore(decision),
+                          unresolvedCore: decisionCore(decision, true),
+                        });
                   if (parsed.data.schema_version === "4")
                     for (const finding of parsed.data.actionable_findings)
                       retainedFindings.set(
