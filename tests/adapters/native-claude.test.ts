@@ -605,8 +605,8 @@ it("keeps Claude's native tools and uses one SDK session even for a terminal pro
   expect(options?.mcpServers).toEqual({});
   expect(options?.settings).toMatchObject({
     autoCompactEnabled: true,
-    autoCompactWindow: 128000,
   });
+  expect(options?.settings).not.toHaveProperty("autoCompactWindow");
   expect(options?.env?.CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS).toBe("8000");
   expect(options?.env?.ANTHROPIC_API_KEY).toBe("test-only");
   expect(options?.env?.ANTHROPIC_BASE_URL).toBe(

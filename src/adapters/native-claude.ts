@@ -382,9 +382,9 @@ export function createNativeClaudeAdapter(
     pathToClaudeCodeExecutable: settings.executable ?? runtime().executablePath,
     env: { ...environment, CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS: "8000" },
     settingSources: [],
-    // Start native compaction before full-file tool results consume the 200K
-    // window. The SDK retains its summary/output reserves and owns all turns.
-    settings: { autoCompactEnabled: true, autoCompactWindow: 128000 },
+    // Keep the selected model's native window and summary/output reserves.
+    // Bounded Read pages must not shrink the model's usable context capacity.
+    settings: { autoCompactEnabled: true },
     hooks: { PostToolUse: nativeReadPageHint },
     strictMcpConfig: true,
     mcpServers: {},

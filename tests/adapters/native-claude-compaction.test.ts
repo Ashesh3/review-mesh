@@ -11,7 +11,7 @@ import {
 import { resolvedContext, resolvedReviewer } from "../helpers/fixtures.js";
 
 it.runIf(process.env.REVIEW_MESH_VERIFY_SDK_RUNTIME === "1")(
-  "compacts inside the native SDK at the configured window before provider overflow",
+  "compacts inside the native SDK at the selected model window before provider overflow",
   async () => {
     const workspace = await mkdtemp(join(tmpdir(), "mesh-claude-compaction-"));
     await writeFile(join(workspace, "source.txt"), "controlled fixture\n");
@@ -143,7 +143,7 @@ it.runIf(process.env.REVIEW_MESH_VERIFY_SDK_RUNTIME === "1")(
                 limit: 1,
               },
             },
-            70000 + calls * 10000,
+            140000 + calls * 10000,
           );
         } else {
           send(
