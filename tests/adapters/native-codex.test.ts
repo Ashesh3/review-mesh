@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
+import { parse as parseToml } from "smol-toml";
 import { resolvedContext, resolvedReviewer } from "../helpers/fixtures.js";
 import { nativeResultJsonSchema } from "../../src/protocol/native-review.js";
 import type {
@@ -876,6 +877,137 @@ describe("native Codex isolation", () => {
     expect(JSON.stringify(argumentsPolicy ?? {})).not.toContain(
       "TRUSTED_LONG_POLICY",
     );
+  });
+
+  it("keeps original review context readable from pinned policy after the user turn is compacted", async () => {
+    const { createNativeCodexAdapter } =
+      await import("../../src/adapters/native-codex.js");
+    const root = await temporary();
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    await writeFile(join(workspace, "source.ts"), "NEW_VALUE\n");
+    let runtimeDirectory = "";
+    let contextPath = "";
+    let persistentPolicy = "";
+    let recovered: Record<string, any> | undefined;
+    const adapter = createNativeCodexAdapter(
+      { type: "codex", api_key_env: "KEY" },
+      {
+        applicationDataDirectory: join(root, "app"),
+        environment: { KEY: "NEVER_WRITE_REAL_AUTH" },
+        createClient: (options) =>
+          ({
+            startThread: (threadOptions: { workingDirectory: string }) => ({
+              async runStreamed() {
+                // Model lost the first user message. Use only persistent developer
+                // policy and the file it identifies to reconstruct the original task.
+                runtimeDirectory = threadOptions.workingDirectory;
+                persistentPolicy = String(
+                  parseToml(
+                    await readFile(
+                      join(options.env!.CODEX_HOME!, "config.toml"),
+                      "utf8",
+                    ),
+                  ).developer_instructions,
+                );
+                const files = (await readdir(runtimeDirectory)).filter((name) =>
+                  /^native-context-[a-f0-9]{64}\.json$/.test(name),
+                );
+                if (files[0]) {
+                  contextPath = join(runtimeDirectory, files[0]);
+                  recovered = JSON.parse(await readFile(contextPath, "utf8"));
+                }
+                return {
+                  events: (async function* () {
+                    yield {
+                      type: "item.completed",
+                      item: {
+                        id: "final",
+                        type: "agent_message",
+                        text: JSON.stringify(result()),
+                      },
+                    };
+                    yield {
+                      type: "turn.completed",
+                      usage: {
+                        input_tokens: 1,
+                        cached_input_tokens: 0,
+                        output_tokens: 1,
+                      },
+                    };
+                  })(),
+                };
+              },
+            }),
+          }) as never,
+      },
+    );
+    const review = await input(workspace);
+    const originalDiff =
+      "diff --git a/source.ts b/source.ts\n@@ -1 +1 @@\n-OLD_VALUE\n+NEW_VALUE\n";
+    review.context = resolvedContext({
+      workspace,
+      instructions: "Check the original requested behavior.",
+      caller_context: {
+        ticket: "ORIGINAL_REQUEST_CONTEXT",
+        api_key: "REDACT_THIS_CONTEXT_SECRET",
+      },
+      request: { schema_version: "3", request_id: "original-request" },
+      review_scope: {
+        mode: "changes",
+        source: "request",
+        base: "PINNED_BASE",
+        head: "PINNED_HEAD",
+      },
+      git: {
+        is_repository: true,
+        root: workspace,
+        branch: "fixture",
+        head: "PINNED_HEAD",
+        merge_base: "PINNED_BASE",
+        status_entries: [],
+        changed_files: ["source.ts"],
+        diff_stat: "1 file changed",
+        diff: originalDiff,
+        truncated: {
+          status_entries: false,
+          changed_files: false,
+          diff_stat: false,
+          diff: false,
+        },
+      },
+    });
+    review.prompt.user =
+      "This first user turn is intentionally unavailable after compaction.";
+    const events = await collect(adapter.run(review));
+    expect(events.at(-1)?.type).toBe("result");
+    expect(recovered).toMatchObject({
+      schema_version: "1",
+      kind: "review-mesh.native-context",
+      required_changed_paths: ["source.ts"],
+      context: {
+        instructions: "Check the original requested behavior.",
+        caller_context: {
+          ticket: "ORIGINAL_REQUEST_CONTEXT",
+          api_key: "[redacted]",
+        },
+        request: { request_id: "original-request" },
+        git: {
+          diff: originalDiff,
+          head: "PINNED_HEAD",
+          merge_base: "PINNED_BASE",
+        },
+      },
+    });
+    expect(contextPath).not.toBe("");
+    expect(persistentPolicy).toContain(JSON.stringify(contextPath));
+    expect(persistentPolicy).toContain("TRUSTED_REVIEW_POLICY");
+    expect(JSON.stringify({ recovered, persistentPolicy })).not.toMatch(
+      /NEVER_WRITE_REAL_AUTH|REDACT_THIS_CONTEXT_SECRET/,
+    );
+    expect(contextPath.startsWith(workspace)).toBe(false);
+    await expect(access(runtimeDirectory)).rejects.toThrow();
+    expect(await readdir(workspace)).toEqual(["source.ts"]);
   });
 
   it("runs one native SDK turn with isolated project content, schema output and a denied workspace write", async () => {

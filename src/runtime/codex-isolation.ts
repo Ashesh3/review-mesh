@@ -15,6 +15,11 @@ import { promisify } from "node:util";
 import type { CodexOptions } from "@openai/codex-sdk";
 import { stringify } from "smol-toml";
 import { buildAllowlistedEnvironment } from "../adapters/types.js";
+import type { ResolvedContext } from "../context/resolve.js";
+import {
+  createNativeContextFile,
+  nativeContextFileHint,
+} from "./native-context.js";
 
 const execute = promisify(execFile);
 type SkillDisable = { path: string; enabled: false };
@@ -111,6 +116,7 @@ async function privateDirectory(path: string): Promise<void> {
 export async function createCodexIsolationHome(
   applicationDataDirectory: string,
   systemPrompt: string,
+  context?: ResolvedContext,
 ): Promise<CodexIsolationHome> {
   await privateDirectory(applicationDataDirectory);
   const applicationRoot = await realpath(applicationDataDirectory);
@@ -138,8 +144,14 @@ export async function createCodexIsolationHome(
     const disabledSkills = await enumerateCodexSkillDisables(
       await ambientSkillRoots(),
     );
+    const contextFile =
+      context === undefined
+        ? undefined
+        : await createNativeContextFile(workingDirectory, context);
     const config: NonNullable<CodexOptions["config"]> = {
-      developer_instructions: systemPrompt,
+      developer_instructions: contextFile
+        ? `${systemPrompt}\n\n${nativeContextFileHint(contextFile)}`
+        : systemPrompt,
       project_doc_max_bytes: 0,
       project_root_markers: [],
       mcp_servers: {},

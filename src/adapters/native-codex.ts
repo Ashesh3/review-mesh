@@ -317,6 +317,7 @@ class NativeCodexAdapter implements ReviewAdapter {
         this.dependencies.applicationDataDirectory ??
           dirname(getAppPaths().runsDirectory),
         input.prompt.system,
+        input.context,
       );
       this.active.set(isolated, controller);
       if (input.signal.aborted) cancel();
