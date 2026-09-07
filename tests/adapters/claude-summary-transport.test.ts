@@ -58,6 +58,7 @@ it("forces only the native internal summary to text while forwarding ordinary SD
     baseUrl: `${upstream}/provider`,
     apiKey: "provider-secret",
     signal: new AbortController().signal,
+    isCompacting: () => true,
   });
   cleanups.push(relay.close);
   expect(relay.apiKey).not.toBe("provider-secret");
@@ -123,7 +124,7 @@ it("forces only the native internal summary to text while forwarding ordinary SD
   ).toBe(true);
 });
 
-it("recognizes the pinned SDK's merged tool results and trailing token-budget message without matching older summaries", async () => {
+it("recognizes native summary blocks only during the trusted compaction phase without matching older summaries", async () => {
   const received: unknown[] = [];
   const upstream = await listen(
     createServer((request, response) => {
@@ -137,10 +138,12 @@ it("recognizes the pinned SDK's merged tool results and trailing token-budget me
       });
     }),
   );
+  let isCompacting = true;
   const relay = await createClaudeSummaryTransport({
     baseUrl: upstream,
     apiKey: "provider-secret",
     signal: new AbortController().signal,
+    isCompacting: () => isCompacting,
   });
   cleanups.push(relay.close);
   const merged = {
@@ -171,7 +174,7 @@ it("recognizes the pinned SDK's merged tool results and trailing token-budget me
     {
       messages: [
         merged,
-        { role: "system", content: "Ordinary system message." },
+        { role: "system", content: "Native auxiliary metadata." },
       ],
       tools: [{ name: "Read" }],
     },
@@ -180,8 +183,21 @@ it("recognizes the pinned SDK's merged tool results and trailing token-budget me
         {
           role: "user",
           content: [
-            { type: "text", text: "Quoted source follows." },
+            { type: "text", text: "Native Read page metadata." },
             ...merged.content,
+            { type: "text", text: "Native additional context." },
+          ],
+        },
+        budget,
+      ],
+      tools: [{ name: "Read" }],
+    },
+    {
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: `Quoted source follows:\n${summary}` },
           ],
         },
         budget,
@@ -202,7 +218,19 @@ it("recognizes the pinned SDK's merged tool results and trailing token-budget me
     ...bodies[0],
     tool_choice: { type: "none" },
   });
-  expect(received.slice(1)).toEqual(bodies.slice(1));
+  expect(received[1]).toEqual(bodies[1]);
+  expect(received[2]).toEqual({ ...bodies[2], tool_choice: { type: "none" } });
+  expect(received[3]).toEqual({ ...bodies[3], tool_choice: { type: "none" } });
+  expect(received[4]).toEqual(bodies[4]);
+  isCompacting = false;
+  const response = await fetch(`${relay.baseUrl}/v1/messages`, {
+    method: "POST",
+    headers: { "x-api-key": relay.apiKey },
+    body: JSON.stringify(bodies[0]),
+  });
+  expect(response.status).toBe(200);
+  await response.text();
+  expect(received[5]).toEqual(bodies[0]);
 });
 
 it("refuses upstream redirects without forwarding provider credentials to another listener", async () => {
@@ -223,6 +251,7 @@ it("refuses upstream redirects without forwarding provider credentials to anothe
     baseUrl: upstream,
     apiKey: "provider-secret",
     signal: new AbortController().signal,
+    isCompacting: () => true,
   });
   cleanups.push(relay.close);
   const response = await fetch(`${relay.baseUrl}/v1/messages`, {
@@ -257,6 +286,7 @@ it("forwards required provider response metadata but not echoed credentials or a
     baseUrl: upstream,
     apiKey: "provider-secret",
     signal: new AbortController().signal,
+    isCompacting: () => true,
   });
   localCredential = relay.apiKey;
   cleanups.push(relay.close);
@@ -293,6 +323,7 @@ it("rejects oversized or invalid JSON locally without an upstream attempt", asyn
     baseUrl: upstream,
     apiKey: "provider-secret",
     signal: new AbortController().signal,
+    isCompacting: () => true,
   });
   cleanups.push(relay.close);
   for (const [body, status] of [
@@ -325,6 +356,7 @@ it("rejects unauthenticated, cross-origin and out-of-route requests without touc
     baseUrl: upstream,
     apiKey: "provider-secret",
     signal: new AbortController().signal,
+    isCompacting: () => true,
   });
   cleanups.push(relay.close);
   for (const input of [
@@ -366,6 +398,7 @@ it("aborts active upstream work and closes the listener idempotently", async () 
     baseUrl: upstream,
     apiKey: "provider-secret",
     signal: controller.signal,
+    isCompacting: () => true,
   });
   cleanups.push(relay.close);
   const pending = fetch(`${relay.baseUrl}/v1/messages`, {
@@ -400,6 +433,7 @@ it("cancels the upstream response when the SDK disconnects during an SSE stream"
     baseUrl: upstream,
     apiKey: "provider-secret",
     signal: new AbortController().signal,
+    isCompacting: () => true,
   });
   cleanups.push(relay.close);
   const response = await fetch(`${relay.baseUrl}/v1/messages`, {
@@ -427,6 +461,7 @@ it("closes an incomplete SDK upload without forwarding it or leaving the socket 
     baseUrl: upstream,
     apiKey: "provider-secret",
     signal: new AbortController().signal,
+    isCompacting: () => true,
   });
   cleanups.push(relay.close);
   const client = httpRequest(`${relay.baseUrl}/v1/messages`, {

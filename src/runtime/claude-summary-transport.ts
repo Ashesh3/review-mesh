@@ -22,44 +22,35 @@ function isNativeSummary(body: unknown): body is Record<string, unknown> {
     value.tools.length === 0
   )
     return false;
-  // SDK 0.3.251 can append its native token-budget system message after the
-  // final user turn. Do not search past an assistant or an arbitrary message.
+  // The trusted PreCompact/PostCompact phase gate is checked by the caller.
+  // The SDK can append system metadata, but never search past an assistant.
   let index = value.messages.length - 1;
-  while (
-    index >= 0 &&
-    value.messages[index]?.role === "system" &&
-    typeof value.messages[index]?.content === "string" &&
-    /^<total_tokens>\d+ tokens left<\/total_tokens>$/.test(
-      value.messages[index].content,
-    )
-  )
-    index--;
+  while (index >= 0 && value.messages[index]?.role === "system") index--;
   const latest = value.messages[index] as
     { role?: unknown; content?: unknown } | undefined;
   if (latest?.role !== "user") return false;
   const content = latest.content;
-  // The SDK merges pending Read results into this user turn before appending
-  // its summary instruction. Other preceding text is not an internal summary.
-  const lastBlock = Array.isArray(content) ? content.at(-1) : undefined;
-  const text =
+  // Native tool results and hook metadata may surround the summary block.
+  // Match its entire text, not a marker quoted inside source or older turns.
+  const texts =
     typeof content === "string"
-      ? content
-      : Array.isArray(content) &&
-          content
-            .slice(0, -1)
-            .every((block) => block?.type === "tool_result") &&
-          lastBlock?.type === "text" &&
-          typeof lastBlock?.text === "string"
-        ? lastBlock.text
-        : undefined;
-  return (
-    typeof text === "string" &&
-    text.startsWith(summaryPrefix) &&
-    text.endsWith(summarySuffix) &&
-    text.includes(
-      "Your task is to create a detailed summary of the conversation",
-    ) &&
-    text.includes("an <analysis> block followed by a <summary> block")
+      ? [content]
+      : Array.isArray(content)
+        ? content
+            .filter(
+              (block) =>
+                block?.type === "text" && typeof block.text === "string",
+            )
+            .map((block) => block.text as string)
+        : [];
+  return texts.some(
+    (text) =>
+      text.startsWith(summaryPrefix) &&
+      text.endsWith(summarySuffix) &&
+      text.includes(
+        "Your task is to create a detailed summary of the conversation",
+      ) &&
+      text.includes("an <analysis> block followed by a <summary> block"),
   );
 }
 
@@ -78,6 +69,7 @@ export async function createClaudeSummaryTransport(options: {
   baseUrl: string;
   apiKey: string;
   signal: AbortSignal;
+  isCompacting(): boolean;
 }): Promise<{ baseUrl: string; apiKey: string; close(): Promise<void> }> {
   options.signal.throwIfAborted();
   const upstream = new URL(options.baseUrl);
@@ -157,7 +149,11 @@ export async function createClaudeSummaryTransport(options: {
       reply(response, 400, "Claude transport requires valid JSON.");
       return;
     }
-    if (endpoint === "/v1/messages" && isNativeSummary(parsed))
+    if (
+      endpoint === "/v1/messages" &&
+      options.isCompacting() &&
+      isNativeSummary(parsed)
+    )
       body = Buffer.from(
         JSON.stringify({ ...parsed, tool_choice: { type: "none" } }),
       );

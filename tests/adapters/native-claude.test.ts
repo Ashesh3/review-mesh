@@ -649,6 +649,8 @@ it("keeps Claude's native tools and uses one SDK session even for a terminal pro
     autoCompactEnabled: true,
   });
   expect(options?.settings).not.toHaveProperty("autoCompactWindow");
+  expect(options?.hooks?.PreCompact).toHaveLength(1);
+  expect(options?.hooks?.PostCompact).toHaveLength(1);
   expect(options?.env?.CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS).toBe("8000");
   expect(options?.env?.ANTHROPIC_API_KEY).not.toBe("test-only");
   expect(options?.env?.ANTHROPIC_API_KEY).toMatch(/^[a-f0-9]{64}$/);

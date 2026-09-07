@@ -569,6 +569,7 @@ export function createNativeClaudeAdapter(
       let home: string | undefined;
       let summaryTransport:
         Awaited<ReturnType<typeof createClaudeSummaryTransport>> | undefined;
+      let compacting = false;
       let stderr = "";
       const redactions = Object.values(runtimeEnvironment).filter(
         (value): value is string =>
@@ -626,6 +627,7 @@ export function createNativeClaudeAdapter(
               "https://api.anthropic.com",
             apiKey: runtimeEnvironment.ANTHROPIC_API_KEY,
             signal: controller.signal,
+            isCompacting: () => compacting,
           });
           redactions.push(summaryTransport.apiKey);
           childEnvironment = Object.fromEntries(
@@ -640,6 +642,30 @@ export function createNativeClaudeAdapter(
           childEnvironment.ANTHROPIC_BASE_URL = summaryTransport.baseUrl;
         }
         const options = nativeOptions(controller, childEnvironment);
+        if (summaryTransport)
+          options.hooks = {
+            ...options.hooks,
+            PreCompact: [
+              {
+                hooks: [
+                  async () => {
+                    compacting = true;
+                    return {};
+                  },
+                ],
+              },
+            ],
+            PostCompact: [
+              {
+                hooks: [
+                  async () => {
+                    compacting = false;
+                    return {};
+                  },
+                ],
+              },
+            ],
+          };
         // dontAsk denies reads outside cwd before canUseTool; grant only the
         // host-owned context subdirectory, never the runtime configuration home.
         options.additionalDirectories = [await realpath(contextDirectory)];
