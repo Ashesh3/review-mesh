@@ -71,6 +71,21 @@ agent's declared inspection/completion of the requested scope; it is not exact-b
 snapshot proof or a guarantee of exhaustive defect detection. Review Mesh validates
 structured output, scope declarations, citation ranges, and configured gate policy.
 
+For complete-roster evaluation, select `execution.review_profile = "strict-evaluation"`
+in trusted configuration. Every applicable configured model runs, including the
+remaining independent adjudicators after a finding. Failed jobs or conflicting
+adjudications keep the evaluation inconclusive; they are not counted as passes.
+Routine reviews retain their configured early exits. Model-job completion is
+distinct from a clean PR: a complete review may correctly exit `1` with findings.
+
+Native heartbeats include model counts and active reviewer details from workspace
+preparation through finalization. The configured `no_progress_timeout_ms` is
+enforced using advancing native response bytes or distinct inspection activity;
+repeating the same read does not extend it. Rejected Copilot submissions receive
+schema/scope feedback inside the same SDK session, and their complete sanitized
+drafts remain in the artifact. Adjudication base citations are checked against the
+immutable merge-base Git blob, separately from current-worktree citations.
+
 Existing raw configuration can be migrated through a read-only preview:
 
 ```powershell
